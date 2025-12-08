@@ -30,6 +30,63 @@ pub const COASTLINE_COLOR: Color = [0.4, 0.35, 0.3, 1.0]; // Dark brown
 /// Depth contour color
 pub const CONTOUR_COLOR: Color = [0.5, 0.6, 0.65, 1.0]; // Gray-blue
 
+// Note: Line styles (COASTLINE_STYLE, CONTOUR_STYLE) have been moved to s52_styles.rs
+// for S-52 compliance. Import from super::s52_styles instead.
+
+/// Shoreline construction (piers, jetties, seawalls) - SLCONS
+pub const SHORELINE_CONSTRUCTION_COLOR: Color = [0.55, 0.50, 0.45, 1.0]; // Brown-gray
+
+/// Road color - ROADWY
+pub const ROAD_COLOR: Color = [0.6, 0.55, 0.5, 1.0]; // Light brown
+
+/// Cable (overhead) - CBLOHD
+pub const CABLE_OVERHEAD_COLOR: Color = [0.5, 0.5, 0.5, 1.0]; // Gray
+
+/// Cable (submarine) - CBLSUB
+pub const CABLE_SUBMARINE_COLOR: Color = [0.6, 0.4, 0.55, 1.0]; // Purple-gray
+
+/// Traffic separation line - TSELNE
+pub const TRAFFIC_SEPARATION_COLOR: Color = [0.7, 0.3, 0.6, 1.0]; // Magenta
+
+/// Recommended route centerline - RCRTCL
+pub const RECOMMENDED_ROUTE_COLOR: Color = [0.6, 0.4, 0.7, 1.0]; // Purple
+
+/// Pipeline (submarine/on land) - PIPSOL
+pub const PIPELINE_COLOR: Color = [0.6, 0.5, 0.3, 1.0]; // Brown
+
+/// Ferry route - FERYRT
+pub const FERRY_ROUTE_COLOR: Color = [0.5, 0.3, 0.6, 1.0]; // Purple
+
+/// River bank - RIVBNK
+pub const RIVER_BANK_COLOR: Color = [0.4, 0.5, 0.4, 1.0]; // Green-gray
+
+/// Anchorage area - ACHARE (semi-transparent)
+pub const ANCHORAGE_AREA_COLOR: Color = [0.6, 0.5, 0.8, 0.3]; // Light purple, transparent
+
+/// Traffic separation zone - TSEZNE (semi-transparent)
+pub const TRAFFIC_ZONE_COLOR: Color = [0.8, 0.4, 0.7, 0.3]; // Magenta, transparent
+
+/// Restricted area - RESARE (semi-transparent)
+pub const RESTRICTED_AREA_COLOR: Color = [0.9, 0.6, 0.6, 0.3]; // Light red, transparent
+
+/// Fairway - FAIRWY (semi-transparent)
+pub const FAIRWAY_COLOR: Color = [0.7, 0.7, 0.9, 0.2]; // Light blue, very transparent
+
+/// Built-up area - BUAARE
+pub const BUILT_UP_AREA_COLOR: Color = [0.85, 0.8, 0.75, 1.0]; // Light gray-brown
+
+/// Lake - LAKARE
+pub const LAKE_COLOR: Color = [0.7, 0.82, 0.92, 1.0]; // Light blue (like medium water)
+
+/// Dredged area - DRGARE (semi-transparent)
+pub const DREDGED_AREA_COLOR: Color = [0.6, 0.7, 0.8, 0.4]; // Blue-gray, transparent
+
+/// Sea area / named water area - SEAARE (no fill, just for labeling)
+pub const SEA_AREA_COLOR: Color = [0.0, 0.0, 0.0, 0.0]; // Transparent
+
+/// Obstruction - OBSTRN
+pub const OBSTRUCTION_COLOR: Color = [0.3, 0.3, 0.3, 0.5]; // Dark gray, semi-transparent
+
 /// Preset depth color palette
 pub struct DepthPalette {
     /// Depth breakpoints in meters
