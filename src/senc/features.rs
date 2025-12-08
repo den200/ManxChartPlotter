@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::geometry::{AreaGeometry, PointGeometry};
+use super::geometry::{AreaGeometry, EdgeTable, LineGeometry, PointGeometry};
 use super::reader::{RawRecord, SencError, SencReader};
 use super::records::{ObjectClass, RecordType, SencHeader};
 
@@ -21,6 +21,11 @@ fn s57_attribute_name(code: u16) -> String {
         88 => "DRVAL2".to_string(),   // Depth range value 2 (deep)
         174 => "VALDCO".to_string(),  // Value of depth contour
         178 => "VALSOU".to_string(),  // Value of sounding
+
+        // Symbol-related attributes (for buoys, beacons, etc.)
+        36 => "CATLAM".to_string(),   // Category of lateral mark (1=port, 2=starboard)
+        75 => "COLOUR".to_string(),   // Colour (3=red, 4=green)
+        179 => "WATLEV".to_string(),  // Water level effect (for rocks)
 
         // Other common attributes
         76 => "OBJNAM".to_string(),   // Object name
@@ -58,6 +63,8 @@ pub struct Feature {
     pub area_geometry: Option<AreaGeometry>,
     /// Point geometry (if feature_type == Point)
     pub point_geometry: Option<PointGeometry>,
+    /// Line geometry (if feature_type == Line)
+    pub line_geometry: Option<LineGeometry>,
 }
 
 /// Attribute value types
@@ -105,6 +112,65 @@ impl Feature {
     pub fn is_depth_area(&self) -> bool {
         self.object_class == ObjectClass::DepthArea
     }
+
+    /// Check if this is a depth contour
+    pub fn is_depth_contour(&self) -> bool {
+        self.object_class == ObjectClass::DepthContour
+    }
+
+    /// Check if this is a coastline
+    pub fn is_coastline(&self) -> bool {
+        self.object_class == ObjectClass::Coastline
+    }
+
+    /// Check if this is shoreline construction (piers, jetties, seawalls)
+    pub fn is_shoreline_construction(&self) -> bool {
+        self.object_class == ObjectClass::ShorelineConstruction
+    }
+
+    /// Check if this is a road
+    pub fn is_road(&self) -> bool {
+        self.object_class == ObjectClass::Road
+    }
+
+    /// Check if this is an overhead cable
+    pub fn is_cable_overhead(&self) -> bool {
+        self.object_class == ObjectClass::CableOverhead
+    }
+
+    /// Check if this is a submarine cable
+    pub fn is_cable_submarine(&self) -> bool {
+        self.object_class == ObjectClass::CableSubmarine
+    }
+
+    /// Check if this is any type of cable
+    pub fn is_cable(&self) -> bool {
+        matches!(self.object_class, ObjectClass::CableOverhead | ObjectClass::CableSubmarine)
+    }
+
+    /// Check if this is a traffic separation line
+    pub fn is_traffic_separation(&self) -> bool {
+        self.object_class == ObjectClass::TrafficSeparationLine
+    }
+
+    /// Check if this is a recommended route
+    pub fn is_recommended_route(&self) -> bool {
+        self.object_class == ObjectClass::RecommendedRoute
+    }
+
+    /// Check if this is a coverage meta feature
+    pub fn is_coverage(&self) -> bool {
+        self.object_class == ObjectClass::Coverage
+    }
+
+    /// Get depth contour value (VALDCO attribute)
+    pub fn valdco(&self) -> Option<f64> {
+        match self.attributes.get("VALDCO") {
+            Some(AttributeValue::Float(v)) => Some(*v),
+            Some(AttributeValue::Integer(v)) => Some(*v as f64),
+            _ => None,
+        }
+    }
 }
 
 /// Complete parsed chart data
@@ -114,6 +180,8 @@ pub struct ChartData {
     pub header: SencHeader,
     /// All parsed features
     pub features: Vec<Feature>,
+    /// Edge table for resolving line geometry
+    pub edge_table: EdgeTable,
 }
 
 impl ChartData {
@@ -124,6 +192,7 @@ impl ChartData {
 
         let mut features = Vec::new();
         let mut current_feature: Option<PartialFeature> = None;
+        let mut edge_table = EdgeTable::new();
 
         // Parse remaining records
         while let Some(record) = reader.next_record()? {
@@ -156,12 +225,24 @@ impl ChartData {
                 }
                 RecordType::LineGeometry => {
                     if let Some(ref mut partial) = current_feature {
-                        partial.feature_type = Some(FeatureType::Line);
+                        partial.set_line_geometry(&record)?;
                     }
                 }
                 RecordType::MultipointGeometry => {
                     if let Some(ref mut partial) = current_feature {
                         partial.feature_type = Some(FeatureType::Multipoint);
+                    }
+                }
+                RecordType::VectorEdge => {
+                    // Edge table record contains multiple edges
+                    if let Err(e) = edge_table.parse_edge_table(&record.payload) {
+                        eprintln!("WARN: Edge table parse error: {}", e);
+                    }
+                }
+                RecordType::VectorConnectedNode => {
+                    // Node table record contains multiple nodes
+                    if let Err(e) = edge_table.parse_node_table(&record.payload) {
+                        eprintln!("WARN: Node table parse error: {}", e);
                     }
                 }
                 _ => {}
@@ -175,7 +256,7 @@ impl ChartData {
             }
         }
 
-        Ok(Self { header, features })
+        Ok(Self { header, features, edge_table })
     }
 
     /// Get all land area features
@@ -195,24 +276,88 @@ impl ChartData {
             .filter(|f| f.feature_type == FeatureType::Area)
     }
 
+    /// Get all line features (for rendering)
+    pub fn lines(&self) -> impl Iterator<Item = &Feature> {
+        self.features
+            .iter()
+            .filter(|f| f.feature_type == FeatureType::Line)
+    }
+
+    /// Get all point features (for symbol rendering)
+    pub fn points(&self) -> impl Iterator<Item = &Feature> {
+        self.features
+            .iter()
+            .filter(|f| f.feature_type == FeatureType::Point)
+    }
+
+    /// Get all depth contour features
+    pub fn depth_contours(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_depth_contour())
+    }
+
+    /// Get all coastline features
+    pub fn coastlines(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_coastline())
+    }
+
+    /// Get all shoreline construction features (piers, jetties, seawalls)
+    pub fn shoreline_constructions(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_shoreline_construction())
+    }
+
+    /// Get all road features
+    pub fn roads(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_road())
+    }
+
+    /// Get all cable features (overhead and submarine)
+    pub fn cables(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_cable())
+    }
+
+    /// Get all traffic separation lines
+    pub fn traffic_separations(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_traffic_separation())
+    }
+
+    /// Get all recommended routes
+    pub fn recommended_routes(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_recommended_route())
+    }
+
     /// Summary stats for debugging
     pub fn summary(&self) -> String {
         let land_count = self.land_areas().count();
         let depth_count = self.depth_areas().count();
         let area_count = self.areas().count();
+        let line_count = self.lines().count();
+        let point_count = self.points().count();
+        let contour_count = self.depth_contours().count();
+        let coastline_count = self.coastlines().count();
         let total = self.features.len();
 
         format!(
             "Chart '{}' (scale 1:{}): {} features total\n\
              - Land areas: {}\n\
              - Depth areas: {}\n\
-             - All areas: {}",
+             - All areas: {}\n\
+             - All lines: {}\n\
+             - All points: {}\n\
+             - Depth contours: {}\n\
+             - Coastlines: {}\n\
+             - Edge table: {} edges, {} nodes",
             self.header.cell_name,
             self.header.native_scale,
             total,
             land_count,
             depth_count,
-            area_count
+            area_count,
+            line_count,
+            point_count,
+            contour_count,
+            coastline_count,
+            self.edge_table.edge_count(),
+            self.edge_table.node_count()
         )
     }
 }
@@ -225,6 +370,7 @@ struct PartialFeature {
     attributes: HashMap<String, AttributeValue>,
     area_geometry: Option<AreaGeometry>,
     point_geometry: Option<PointGeometry>,
+    line_geometry: Option<LineGeometry>,
 }
 
 impl PartialFeature {
@@ -266,6 +412,7 @@ impl PartialFeature {
             attributes: HashMap::new(),
             area_geometry: None,
             point_geometry: None,
+            line_geometry: None,
         })
     }
 
@@ -350,6 +497,15 @@ impl PartialFeature {
         Ok(())
     }
 
+    fn set_line_geometry(&mut self, record: &RawRecord) -> Result<(), SencError> {
+        self.feature_type = Some(FeatureType::Line);
+        self.line_geometry = Some(
+            LineGeometry::parse(&record.payload)
+                .map_err(|e| SencError::Format(e.to_string()))?,
+        );
+        Ok(())
+    }
+
     fn finalize(self) -> Option<Feature> {
         let feature_type = self.feature_type?;
 
@@ -360,6 +516,7 @@ impl PartialFeature {
             attributes: self.attributes,
             area_geometry: self.area_geometry,
             point_geometry: self.point_geometry,
+            line_geometry: self.line_geometry,
         })
     }
 }

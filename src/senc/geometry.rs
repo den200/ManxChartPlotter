@@ -62,8 +62,10 @@ pub struct TriPrim {
 
 impl TriPrim {
     /// Parse a triangle primitive from binary data
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
-        let prim_type = TriPrimType::try_from(reader.read_u8()?)?;
+    /// prim_index is for diagnostic logging only
+    pub fn read<R: Read>(reader: &mut R, prim_index: u32) -> Result<Self> {
+        let prim_type_byte = reader.read_u8()?;
+        let prim_type = TriPrimType::try_from(prim_type_byte)?;
         let nvert = reader.read_u32::<LittleEndian>()?;
 
         // Skip bounding box (4 × f64 = 32 bytes)
@@ -78,13 +80,29 @@ impl TriPrim {
             vertices.push([x, y]);
         }
 
+        // DEBUG: Check for corrupt data (NaN or huge coordinates)
+        let has_nan = vertices.iter().any(|v| v[0].is_nan() || v[1].is_nan());
+        let has_huge = vertices.iter().any(|v| v[0].abs() > 50000.0 || v[1].abs() > 50000.0);
+        if has_nan || has_huge {
+            eprintln!("WARN: Corrupt prim[{}] type=0x{:02x} nvert={} nan={} huge={}",
+                prim_index, prim_type_byte, nvert, has_nan, has_huge);
+            eprintln!("  first={:?} last={:?}", vertices.first(), vertices.last());
+        }
+
         Ok(Self { prim_type, vertices })
     }
 
     /// Convert STRIP/FAN to plain triangles for GPU
     pub fn to_triangles(&self) -> Vec<[f32; 2]> {
         match self.prim_type {
-            TriPrimType::Triangles => self.vertices.clone(),
+            TriPrimType::Triangles => {
+                // Plain triangles - just verify count is divisible by 3
+                if self.vertices.len() % 3 != 0 {
+                    eprintln!("WARN: Plain triangles has {} vertices (not divisible by 3)",
+                        self.vertices.len());
+                }
+                self.vertices.clone()
+            },
             TriPrimType::TriangleStrip => self.strip_to_triangles(),
             TriPrimType::TriangleFan => self.fan_to_triangles(),
         }
@@ -98,16 +116,15 @@ impl TriPrim {
 
         let mut result = Vec::with_capacity((self.vertices.len() - 2) * 3);
         for i in 2..self.vertices.len() {
-            if i % 2 == 0 {
-                result.push(self.vertices[i - 2]);
-                result.push(self.vertices[i - 1]);
-                result.push(self.vertices[i]);
+            // Alternate winding for consistent face orientation
+            let (v0, v1, v2) = if i % 2 == 0 {
+                (self.vertices[i - 2], self.vertices[i - 1], self.vertices[i])
             } else {
-                // Flip winding for odd triangles to maintain consistent face
-                result.push(self.vertices[i - 1]);
-                result.push(self.vertices[i - 2]);
-                result.push(self.vertices[i]);
-            }
+                (self.vertices[i - 1], self.vertices[i - 2], self.vertices[i])
+            };
+            result.push(v0);
+            result.push(v1);
+            result.push(v2);
         }
         result
     }
@@ -186,10 +203,24 @@ impl AreaGeometry {
         // Skip contour counts (not needed for fill rendering)
         cursor.seek(SeekFrom::Current((contour_count * 4) as i64))?;
 
+        // DEBUG: Verify offset to first TriPrim
+        // Expected offset = 44 + 4*contour_count (32 extent + 12 counts + contour array)
+        let pos = cursor.position() as usize;
+        let expected_offset = 44 + (contour_count as usize * 4);
+        if pos != expected_offset {
+            eprintln!("WARN: TriPrim offset mismatch: cursor at {}, expected {}", pos, expected_offset);
+        }
+        if triprim_count > 0 && pos + 20 <= payload.len() {
+            // Expected: byte[0]=0x04/05/06 (type), bytes[1-4]=nvert (little-endian u32)
+            println!("DEBUG: contour_count={}, triprim_count={}, cursor at {}, expected {}",
+                contour_count, triprim_count, pos, expected_offset);
+            println!("DEBUG: First 20 TriPrim bytes: {:02x?}", &payload[pos..pos+20]);
+        }
+
         // Read pre-triangulated data directly
         let mut triangles = Vec::with_capacity(triprim_count as usize);
-        for _ in 0..triprim_count {
-            triangles.push(TriPrim::read(&mut cursor)?);
+        for i in 0..triprim_count {
+            triangles.push(TriPrim::read(&mut cursor, i)?);
         }
 
         // Skip edge refs for now (used for outline rendering)
@@ -210,9 +241,77 @@ impl AreaGeometry {
         vertices
     }
 
+    /// Analyze triangles for quality issues (skinny/degenerate triangles).
+    /// Returns (total_triangles, skinny_count, degenerate_count)
+    /// Also prints warnings for any suspicious triangles found.
+    pub fn analyze_triangle_quality(&self) -> (usize, usize, usize) {
+        let mut total = 0;
+        let mut skinny = 0;
+        let mut degenerate = 0;
+
+        for (prim_idx, tri) in self.triangles.iter().enumerate() {
+            let verts = tri.to_triangles();
+            for (tri_idx, chunk) in verts.chunks(3).enumerate() {
+                if chunk.len() < 3 {
+                    continue;
+                }
+                total += 1;
+
+                let v0 = chunk[0];
+                let v1 = chunk[1];
+                let v2 = chunk[2];
+
+                // Calculate edge lengths
+                let edge1 = ((v1[0] - v0[0]).powi(2) + (v1[1] - v0[1]).powi(2)).sqrt();
+                let edge2 = ((v2[0] - v1[0]).powi(2) + (v2[1] - v1[1]).powi(2)).sqrt();
+                let edge3 = ((v0[0] - v2[0]).powi(2) + (v0[1] - v2[1]).powi(2)).sqrt();
+
+                let max_edge = edge1.max(edge2).max(edge3);
+                let min_edge = edge1.min(edge2).min(edge3);
+
+                // Check for degenerate (zero-area) triangles
+                if min_edge < 0.001 {
+                    degenerate += 1;
+                    eprintln!("WARN: Degenerate tri prim[{}] tri[{}]: edges={:.4}/{:.4}/{:.4}",
+                        prim_idx, tri_idx, edge1, edge2, edge3);
+                    eprintln!("      verts: ({:.2},{:.2}), ({:.2},{:.2}), ({:.2},{:.2})",
+                        v0[0], v0[1], v1[0], v1[1], v2[0], v2[1]);
+                    continue;
+                }
+
+                // Check for skinny triangles (edge ratio > 50 is suspicious)
+                let ratio = max_edge / min_edge;
+                if ratio > 50.0 {
+                    skinny += 1;
+                    eprintln!("WARN: Skinny tri prim[{}] tri[{}]: ratio={:.1} edges={:.1}/{:.1}/{:.1}",
+                        prim_idx, tri_idx, ratio, edge1, edge2, edge3);
+                    eprintln!("      verts: ({:.2},{:.2}), ({:.2},{:.2}), ({:.2},{:.2})",
+                        v0[0], v0[1], v1[0], v1[1], v2[0], v2[1]);
+                }
+            }
+        }
+
+        (total, skinny, degenerate)
+    }
+
     /// Total triangle count across all primitives
     pub fn total_triangles(&self) -> usize {
         self.triangles.iter().map(|t| t.triangle_count()).sum()
+    }
+
+    /// Get statistics on primitive types (triangles, strips, fans)
+    pub fn primitive_stats(&self) -> (usize, usize, usize) {
+        let mut plain = 0;
+        let mut strip = 0;
+        let mut fan = 0;
+        for tri in &self.triangles {
+            match tri.prim_type {
+                TriPrimType::Triangles => plain += tri.triangle_count(),
+                TriPrimType::TriangleStrip => strip += tri.triangle_count(),
+                TriPrimType::TriangleFan => fan += tri.triangle_count(),
+            }
+        }
+        (plain, strip, fan)
     }
 }
 
@@ -234,6 +333,337 @@ impl PointGeometry {
         let y = cursor.read_f64::<LittleEndian>()?;
 
         Ok(Self { x, y })
+    }
+}
+
+/// Line geometry (record type 81)
+///
+/// OSENC line geometry contains edge references that point to the edge table
+/// (records 96-97). For MVP, we store the raw edge refs and resolve them
+/// once the full edge table is available.
+#[derive(Debug, Clone)]
+pub struct LineGeometry {
+    /// Bounding box
+    pub extent: BBox,
+    /// Edge references (to be resolved against edge table)
+    pub edge_refs: Vec<EdgeRef>,
+}
+
+/// Reference to an edge in the edge table
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeRef {
+    pub start_node: u32,
+    pub edge_index: i32,  // Signed: negative means reversed
+    pub end_node: u32,
+}
+
+impl EdgeRef {
+    /// Check if edge should be traversed in reverse
+    pub fn is_reversed(&self) -> bool {
+        self.edge_index < 0
+    }
+
+    /// Get the actual edge index (absolute value)
+    pub fn index(&self) -> u32 {
+        self.edge_index.unsigned_abs()
+    }
+}
+
+impl LineGeometry {
+    /// Parse line geometry from record payload (record type 81)
+    ///
+    /// Format (from OpenCPN analysis):
+    /// - 4 × f64: extent (min_x, max_x, min_y, max_y)
+    /// - u32: edge_count
+    /// - [EdgeRef × edge_count]: edge references
+    ///
+    /// Each EdgeRef: start_node (u32), edge_index (i32), end_node (u32) = 12 bytes
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        if payload.len() < 36 {  // 32 (extent) + 4 (count)
+            return Err(GeometryError::Invalid(format!(
+                "Line geometry payload too short: {} bytes",
+                payload.len()
+            )));
+        }
+
+        let mut cursor = Cursor::new(payload);
+
+        // Read bounding box
+        let extent = BBox {
+            min_x: cursor.read_f64::<LittleEndian>()?,
+            max_x: cursor.read_f64::<LittleEndian>()?,
+            min_y: cursor.read_f64::<LittleEndian>()?,
+            max_y: cursor.read_f64::<LittleEndian>()?,
+        };
+
+        let edge_count = cursor.read_u32::<LittleEndian>()?;
+
+        // Read edge references
+        let mut edge_refs = Vec::with_capacity(edge_count as usize);
+        for _ in 0..edge_count {
+            let start_node = cursor.read_u32::<LittleEndian>()?;
+            let edge_index = cursor.read_i32::<LittleEndian>()?;
+            let end_node = cursor.read_u32::<LittleEndian>()?;
+            edge_refs.push(EdgeRef {
+                start_node,
+                edge_index,
+                end_node,
+            });
+        }
+
+        Ok(Self { extent, edge_refs })
+    }
+
+    /// Resolve edge references to actual vertex coordinates using the edge table.
+    /// Returns a list of polylines (each polyline is a Vec of vertices).
+    ///
+    /// Key insight from QuteNav: A single LineGeometry can contain multiple
+    /// disjoint chains. We only stitch edges when they're actually connected
+    /// (prev_end_node == current_start_node), and start a new polyline when
+    /// connectivity breaks. This prevents spurious diagonal lines.
+    pub fn resolve(&self, edge_table: &EdgeTable) -> Vec<Vec<[f32; 2]>> {
+        let mut polylines = Vec::new();
+        let mut current: Vec<[f32; 2]> = Vec::new();
+        let mut prev_end_node: Option<u32> = None;
+
+        for edge_ref in &self.edge_refs {
+            // Account for edge direction when determining node connectivity
+            let (start_id, end_id) = if edge_ref.is_reversed() {
+                (edge_ref.end_node, edge_ref.start_node)
+            } else {
+                (edge_ref.start_node, edge_ref.end_node)
+            };
+
+            // KEY: Split when connectivity breaks (QuteNav pattern)
+            if prev_end_node.is_some() && prev_end_node != Some(start_id) && !current.is_empty() {
+                if current.len() >= 2 {
+                    polylines.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+
+            match edge_table.get_edge(edge_ref.index()) {
+                Some(verts) if !verts.is_empty() => {
+                    // Normal edge with vertices
+                    let iter: Box<dyn Iterator<Item = [f32; 2]>> = if edge_ref.is_reversed() {
+                        Box::new(verts.iter().rev().copied())
+                    } else {
+                        Box::new(verts.iter().copied())
+                    };
+                    for (j, p) in iter.enumerate() {
+                        // Skip duplicate joint vertex
+                        if j == 0 && current.last() == Some(&p) {
+                            continue;
+                        }
+                        current.push(p);
+                    }
+                }
+                Some(verts) if verts.is_empty() => {
+                    // Edge exists but has 0 intermediate vertices - use node positions
+                    let (first_node, last_node) = if edge_ref.is_reversed() {
+                        (edge_ref.end_node, edge_ref.start_node)
+                    } else {
+                        (edge_ref.start_node, edge_ref.end_node)
+                    };
+
+                    if let (Some(p0), Some(p1)) = (
+                        edge_table.get_node(first_node),
+                        edge_table.get_node(last_node)
+                    ) {
+                        // Check distance - if too far, this might be a spurious connection
+                        let dist = ((p1[0]-p0[0]).powi(2) + (p1[1]-p0[1]).powi(2)).sqrt();
+                        if dist > 100.0 {
+                            // Skip this edge - it's likely an incorrect connection
+                            // (edges with 0 vertices should connect nearby nodes)
+                            continue;
+                        }
+                        // Add start node (skip if duplicate of last vertex)
+                        if current.last() != Some(&p0) {
+                            current.push(p0);
+                        }
+                        // Add end node (skip if duplicate)
+                        if p0 != p1 && current.last() != Some(&p1) {
+                            current.push(p1);
+                        }
+                    }
+                }
+                _ => {
+                    // Edge not found - skip silently
+                }
+            }
+
+            prev_end_node = Some(end_id);
+        }
+
+        // Don't forget the last polyline
+        if current.len() >= 2 {
+            polylines.push(current);
+        }
+        polylines
+    }
+}
+
+/// Edge table built from records 96 (VectorEdge) and 97 (VectorConnectedNode).
+/// Used to resolve edge references in LineGeometry to actual vertices.
+#[derive(Debug, Clone, Default)]
+pub struct EdgeTable {
+    /// Edge ID → list of intermediate vertices (SM coordinates)
+    pub edges: std::collections::HashMap<u32, Vec<[f32; 2]>>,
+    /// Node ID → single vertex (SM coordinates)
+    pub nodes: std::collections::HashMap<u32, [f32; 2]>,
+}
+
+impl EdgeTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse a VectorEdge record (type 96)
+    ///
+    /// Format:
+    /// - u32: edge_id
+    /// - u32: vertex_count
+    /// - [f32 × 2 × vertex_count]: vertices (x, y pairs in SM coords)
+    pub fn add_edge(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 8 {
+            return Err(GeometryError::Invalid("VectorEdge payload too short".into()));
+        }
+
+        let mut cursor = Cursor::new(payload);
+        let edge_id = cursor.read_u32::<LittleEndian>()?;
+        let vertex_count = cursor.read_u32::<LittleEndian>()?;
+
+        let mut vertices = Vec::with_capacity(vertex_count as usize);
+        for _ in 0..vertex_count {
+            let x = cursor.read_f32::<LittleEndian>()?;
+            let y = cursor.read_f32::<LittleEndian>()?;
+            vertices.push([x, y]);
+        }
+
+        self.edges.insert(edge_id, vertices);
+        Ok(())
+    }
+
+    /// Parse a VectorConnectedNode record (type 97)
+    ///
+    /// Format:
+    /// - u32: node_id
+    /// - f32: x (SM coords)
+    /// - f32: y (SM coords)
+    pub fn add_node(&mut self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 12 {
+            return Err(GeometryError::Invalid("VectorConnectedNode payload too short".into()));
+        }
+
+        let mut cursor = Cursor::new(payload);
+        let node_id = cursor.read_u32::<LittleEndian>()?;
+        let x = cursor.read_f32::<LittleEndian>()?;
+        let y = cursor.read_f32::<LittleEndian>()?;
+
+        self.nodes.insert(node_id, [x, y]);
+        Ok(())
+    }
+
+    pub fn get_edge(&self, edge_id: u32) -> Option<&Vec<[f32; 2]>> {
+        self.edges.get(&edge_id)
+    }
+
+    pub fn get_node(&self, node_id: u32) -> Option<[f32; 2]> {
+        self.nodes.get(&node_id).copied()
+    }
+
+    pub fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Parse a VectorEdge TABLE record (type 96) containing multiple edges
+    ///
+    /// Format: count-prefixed table
+    /// - u32: total_edge_count
+    /// - For each edge:
+    ///   - u32: edge_id
+    ///   - u32: vertex_count
+    ///   - [f32 × 2 × vertex_count]: intermediate vertices (SM coords)
+    pub fn parse_edge_table(&mut self, payload: &[u8]) -> Result<()> {
+        let mut cursor = Cursor::new(payload);
+
+        let total_edges = cursor.read_u32::<LittleEndian>()?;
+        let mut parsed_count = 0;
+
+        for _ in 0..total_edges {
+            if cursor.position() + 8 > payload.len() as u64 {
+                eprintln!("WARN: Edge table truncated at edge {}/{}", parsed_count, total_edges);
+                break;
+            }
+
+            let edge_id = cursor.read_u32::<LittleEndian>()?;
+            let vertex_count = cursor.read_u32::<LittleEndian>()?;
+
+            // Relaxed sanity check (was 10000, now 100000)
+            // Use continue instead of break to skip just this edge, not abort all parsing
+            if vertex_count > 100000 {
+                eprintln!("WARN: Edge {} has {} vertices, skipping", edge_id, vertex_count);
+                // Skip this edge's vertex data (vertex_count * 8 bytes per vertex)
+                let skip_bytes = vertex_count as i64 * 8;
+                cursor.seek(SeekFrom::Current(skip_bytes))?;
+                continue;
+            }
+
+            let mut vertices = Vec::with_capacity(vertex_count as usize);
+            for _ in 0..vertex_count {
+                let x = cursor.read_f32::<LittleEndian>()?;
+                let y = cursor.read_f32::<LittleEndian>()?;
+                vertices.push([x, y]);
+            }
+
+            self.edges.insert(edge_id, vertices);
+            parsed_count += 1;
+        }
+
+        // Warn on incomplete parsing
+        if parsed_count < total_edges {
+            eprintln!("WARN: Edge table incomplete: parsed {}/{} edges", parsed_count, total_edges);
+        }
+
+        println!("DEBUG: Parsed {}/{} edges from edge table record", parsed_count, total_edges);
+        Ok(())
+    }
+
+    /// Parse a VectorConnectedNode TABLE record (type 97) containing multiple nodes
+    ///
+    /// Format: count-prefixed table
+    /// - u32: total_node_count
+    /// - For each node:
+    ///   - u32: node_id
+    ///   - f32: x (SM coords)
+    ///   - f32: y (SM coords)
+    pub fn parse_node_table(&mut self, payload: &[u8]) -> Result<()> {
+        let mut cursor = Cursor::new(payload);
+
+        // First u32 is node count
+        let total_nodes = cursor.read_u32::<LittleEndian>()?;
+        let mut parsed_count = 0;
+
+        for _ in 0..total_nodes {
+            if cursor.position() + 12 > payload.len() as u64 {
+                eprintln!("WARN: Node table truncated at node {}/{}", parsed_count, total_nodes);
+                break;
+            }
+            let node_id = cursor.read_u32::<LittleEndian>()?;
+            let x = cursor.read_f32::<LittleEndian>()?;
+            let y = cursor.read_f32::<LittleEndian>()?;
+
+            self.nodes.insert(node_id, [x, y]);
+            parsed_count += 1;
+        }
+
+        println!("DEBUG: Parsed {}/{} nodes from node table record", parsed_count, total_nodes);
+        Ok(())
     }
 }
 

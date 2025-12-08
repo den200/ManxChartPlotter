@@ -26,6 +26,11 @@ bytemuck = { version = "1.21", features = ["derive"] }
 # SENC parsing
 byteorder = "1.5"
 
+# Symbol rendering (M2)
+image = "0.25"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
 # Logging
 env_logger = "0.11"
 tracing = "0.1"

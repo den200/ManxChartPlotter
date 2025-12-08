@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "atlas_size": [1024, 1024],
+  "cell_size": [64, 64],
+  "symbols": {
+    "BuoyLatPort": {
+      "cell": [0, 0],
+      "size": [32, 48],
+      "pivot": [0.5, 0.9],
+      "description": "BOYLAT14 - Red lateral buoy (IALA-A port)"
+    },
+    "BuoyLatStarboard": {
+      "cell": [1, 0],
+      "size": [32, 48],
+      "pivot": [0.5, 0.9],
+      "description": "BOYLAT13 - Green lateral buoy (IALA-A starboard)"
+    },
+    "BeaconLatPort": {
+      "cell": [2, 0],
+      "size": [24, 52],
+      "pivot": [0.5, 0.9],
+      "description": "BCNLAT21 - Red lateral beacon"
+    },
+    "BeaconLatStarboard": {
+      "cell": [3, 0],
+      "size": [24, 52],
+      "pivot": [0.5, 0.9],
+      "description": "BCNLAT15 - Green lateral beacon"
+    },
+    "RockAwash": {
+      "cell": [4, 0],
+      "size": [24, 24],
+      "pivot": [0.5, 0.5],
+      "description": "UWTROC03 - Rock awash at chart datum"
+    },
+    "RockSubmerged": {
+      "cell": [5, 0],
+      "size": [24, 24],
+      "pivot": [0.5, 0.5],
+      "description": "UWTROC04 - Submerged rock"
+    },
+    "BuoyCarNorth": {
+      "cell": [6, 0],
+      "size": [32, 48],
+      "pivot": [0.5, 0.9],
+      "description": "BOYCAR01 - North cardinal buoy (black/yellow, triangles up)"
+    },
+    "BuoyCarEast": {
+      "cell": [7, 0],
+      "size": [32, 48],
+      "pivot": [0.5, 0.9],
+      "description": "BOYCAR02 - East cardinal buoy (black/yellow/black)"
+    },
+    "BuoyCarSouth": {
+      "cell": [8, 0],
+      "size": [32, 48],
+      "pivot": [0.5, 0.9],
+      "description": "BOYCAR03 - South cardinal buoy (yellow/black, triangles down)"
+    },
+    "BuoyCarWest": {
+      "cell": [9, 0],
+      "size": [32, 48],
+      "pivot": [0.5, 0.9],
+      "description": "BOYCAR04 - West cardinal buoy (yellow/black/yellow)"
+    }
+  }
+}

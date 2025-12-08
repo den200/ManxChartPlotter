@@ -185,19 +185,29 @@ fn parse_string(payload: &[u8]) -> String {
     String::from_utf8_lossy(&payload[..end]).to_string()
 }
 
-/// Parse CellExtent (4 x f64) from payload
-/// Format: SW_lat, SW_lon, NE_lat, NE_lon (corner pairs per OSENC spec)
+/// Parse CellExtent (8 x f64) from payload
+/// Format per OpenCPN Osenc.h _OSENC_EXTENT_Record_Payload:
+///   SW_lat, SW_lon, NW_lat, NW_lon, NE_lat, NE_lon, SE_lat, SE_lon
+/// We extract min/max from SW and NE corners.
 fn parse_extent(payload: &[u8]) -> Option<CellExtent> {
-    if payload.len() < 32 {
+    // 8 doubles = 64 bytes
+    if payload.len() < 64 {
         return None;
     }
 
     let mut cursor = Cursor::new(payload);
-    // Read as corner pairs: SW corner, then NE corner
+    // SW corner
     let sw_lat = cursor.read_f64::<LittleEndian>().ok()?;
     let sw_lon = cursor.read_f64::<LittleEndian>().ok()?;
+    // NW corner (skip - we only need SW and NE)
+    let _nw_lat = cursor.read_f64::<LittleEndian>().ok()?;
+    let _nw_lon = cursor.read_f64::<LittleEndian>().ok()?;
+    // NE corner
     let ne_lat = cursor.read_f64::<LittleEndian>().ok()?;
     let ne_lon = cursor.read_f64::<LittleEndian>().ok()?;
+    // SE corner (skip)
+    // let _se_lat = cursor.read_f64::<LittleEndian>().ok()?;
+    // let _se_lon = cursor.read_f64::<LittleEndian>().ok()?;
 
     Some(CellExtent {
         min_lat: sw_lat,

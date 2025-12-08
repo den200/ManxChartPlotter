@@ -152,27 +152,108 @@ impl CellExtent {
 }
 
 /// S-57 Object class codes for features we care about
+/// Codes are from IHO S-57 specification (s57objectclasses.csv)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum ObjectClass {
-    /// Land area (LNDARE)
-    LandArea = 0,
-    /// Depth area (DEPARE)
-    DepthArea = 1,
-    /// Depth contour (DEPCNT)
-    DepthContour = 2,
-    /// Coastline (COALNE)
-    Coastline = 3,
-    /// Sounding (SOUNDG)
-    Sounding = 4,
-    /// Buoy lateral (BOYLAT)
-    BuoyLateral = 5,
-    /// Beacon lateral (BCNLAT)
-    BeaconLateral = 6,
-    /// Underwater rock (UWTROC)
-    UnderwaterRock = 7,
-    /// Unknown object class
-    Other = 0xFFFF,
+    // === AREA FEATURES ===
+    /// Anchorage area (ACHARE) - code 3
+    AnchorageArea,
+    /// Built-up area (BUAARE) - code 13
+    BuiltUpArea,
+    /// Depth area (DEPARE) - code 42
+    DepthArea,
+    /// Dredged area (DRGARE) - code 46
+    DredgedArea,
+    /// Fairway (FAIRWY) - code 51
+    Fairway,
+    /// Lake (LAKARE) - code 69
+    Lake,
+    /// Land area (LNDARE) - code 71
+    LandArea,
+    /// Obstruction (OBSTRN) - code 86 (can be area or point)
+    Obstruction,
+    /// Restricted area (RESARE) - code 112
+    RestrictedArea,
+    /// Sea area / named water area (SEAARE) - code 119
+    SeaArea,
+    /// Traffic separation zone (TSEZNE) - code 147
+    TrafficSeparationZone,
+
+    // === LINE FEATURES ===
+    /// Coastline (COALNE) - code 30
+    Coastline,
+    /// Depth contour (DEPCNT) - code 43
+    DepthContour,
+    /// Cable, overhead (CBLOHD) - code 21
+    CableOverhead,
+    /// Cable, submarine (CBLSUB) - code 22
+    CableSubmarine,
+    /// Ferry route (FERYRT) - code 52
+    FerryRoute,
+    /// Pipeline, submarine/on land (PIPSOL) - code 94
+    Pipeline,
+    /// Recommended route centerline (RCRTCL) - code 108
+    RecommendedRoute,
+    /// Road (ROADWY) - code 116
+    Road,
+    /// River bank (RIVBNK) - code 115
+    RiverBank,
+    /// Shoreline construction (SLCONS) - code 122 (piers, jetties, seawalls)
+    ShorelineConstruction,
+    /// Traffic separation line (TSELNE) - code 145
+    TrafficSeparationLine,
+
+    // === POINT FEATURES (symbols) ===
+    /// Anchor berth (ACHBRT) - code 2
+    AnchorBerth,
+    /// Beacon, cardinal (BCNCAR) - code 5
+    BeaconCardinal,
+    /// Beacon, isolated danger (BCNISD) - code 6
+    BeaconIsolatedDanger,
+    /// Beacon, lateral (BCNLAT) - code 7
+    BeaconLateral,
+    /// Beacon, safe water (BCNSAW) - code 8
+    BeaconSafeWater,
+    /// Beacon, special purpose (BCNSPP) - code 9
+    BeaconSpecialPurpose,
+    /// Berth (BERTHS) - code 10
+    Berth,
+    /// Buoy, cardinal (BOYCAR) - code 14
+    BuoyCardinal,
+    /// Buoy, installation (BOYINB) - code 15
+    BuoyInstallation,
+    /// Buoy, isolated danger (BOYISD) - code 16
+    BuoyIsolatedDanger,
+    /// Buoy, lateral (BOYLAT) - code 17
+    BuoyLateral,
+    /// Buoy, safe water (BOYSAW) - code 18
+    BuoySafeWater,
+    /// Buoy, special purpose (BOYSPP) - code 19
+    BuoySpecialPurpose,
+    /// Light (LIGHTS) - code 75
+    Light,
+    /// Mooring/warping facility (MORFAC) - code 84
+    MooringFacility,
+    /// Pile (PILPNT) - code 90
+    Pile,
+    /// Sounding (SOUNDG) - code 129
+    Sounding,
+    /// Underwater rock / awash rock (UWTROC) - code 153
+    UnderwaterRock,
+    /// Wreck (WRECKS) - code 159
+    Wreck,
+
+    // === META FEATURES (usually not rendered) ===
+    /// Coverage meta feature (M_COVR) - code 302
+    Coverage,
+    /// Compilation scale (M_CSCL) - code 305
+    CompilationScale,
+    /// Quality of data (M_QUAL) - code 308
+    QualityOfData,
+
+    /// Unknown/unrecognized object class
+    Other,
 }
 
 impl ObjectClass {
@@ -180,14 +261,58 @@ impl ObjectClass {
     /// Standard S-57 object codes from IHO S-57 specification
     pub fn from_code(code: u16) -> Self {
         match code {
-            4 => ObjectClass::BeaconLateral,    // BCNLAT
-            17 => ObjectClass::BuoyLateral,     // BOYLAT
-            30 => ObjectClass::Coastline,       // COALNE
-            42 => ObjectClass::DepthArea,       // DEPARE
-            43 => ObjectClass::DepthContour,    // DEPCNT
-            71 => ObjectClass::LandArea,        // LNDARE
-            129 => ObjectClass::Sounding,       // SOUNDG
-            153 => ObjectClass::UnderwaterRock, // UWTROC
+            // Point features (symbols)
+            2 => ObjectClass::AnchorBerth,           // ACHBRT
+            5 => ObjectClass::BeaconCardinal,        // BCNCAR
+            6 => ObjectClass::BeaconIsolatedDanger,  // BCNISD
+            7 => ObjectClass::BeaconLateral,         // BCNLAT
+            8 => ObjectClass::BeaconSafeWater,       // BCNSAW
+            9 => ObjectClass::BeaconSpecialPurpose,  // BCNSPP
+            10 => ObjectClass::Berth,                // BERTHS
+            14 => ObjectClass::BuoyCardinal,         // BOYCAR
+            15 => ObjectClass::BuoyInstallation,     // BOYINB
+            16 => ObjectClass::BuoyIsolatedDanger,   // BOYISD
+            17 => ObjectClass::BuoyLateral,          // BOYLAT
+            18 => ObjectClass::BuoySafeWater,        // BOYSAW
+            19 => ObjectClass::BuoySpecialPurpose,   // BOYSPP
+            75 => ObjectClass::Light,                // LIGHTS
+            84 => ObjectClass::MooringFacility,      // MORFAC
+            90 => ObjectClass::Pile,                 // PILPNT
+            129 => ObjectClass::Sounding,            // SOUNDG
+            153 => ObjectClass::UnderwaterRock,      // UWTROC
+            159 => ObjectClass::Wreck,               // WRECKS
+
+            // Line features
+            21 => ObjectClass::CableOverhead,        // CBLOHD
+            22 => ObjectClass::CableSubmarine,       // CBLSUB
+            30 => ObjectClass::Coastline,            // COALNE
+            43 => ObjectClass::DepthContour,         // DEPCNT
+            52 => ObjectClass::FerryRoute,           // FERYRT
+            94 => ObjectClass::Pipeline,             // PIPSOL
+            108 => ObjectClass::RecommendedRoute,    // RCRTCL
+            115 => ObjectClass::RiverBank,           // RIVBNK
+            116 => ObjectClass::Road,                // ROADWY
+            122 => ObjectClass::ShorelineConstruction, // SLCONS
+            145 => ObjectClass::TrafficSeparationLine, // TSELNE
+
+            // Area features
+            3 => ObjectClass::AnchorageArea,         // ACHARE
+            13 => ObjectClass::BuiltUpArea,          // BUAARE
+            42 => ObjectClass::DepthArea,            // DEPARE
+            46 => ObjectClass::DredgedArea,          // DRGARE
+            51 => ObjectClass::Fairway,              // FAIRWY
+            69 => ObjectClass::Lake,                 // LAKARE
+            71 => ObjectClass::LandArea,             // LNDARE
+            86 => ObjectClass::Obstruction,          // OBSTRN
+            112 => ObjectClass::RestrictedArea,      // RESARE
+            119 => ObjectClass::SeaArea,             // SEAARE
+            147 => ObjectClass::TrafficSeparationZone, // TSEZNE
+
+            // Meta features
+            302 => ObjectClass::Coverage,            // M_COVR
+            305 => ObjectClass::CompilationScale,    // M_CSCL
+            308 => ObjectClass::QualityOfData,       // M_QUAL
+
             _ => ObjectClass::Other,
         }
     }
@@ -195,14 +320,58 @@ impl ObjectClass {
     /// Parse from S-57 6-character acronym
     pub fn from_acronym(acronym: &str) -> Self {
         match acronym.trim() {
-            "LNDARE" => ObjectClass::LandArea,
-            "DEPARE" => ObjectClass::DepthArea,
-            "DEPCNT" => ObjectClass::DepthContour,
-            "COALNE" => ObjectClass::Coastline,
-            "SOUNDG" => ObjectClass::Sounding,
-            "BOYLAT" => ObjectClass::BuoyLateral,
+            // Point features
+            "ACHBRT" => ObjectClass::AnchorBerth,
+            "BCNCAR" => ObjectClass::BeaconCardinal,
+            "BCNISD" => ObjectClass::BeaconIsolatedDanger,
             "BCNLAT" => ObjectClass::BeaconLateral,
+            "BCNSAW" => ObjectClass::BeaconSafeWater,
+            "BCNSPP" => ObjectClass::BeaconSpecialPurpose,
+            "BERTHS" => ObjectClass::Berth,
+            "BOYCAR" => ObjectClass::BuoyCardinal,
+            "BOYINB" => ObjectClass::BuoyInstallation,
+            "BOYISD" => ObjectClass::BuoyIsolatedDanger,
+            "BOYLAT" => ObjectClass::BuoyLateral,
+            "BOYSAW" => ObjectClass::BuoySafeWater,
+            "BOYSPP" => ObjectClass::BuoySpecialPurpose,
+            "LIGHTS" => ObjectClass::Light,
+            "MORFAC" => ObjectClass::MooringFacility,
+            "PILPNT" => ObjectClass::Pile,
+            "SOUNDG" => ObjectClass::Sounding,
             "UWTROC" => ObjectClass::UnderwaterRock,
+            "WRECKS" => ObjectClass::Wreck,
+
+            // Line features
+            "CBLOHD" => ObjectClass::CableOverhead,
+            "CBLSUB" => ObjectClass::CableSubmarine,
+            "COALNE" => ObjectClass::Coastline,
+            "DEPCNT" => ObjectClass::DepthContour,
+            "FERYRT" => ObjectClass::FerryRoute,
+            "PIPSOL" => ObjectClass::Pipeline,
+            "RCRTCL" => ObjectClass::RecommendedRoute,
+            "RIVBNK" => ObjectClass::RiverBank,
+            "ROADWY" => ObjectClass::Road,
+            "SLCONS" => ObjectClass::ShorelineConstruction,
+            "TSELNE" => ObjectClass::TrafficSeparationLine,
+
+            // Area features
+            "ACHARE" => ObjectClass::AnchorageArea,
+            "BUAARE" => ObjectClass::BuiltUpArea,
+            "DEPARE" => ObjectClass::DepthArea,
+            "DRGARE" => ObjectClass::DredgedArea,
+            "FAIRWY" => ObjectClass::Fairway,
+            "LAKARE" => ObjectClass::Lake,
+            "LNDARE" => ObjectClass::LandArea,
+            "OBSTRN" => ObjectClass::Obstruction,
+            "RESARE" => ObjectClass::RestrictedArea,
+            "SEAARE" => ObjectClass::SeaArea,
+            "TSEZNE" => ObjectClass::TrafficSeparationZone,
+
+            // Meta features
+            "M_COVR" => ObjectClass::Coverage,
+            "M_CSCL" => ObjectClass::CompilationScale,
+            "M_QUAL" => ObjectClass::QualityOfData,
+
             _ => ObjectClass::Other,
         }
     }
@@ -210,15 +379,127 @@ impl ObjectClass {
     /// Get the 6-character acronym
     pub fn acronym(&self) -> &'static str {
         match self {
-            ObjectClass::LandArea => "LNDARE",
-            ObjectClass::DepthArea => "DEPARE",
-            ObjectClass::DepthContour => "DEPCNT",
-            ObjectClass::Coastline => "COALNE",
-            ObjectClass::Sounding => "SOUNDG",
-            ObjectClass::BuoyLateral => "BOYLAT",
+            // Point features
+            ObjectClass::AnchorBerth => "ACHBRT",
+            ObjectClass::BeaconCardinal => "BCNCAR",
+            ObjectClass::BeaconIsolatedDanger => "BCNISD",
             ObjectClass::BeaconLateral => "BCNLAT",
+            ObjectClass::BeaconSafeWater => "BCNSAW",
+            ObjectClass::BeaconSpecialPurpose => "BCNSPP",
+            ObjectClass::Berth => "BERTHS",
+            ObjectClass::BuoyCardinal => "BOYCAR",
+            ObjectClass::BuoyInstallation => "BOYINB",
+            ObjectClass::BuoyIsolatedDanger => "BOYISD",
+            ObjectClass::BuoyLateral => "BOYLAT",
+            ObjectClass::BuoySafeWater => "BOYSAW",
+            ObjectClass::BuoySpecialPurpose => "BOYSPP",
+            ObjectClass::Light => "LIGHTS",
+            ObjectClass::MooringFacility => "MORFAC",
+            ObjectClass::Pile => "PILPNT",
+            ObjectClass::Sounding => "SOUNDG",
             ObjectClass::UnderwaterRock => "UWTROC",
+            ObjectClass::Wreck => "WRECKS",
+
+            // Line features
+            ObjectClass::CableOverhead => "CBLOHD",
+            ObjectClass::CableSubmarine => "CBLSUB",
+            ObjectClass::Coastline => "COALNE",
+            ObjectClass::DepthContour => "DEPCNT",
+            ObjectClass::FerryRoute => "FERYRT",
+            ObjectClass::Pipeline => "PIPSOL",
+            ObjectClass::RecommendedRoute => "RCRTCL",
+            ObjectClass::RiverBank => "RIVBNK",
+            ObjectClass::Road => "ROADWY",
+            ObjectClass::ShorelineConstruction => "SLCONS",
+            ObjectClass::TrafficSeparationLine => "TSELNE",
+
+            // Area features
+            ObjectClass::AnchorageArea => "ACHARE",
+            ObjectClass::BuiltUpArea => "BUAARE",
+            ObjectClass::DepthArea => "DEPARE",
+            ObjectClass::DredgedArea => "DRGARE",
+            ObjectClass::Fairway => "FAIRWY",
+            ObjectClass::Lake => "LAKARE",
+            ObjectClass::LandArea => "LNDARE",
+            ObjectClass::Obstruction => "OBSTRN",
+            ObjectClass::RestrictedArea => "RESARE",
+            ObjectClass::SeaArea => "SEAARE",
+            ObjectClass::TrafficSeparationZone => "TSEZNE",
+
+            // Meta features
+            ObjectClass::Coverage => "M_COVR",
+            ObjectClass::CompilationScale => "M_CSCL",
+            ObjectClass::QualityOfData => "M_QUAL",
+
             ObjectClass::Other => "UNKNWN",
         }
+    }
+
+    /// Returns true if this is a meta feature that shouldn't be rendered
+    pub fn is_meta(&self) -> bool {
+        matches!(self,
+            ObjectClass::Coverage |
+            ObjectClass::CompilationScale |
+            ObjectClass::QualityOfData
+        )
+    }
+
+    /// Returns true if this is an area feature
+    pub fn is_area(&self) -> bool {
+        matches!(self,
+            ObjectClass::AnchorageArea |
+            ObjectClass::BuiltUpArea |
+            ObjectClass::DepthArea |
+            ObjectClass::DredgedArea |
+            ObjectClass::Fairway |
+            ObjectClass::Lake |
+            ObjectClass::LandArea |
+            ObjectClass::Obstruction |
+            ObjectClass::RestrictedArea |
+            ObjectClass::SeaArea |
+            ObjectClass::TrafficSeparationZone
+        )
+    }
+
+    /// Returns true if this is a line feature
+    pub fn is_line(&self) -> bool {
+        matches!(self,
+            ObjectClass::CableOverhead |
+            ObjectClass::CableSubmarine |
+            ObjectClass::Coastline |
+            ObjectClass::DepthContour |
+            ObjectClass::FerryRoute |
+            ObjectClass::Pipeline |
+            ObjectClass::RecommendedRoute |
+            ObjectClass::RiverBank |
+            ObjectClass::Road |
+            ObjectClass::ShorelineConstruction |
+            ObjectClass::TrafficSeparationLine
+        )
+    }
+
+    /// Returns true if this is a point/symbol feature
+    pub fn is_point(&self) -> bool {
+        matches!(self,
+            ObjectClass::AnchorBerth |
+            ObjectClass::BeaconCardinal |
+            ObjectClass::BeaconIsolatedDanger |
+            ObjectClass::BeaconLateral |
+            ObjectClass::BeaconSafeWater |
+            ObjectClass::BeaconSpecialPurpose |
+            ObjectClass::Berth |
+            ObjectClass::BuoyCardinal |
+            ObjectClass::BuoyInstallation |
+            ObjectClass::BuoyIsolatedDanger |
+            ObjectClass::BuoyLateral |
+            ObjectClass::BuoySafeWater |
+            ObjectClass::BuoySpecialPurpose |
+            ObjectClass::Light |
+            ObjectClass::MooringFacility |
+            ObjectClass::Pile |
+            ObjectClass::Sounding |
+            ObjectClass::UnderwaterRock |
+            ObjectClass::Wreck
+        )
     }
 }

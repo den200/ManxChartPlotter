@@ -1,0 +1,124 @@
+// Shader-based polyline rendering with screen-space stroke width and dash patterns.
+//
+// Uses triangle strip topology with adjacency data (prev/curr/next) to compute
+// miter/bevel joins in the vertex shader. Width is in screen pixels, not world units.
+// Dash patterns are computed in the fragment shader using arc-length.
+
+struct LineUniforms {
+    view_proj: mat4x4<f32>,      // SM -> clip space (64 bytes)
+    viewport_size: vec2<f32>,    // window size in pixels (8 bytes)
+    line_width_px: f32,          // stroke width in pixels, e.g., 2.0 (4 bytes)
+    join_limit: f32,             // miter limit, e.g., 4.0 (4 bytes)
+    color: vec4<f32>,            // RGBA line color (16 bytes)
+    dash_on_px: f32,             // dash on length in screen pixels (4 bytes)
+    dash_off_px: f32,            // dash off (gap) length in screen pixels (4 bytes)
+    px_per_meter: f32,           // pixels per meter at current zoom (4 bytes)
+    _pad: f32,                   // padding for alignment (4 bytes)
+    // Total: 112 bytes, 16-byte aligned
+}
+
+@group(0) @binding(0) var<uniform> u: LineUniforms;
+
+struct VertexInput {
+    @location(0) prev: vec2<f32>,
+    @location(1) curr: vec2<f32>,
+    @location(2) next: vec2<f32>,
+    @location(3) side: f32,
+    @location(4) arc_len: f32,   // cumulative arc length in meters
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) arc_len: f32,   // pass to fragment for dash pattern
+}
+
+@vertex
+fn vs_main(in: VertexInput) -> VertexOutput {
+    // Project all points to clip space
+    let clip_prev = u.view_proj * vec4(in.prev, 0.0, 1.0);
+    let clip_curr = u.view_proj * vec4(in.curr, 0.0, 1.0);
+    let clip_next = u.view_proj * vec4(in.next, 0.0, 1.0);
+
+    // Convert to NDC
+    let ndc_prev = clip_prev.xy / clip_prev.w;
+    let ndc_curr = clip_curr.xy / clip_curr.w;
+    let ndc_next = clip_next.xy / clip_next.w;
+
+    // Compute direction vectors
+    var dir_from_prev = ndc_curr - ndc_prev;
+    var dir_to_next = ndc_next - ndc_curr;
+
+    let len_prev = length(dir_from_prev);
+    let len_next = length(dir_to_next);
+
+    // Normalize or use fallback
+    if len_prev > 0.0001 {
+        dir_from_prev = dir_from_prev / len_prev;
+    }
+    if len_next > 0.0001 {
+        dir_to_next = dir_to_next / len_next;
+    }
+
+    // Handle endpoints and degenerate cases
+    if len_prev < 0.0001 && len_next < 0.0001 {
+        // Both directions are zero - degenerate vertex, use arbitrary direction
+        dir_from_prev = vec2<f32>(1.0, 0.0);
+        dir_to_next = vec2<f32>(1.0, 0.0);
+    } else if len_prev < 0.0001 {
+        dir_from_prev = dir_to_next;
+    } else if len_next < 0.0001 {
+        dir_to_next = dir_from_prev;
+    }
+
+    // Compute tangent as bisector of the two directions
+    let tangent_sum = dir_from_prev + dir_to_next;
+    let tangent_len = length(tangent_sum);
+
+    // Handle 180° turn (directions cancel out) - use perpendicular to incoming direction
+    var tangent: vec2<f32>;
+    var miter: vec2<f32>;
+    var miter_scale: f32 = 1.0;
+
+    if tangent_len < 0.0001 {
+        // 180° turn: use perpendicular to incoming direction
+        tangent = vec2<f32>(-dir_from_prev.y, dir_from_prev.x);
+        miter = dir_from_prev;  // Perpendicular to tangent
+        miter_scale = 1.0;  // No miter extension for 180° turn (bevel)
+    } else {
+        tangent = tangent_sum / tangent_len;
+        miter = vec2<f32>(-tangent.y, tangent.x);
+
+        // Miter length calculation (avoid spikes at sharp corners)
+        let normal_prev = vec2<f32>(-dir_from_prev.y, dir_from_prev.x);
+        let cos_half = max(abs(dot(miter, normal_prev)), 0.1);
+        miter_scale = min(1.0 / cos_half, u.join_limit);
+    }
+
+    // Convert pixel width to NDC offset
+    let px_to_ndc = 2.0 / u.viewport_size;
+    let offset = miter * in.side * u.line_width_px * 0.5 * miter_scale * px_to_ndc;
+
+    let final_pos = ndc_curr + offset;
+
+    var out: VertexOutput;
+    out.position = vec4<f32>(final_pos, 0.5, 1.0);
+    out.arc_len = in.arc_len;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Convert arc_len (meters) to screen pixels
+    let arc_px = in.arc_len * u.px_per_meter;
+    let pattern_len = u.dash_on_px + u.dash_off_px;
+
+    // Apply dash pattern: discard pixels in the "off" (gap) portion
+    if pattern_len > 0.0 && u.dash_off_px > 0.0 {
+        let pos_in_pattern = arc_px % pattern_len;
+        if pos_in_pattern > u.dash_on_px {
+            discard;
+        }
+    }
+
+    return u.color;
+}
