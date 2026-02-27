@@ -24,8 +24,12 @@
 //! println!("{}", chart.summary());
 //! ```
 
+pub mod cache;
 pub mod decrypt;
 pub mod render;
+pub mod s52;
 pub mod senc;
+pub mod tiles;
 
+pub use cache::{CachedDecryptor, SencCache};
 pub use decrypt::{ChartDecryptor, ChartKey, DecryptError, KeyStore};

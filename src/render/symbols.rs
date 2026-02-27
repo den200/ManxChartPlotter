@@ -2,13 +2,17 @@
 //!
 //! Renders nautical chart symbols (buoys, beacons, rocks) using a single
 //! draw call with instanced quads that sample from a pre-baked atlas texture.
+//!
+//! Supports 1000+ S-52 symbols via dynamic atlas lookup.
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use wgpu::util::DeviceExt;
 use serde::Deserialize;
 use image::GenericImageView;
+use crate::render::debug_render_mode;
 
-/// Symbol identifier - maps S-57 objects to atlas positions
+/// Symbol identifier - kept for backwards compatibility but now uses dynamic index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum SymbolId {
@@ -25,22 +29,47 @@ pub enum SymbolId {
     Unknown = 255,
 }
 
-impl SymbolId {
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "BuoyLatPort" => Some(Self::BuoyLatPort),
-            "BuoyLatStarboard" => Some(Self::BuoyLatStarboard),
-            "BeaconLatPort" => Some(Self::BeaconLatPort),
-            "BeaconLatStarboard" => Some(Self::BeaconLatStarboard),
-            "RockAwash" => Some(Self::RockAwash),
-            "RockSubmerged" => Some(Self::RockSubmerged),
-            "BuoyCarNorth" => Some(Self::BuoyCarNorth),
-            "BuoyCarEast" => Some(Self::BuoyCarEast),
-            "BuoyCarSouth" => Some(Self::BuoyCarSouth),
-            "BuoyCarWest" => Some(Self::BuoyCarWest),
-            _ => None,
-        }
+/// Map legacy SymbolId to S-52 symbol name (atlas key).
+pub fn symbol_name_from_id(id: SymbolId) -> &'static str {
+    match id {
+        SymbolId::BuoyLatPort => "BOYLAT14",
+        SymbolId::BuoyLatStarboard => "BOYLAT13",
+        SymbolId::BeaconLatPort => "BCNLAT21",
+        SymbolId::BeaconLatStarboard => "BCNLAT15",
+        SymbolId::RockAwash => "UWTROC03",
+        SymbolId::RockSubmerged => "UWTROC04",
+        SymbolId::BuoyCarNorth => "BOYCAR01",
+        SymbolId::BuoyCarEast => "BOYCAR02",
+        SymbolId::BuoyCarSouth => "BOYCAR03",
+        SymbolId::BuoyCarWest => "BOYCAR04",
+        SymbolId::Unknown => "QUESMRK1",
     }
+}
+
+/// Global symbol name to index lookup table
+static SYMBOL_LOOKUP: OnceLock<HashMap<String, u32>> = OnceLock::new();
+
+/// Get the global symbol lookup table, loading it on first access
+pub fn get_symbol_lookup() -> &'static HashMap<String, u32> {
+    SYMBOL_LOOKUP.get_or_init(|| {
+        let atlas_json = include_str!("../../assets/symbols/atlas.json");
+        let atlas_data: AtlasJson = serde_json::from_str(atlas_json)
+            .expect("Failed to parse atlas.json");
+
+        // Build lookup from symbol name to index
+        let mut lookup = HashMap::with_capacity(atlas_data.symbols.len());
+        for (idx, name) in ordered_symbol_names(&atlas_data).iter().enumerate() {
+            lookup.insert((*name).clone(), idx as u32);
+        }
+
+        log::info!("Loaded {} symbols into atlas lookup", lookup.len());
+        lookup
+    })
+}
+
+/// Look up a symbol ID from its S-52 name (e.g., "BOYLAT13", "UWTROC03")
+pub fn symbol_id_from_s52_name(name: &str) -> Option<u32> {
+    get_symbol_lookup().get(name).copied()
 }
 
 /// Per-instance data sent to GPU
@@ -81,33 +110,51 @@ struct SymbolMetaGpu {
     pivot_size: [f32; 4],
 }
 
-/// Atlas JSON format
-#[derive(Deserialize)]
+/// Atlas JSON format (v2 - direct pixel coordinates)
+#[derive(Deserialize, Clone)]
 struct AtlasJson {
     #[allow(dead_code)]
     version: u32,
+    #[allow(dead_code)]
+    format: Option<String>,  // "direct" for v2
+    #[allow(dead_code)]
     atlas_size: [u32; 2],
-    cell_size: [u32; 2],
+    #[serde(default)]
+    cell_size: Option<[u32; 2]>,  // v1 only
     symbols: HashMap<String, SymbolEntry>,
 }
 
-#[derive(Deserialize)]
+/// Symbol entry - supports both v1 (cell-based) and v2 (direct) formats
+#[derive(Deserialize, Clone)]
 struct SymbolEntry {
-    cell: [u32; 2],
-    size: [u32; 2],
+    // v2 format: direct pixel coordinates [x, y, width, height]
+    rect: Option<[u32; 4]>,
+    // v1 format: cell-based
+    cell: Option<[u32; 2]>,
+    size: Option<[u32; 2]>,
+    // Both formats
     pivot: [f32; 2],
     #[allow(dead_code)]
     description: Option<String>,
 }
 
-/// Maximum number of symbol types
-const MAX_SYMBOL_TYPES: usize = 16;
+/// Maximum number of symbol types (expanded for full S-52 coverage)
+const MAX_SYMBOL_TYPES: usize = 2048;
 /// Maximum symbols per chart
 const MAX_INSTANCES: usize = 16384;
+
+fn ordered_symbol_names(atlas_data: &AtlasJson) -> Vec<&String> {
+    let mut names: Vec<_> = atlas_data.symbols.keys().collect();
+    names.sort();
+    names
+}
 
 /// Symbol renderer with atlas and instancing
 pub struct SymbolRenderer {
     pipeline: wgpu::RenderPipeline,
+    pipeline_solid: wgpu::RenderPipeline,
+    pipeline_no_depth: wgpu::RenderPipeline,
+    pipeline_atlas_debug: wgpu::RenderPipeline,
     atlas_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
     instance_count: u32,
@@ -121,7 +168,7 @@ impl SymbolRenderer {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         surface_format: wgpu::TextureFormat,
-        camera_bind_group_layout: &wgpu::BindGroupLayout,
+        _camera_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Load atlas PNG
         let atlas_png = include_bytes!("../../assets/symbols/atlas.png");
@@ -174,43 +221,56 @@ impl SymbolRenderer {
             ..Default::default()
         });
 
-        // Build metadata array indexed by SymbolId
-        let atlas_w = atlas_data.atlas_size[0] as f32;
-        let atlas_h = atlas_data.atlas_size[1] as f32;
-        let cell_w = atlas_data.cell_size[0] as f32;
-        let cell_h = atlas_data.cell_size[1] as f32;
+        // Build metadata array indexed by symbol index
+        let atlas_w = width as f32;
+        let atlas_h = height as f32;
+        let cell_w = atlas_data.cell_size.map(|c| c[0] as f32).unwrap_or(64.0);
+        let cell_h = atlas_data.cell_size.map(|c| c[1] as f32).unwrap_or(64.0);
 
-        let mut metadata = [SymbolMetaGpu {
+        // Initialize lookup table (must match order in get_symbol_lookup)
+        let symbol_names = ordered_symbol_names(&atlas_data);
+        let symbol_count = symbol_names.len().min(MAX_SYMBOL_TYPES);
+
+        let mut metadata = vec![SymbolMetaGpu {
             uv_rect: [0.0; 4],
             pivot_size: [0.5, 0.5, 32.0, 32.0],
         }; MAX_SYMBOL_TYPES];
 
-        for (name, entry) in &atlas_data.symbols {
-            if let Some(id) = SymbolId::from_name(name) {
-                let idx = id as usize;
-                if idx < MAX_SYMBOL_TYPES {
-                    let x = entry.cell[0] as f32 * cell_w;
-                    let y = entry.cell[1] as f32 * cell_h;
-                    let w = entry.size[0] as f32;
-                    let h = entry.size[1] as f32;
-
-                    metadata[idx] = SymbolMetaGpu {
-                        uv_rect: [
-                            x / atlas_w,           // uv_min_x
-                            y / atlas_h,           // uv_min_y
-                            (x + w) / atlas_w,     // uv_max_x
-                            (y + h) / atlas_h,     // uv_max_y
-                        ],
-                        pivot_size: [
-                            entry.pivot[0],
-                            entry.pivot[1],
-                            w,
-                            h,
-                        ],
-                    };
-                }
+        for (idx, name) in symbol_names.iter().enumerate() {
+            if idx >= MAX_SYMBOL_TYPES {
+                break;
             }
+            let entry = &atlas_data.symbols[*name];
+
+            // Handle both v1 (cell-based) and v2 (direct rect) formats
+            let (x, y, w, h) = if let Some(rect) = entry.rect {
+                // v2: direct pixel coordinates [x, y, width, height]
+                (rect[0] as f32, rect[1] as f32, rect[2] as f32, rect[3] as f32)
+            } else if let (Some(cell), Some(size)) = (entry.cell, entry.size) {
+                // v1: cell-based
+                (cell[0] as f32 * cell_w, cell[1] as f32 * cell_h, size[0] as f32, size[1] as f32)
+            } else {
+                // Fallback to default
+                (0.0, 0.0, 32.0, 32.0)
+            };
+
+            metadata[idx] = SymbolMetaGpu {
+                uv_rect: [
+                    x / atlas_w,           // uv_min_x
+                    y / atlas_h,           // uv_min_y
+                    (x + w) / atlas_w,     // uv_max_x
+                    (y + h) / atlas_h,     // uv_max_y
+                ],
+                pivot_size: [
+                    entry.pivot[0],
+                    entry.pivot[1],
+                    w,
+                    h,
+                ],
+            };
         }
+
+        log::info!("Built GPU metadata for {} symbols", symbol_count);
 
         // Create metadata storage buffer
         let metadata_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -302,40 +362,83 @@ impl SymbolRenderer {
             push_constant_ranges: &[],
         });
 
-        // Render pipeline
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("symbol_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: "vs_main",
-                buffers: &[SymbolInstance::desc()],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let make_pipeline = |label: &'static str,
+                             vertex_entry: &'static str,
+                             fragment_entry: &'static str,
+                             buffers: &[wgpu::VertexBufferLayout<'_>],
+                             depth_stencil: Option<wgpu::DepthStencilState>,
+                             cull_mode: Option<wgpu::Face>| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: vertex_entry,
+                    buffers,
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: fragment_entry,
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+
+        let symbol_instance_layout = [SymbolInstance::desc()];
+        let pipeline = make_pipeline(
+            "symbol_pipeline",
+            "vs_main",
+            "fs_main",
+            &symbol_instance_layout,
+            None,
+            None,
+        );
+
+        let pipeline_solid = make_pipeline(
+            "symbol_pipeline_solid",
+            "vs_main",
+            "fs_solid",
+            &symbol_instance_layout,
+            None,
+            None,
+        );
+
+        let pipeline_no_depth = make_pipeline(
+            "symbol_pipeline_no_depth",
+            "vs_main",
+            "fs_main",
+            &symbol_instance_layout,
+            None,
+            None,
+        );
+
+        let pipeline_atlas_debug = make_pipeline(
+            "symbol_pipeline_atlas_debug",
+            "vs_atlas_debug",
+            "fs_atlas_debug",
+            &[],
+            None,
+            None,
+        );
 
         // Instance buffer (pre-allocated)
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -347,6 +450,9 @@ impl SymbolRenderer {
 
         Ok(Self {
             pipeline,
+            pipeline_solid,
+            pipeline_no_depth,
+            pipeline_atlas_debug,
             atlas_bind_group,
             instance_buffer,
             instance_count: 0,
@@ -400,12 +506,116 @@ impl SymbolRenderer {
             return;
         }
 
-        render_pass.set_pipeline(&self.pipeline);
+        let pipeline = match debug_render_mode() {
+            1 => &self.pipeline_solid,
+            2 => &self.pipeline_no_depth,
+            _ => &self.pipeline,
+        };
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, camera_bind_group, &[]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
 
         // 6 vertices per quad (procedurally generated), N instances
         render_pass.draw(0..6, 0..self.instance_count);
+    }
+
+    /// Render symbols from an external instance buffer (for tile mode)
+    pub fn render_with_buffer<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        instance_buffer: &'a wgpu::Buffer,
+        instance_count: u32,
+    ) {
+        if instance_count == 0 {
+            return;
+        }
+
+        let pipeline = match debug_render_mode() {
+            1 => &self.pipeline_solid,
+            2 => &self.pipeline_no_depth,
+            _ => &self.pipeline,
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+
+        // 6 vertices per quad (procedurally generated), N instances
+        render_pass.draw(0..6, 0..instance_count);
+    }
+
+    /// Render a range of symbol instances from an external buffer.
+    pub fn render_range_with_buffer<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+        instance_buffer: &'a wgpu::Buffer,
+        start: u32,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+
+        let pipeline = match debug_render_mode() {
+            1 => &self.pipeline_solid,
+            2 => &self.pipeline_no_depth,
+            _ => &self.pipeline,
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+
+        // 6 vertices per quad (procedurally generated), range of instances
+        render_pass.draw(0..6, start..start + count);
+    }
+
+    /// Set pipeline and bind groups once (call before a batch of draw_range calls).
+    pub fn set_state<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+    ) {
+        let pipeline = match debug_render_mode() {
+            1 => &self.pipeline_solid,
+            2 => &self.pipeline_no_depth,
+            _ => &self.pipeline,
+        };
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+    }
+
+    /// Draw a range of symbol instances (call set_state first).
+    pub fn draw_range<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        instance_buffer: &'a wgpu::Buffer,
+        start: u32,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
+        render_pass.draw(0..6, start..start + count);
+    }
+
+    pub fn render_atlas_debug<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        camera_bind_group: &'a wgpu::BindGroup,
+    ) {
+        render_pass.set_pipeline(&self.pipeline_atlas_debug);
+        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
+        render_pass.draw(0..6, 0..1);
+    }
+
+    pub fn instance_count(&self) -> u32 {
+        self.instance_count
     }
 }

@@ -622,7 +622,7 @@ fn platform_subdir() -> &'static str {
         "win"
     } else if cfg!(target_arch = "aarch64") {
         "linuxarm64"
-    } else if cfg!(any(target_arch = "arm", target_arch = "armv7")) {
+    } else if cfg!(target_arch = "arm") {
         "linuxarm"
     } else {
         "linux64"

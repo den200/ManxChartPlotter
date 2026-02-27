@@ -80,9 +80,14 @@ impl TriPrim {
             vertices.push([x, y]);
         }
 
-        // DEBUG: Check for corrupt data (NaN or huge coordinates)
+        // DEBUG: Check for corrupt data (NaN or extremely huge coordinates).
+        //
+        // Note: Many valid charts have SM coordinates tens/hundreds of km from the chart
+        // reference; treat only truly extreme values as suspicious.
         let has_nan = vertices.iter().any(|v| v[0].is_nan() || v[1].is_nan());
-        let has_huge = vertices.iter().any(|v| v[0].abs() > 50000.0 || v[1].abs() > 50000.0);
+        let has_huge = vertices
+            .iter()
+            .any(|v| v[0].abs() > 5_000_000.0 || v[1].abs() > 5_000_000.0);
         if has_nan || has_huge {
             eprintln!("WARN: Corrupt prim[{}] type=0x{:02x} nvert={} nan={} huge={}",
                 prim_index, prim_type_byte, nvert, has_nan, has_huge);
@@ -163,15 +168,57 @@ pub struct AreaGeometry {
     pub extent: BBox,
     /// Pre-tessellated triangle primitives
     pub triangles: Vec<TriPrim>,
+    /// Edge references for outlines (optional, for ring extraction)
+    pub edge_refs: Vec<EdgeRef>,
+}
+
+/// Classifies the spatial relationship between a feature's bbox and a tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BBoxTileRelation {
+    /// No overlap — skip entirely
+    Outside,
+    /// Partially overlaps — needs per-triangle clipping
+    Intersects,
+    /// All geometry guaranteed inside tile — skip clipping
+    FullyInside,
 }
 
 /// Bounding box
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BBox {
+    /// West longitude (degrees)
     pub min_x: f64,
+    /// East longitude (degrees)
     pub max_x: f64,
+    /// South latitude (degrees)
     pub min_y: f64,
+    /// North latitude (degrees)
     pub max_y: f64,
+}
+
+impl BBox {
+    /// Classify the spatial relationship between this WGS84 bbox and tile bounds (Mercator meters).
+    pub fn tile_relation(&self, tile: &crate::tiles::TileBounds) -> BBoxTileRelation {
+        let (min_x_m, min_y_m) = crate::tiles::latlon_to_mercator(self.min_y, self.min_x);
+        let (max_x_m, max_y_m) = crate::tiles::latlon_to_mercator(self.max_y, self.max_x);
+
+        if max_x_m < tile.min_x || min_x_m > tile.max_x
+            || max_y_m < tile.min_y || min_y_m > tile.max_y
+        {
+            BBoxTileRelation::Outside
+        } else if min_x_m >= tile.min_x && max_x_m <= tile.max_x
+               && min_y_m >= tile.min_y && max_y_m <= tile.max_y
+        {
+            BBoxTileRelation::FullyInside
+        } else {
+            BBoxTileRelation::Intersects
+        }
+    }
+
+    /// Check if this WGS84 bounding box intersects tile bounds (global Mercator meters).
+    pub fn intersects_tile(&self, tile: &crate::tiles::TileBounds) -> bool {
+        self.tile_relation(tile) != BBoxTileRelation::Outside
+    }
 }
 
 impl AreaGeometry {
@@ -185,36 +232,43 @@ impl AreaGeometry {
     /// - [u32 × contour_count]: contour vertex counts (skipped for fill)
     /// - [TriPrim × triprim_count]: pre-triangulated data
     /// - [EdgeRef × edge_count]: edge references for outline (optional)
-    pub fn parse(payload: &[u8]) -> Result<Self> {
+    ///
+    /// v200: Each EdgeRef = 12 bytes; v201+: Each EdgeRef = 16 bytes (+ reversed flag)
+    pub fn parse(payload: &[u8], senc_version: u16) -> Result<Self> {
         let mut cursor = Cursor::new(payload);
 
-        // Read bounding box
+        // Read bounding box (WGS84 degrees): south_lat, north_lat, west_lon, east_lon
         let extent = BBox {
-            min_x: cursor.read_f64::<LittleEndian>()?,
-            max_x: cursor.read_f64::<LittleEndian>()?,
             min_y: cursor.read_f64::<LittleEndian>()?,
             max_y: cursor.read_f64::<LittleEndian>()?,
+            min_x: cursor.read_f64::<LittleEndian>()?,
+            max_x: cursor.read_f64::<LittleEndian>()?,
         };
 
         let contour_count = cursor.read_u32::<LittleEndian>()?;
         let triprim_count = cursor.read_u32::<LittleEndian>()?;
-        let _edge_count = cursor.read_u32::<LittleEndian>()?;
+        let edge_count = cursor.read_u32::<LittleEndian>()?;
 
         // Skip contour counts (not needed for fill rendering)
         cursor.seek(SeekFrom::Current((contour_count * 4) as i64))?;
 
-        // DEBUG: Verify offset to first TriPrim
+        // Verify offset to first TriPrim.
         // Expected offset = 44 + 4*contour_count (32 extent + 12 counts + contour array)
         let pos = cursor.position() as usize;
         let expected_offset = 44 + (contour_count as usize * 4);
         if pos != expected_offset {
             eprintln!("WARN: TriPrim offset mismatch: cursor at {}, expected {}", pos, expected_offset);
         }
-        if triprim_count > 0 && pos + 20 <= payload.len() {
+        if log::log_enabled!(log::Level::Debug) && triprim_count > 0 && pos + 20 <= payload.len() {
             // Expected: byte[0]=0x04/05/06 (type), bytes[1-4]=nvert (little-endian u32)
-            println!("DEBUG: contour_count={}, triprim_count={}, cursor at {}, expected {}",
-                contour_count, triprim_count, pos, expected_offset);
-            println!("DEBUG: First 20 TriPrim bytes: {:02x?}", &payload[pos..pos+20]);
+            log::debug!(
+                "contour_count={} triprim_count={} cursor_at={} expected={}",
+                contour_count,
+                triprim_count,
+                pos,
+                expected_offset
+            );
+            log::debug!("first 20 TriPrim bytes: {:02x?}", &payload[pos..pos + 20]);
         }
 
         // Read pre-triangulated data directly
@@ -223,9 +277,27 @@ impl AreaGeometry {
             triangles.push(TriPrim::read(&mut cursor, i)?);
         }
 
-        // Skip edge refs for now (used for outline rendering)
+        // Read edge refs for outline/ring reconstruction (if present).
+        let has_reversed = senc_version > 200;
+        let mut edge_refs = Vec::with_capacity(edge_count as usize);
+        for _ in 0..edge_count {
+            let start_node = cursor.read_u32::<LittleEndian>()?;
+            let edge_index = cursor.read_i32::<LittleEndian>()?;
+            let end_node = cursor.read_u32::<LittleEndian>()?;
+            let reversed = if has_reversed {
+                Some(cursor.read_u32::<LittleEndian>()? != 0)
+            } else {
+                None
+            };
+            edge_refs.push(EdgeRef {
+                start_node,
+                edge_index,
+                end_node,
+                reversed,
+            });
+        }
 
-        Ok(Self { extent, triangles })
+        Ok(Self { extent, triangles, edge_refs })
     }
 
     /// Convert all triangles to a flat vertex list for GPU.
@@ -313,6 +385,178 @@ impl AreaGeometry {
         }
         (plain, strip, fan)
     }
+
+    /// Emit all vertices directly as f32 global Mercator coordinates.
+    ///
+    /// Zero-allocation fast path for features fully inside a tile.
+    /// Expands STRIP/FAN to plain triangles (3 verts each) in-place.
+    /// Stays in f32 throughout — avoids the f32→f64→clip→f64→f32 round-trip.
+    pub fn for_each_vertex_direct<F>(&self, ref_mx: f32, ref_my: f32, mut callback: F)
+    where
+        F: FnMut([f32; 2]),
+    {
+        for prim in &self.triangles {
+            let verts = &prim.vertices;
+            match prim.prim_type {
+                TriPrimType::Triangles => {
+                    for v in verts {
+                        callback([ref_mx + v[0], ref_my + v[1]]);
+                    }
+                }
+                TriPrimType::TriangleStrip => {
+                    for i in 0..verts.len().saturating_sub(2) {
+                        let (a, b, c) = if i % 2 == 0 {
+                            (i, i + 1, i + 2)
+                        } else {
+                            (i + 1, i, i + 2)
+                        };
+                        callback([ref_mx + verts[a][0], ref_my + verts[a][1]]);
+                        callback([ref_mx + verts[b][0], ref_my + verts[b][1]]);
+                        callback([ref_mx + verts[c][0], ref_my + verts[c][1]]);
+                    }
+                }
+                TriPrimType::TriangleFan => {
+                    if verts.len() >= 3 {
+                        let center = &verts[0];
+                        for i in 1..verts.len() - 1 {
+                            callback([ref_mx + center[0], ref_my + center[1]]);
+                            callback([ref_mx + verts[i][0], ref_my + verts[i][1]]);
+                            callback([ref_mx + verts[i + 1][0], ref_my + verts[i + 1][1]]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Iterate triangles as global Mercator coordinates via callback.
+    ///
+    /// Zero-allocation: uses callback pattern instead of intermediate Vecs.
+    /// Each triangle is passed as [[f64; 2]; 3] in global Mercator coords.
+    pub fn for_each_triangle_global<F>(&self, ref_lat: f64, ref_lon: f64, mut callback: F)
+    where
+        F: FnMut([[f64; 2]; 3])
+    {
+        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(ref_lat, ref_lon);
+
+        for prim in &self.triangles {
+            let verts = &prim.vertices;
+
+            match prim.prim_type {
+                TriPrimType::Triangles => {
+                    // Every 3 vertices is a triangle
+                    for chunk in verts.chunks_exact(3) {
+                        callback([
+                            [ref_mx + chunk[0][0] as f64, ref_my + chunk[0][1] as f64],
+                            [ref_mx + chunk[1][0] as f64, ref_my + chunk[1][1] as f64],
+                            [ref_mx + chunk[2][0] as f64, ref_my + chunk[2][1] as f64],
+                        ]);
+                    }
+                }
+                TriPrimType::TriangleStrip => {
+                    // v0,v1,v2, then v1,v2,v3, etc. with alternating winding
+                    for i in 0..verts.len().saturating_sub(2) {
+                        let (a, b, c) = if i % 2 == 0 {
+                            (i, i + 1, i + 2)
+                        } else {
+                            (i + 1, i, i + 2)  // Flip winding for odd triangles
+                        };
+                        callback([
+                            [ref_mx + verts[a][0] as f64, ref_my + verts[a][1] as f64],
+                            [ref_mx + verts[b][0] as f64, ref_my + verts[b][1] as f64],
+                            [ref_mx + verts[c][0] as f64, ref_my + verts[c][1] as f64],
+                        ]);
+                    }
+                }
+                TriPrimType::TriangleFan => {
+                    // v0 is center, then v0,v1,v2, then v0,v2,v3, etc.
+                    if verts.len() >= 3 {
+                        let center = &verts[0];
+                        for i in 1..verts.len() - 1 {
+                            callback([
+                                [ref_mx + center[0] as f64, ref_my + center[1] as f64],
+                                [ref_mx + verts[i][0] as f64, ref_my + verts[i][1] as f64],
+                                [ref_mx + verts[i + 1][0] as f64, ref_my + verts[i + 1][1] as f64],
+                            ]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve edge references into ring polylines in SM coordinates.
+    ///
+    /// Returns polylines as Vec<[f32; 2]>; the caller can close/transform as needed.
+    pub fn resolve_rings(&self, edge_table: &EdgeTable) -> Vec<Vec<[f32; 2]>> {
+        if self.edge_refs.is_empty() {
+            return Vec::new();
+        }
+
+        let mut rings = Vec::new();
+        let mut current: Vec<[f32; 2]> = Vec::new();
+        let mut prev_end_node: Option<u32> = None;
+
+        for edge_ref in &self.edge_refs {
+            let (start_id, end_id) = if edge_ref.is_reversed() {
+                (edge_ref.end_node, edge_ref.start_node)
+            } else {
+                (edge_ref.start_node, edge_ref.end_node)
+            };
+
+            if prev_end_node.is_some() && prev_end_node != Some(start_id) && !current.is_empty() {
+                if current.len() >= 2 {
+                    rings.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+
+            match edge_table.get_edge(edge_ref.index()) {
+                Some(verts) if !verts.is_empty() => {
+                    let iter: Box<dyn Iterator<Item = [f32; 2]>> = if edge_ref.is_reversed() {
+                        Box::new(verts.iter().rev().copied())
+                    } else {
+                        Box::new(verts.iter().copied())
+                    };
+                    for (j, p) in iter.enumerate() {
+                        if j == 0 && current.last() == Some(&p) {
+                            continue;
+                        }
+                        current.push(p);
+                    }
+                }
+                Some(verts) if verts.is_empty() => {
+                    let (first_node, last_node) = if edge_ref.is_reversed() {
+                        (edge_ref.end_node, edge_ref.start_node)
+                    } else {
+                        (edge_ref.start_node, edge_ref.end_node)
+                    };
+
+                    if let (Some(p0), Some(p1)) = (
+                        edge_table.get_node(first_node),
+                        edge_table.get_node(last_node)
+                    ) {
+                        if current.last() != Some(&p0) {
+                            current.push(p0);
+                        }
+                        if p0 != p1 && current.last() != Some(&p1) {
+                            current.push(p1);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            prev_end_node = Some(end_id);
+        }
+
+        if current.len() >= 2 {
+            rings.push(current);
+        }
+
+        rings
+    }
 }
 
 /// Point geometry (record type 80)
@@ -336,6 +580,71 @@ impl PointGeometry {
     }
 }
 
+/// Multipoint geometry (record type 83)
+/// Used for SOUNDG (depth soundings) - each point has X, Y, Z (depth)
+#[derive(Debug, Clone)]
+pub struct MultipointGeometry {
+    /// Points as (x, y, z) tuples in SM coordinates.
+    /// Z is depth in meters for soundings.
+    pub points: Vec<[f32; 3]>,
+}
+
+impl MultipointGeometry {
+    /// Parse multipoint geometry from record payload (record type 83).
+    ///
+    /// Format (per qutenav osenc.h):
+    /// - 4 × f64: extent_s_lat, extent_n_lat, extent_w_lon, extent_e_lon (WGS84 degrees)
+    /// - u32: point_count
+    /// - point_count × 3 × f32: x, y, z (SM meters, depth)
+    pub fn parse(payload: &[u8]) -> Result<Self> {
+        // 4 × f64 (extent) + u32 (point_count) = 36 bytes minimum header
+        if payload.len() < 36 {
+            return Err(GeometryError::Invalid(format!(
+                "Multipoint payload too short: {} bytes (need at least 36 for header)",
+                payload.len()
+            )));
+        }
+
+        let mut cursor = Cursor::new(payload);
+
+        // Skip extent bounding box (4 × f64 = 32 bytes)
+        // We don't need it for rendering - points have their own coordinates
+        let _extent_s_lat = cursor.read_f64::<LittleEndian>()?;
+        let _extent_n_lat = cursor.read_f64::<LittleEndian>()?;
+        let _extent_w_lon = cursor.read_f64::<LittleEndian>()?;
+        let _extent_e_lon = cursor.read_f64::<LittleEndian>()?;
+
+        let point_count = cursor.read_u32::<LittleEndian>()?;
+
+        // Sanity check - soundings shouldn't have millions of points
+        if point_count > 100000 {
+            return Err(GeometryError::Invalid(format!(
+                "Multipoint has unreasonable point count: {}",
+                point_count
+            )));
+        }
+
+        // Each point is 12 bytes (3 × f32)
+        let expected_size = 36 + (point_count as usize * 12);
+        if payload.len() < expected_size {
+            return Err(GeometryError::Invalid(format!(
+                "Multipoint payload too short: {} bytes for {} points (need {})",
+                payload.len(), point_count, expected_size
+            )));
+        }
+
+        let mut points = Vec::with_capacity(point_count as usize);
+        for _ in 0..point_count {
+            let x = cursor.read_f32::<LittleEndian>()?;
+            let y = cursor.read_f32::<LittleEndian>()?;
+            let z = cursor.read_f32::<LittleEndian>()?;
+            points.push([x, y, z]);
+        }
+
+        Ok(Self { points })
+    }
+}
+
 /// Line geometry (record type 81)
 ///
 /// OSENC line geometry contains edge references that point to the edge table
@@ -353,14 +662,16 @@ pub struct LineGeometry {
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeRef {
     pub start_node: u32,
-    pub edge_index: i32,  // Signed: negative means reversed
+    pub edge_index: i32,  // Signed: negative means reversed (v200)
     pub end_node: u32,
+    pub reversed: Option<bool>,  // Explicit flag for v201+
 }
 
 impl EdgeRef {
-    /// Check if edge should be traversed in reverse
+    /// Check if edge should be traversed in reverse.
+    /// Prefers explicit v201 flag; falls back to sign of edge_index (v200).
     pub fn is_reversed(&self) -> bool {
-        self.edge_index < 0
+        self.reversed.unwrap_or_else(|| self.edge_index < 0)
     }
 
     /// Get the actual edge index (absolute value)
@@ -377,8 +688,9 @@ impl LineGeometry {
     /// - u32: edge_count
     /// - [EdgeRef × edge_count]: edge references
     ///
-    /// Each EdgeRef: start_node (u32), edge_index (i32), end_node (u32) = 12 bytes
-    pub fn parse(payload: &[u8]) -> Result<Self> {
+    /// v200: Each EdgeRef = start_node (u32), edge_index (i32), end_node (u32) = 12 bytes
+    /// v201+: Each EdgeRef += reversed_flag (u32) = 16 bytes
+    pub fn parse(payload: &[u8], senc_version: u16) -> Result<Self> {
         if payload.len() < 36 {  // 32 (extent) + 4 (count)
             return Err(GeometryError::Invalid(format!(
                 "Line geometry payload too short: {} bytes",
@@ -388,15 +700,16 @@ impl LineGeometry {
 
         let mut cursor = Cursor::new(payload);
 
-        // Read bounding box
+        // Read bounding box (WGS84 degrees): south_lat, north_lat, west_lon, east_lon
         let extent = BBox {
-            min_x: cursor.read_f64::<LittleEndian>()?,
-            max_x: cursor.read_f64::<LittleEndian>()?,
             min_y: cursor.read_f64::<LittleEndian>()?,
             max_y: cursor.read_f64::<LittleEndian>()?,
+            min_x: cursor.read_f64::<LittleEndian>()?,
+            max_x: cursor.read_f64::<LittleEndian>()?,
         };
 
         let edge_count = cursor.read_u32::<LittleEndian>()?;
+        let has_reversed = senc_version > 200;
 
         // Read edge references
         let mut edge_refs = Vec::with_capacity(edge_count as usize);
@@ -404,10 +717,16 @@ impl LineGeometry {
             let start_node = cursor.read_u32::<LittleEndian>()?;
             let edge_index = cursor.read_i32::<LittleEndian>()?;
             let end_node = cursor.read_u32::<LittleEndian>()?;
+            let reversed = if has_reversed {
+                Some(cursor.read_u32::<LittleEndian>()? != 0)
+            } else {
+                None
+            };
             edge_refs.push(EdgeRef {
                 start_node,
                 edge_index,
                 end_node,
+                reversed,
             });
         }
 
@@ -471,12 +790,15 @@ impl LineGeometry {
                         edge_table.get_node(first_node),
                         edge_table.get_node(last_node)
                     ) {
-                        // Check distance - if too far, this might be a spurious connection
-                        let dist = ((p1[0]-p0[0]).powi(2) + (p1[1]-p0[1]).powi(2)).sqrt();
-                        if dist > 100.0 {
-                            // Skip this edge - it's likely an incorrect connection
-                            // (edges with 0 vertices should connect nearby nodes)
-                            continue;
+                        // Log but don't skip long zero-vertex edges - they may be legitimate
+                        // straight segments (e.g., breakwaters, piers)
+                        #[cfg(debug_assertions)]
+                        {
+                            let dist = ((p1[0]-p0[0]).powi(2) + (p1[1]-p0[1]).powi(2)).sqrt();
+                            if dist > 100.0 {
+                                log::trace!("Long zero-vertex edge: {:.0}m from node {} to {}",
+                                           dist, first_node, last_node);
+                            }
                         }
                         // Add start node (skip if duplicate of last vertex)
                         if current.last() != Some(&p0) {
@@ -501,6 +823,24 @@ impl LineGeometry {
             polylines.push(current);
         }
         polylines
+    }
+
+    /// Resolve and return polylines in global Mercator coordinates.
+    ///
+    /// Transforms local SM coords to global Mercator using ref_lat/ref_lon.
+    pub fn resolve_global(&self, edge_table: &EdgeTable, ref_lat: f64, ref_lon: f64)
+        -> Vec<Vec<[f64; 2]>>
+    {
+        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(ref_lat, ref_lon);
+
+        self.resolve(edge_table)
+            .into_iter()
+            .map(|polyline| {
+                polyline.into_iter()
+                    .map(|p| [ref_mx + p[0] as f64, ref_my + p[1] as f64])
+                    .collect()
+            })
+            .collect()
     }
 }
 
@@ -630,7 +970,6 @@ impl EdgeTable {
             eprintln!("WARN: Edge table incomplete: parsed {}/{} edges", parsed_count, total_edges);
         }
 
-        println!("DEBUG: Parsed {}/{} edges from edge table record", parsed_count, total_edges);
         Ok(())
     }
 
@@ -662,7 +1001,6 @@ impl EdgeTable {
             parsed_count += 1;
         }
 
-        println!("DEBUG: Parsed {}/{} nodes from node table record", parsed_count, total_nodes);
         Ok(())
     }
 }

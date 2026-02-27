@@ -5,6 +5,7 @@
 //! Line styles follow S-52 LS() specifications with proper dash/dot patterns.
 
 use super::state::LineStyle;
+use crate::s52::{LinePattern, LineStyleKey, LookupTables};
 
 pub type Color = [f32; 4];
 
@@ -37,6 +38,21 @@ pub const CHMGD: Color = [0.773, 0.271, 0.765, 1.0];
 /// CHMGF - Chart magenta light (211, 166, 233)
 pub const CHMGF: Color = [0.827, 0.651, 0.914, 1.0];
 
+/// CHBRN - Chart brown (177, 145, 57)
+pub const CHBRN: Color = [0.694, 0.569, 0.224, 1.0];
+
+/// OUTLW - Outline black (7, 7, 7) - same as CHBLK
+pub const OUTLW: Color = [0.027, 0.027, 0.027, 1.0];
+
+/// LITRD - Light red (241, 84, 105)
+pub const LITRD: Color = [0.945, 0.329, 0.412, 1.0];
+
+/// LITGN - Light green (104, 228, 86)
+pub const LITGN: Color = [0.408, 0.894, 0.337, 1.0];
+
+/// LITYW - Light yellow (244, 218, 72)
+pub const LITYW: Color = [0.957, 0.855, 0.282, 1.0];
+
 /// LANDF - Land fill dark (139, 102, 31)
 pub const LANDF: Color = [0.545, 0.400, 0.122, 1.0];
 
@@ -51,6 +67,14 @@ pub const TRFCF: Color = [0.827, 0.651, 0.914, 1.0];
 
 /// CURSR - Cursor/range (235, 125, 54)
 pub const CURSR: Color = [0.922, 0.490, 0.212, 1.0];
+
+/// SNDG1 - Sounding color 1 (125, 137, 140) - same as DEPCN/CHGRD
+/// Used for normal soundings per SNDFRM02
+pub const SNDG1: Color = [0.490, 0.537, 0.549, 1.0];
+
+/// SNDG2 - Sounding color 2 (7, 7, 7) - same as CHBLK
+/// Used for safety-critical soundings (depth < safety_depth)
+pub const SNDG2: Color = [0.027, 0.027, 0.027, 1.0];
 
 // ============================================================
 // S-52 Pattern Constants
@@ -70,9 +94,11 @@ const DOT_PERIOD: f32 = 1.0 * PPMM;       // 4 px
 const DOT_ON: f32 = DOT_PERIOD * 0.5;     // 2 px
 const DOT_OFF: f32 = DOT_PERIOD * 0.5;    // 2 px
 
-/// Convert S-52 width units to pixels (0.5mm per unit)
+/// Convert S-52 width units to pixels.
+/// OpenCPN uses width values directly as pixel widths (not 0.3mm per unit from spec K.3).
+/// This matches OpenCPN's RenderLS behavior: `glLineWidth(wxMax(m_GLMinCartographicLineWidth, w))`
 const fn width(w: u8) -> f32 {
-    0.5 * (w as f32) * PPMM
+    if w == 0 { 1.0 } else { w as f32 }
 }
 
 // ============================================================
@@ -80,12 +106,13 @@ const fn width(w: u8) -> f32 {
 // Each constant corresponds to an S-52 LS() specification
 // ============================================================
 
-/// COALNE: LS(DASH,1,CSTLN) - Coastline: dashed, width 1, gray
+/// COALNE: LS(SOLD,1,CSTLN) - Coastline: solid, width 1, gray
+/// Per S52-RENDERING-SPEC.md Appendix N: coastlines are SOLID, not dashed
 pub const COALNE: LineStyle = LineStyle {
     color: CSTLN,
     width_px: width(1),
-    dash_on_px: DASH_ON,
-    dash_off_px: DASH_OFF,
+    dash_on_px: 0.0,
+    dash_off_px: 0.0,
 };
 
 /// DEPCNT normal: LS(SOLD,1,DEPCN) - Depth contour: solid, width 1, gray-blue
@@ -253,3 +280,187 @@ pub const CONTOUR_STYLE: LineStyle = DEPCNT;
 
 /// Safety contour style (solid, thicker)
 pub const SAFETY_CONTOUR_STYLE: LineStyle = DEPCNT_SAFETY;
+
+// ============================================================
+// LineStyleId to LineStyle mapping for tile rendering
+// ============================================================
+
+use crate::tiles::LineStyleId;
+
+/// Convert S-52 width units to pixels with custom ppmm.
+/// Matches OpenCPN's line width handling:
+/// - For normal displays (ppmm <= 7): use w directly as pixel width
+/// - For HiDPI displays (ppmm > 7): scale assuming w was designed for 6 ppmm
+fn width_scaled(w: u8, ppmm: f32) -> f32 {
+    let w_f = if w == 0 { 1.0 } else { w as f32 };
+    if ppmm > 7.0 {
+        // HiDPI: treat w as "pixels at 6 ppmm" and scale to actual ppmm
+        // This matches OpenCPN: target_w_mm = w / 6.0; lineWidth = target_w_mm * ppmm
+        (w_f / 6.0) * ppmm
+    } else {
+        // Normal displays: use w directly as pixel width
+        w_f
+    }
+}
+
+/// Compute dash pattern for given ppmm
+fn dash_pattern(ppmm: f32) -> (f32, f32) {
+    let period = 3.0 * ppmm;  // 3mm period
+    (period * 0.66, period * 0.34)
+}
+
+/// Compute dot pattern for given ppmm
+fn dot_pattern(ppmm: f32) -> (f32, f32) {
+    let period = 1.0 * ppmm;  // 1mm period
+    (period * 0.5, period * 0.5)
+}
+
+/// Get the LineStyle for a given LineStyleId, scaled by ppmm for HiDPI
+pub fn style_for_id(id: LineStyleId, ppmm: f32) -> LineStyle {
+    let (dash_on, dash_off) = dash_pattern(ppmm);
+    let (dot_on, dot_off) = dot_pattern(ppmm);
+
+    match id {
+        LineStyleId::Coastline => LineStyle {
+            color: CSTLN,
+            width_px: width_scaled(1, ppmm),
+            dash_on_px: 0.0,  // SOLD per spec Appendix N
+            dash_off_px: 0.0,
+        },
+        LineStyleId::ShorelineConstruction => LineStyle {
+            color: CSTLN,
+            width_px: width_scaled(2, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+        LineStyleId::ShorelineConstructionWharf => LineStyle {
+            color: CSTLN,
+            width_px: width_scaled(4, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+        LineStyleId::DepthContour => LineStyle {
+            color: DEPCN,
+            width_px: width_scaled(1, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+        LineStyleId::DepthContourSafety => LineStyle {
+            color: DEPSC,
+            width_px: width_scaled(2, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+        LineStyleId::CableOverhead => LineStyle {
+            color: CHGRD,
+            width_px: width_scaled(4, ppmm),
+            dash_on_px: dash_on,
+            dash_off_px: dash_off,
+        },
+        LineStyleId::CableSubmarine => LineStyle {
+            color: CHMGD,
+            width_px: width_scaled(1, ppmm),
+            dash_on_px: dash_on,
+            dash_off_px: dash_off,
+        },
+        LineStyleId::TrafficSeparationLine => LineStyle {
+            color: TRFCF,
+            width_px: width_scaled(6, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+        LineStyleId::Road => LineStyle {
+            color: LANDF,
+            width_px: width_scaled(2, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+        LineStyleId::RiverBank => LineStyle {
+            color: CSTLN,
+            width_px: width_scaled(2, ppmm),
+            dash_on_px: dot_on,
+            dash_off_px: dot_off,
+        },
+        LineStyleId::Pipeline => LineStyle {
+            color: CHGRD,
+            width_px: width_scaled(2, ppmm),
+            dash_on_px: 0.0,
+            dash_off_px: 0.0,
+        },
+    }
+}
+
+// ============================================================
+// Dynamic Style Resolution (for LineStyleKey from S-52 lookups)
+// ============================================================
+
+/// Resolve S-52 color token to RGB color.
+/// Returns CHBLK (black) for unknown tokens.
+pub fn color_for_token(token: &str, tables: Option<&LookupTables>) -> Color {
+    if let Some(tables) = tables {
+        if let Some(color) = tables.get_color_f32(token) {
+            return color;
+        }
+    }
+
+    match token {
+        "CSTLN" => CSTLN,
+        "DEPCN" => DEPCN,
+        "DEPSC" => DEPSC,
+        "CHBLK" => CHBLK,
+        "CHGRD" => CHGRD,
+        "CHGRF" => CHGRF,
+        "CHMGD" => CHMGD,
+        "CHMGF" => CHMGF,
+        "CHBRN" => CHBRN,
+        "OUTLW" => OUTLW,
+        "LITRD" => LITRD,
+        "LITGN" => LITGN,
+        "LITYW" => LITYW,
+        "LANDF" => LANDF,
+        "LANDA" => LANDA,
+        "TRFCD" => TRFCD,
+        "ATRFCD" => TRFCD,   // compound ref: foreground traffic route color
+        "TRFCF" => TRFCF,
+        "CURSR" => CURSR,
+        "SNDG1" => SNDG1,
+        "SNDG2" => SNDG2,
+        // Depth area colors (fallback)
+        "DEPIT" => [0.514, 0.698, 0.584, 1.0],  // Intertidal
+        "DEPVS" => [0.451, 0.714, 0.937, 1.0],  // Very shallow
+        "DEPMS" => [0.596, 0.773, 0.949, 1.0],  // Medium shallow
+        "DEPMD" => [0.729, 0.835, 0.882, 1.0],  // Medium deep
+        "DEPDW" => [0.831, 0.918, 0.933, 1.0],  // Deep water
+        _ => {
+            // Unknown token - log and return black
+            log::trace!("Unknown S-52 color token: {}", token);
+            CHBLK
+        }
+    }
+}
+
+/// Get LineStyle from LineStyleKey, scaled by ppmm for HiDPI.
+///
+/// This is the dynamic equivalent of style_for_id(), used when
+/// styles come from S-52 lookup tables rather than hardcoded enums.
+pub fn style_for_key(key: &LineStyleKey, ppmm: f32, tables: Option<&LookupTables>) -> LineStyle {
+    // Resolve color token to RGB
+    let color = color_for_token(&key.color_token, tables);
+
+    // Convert S-52 width units to pixels using OpenCPN-compatible formula
+    let width_px = width_scaled(key.width, ppmm);
+
+    // Convert pattern to dash/dot parameters
+    let (dash_on_px, dash_off_px) = match key.pattern {
+        LinePattern::Solid => (0.0, 0.0),
+        LinePattern::Dashed => dash_pattern(ppmm),
+        LinePattern::Dotted => dot_pattern(ppmm),
+    };
+
+    LineStyle {
+        color,
+        width_px,
+        dash_on_px,
+        dash_off_px,
+    }
+}

@@ -8,10 +8,12 @@ mod reader;
 mod records;
 mod geometry;
 mod features;
+mod catalog;
 pub mod symbol_lookup;
 
-pub use reader::SencReader;
-pub use records::{RecordType, SencHeader};
-pub use geometry::{TriPrim, TriPrimType, AreaGeometry, LineGeometry, EdgeRef, EdgeTable};
-pub use features::{Feature, FeatureType, ChartData};
-pub use symbol_lookup::features_to_instances;
+pub use reader::{SencReader, SencError};
+pub use records::{RecordType, SencHeader, CellExtent, ObjectClass};
+pub use geometry::{TriPrim, TriPrimType, AreaGeometry, LineGeometry, EdgeRef, EdgeTable, BBox, BBoxTileRelation};
+pub use features::{AttributeValue, Feature, FeatureType, ChartData};
+pub use catalog::{ChartCatalog, ChartInfo, CatalogError};
+pub use symbol_lookup::{features_to_instances, soundings_to_instances};

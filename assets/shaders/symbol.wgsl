@@ -33,8 +33,14 @@ struct VertexOutput {
     @location(0) tex_coord: vec2<f32>,
 }
 
-// Symbol size in screen pixels (fixed regardless of zoom)
-const SYMBOL_SIZE_PIXELS: f32 = 32.0;
+struct AtlasDebugOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) tex_coord: vec2<f32>,
+}
+
+// Symbol size scale (multiplier on atlas native size)
+// Atlas symbols are typically 14-20px, so 2.5x gives ~35-50px on screen
+const SYMBOL_SCALE: f32 = 2.5;
 
 @vertex
 fn vs_main(
@@ -67,12 +73,8 @@ fn vs_main(
     // Offset from pivot (pivot is normalized [0,1] within symbol)
     let offset = corner - pivot;
 
-    // Symbol size - maintain aspect ratio, scale to SYMBOL_SIZE_PIXELS
-    let aspect = size_px.x / max(size_px.y, 1.0);
-    let scaled_size = vec2<f32>(
-        SYMBOL_SIZE_PIXELS * aspect,
-        SYMBOL_SIZE_PIXELS
-    );
+    // Symbol size - use atlas native size scaled by SYMBOL_SCALE
+    let scaled_size = size_px * SYMBOL_SCALE;
     let pixel_offset = offset * scaled_size;
 
     // Apply rotation
@@ -109,4 +111,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return color;
+}
+
+@fragment
+fn fs_solid(_in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+}
+
+@vertex
+fn vs_atlas_debug(@builtin(vertex_index) vertex_index: u32) -> AtlasDebugOutput {
+    var out: AtlasDebugOutput;
+
+    var positions = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(-1.0, 1.0),
+        vec2<f32>(-1.0, 1.0),
+        vec2<f32>(1.0, -1.0),
+        vec2<f32>(1.0, 1.0),
+    );
+
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+    );
+
+    out.clip_position = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    out.tex_coord = uvs[vertex_index];
+    return out;
+}
+
+@fragment
+fn fs_atlas_debug(in: AtlasDebugOutput) -> @location(0) vec4<f32> {
+    return textureSample(t_atlas, s_atlas, in.tex_coord);
 }

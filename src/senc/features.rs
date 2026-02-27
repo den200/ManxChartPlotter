@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use super::geometry::{AreaGeometry, EdgeTable, LineGeometry, PointGeometry};
+use super::geometry::{AreaGeometry, EdgeTable, LineGeometry, MultipointGeometry, PointGeometry};
 use super::reader::{RawRecord, SencError, SencReader};
 use super::records::{ObjectClass, RecordType, SencHeader};
 
@@ -16,23 +16,31 @@ use super::records::{ObjectClass, RecordType, SencHeader};
 /// Only the attributes we care about for MVP (depth values)
 fn s57_attribute_name(code: u16) -> String {
     match code {
+        // Category/condition attributes used by S-52 lookups/procedures
+        15 => "CATCOA".to_string(),   // Category of coastline
+        60 => "CATSLC".to_string(),   // Category of shoreline construction
+        81 => "CONDTN".to_string(),   // Condition
+
         // Depth-related attributes
         87 => "DRVAL1".to_string(),   // Depth range value 1 (shallow)
         88 => "DRVAL2".to_string(),   // Depth range value 2 (deep)
         174 => "VALDCO".to_string(),  // Value of depth contour
-        178 => "VALSOU".to_string(),  // Value of sounding
+        179 => "VALSOU".to_string(),  // Value of sounding
 
         // Symbol-related attributes (for buoys, beacons, etc.)
         36 => "CATLAM".to_string(),   // Category of lateral mark (1=port, 2=starboard)
         75 => "COLOUR".to_string(),   // Colour (3=red, 4=green)
-        179 => "WATLEV".to_string(),  // Water level effect (for rocks)
+        187 => "WATLEV".to_string(),  // Water level effect (for rocks)
+
+        // Position quality attribute (for QUAPOS01)
+        402 => "QUAPOS".to_string(),  // Quality of position (1=surveyed, 4+=low accuracy)
 
         // Other common attributes
-        76 => "OBJNAM".to_string(),   // Object name
-        113 => "INFORM".to_string(),  // Information
-        116 => "NINFOM".to_string(),  // Information in national language
-        142 => "SCAMIN".to_string(),  // Scale minimum
-        143 => "SCAMAX".to_string(),  // Scale maximum
+        102 => "INFORM".to_string(),  // Information
+        116 => "OBJNAM".to_string(),  // Object name
+        132 => "SCAMAX".to_string(),  // Scale maximum
+        133 => "SCAMIN".to_string(),  // Scale minimum
+        300 => "NINFOM".to_string(),  // Information in national language
 
         // Return numeric code as string for unknown attributes
         _ => format!("ATTR_{}", code),
@@ -65,6 +73,8 @@ pub struct Feature {
     pub point_geometry: Option<PointGeometry>,
     /// Line geometry (if feature_type == Line)
     pub line_geometry: Option<LineGeometry>,
+    /// Multipoint geometry (if feature_type == Multipoint, e.g., SOUNDG)
+    pub multipoint_geometry: Option<MultipointGeometry>,
 }
 
 /// Attribute value types
@@ -99,6 +109,85 @@ impl Feature {
         match (self.drval1(), self.drval2()) {
             (Some(d1), Some(d2)) => Some((d1 + d2) / 2.0),
             (Some(d), None) | (None, Some(d)) => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Get an integer attribute by name
+    pub fn attribute_int(&self, name: &str) -> Option<i32> {
+        match self.attributes.get(name) {
+            Some(AttributeValue::Integer(v)) => Some(*v),
+            Some(AttributeValue::Float(v)) => Some(*v as i32),
+            _ => None,
+        }
+    }
+
+    /// Get a float attribute by name
+    pub fn attribute_float(&self, name: &str) -> Option<f64> {
+        match self.attributes.get(name) {
+            Some(AttributeValue::Float(v)) => Some(*v),
+            Some(AttributeValue::Integer(v)) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    /// Get a string attribute by name
+    pub fn attribute_str(&self, name: &str) -> Option<&str> {
+        match self.attributes.get(name) {
+            Some(AttributeValue::String(s)) => Some(s.as_str()),
+            // Also handle integer/float as strings for comma-separated lists
+            Some(AttributeValue::Integer(_v)) => None, // Can't return reference to temp
+            Some(AttributeValue::Float(_)) => None,
+            None => None,
+        }
+    }
+
+    /// Get attributes as a map of integer values (for S-52 lookup matching).
+    ///
+    /// Returns attribute name → list of integer values. String attributes are
+    /// parsed as comma-separated lists. Non-numeric strings are stored as empty
+    /// lists to preserve attribute presence checks.
+    pub fn attributes_as_map(&self) -> HashMap<&str, Vec<i32>> {
+        let mut map = HashMap::new();
+        for (name, value) in &self.attributes {
+            match value {
+                AttributeValue::Integer(v) => {
+                    map.insert(name.as_str(), vec![*v]);
+                }
+                AttributeValue::Float(v) => {
+                    map.insert(name.as_str(), vec![*v as i32]);
+                }
+                AttributeValue::String(s) => {
+                    let mut values = Vec::new();
+                    for part in s.split(',') {
+                        if let Ok(v) = part.trim().parse::<i32>() {
+                            values.push(v);
+                        }
+                    }
+                    map.insert(name.as_str(), values);
+                }
+            }
+        }
+        map
+    }
+
+    /// Get SCAMIN (scale minimum) - the smallest scale at which feature should display.
+    /// Scale is denominator of 1:N, so larger SCAMIN = feature hidden at higher zoom levels.
+    /// Returns None if attribute not present (feature always visible).
+    pub fn scamin(&self) -> Option<f64> {
+        match self.attributes.get("SCAMIN") {
+            Some(AttributeValue::Integer(v)) => Some(*v as f64),
+            Some(AttributeValue::Float(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// Get SCAMAX (scale maximum) - the largest scale at which feature should display.
+    /// Returns None if attribute not present (no upper limit).
+    pub fn scamax(&self) -> Option<f64> {
+        match self.attributes.get("SCAMAX") {
+            Some(AttributeValue::Integer(v)) => Some(*v as f64),
+            Some(AttributeValue::Float(v)) => Some(*v),
             _ => None,
         }
     }
@@ -163,6 +252,11 @@ impl Feature {
         self.object_class == ObjectClass::Coverage
     }
 
+    /// Check if this is a sounding (SOUNDG)
+    pub fn is_sounding(&self) -> bool {
+        self.object_class == ObjectClass::Sounding
+    }
+
     /// Get depth contour value (VALDCO attribute)
     pub fn valdco(&self) -> Option<f64> {
         match self.attributes.get("VALDCO") {
@@ -188,14 +282,18 @@ impl ChartData {
     /// Parse chart data from decrypted SENC bytes
     pub fn parse(data: Vec<u8>) -> Result<Self, SencError> {
         let mut reader = SencReader::from_bytes(data);
-        let header = reader.read_header()?;
+        let (header, overflow) = reader.read_header()?;
+        let senc_version = header.version;
 
         let mut features = Vec::new();
         let mut current_feature: Option<PartialFeature> = None;
         let mut edge_table = EdgeTable::new();
 
-        // Parse remaining records
-        while let Some(record) = reader.next_record()? {
+        // Helper closure to process a single record
+        let process_record = |record: &RawRecord,
+                                   current_feature: &mut Option<PartialFeature>,
+                                   features: &mut Vec<Feature>,
+                                   edge_table: &mut EdgeTable| -> Result<(), SencError> {
             match record.record_type {
                 RecordType::FeatureId => {
                     // Save previous feature if complete
@@ -206,31 +304,33 @@ impl ChartData {
                     }
 
                     // Start new feature
-                    current_feature = Some(PartialFeature::from_record(&record)?);
+                    *current_feature = Some(PartialFeature::from_record(record)?);
                 }
                 RecordType::FeatureAttribute => {
                     if let Some(ref mut partial) = current_feature {
-                        partial.add_attribute(&record)?;
+                        partial.add_attribute(record)?;
                     }
                 }
                 RecordType::AreaGeometry => {
                     if let Some(ref mut partial) = current_feature {
-                        partial.set_area_geometry(&record)?;
+                        partial.set_area_geometry(record, senc_version)?;
                     }
                 }
                 RecordType::PointGeometry => {
                     if let Some(ref mut partial) = current_feature {
-                        partial.set_point_geometry(&record)?;
+                        partial.set_point_geometry(record)?;
                     }
                 }
                 RecordType::LineGeometry => {
                     if let Some(ref mut partial) = current_feature {
-                        partial.set_line_geometry(&record)?;
+                        partial.set_line_geometry(record, senc_version)?;
                     }
                 }
                 RecordType::MultipointGeometry => {
                     if let Some(ref mut partial) = current_feature {
-                        partial.feature_type = Some(FeatureType::Multipoint);
+                        if let Err(e) = partial.set_multipoint_geometry(record) {
+                            eprintln!("WARN: Multipoint geometry parse error: {}", e);
+                        }
                     }
                 }
                 RecordType::VectorEdge => {
@@ -247,6 +347,17 @@ impl ChartData {
                 }
                 _ => {}
             }
+            Ok(())
+        };
+
+        // Process the overflow record from read_header (first non-header record)
+        if let Some(ref record) = overflow {
+            process_record(record, &mut current_feature, &mut features, &mut edge_table)?;
+        }
+
+        // Parse remaining records
+        while let Some(record) = reader.next_record()? {
+            process_record(&record, &mut current_feature, &mut features, &mut edge_table)?;
         }
 
         // Don't forget the last feature
@@ -255,6 +366,14 @@ impl ChartData {
                 features.push(feature);
             }
         }
+
+        log::info!(
+            "Parsed '{}': {} features, {} edges, {} nodes",
+            header.cell_name,
+            features.len(),
+            edge_table.edge_count(),
+            edge_table.node_count(),
+        );
 
         Ok(Self { header, features, edge_table })
     }
@@ -325,6 +444,11 @@ impl ChartData {
         self.features.iter().filter(|f| f.is_recommended_route())
     }
 
+    /// Get all sounding features (SOUNDG with multipoint geometry)
+    pub fn soundings(&self) -> impl Iterator<Item = &Feature> {
+        self.features.iter().filter(|f| f.is_sounding())
+    }
+
     /// Summary stats for debugging
     pub fn summary(&self) -> String {
         let land_count = self.land_areas().count();
@@ -334,6 +458,10 @@ impl ChartData {
         let point_count = self.points().count();
         let contour_count = self.depth_contours().count();
         let coastline_count = self.coastlines().count();
+        let sounding_count = self.soundings().count();
+        let multipoint_count = self.features.iter()
+            .filter(|f| f.feature_type == FeatureType::Multipoint)
+            .count();
         let total = self.features.len();
 
         format!(
@@ -343,6 +471,8 @@ impl ChartData {
              - All areas: {}\n\
              - All lines: {}\n\
              - All points: {}\n\
+             - Soundings (SOUNDG): {}\n\
+             - Multipoint features: {}\n\
              - Depth contours: {}\n\
              - Coastlines: {}\n\
              - Edge table: {} edges, {} nodes",
@@ -354,6 +484,8 @@ impl ChartData {
             area_count,
             line_count,
             point_count,
+            sounding_count,
+            multipoint_count,
             contour_count,
             coastline_count,
             self.edge_table.edge_count(),
@@ -371,6 +503,7 @@ struct PartialFeature {
     area_geometry: Option<AreaGeometry>,
     point_geometry: Option<PointGeometry>,
     line_geometry: Option<LineGeometry>,
+    multipoint_geometry: Option<MultipointGeometry>,
 }
 
 impl PartialFeature {
@@ -413,6 +546,7 @@ impl PartialFeature {
             area_geometry: None,
             point_geometry: None,
             line_geometry: None,
+            multipoint_geometry: None,
         })
     }
 
@@ -479,10 +613,10 @@ impl PartialFeature {
         Ok(())
     }
 
-    fn set_area_geometry(&mut self, record: &RawRecord) -> Result<(), SencError> {
+    fn set_area_geometry(&mut self, record: &RawRecord, senc_version: u16) -> Result<(), SencError> {
         self.feature_type = Some(FeatureType::Area);
         self.area_geometry = Some(
-            AreaGeometry::parse(&record.payload)
+            AreaGeometry::parse(&record.payload, senc_version)
                 .map_err(|e| SencError::Format(e.to_string()))?,
         );
         Ok(())
@@ -497,10 +631,19 @@ impl PartialFeature {
         Ok(())
     }
 
-    fn set_line_geometry(&mut self, record: &RawRecord) -> Result<(), SencError> {
+    fn set_line_geometry(&mut self, record: &RawRecord, senc_version: u16) -> Result<(), SencError> {
         self.feature_type = Some(FeatureType::Line);
         self.line_geometry = Some(
-            LineGeometry::parse(&record.payload)
+            LineGeometry::parse(&record.payload, senc_version)
+                .map_err(|e| SencError::Format(e.to_string()))?,
+        );
+        Ok(())
+    }
+
+    fn set_multipoint_geometry(&mut self, record: &RawRecord) -> Result<(), SencError> {
+        self.feature_type = Some(FeatureType::Multipoint);
+        self.multipoint_geometry = Some(
+            MultipointGeometry::parse(&record.payload)
                 .map_err(|e| SencError::Format(e.to_string()))?,
         );
         Ok(())
@@ -517,6 +660,7 @@ impl PartialFeature {
             area_geometry: self.area_geometry,
             point_geometry: self.point_geometry,
             line_geometry: self.line_geometry,
+            multipoint_geometry: self.multipoint_geometry,
         })
     }
 }

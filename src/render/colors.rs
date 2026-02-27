@@ -1,31 +1,35 @@
-//! Hardcoded Nautograf-style chart colors.
+//! S-52 DAY_BRIGHT chart colors from OpenCPN chartsymbols.xml.
 //!
-//! Instead of full S-52 compliance, we use a simple, readable
-//! color scheme inspired by Nautograf/OpenCPN.
+//! These are the exact colors used by OpenCPN for the Day Bright scheme.
+
+#![allow(dead_code)]
 
 /// RGBA color type
 pub type Color = [f32; 4];
 
-/// Land area (tan/beige) - LNDARE
-pub const LAND_COLOR: Color = [0.98, 0.93, 0.78, 1.0]; // Sandy beige
+/// Land area - S-52 LANDF RGB(139, 102, 31) - dark brown for maritime charts
+/// LANDF is the correct land color for Day Bright scheme (matches OpenCPN)
+pub const LAND_COLOR: Color = [0.545, 0.400, 0.122, 1.0];
 
-/// Ocean background (deep blue)
-pub const OCEAN_BACKGROUND: Color = [0.71, 0.83, 0.93, 1.0]; // Light blue
+/// Ocean background - S-52 DEPDW RGB(212, 234, 238) - deep water
+pub const OCEAN_BACKGROUND: Color = [0.831, 0.918, 0.933, 1.0];
 
-/// Shallow water (danger zone < 5m)
-pub const WATER_SHALLOW: Color = [0.65, 0.85, 0.75, 1.0]; // Greenish
+/// Very shallow water (< 2m) - S-52 DEPVS RGB(115, 182, 239)
+/// Blue (NOT pink!) - S-52 uses blue gradients for all water depths
+pub const WATER_SHALLOW: Color = [0.451, 0.714, 0.937, 1.0];
 
-/// Critical water (< 2m) - visible warning
-pub const WATER_CRITICAL: Color = [0.55, 0.80, 0.55, 1.0]; // More green
+/// Intertidal/drying water - S-52 DEPIT RGB(131, 178, 149)
+/// Greenish for areas that dry at low tide
+pub const WATER_INTERTIDAL: Color = [0.514, 0.698, 0.584, 1.0];
 
-/// Medium depth water (5-20m)
-pub const WATER_MEDIUM: Color = [0.78, 0.88, 0.95, 1.0]; // Light blue
+/// Medium depth water (5-10m) - S-52 DEPMD RGB(186, 213, 225)
+pub const WATER_MEDIUM: Color = [0.729, 0.835, 0.882, 1.0];
 
-/// Deep water (> 20m)
-pub const WATER_DEEP: Color = [0.85, 0.92, 0.98, 1.0]; // Very light blue/white
+/// Deep water (> 20m) - S-52 DEPDW RGB(212, 234, 238)
+pub const WATER_DEEP: Color = [0.831, 0.918, 0.933, 1.0];
 
-/// Coastline color
-pub const COASTLINE_COLOR: Color = [0.4, 0.35, 0.3, 1.0]; // Dark brown
+/// Coastline color - S-52 CSTLN RGB(82, 90, 92)
+pub const COASTLINE_COLOR: Color = [0.322, 0.353, 0.361, 1.0];
 
 /// Depth contour color
 pub const CONTOUR_COLOR: Color = [0.5, 0.6, 0.65, 1.0]; // Gray-blue
@@ -101,18 +105,18 @@ impl Default for DepthPalette {
             // Standard depth breakpoints (meters)
             breakpoints: [0.0, 2.0, 5.0, 10.0, 20.0],
             colors: [
-                // Drying heights (negative depth / above water at low tide)
-                [0.55, 0.80, 0.55, 1.0], // Green
-                // 0-2m: Critical shallow
-                [0.65, 0.85, 0.75, 1.0], // Light green
-                // 2-5m: Shallow
-                [0.72, 0.87, 0.90, 1.0], // Blue-green
-                // 5-10m: Medium
-                [0.78, 0.88, 0.95, 1.0], // Light blue
-                // 10-20m: Deep
-                [0.82, 0.90, 0.96, 1.0], // Lighter blue
-                // >20m: Very deep
-                [0.88, 0.94, 0.98, 1.0], // Near white
+                // Drying/intertidal (negative depth) - S-52 DEPIT RGB(131, 178, 149)
+                WATER_INTERTIDAL,
+                // 0-2m: Very shallow - S-52 DEPVS RGB(115, 182, 239)
+                WATER_SHALLOW,
+                // 2-5m: Shallow - S-52 DEPMS RGB(152, 197, 242)
+                [0.596, 0.773, 0.949, 1.0],
+                // 5-10m: Medium - S-52 DEPMD RGB(186, 213, 225)
+                WATER_MEDIUM,
+                // 10-20m: Medium-deep - interpolated between DEPMD and DEPDW
+                [0.780, 0.876, 0.908, 1.0],
+                // >20m: Deep - S-52 DEPDW RGB(212, 234, 238)
+                WATER_DEEP,
             ],
         }
     }
@@ -134,17 +138,31 @@ impl DepthPalette {
     /// Get color with logarithmic interpolation for smoother gradients
     pub fn color_for_depth_smooth(&self, depth: f64) -> Color {
         if depth < 0.0 {
-            return self.colors[0]; // Drying
+            return self.colors[0]; // Drying/intertidal (green)
         }
 
-        // Use logarithmic scale for more detail in shallow areas
-        let log_depth = (depth + 1.0).ln();
-        let log_max = 21.0_f64.ln(); // ln(20+1)
+        // Use stepped bands matching S-52 depth classifications
+        // Very shallow (0-2m): pinkish warning
+        // Shallow (2-5m): light blue
+        // Medium-deep (5-20m): lighter blue
+        // Deep (>20m): background blue
 
-        let t = (log_depth / log_max).clamp(0.0, 1.0);
+        if depth < 2.0 {
+            // Very shallow danger zone - pinkish
+            let t = (depth / 2.0) as f32;
+            return lerp_color(self.colors[1], self.colors[2], t);
+        } else if depth < 5.0 {
+            // Shallow - transition to medium
+            let t = ((depth - 2.0) / 3.0) as f32;
+            return lerp_color(self.colors[2], self.colors[3], t);
+        } else if depth < 20.0 {
+            // Medium to deep
+            let t = ((depth - 5.0) / 15.0) as f32;
+            return lerp_color(self.colors[3], self.colors[5], t);
+        }
 
-        // Interpolate between shallow and deep colors
-        lerp_color(WATER_SHALLOW, WATER_DEEP, t as f32)
+        // Deep water
+        self.colors[5]
     }
 }
 
@@ -181,12 +199,14 @@ mod tests {
     fn depth_colors_gradient() {
         let palette = DepthPalette::default();
 
-        // Shallow should be more green
+        // S-52 depth colors: shallow is saturated blue, deep is pale/light
         let shallow = palette.color_for_depth(1.0);
         let deep = palette.color_for_depth(50.0);
 
-        // Green component should be higher in shallow
-        assert!(shallow[1] > deep[1] || (shallow[1] - deep[1]).abs() < 0.1);
+        // Deep water is lighter (higher green component) in S-52 palette
+        // DEPVS (shallow) = [0.451, 0.714, 0.937]
+        // DEPDW (deep)    = [0.831, 0.918, 0.933]
+        assert!(deep[1] >= shallow[1]); // Deep is lighter/paler
     }
 
     #[test]

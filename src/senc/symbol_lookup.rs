@@ -2,15 +2,27 @@
 //!
 //! Maps S-57 object classes and attributes to SymbolId for rendering.
 
-use crate::render::symbols::{SymbolId, SymbolInstance};
+use crate::render::symbols::{SymbolId, SymbolInstance, symbol_id_from_s52_name, symbol_name_from_id};
 use crate::senc::features::{Feature, FeatureType, AttributeValue};
+use crate::s52::cs::lights06_symbol;
+use crate::s52::MarinerSettings;
 
 /// S-57 object class codes for symbol features
+/// (From IHO S-57 spec, matching records.rs ObjectClass::from_code)
 pub mod s57_classes {
-    pub const BCNLAT: u16 = 14;  // Lateral beacon
-    pub const BOYCAR: u16 = 16;  // Cardinal buoy
+    pub const BCNCAR: u16 = 5;   // Cardinal beacon
+    pub const BCNISD: u16 = 6;   // Isolated danger beacon
+    pub const BCNLAT: u16 = 7;   // Lateral beacon
+    pub const BCNSAW: u16 = 8;   // Safe water beacon
+    pub const BCNSPP: u16 = 9;   // Special purpose beacon
+    pub const BOYCAR: u16 = 14;  // Cardinal buoy
+    pub const BOYISD: u16 = 16;  // Isolated danger buoy
     pub const BOYLAT: u16 = 17;  // Lateral buoy
+    pub const BOYSAW: u16 = 18;  // Safe water buoy
+    pub const BOYSPP: u16 = 19;  // Special purpose buoy
+    pub const LIGHTS: u16 = 75;  // Light
     pub const UWTROC: u16 = 153; // Underwater rock
+    pub const WRECKS: u16 = 159; // Wreck
 }
 
 /// Map an S-57 feature to a symbol ID based on object class and attributes
@@ -21,6 +33,11 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
     }
 
     match feature.type_code {
+        // LIGHTS uses dynamic symbol selection via CS procedure
+        s57_classes::LIGHTS => {
+            // Lights are handled by lookup_symbol_dynamic for S-52 CS support
+            None
+        }
         s57_classes::BOYLAT => {
             // BOYLAT - Lateral buoy
             // S-57 COLOUR: 1=white, 2=black, 3=red, 4=green, 5=yellow
@@ -45,6 +62,20 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
             }
         }
 
+        s57_classes::BCNCAR => {
+            // BCNCAR - Cardinal beacon (same logic as BOYCAR)
+            // CATCAM: 1=north, 2=east, 3=south, 4=west
+            let catcam = get_attr_int(feature, "CATCAM").unwrap_or(1);
+
+            match catcam {
+                1 => Some(SymbolId::BuoyCarNorth),  // Using buoy symbol for now
+                2 => Some(SymbolId::BuoyCarEast),
+                3 => Some(SymbolId::BuoyCarSouth),
+                4 => Some(SymbolId::BuoyCarWest),
+                _ => Some(SymbolId::BuoyCarNorth),
+            }
+        }
+
         s57_classes::BCNLAT => {
             // BCNLAT - Lateral beacon
             // S-57 COLOUR: 1=white, 2=black, 3=red, 4=green
@@ -65,6 +96,11 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
             } else {
                 Some(SymbolId::BeaconLatStarboard)
             }
+        }
+
+        s57_classes::BCNSPP => {
+            // BCNSPP - Special purpose beacon - render as port beacon (default)
+            Some(SymbolId::BeaconLatPort)
         }
 
         s57_classes::BOYCAR => {
@@ -94,6 +130,38 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
         }
 
         _ => None,
+    }
+}
+
+/// Map an S-57 feature to a symbol atlas index using S-52 CS procedures.
+///
+/// This is the preferred lookup function for dynamic symbol selection.
+/// Returns the atlas index directly (u32) instead of a SymbolId enum.
+///
+/// # Arguments
+/// * `feature` - S-57 feature to lookup
+/// * `settings` - Optional mariner settings for CS procedures
+///
+/// # Returns
+/// Atlas index for the symbol, or None if no symbol
+pub fn lookup_symbol_dynamic(feature: &Feature, settings: Option<&MarinerSettings>) -> Option<u32> {
+    // Only point features have symbols
+    if feature.feature_type != FeatureType::Point {
+        return None;
+    }
+
+    match feature.type_code {
+        s57_classes::LIGHTS => {
+            // Use LIGHTS05/06 CS procedure to select symbol
+            let default_settings = MarinerSettings::default();
+            let s = settings.unwrap_or(&default_settings);
+            let symbol_name = lights06_symbol(feature, s);
+            symbol_id_from_s52_name(symbol_name)
+        }
+
+        // For other types, fall back to static lookup
+        _ => lookup_symbol(feature)
+            .and_then(|id| symbol_id_from_s52_name(symbol_name_from_id(id))),
     }
 }
 
@@ -144,7 +212,7 @@ pub fn features_to_instances(features: &[Feature], ref_lat: f64, ref_lon: f64) -
         .collect();
     println!("DEBUG: Point features type codes:");
     for f in &point_features {
-        println!("  type_code={} (looking for BOYLAT=17, BCNLAT=14, UWTROC=153)", f.type_code);
+        println!("  type_code={} (symbols: BCNCAR=5, BCNLAT=7, BCNSPP=9, BOYCAR=14, BOYLAT=17, UWTROC=153)", f.type_code);
     }
     println!("DEBUG: Total {} point features, checking for matching symbols...", point_features.len());
 
@@ -219,4 +287,51 @@ fn get_attr_int(feature: &Feature, name: &str) -> Option<i32> {
         Some(AttributeValue::Float(v)) => Some(*v as i32),
         _ => None,
     }
+}
+
+use crate::render::text::SoundingInstance;
+use crate::s52::sndfrm02;
+
+/// SOUNDG object class code (S-57)
+pub const SOUNDG: u16 = 129;
+
+/// Convert SOUNDG features to sounding instances with SNDFRM02 formatting.
+///
+/// SOUNDG features use multipoint geometry where each point is (x, y, z)
+/// with z being the depth in meters. The coordinates are already in SM (Simple Mercator).
+///
+/// Uses SNDFRM02 to determine:
+/// - Safety depth coloring (SNDG1 gray for safe, SNDG2 black for shallow)
+/// - QUASOU/TECSOU/QUAPOS uncertainty indicators
+/// - Drying height handling
+pub fn soundings_to_instances(features: &[Feature], settings: &MarinerSettings) -> Vec<SoundingInstance> {
+    let mut instances = Vec::new();
+
+    for feature in features {
+        // Only process SOUNDG features with multipoint geometry
+        if feature.type_code != SOUNDG {
+            continue;
+        }
+
+        if let Some(ref mp) = feature.multipoint_geometry {
+            for point in &mp.points {
+                // Multipoint geometry stores SM coords directly (x, y, depth)
+                let x = point[0] as f32;
+                let y = point[1] as f32;
+                let depth = point[2] as f32;
+
+                // Use SNDFRM02 to compute flags based on safety depth and attributes
+                let render_info = sndfrm02(depth as f64, feature, settings);
+                let flags = render_info.to_flags();
+
+                instances.push(SoundingInstance {
+                    position: [x, y],
+                    depth: render_info.whole_part as f32,
+                    flags,
+                });
+            }
+        }
+    }
+
+    instances
 }

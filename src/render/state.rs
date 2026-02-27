@@ -1,31 +1,40 @@
 //! WGPU render state and chart rendering pipeline.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
 
 use super::camera::Camera;
-use super::colors::{
-    depth_color, Color, COASTLINE_COLOR,
-    LAND_COLOR, OCEAN_BACKGROUND,
-};
-use super::s52_styles::{COASTLINE_STYLE, CONTOUR_STYLE};
+use super::colors::{Color, OCEAN_BACKGROUND};
+use super::line_vertices::build_line_vertices_multi_indexed;
+use super::s52_styles::{COASTLINE_STYLE, CONTOUR_STYLE, style_for_key};
 use super::symbols::SymbolRenderer;
-use crate::senc::{ChartData, Feature, features_to_instances};
+use super::patterns::PatternRenderer;
+use super::label::LabelRenderer;
+use super::text::TextRenderer;
+use super::debug_render_mode;
+use crate::cache::CachedDecryptor;
+use crate::decrypt::KeyStore;
+use crate::s52::{S52Engine, LineStyleKey};
+use crate::senc::{ChartData, ChartCatalog, features_to_instances, soundings_to_instances};
+use crate::tiles::{TileId, visible_tiles, zoom_from_camera_raw};
+use crate::tiles::cache::{TileGpuCache, TileCacheKey, LineBatchGpu};
 
-/// Vertex with position and color
+
+/// Vertex with position and palette color index
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Vertex {
     pub position: [f32; 2],
-    pub color: [f32; 4],
+    pub color_index: u32,
 }
 
 impl Vertex {
     const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
         0 => Float32x2,
-        1 => Float32x4,
+        1 => Uint32,
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -167,12 +176,16 @@ impl LineStyle {
     }
 }
 
-/// A batch of lines with shared style and vertex buffer.
+/// A batch of lines with shared style and vertex/index buffers.
 pub struct LineBatch {
     /// Style configuration for this batch
     pub style: LineStyle,
     /// GPU vertex buffer
     pub vertex_buffer: wgpu::Buffer,
+    /// GPU index buffer (uses primitive restart)
+    pub index_buffer: wgpu::Buffer,
+    /// Number of indices in the buffer
+    pub index_count: u32,
     /// Number of vertices in the buffer
     pub vertex_count: u32,
 }
@@ -186,10 +199,19 @@ pub struct RenderState {
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
 
+    // HiDPI scaling
+    /// Display scale factor (1.0 for standard, 2.0 for Retina, etc.)
+    pub scale_factor: f32,
+    /// Effective pixels per millimeter (4.0 * scale_factor for 96 DPI base)
+    pub effective_ppmm: f32,
+
     // Pipeline
     pub pipeline: wgpu::RenderPipeline,
     pub uniform_buffer: wgpu::Buffer,
     pub uniform_bind_group: wgpu::BindGroup,
+    /// Palette color buffer for indexed area colors (Day/Dusk/Night switching)
+    pub palette_buffer: wgpu::Buffer,
+    pub uniform_bind_group_layout: wgpu::BindGroupLayout,
 
     // Geometry
     pub vertex_buffer: Option<wgpu::Buffer>,
@@ -202,18 +224,68 @@ pub struct RenderState {
     pub symbol_renderer: Option<SymbolRenderer>,
     pub symbol_camera_bind_group: Option<wgpu::BindGroup>,
 
+    // Pattern fill rendering (area patterns)
+    pub pattern_renderer: Option<PatternRenderer>,
+    pub pattern_camera_bind_group: Option<wgpu::BindGroup>,
+
+    // Text/sounding rendering
+    pub text_renderer: Option<TextRenderer>,
+    pub text_camera_bind_group: Option<wgpu::BindGroup>,
+
+    // Label rendering (text atlas)
+    pub label_renderer: Option<LabelRenderer>,
+    pub label_camera_bind_group: Option<wgpu::BindGroup>,
+
     // Line rendering (shader-based polylines with per-batch styling)
     pub line_pipeline: wgpu::RenderPipeline,
     pub line_bind_group_layout: wgpu::BindGroupLayout,
     pub line_uniform_buffer: wgpu::Buffer,
     pub line_bind_group: wgpu::BindGroup,
+    /// Alignment for dynamic uniform buffer offsets (from device limits)
+    pub line_uniform_align: u32,
     /// Line batches with different styles (coastlines, contours, etc.)
     pub line_batches: Vec<LineBatch>,
+
+    // Tile-based rendering (for multi-chart mode)
+    /// Chart catalog (metadata only) - None for single chart mode
+    catalog: Option<Arc<ChartCatalog>>,
+    /// GPU tile cache with LRU eviction
+    tile_cache: TileGpuCache,
+    /// Key store for chart decryption (Arc for sharing)
+    keys: Option<Arc<KeyStore>>,
+    /// Chart decryptor with disk cache — moved to worker in tile mode
+    decryptor: Option<CachedDecryptor>,
+    /// Background tile worker thread (tile mode only)
+    tile_worker: Option<crate::tiles::worker::TileWorkerHandle>,
+    /// Set of tile IDs currently requested from the worker (pending results)
+    pending_tiles: std::collections::HashSet<TileId>,
+    /// Completed tile results deferred from previous frame (upload budget exceeded)
+    deferred_tile_results: Vec<crate::tiles::worker::TileResponse>,
+    /// Persistent parsed chart cache (keyed by chart.id)
+    chart_cache: HashMap<u64, ChartData>,
+    /// Current style hash for cache invalidation
+    style_hash: u64,
+    /// Tile mode active flag
+    tile_mode: bool,
+    /// Cached visible tiles for current frame (computed once, used in draw)
+    visible_tiles_cache: Vec<TileId>,
+    /// Current zoom level with hysteresis (sticky — only changes when raw z drifts ≥0.6)
+    current_z: u8,
+    /// Fallback tiles from previous z-level (drawn while new tiles load after z-change)
+    previous_visible_tiles: Vec<TileId>,
+    /// Style hash for previous z-level fallback tiles
+    previous_style_hash: u64,
+    /// S-52 presentation engine for display category filtering
+    s52_engine: Option<S52Engine>,
+    /// Dirty flag — set on camera move, tile upload, resize; cleared after render
+    needs_redraw: bool,
 }
 
 impl RenderState {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
+        let scale_factor = window.scale_factor() as f32;
+        let effective_ppmm = 4.0 * scale_factor; // 96 DPI base = 4.0 ppmm
 
         // WGPU setup
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -288,27 +360,53 @@ impl RenderState {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        // Default palette buffer (64 colors, initialized to black — populated on chart load)
+        let default_palette: Vec<[f32; 4]> = vec![[0.0, 0.0, 0.0, 1.0]; 64];
+        let palette_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Palette Buffer"),
+            contents: bytemuck::cast_slice(&default_palette),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
                 label: Some("uniform_bind_group_layout"),
             });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: palette_buffer.as_entire_binding(),
+                },
+            ],
             label: Some("uniform_bind_group"),
         });
 
@@ -373,27 +471,21 @@ impl RenderState {
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
                 },
                 count: None,
             }],
         });
 
-        let line_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let line_uniform_align = device.limits().min_uniform_buffer_offset_alignment;
+        let slot_size = (line_uniform_align as usize).max(std::mem::size_of::<LineUniforms>());
+        let max_line_styles = 128;
+        let line_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Line Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[LineUniforms {
-                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                viewport_size: [size.width as f32, size.height as f32],
-                line_width_px: 2.0,
-                join_limit: 4.0,
-                color: COASTLINE_COLOR,
-                dash_on_px: 0.0,
-                dash_off_px: 0.0,
-                px_per_meter: 1.0,
-                _pad: 0.0,
-            }]),
+            size: (slot_size * max_line_styles) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -401,7 +493,11 @@ impl RenderState {
             layout: &line_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
-                resource: line_uniform_buffer.as_entire_binding(),
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &line_uniform_buffer,
+                    offset: 0,
+                    size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+                }),
             }],
         });
 
@@ -432,7 +528,8 @@ impl RenderState {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleStrip,
-                strip_index_format: None,
+                // Enable primitive restart with u32::MAX as restart marker
+                strip_index_format: Some(wgpu::IndexFormat::Uint32),
                 front_face: wgpu::FrontFace::Ccw,
                 cull_mode: None,
                 polygon_mode: wgpu::PolygonMode::Fill,
@@ -463,6 +560,65 @@ impl RenderState {
             }
         };
 
+        // Pattern renderer (optional - may fail if assets not found)
+        let (pattern_renderer, pattern_camera_bind_group) = match PatternRenderer::new(
+            &device,
+            &queue,
+            surface_format,
+            &uniform_bind_group_layout,
+        ) {
+            Ok(renderer) => {
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("pattern_camera_bind_group"),
+                    layout: renderer.camera_bind_group_layout(),
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    }],
+                });
+                println!("DEBUG: Pattern renderer initialized");
+                (Some(renderer), Some(bind_group))
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize pattern renderer: {}", e);
+                (None, None)
+            }
+        };
+
+        // Text/sounding renderer
+        let (text_renderer, text_camera_bind_group) = match TextRenderer::new(
+            &device,
+            surface_format,
+            &uniform_bind_group_layout,
+        ) {
+            Ok(renderer) => {
+                let bind_group = renderer.create_camera_bind_group(&device, &uniform_buffer);
+                println!("DEBUG: Text renderer initialized");
+                (Some(renderer), Some(bind_group))
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize text renderer: {}", e);
+                (None, None)
+            }
+        };
+
+        let (label_renderer, label_camera_bind_group) = match LabelRenderer::new(
+            &device,
+            &queue,
+            surface_format,
+            &uniform_bind_group_layout,
+        ) {
+            Ok(renderer) => {
+                let bind_group = renderer.create_camera_bind_group(&device, &uniform_buffer);
+                println!("DEBUG: Label renderer initialized");
+                (Some(renderer), Some(bind_group))
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize label renderer: {}", e);
+                (None, None)
+            }
+        };
+
         Self {
             window,
             surface,
@@ -470,19 +626,47 @@ impl RenderState {
             queue,
             config,
             size,
+            scale_factor,
+            effective_ppmm,
             pipeline,
             uniform_buffer,
             uniform_bind_group,
+            palette_buffer,
+            uniform_bind_group_layout,
             vertex_buffer: None,
             vertex_count: 0,
             camera,
             symbol_renderer,
             symbol_camera_bind_group,
+            pattern_renderer,
+            pattern_camera_bind_group,
+            text_renderer,
+            text_camera_bind_group,
+            label_renderer,
+            label_camera_bind_group,
             line_pipeline,
             line_bind_group_layout,
             line_uniform_buffer,
             line_bind_group,
+            line_uniform_align,
             line_batches: Vec::new(),
+            // Tile mode (disabled by default - single chart mode)
+            catalog: None,
+            tile_cache: TileGpuCache::default_auto(),
+            keys: None,
+            decryptor: None,
+            tile_worker: None,
+            pending_tiles: std::collections::HashSet::new(),
+            deferred_tile_results: Vec::new(),
+            chart_cache: HashMap::new(),
+            style_hash: 0,
+            tile_mode: false,
+            visible_tiles_cache: Vec::new(),
+            current_z: 0,
+            previous_visible_tiles: Vec::new(),
+            previous_style_hash: 0,
+            s52_engine: None,
+            needs_redraw: true,
         }
     }
 
@@ -519,13 +703,18 @@ impl RenderState {
                 continue;
             }
 
-            // Only render features we have colors for (land and depth areas)
+            // Only render features we have colors for (land, depth areas, built-up areas, lakes)
             // Unknown features would get transparent color and waste vertices
-            if !feature.is_land() && !feature.is_depth_area() {
+            let is_known_area = feature.is_land()
+                || feature.is_depth_area()
+                || feature.type_code == BUAARE
+                || feature.type_code == LAKARE;
+            if !is_known_area {
                 continue;
             }
 
-            let color = feature_color(feature);
+            // Legacy path: use color index 0 as fallback (LANDA is typical first token)
+            let color_index: u32 = 0;
 
             if let Some(ref geom) = feature.area_geometry {
                 *rendered_area_types.entry(feature.type_code).or_insert(0) += 1;
@@ -548,7 +737,7 @@ impl RenderState {
                 for pos in tri_verts {
                     vertices.push(Vertex {
                         position: pos,
-                        color,
+                        color_index,
                     });
                 }
             }
@@ -638,8 +827,8 @@ impl RenderState {
 
         // Build coastline batch (solid, 2px, dark brown)
         if !coastline_polylines.is_empty() {
-            let coastline_verts = build_line_vertices_multi(&coastline_polylines);
-            if !coastline_verts.is_empty() {
+            let (coastline_verts, coastline_indices) = build_line_vertices_multi_indexed(&coastline_polylines);
+            if !coastline_indices.is_empty() {
                 self.line_batches.push(LineBatch {
                     style: COASTLINE_STYLE,
                     vertex_buffer: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -647,16 +836,22 @@ impl RenderState {
                         contents: bytemuck::cast_slice(&coastline_verts),
                         usage: wgpu::BufferUsages::VERTEX,
                     }),
+                    index_buffer: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Coastline Index Buffer"),
+                        contents: bytemuck::cast_slice(&coastline_indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    }),
+                    index_count: coastline_indices.len() as u32,
                     vertex_count: coastline_verts.len() as u32,
                 });
-                println!("DEBUG: Coastline batch: {} vertices", coastline_verts.len());
+                println!("DEBUG: Coastline batch: {} vertices, {} indices", coastline_verts.len(), coastline_indices.len());
             }
         }
 
         // Build contour batch (dashed, 1px, gray-blue)
         if !contour_polylines.is_empty() {
-            let contour_verts = build_line_vertices_multi(&contour_polylines);
-            if !contour_verts.is_empty() {
+            let (contour_verts, contour_indices) = build_line_vertices_multi_indexed(&contour_polylines);
+            if !contour_indices.is_empty() {
                 self.line_batches.push(LineBatch {
                     style: CONTOUR_STYLE,
                     vertex_buffer: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -664,16 +859,22 @@ impl RenderState {
                         contents: bytemuck::cast_slice(&contour_verts),
                         usage: wgpu::BufferUsages::VERTEX,
                     }),
+                    index_buffer: self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("Contour Index Buffer"),
+                        contents: bytemuck::cast_slice(&contour_indices),
+                        usage: wgpu::BufferUsages::INDEX,
+                    }),
+                    index_count: contour_indices.len() as u32,
                     vertex_count: contour_verts.len() as u32,
                 });
-                println!("DEBUG: Contour batch: {} vertices", contour_verts.len());
+                println!("DEBUG: Contour batch: {} vertices, {} indices", contour_verts.len(), contour_indices.len());
             }
         }
 
-        // Total line vertex count for logging
-        let total_line_verts: u32 = self.line_batches.iter().map(|b| b.vertex_count).sum();
-        println!("DEBUG: Loaded {} area vertices, {} line vertices in {} batches",
-            area_vertex_count, total_line_verts, self.line_batches.len());
+        // Total line index count for logging
+        let total_line_indices: u32 = self.line_batches.iter().map(|b| b.index_count).sum();
+        println!("DEBUG: Loaded {} area vertices, {} line indices in {} batches",
+            area_vertex_count, total_line_indices, self.line_batches.len());
 
         println!("Loaded {} total area vertices from chart", vertices.len());
 
@@ -733,6 +934,17 @@ impl RenderState {
             println!("DEBUG: Created {} symbol instances", instances.len());
             symbol_renderer.update_instances(&self.queue, &instances);
         }
+
+        // Update sounding instances (SOUNDG with multipoint geometry)
+        // Use SNDFRM02 for safety depth coloring
+        if let Some(ref mut text_renderer) = self.text_renderer {
+            let settings = self.s52_engine.as_ref()
+                .map(|e| &e.settings)
+                .cloned()
+                .unwrap_or_default();
+            let soundings = soundings_to_instances(&chart.features, &settings);
+            text_renderer.update_soundings(&self.queue, &soundings);
+        }
     }
 
     /// Load a test triangle to verify the rendering pipeline works.
@@ -742,9 +954,9 @@ impl RenderState {
 
         // Simple triangle in NDC space
         let vertices = vec![
-            Vertex { position: [0.0, 0.5], color: [1.0, 0.0, 0.0, 1.0] },   // Top - RED
-            Vertex { position: [-0.5, -0.5], color: [0.0, 1.0, 0.0, 1.0] }, // Bottom-left - GREEN
-            Vertex { position: [0.5, -0.5], color: [0.0, 0.0, 1.0, 1.0] },  // Bottom-right - BLUE
+            Vertex { position: [0.0, 0.5], color_index: 0 },   // Top
+            Vertex { position: [-0.5, -0.5], color_index: 0 }, // Bottom-left
+            Vertex { position: [0.5, -0.5], color_index: 0 },  // Bottom-right
         ];
 
         // Create vertex buffer
@@ -770,6 +982,132 @@ impl RenderState {
         println!("  {:?}", vp.row(3));
     }
 
+    /// Upload the active palette colors to the GPU storage buffer.
+    /// Called when S52 engine loads or palette changes.
+    fn upload_palette(&mut self, tables: &crate::s52::LookupTables) {
+        let palette_data = tables.active_palette_f32();
+        if palette_data.is_empty() {
+            return;
+        }
+
+        // Recreate palette buffer with correct size
+        self.palette_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Palette Buffer"),
+            contents: bytemuck::cast_slice(&palette_data),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Recreate bind group with new palette buffer
+        self.uniform_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &self.uniform_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.palette_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("uniform_bind_group"),
+        });
+
+        log::info!("Uploaded palette with {} colors to GPU", palette_data.len());
+    }
+
+    /// Switch the active palette (Day/Dusk/Night) — zero tile rebuilds.
+    pub fn switch_palette(&mut self, palette_name: &str) {
+        if let Some(ref mut engine) = self.s52_engine {
+            engine.tables.set_active_palette(palette_name);
+            let palette_data = engine.tables.active_palette_f32();
+            if !palette_data.is_empty() {
+                self.queue.write_buffer(
+                    &self.palette_buffer,
+                    0,
+                    bytemuck::cast_slice(&palette_data),
+                );
+                log::info!("Switched palette to '{}' ({} colors)", palette_name, palette_data.len());
+            }
+        }
+    }
+
+    /// Load chart catalog for tile-based multi-chart rendering.
+    /// Takes ownership of decryptor (not Clone) and wraps catalog in Arc.
+    pub fn load_catalog(
+        &mut self,
+        catalog: ChartCatalog,
+        keys: Arc<KeyStore>,
+        decryptor: CachedDecryptor,
+    ) {
+        // Camera position must be in GLOBAL MERCATOR meters
+        // catalog.combined_extent is already in global Mercator (computed during catalog build)
+        let extent = &catalog.combined_extent;
+        let center_x = ((extent.min_x + extent.max_x) / 2.0) as f32;
+        let center_y = ((extent.min_y + extent.max_y) / 2.0) as f32;
+        let width = (extent.max_x - extent.min_x) as f32;
+        let height = (extent.max_y - extent.min_y) as f32;
+
+        let zoom_x = (width * 1.1) / self.size.width as f32;
+        let zoom_y = (height * 1.1) / self.size.height as f32;
+        let zoom = zoom_x.max(zoom_y);
+
+        // Camera now in global Mercator meters (not chart-local SM)
+        self.camera = Camera::new(
+            center_x, center_y, zoom,
+            self.size.width as f32, self.size.height as f32,
+        );
+
+        println!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
+            catalog.charts.len(), center_x, center_y, zoom);
+
+        let catalog_arc = Arc::new(catalog);
+        let keys_arc = keys;
+
+        self.tile_mode = true;
+        self.tile_cache = TileGpuCache::default_auto();
+        self.style_hash = 0;
+        self.chart_cache = HashMap::new();
+
+        // Load S-52 presentation engine for display category filtering
+        // Load once for main thread (palette ops), once for worker (tile building)
+        let mut worker_engine: Option<S52Engine> = None;
+        match S52Engine::load("assets/s52/chartsymbols.xml") {
+            Ok(engine) => {
+                println!("{}", engine.summary());
+                // Upload active palette to GPU
+                self.upload_palette(&engine.tables);
+                self.s52_engine = Some(engine);
+                // Load a second engine for the worker thread
+                if let Ok(engine2) = S52Engine::load("assets/s52/chartsymbols.xml") {
+                    worker_engine = Some(engine2);
+                }
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not load S-52 engine: {}", e);
+                eprintln!("Display category filtering will be disabled.");
+            }
+        }
+
+        // Spawn background tile worker thread
+        // Worker takes ownership of decryptor and chart_cache
+        let worker = crate::tiles::worker::spawn_tile_worker(
+            Arc::clone(&catalog_arc),
+            Arc::clone(&keys_arc),
+            decryptor,
+            worker_engine,
+        );
+        self.tile_worker = Some(worker);
+        self.pending_tiles.clear();
+        self.deferred_tile_results.clear();
+        println!("Background tile worker spawned");
+
+        self.catalog = Some(catalog_arc);
+        self.keys = Some(keys_arc);
+        // decryptor is now owned by worker - clear main thread reference
+        self.decryptor = None;
+    }
+
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
@@ -777,10 +1115,24 @@ impl RenderState {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.camera.resize(new_size.width as f32, new_size.height as f32);
+            self.needs_redraw = true;
         }
     }
 
+    /// Update scale factor for HiDPI display changes
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        self.scale_factor = scale_factor;
+        self.effective_ppmm = 4.0 * scale_factor; // 96 DPI base = 4.0 ppmm
+    }
+
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        // In tile mode, keep the camera near the loaded chart extent.
+        // This prevents panning/gesture glitches from throwing the view outside the
+        // valid Mercator range, which would yield empty tiles (ocean-only).
+        if self.tile_mode {
+            self.clamp_camera_to_catalog();
+        }
+
         // Update uniforms
         let uniforms = Uniforms {
             view_proj: self.camera.view_projection_matrix().to_cols_array_2d(),
@@ -789,6 +1141,81 @@ impl RenderState {
             _pad: 0.0,
         };
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        // CRITICAL: Build tiles BEFORE starting render pass (avoid stalls during draw)
+        if self.tile_mode {
+            self.build_visible_tiles();
+        }
+
+        // Pre-write line uniform styles to dynamic UBO BEFORE the render pass.
+        // Each unique style gets its own aligned slot; draw calls reference by dynamic offset.
+        let line_style_offsets: HashMap<LineStyleKey, u32> = if self.tile_mode {
+            let px_per_meter = 1.0 / self.camera.zoom;
+            let view_proj = self.camera.view_projection_matrix().to_cols_array_2d();
+            let viewport_size = [self.size.width as f32, self.size.height as f32];
+            let align = self.line_uniform_align;
+
+            let mut offsets: HashMap<LineStyleKey, u32> = HashMap::new();
+            let mut next_slot = 0u32;
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
+                if let Some(buffers) = self.tile_cache.get(&key) {
+                    for batch in &buffers.line_batches {
+                        if batch.index_count > 0 && !offsets.contains_key(&batch.key.style) {
+                            let offset = next_slot * align;
+                            let tables = self.s52_engine.as_ref().map(|e| &e.tables);
+                            let style = style_for_key(&batch.key.style, self.effective_ppmm, tables);
+                            let line_uniforms = LineUniforms {
+                                view_proj,
+                                viewport_size,
+                                line_width_px: style.width_px,
+                                join_limit: 4.0,
+                                color: style.color,
+                                dash_on_px: style.dash_on_px,
+                                dash_off_px: style.dash_off_px,
+                                px_per_meter,
+                                _pad: 0.0,
+                            };
+                            self.queue.write_buffer(
+                                &self.line_uniform_buffer,
+                                offset as u64,
+                                bytemuck::cast_slice(&[line_uniforms]),
+                            );
+                            offsets.insert(batch.key.style.clone(), offset);
+                            next_slot += 1;
+                        }
+                    }
+                }
+            }
+            offsets
+        } else {
+            // Single-chart mode: pre-write each batch's style to its own slot
+            let px_per_meter = 1.0 / self.camera.zoom;
+            let view_proj = self.camera.view_projection_matrix().to_cols_array_2d();
+            let viewport_size = [self.size.width as f32, self.size.height as f32];
+            let align = self.line_uniform_align;
+
+            for (i, batch) in self.line_batches.iter().enumerate() {
+                let offset = (i as u32) * align;
+                let line_uniforms = LineUniforms {
+                    view_proj,
+                    viewport_size,
+                    line_width_px: batch.style.width_px,
+                    join_limit: 4.0,
+                    color: batch.style.color,
+                    dash_on_px: batch.style.dash_on_px,
+                    dash_off_px: batch.style.dash_off_px,
+                    px_per_meter,
+                    _pad: 0.0,
+                };
+                self.queue.write_buffer(
+                    &self.line_uniform_buffer,
+                    offset as u64,
+                    bytemuck::cast_slice(&[line_uniforms]),
+                );
+            }
+            HashMap::new() // Not used in single-chart draw path
+        };
 
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -818,159 +1245,555 @@ impl RenderState {
                 timestamp_writes: None,
             });
 
-            // 1. Render areas (land, depth)
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            if self.tile_mode {
+                // Tile-based multi-chart rendering
+                self.draw_tiles(&mut render_pass, &line_style_offsets);
+            } else {
+                // Single chart mode (existing code)
+                // 1. Render areas (land, depth)
+                render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
 
-            if let Some(ref buffer) = self.vertex_buffer {
-                render_pass.set_vertex_buffer(0, buffer.slice(..));
-                render_pass.draw(0..self.vertex_count, 0..1);
-            }
+                if let Some(ref buffer) = self.vertex_buffer {
+                    render_pass.set_vertex_buffer(0, buffer.slice(..));
+                    render_pass.draw(0..self.vertex_count, 0..1);
+                }
 
-            // 2. Render lines (coastlines + depth contours) with shader-based pipeline
-            // Iterate over batches, each with its own style
-            for batch in &self.line_batches {
-                // px_per_meter: at zoom=1 m/px, 1 meter = 1 pixel
-                // zoom is meters-per-pixel, so px/m = 1/zoom
-                let px_per_meter = 1.0 / self.camera.zoom;
-
-                // Update line uniforms with batch-specific styling
-                let line_uniforms = LineUniforms {
-                    view_proj: self.camera.view_projection_matrix().to_cols_array_2d(),
-                    viewport_size: [self.size.width as f32, self.size.height as f32],
-                    line_width_px: batch.style.width_px,
-                    join_limit: 4.0,
-                    color: batch.style.color,
-                    dash_on_px: batch.style.dash_on_px,
-                    dash_off_px: batch.style.dash_off_px,
-                    px_per_meter,
-                    _pad: 0.0,
-                };
-                self.queue.write_buffer(&self.line_uniform_buffer, 0, bytemuck::cast_slice(&[line_uniforms]));
-
+                // 2. Render lines (coastlines + depth contours) with shader-based pipeline
                 render_pass.set_pipeline(&self.line_pipeline);
-                render_pass.set_bind_group(0, &self.line_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                render_pass.draw(0..batch.vertex_count, 0..1);
-            }
+                let mut slot = 0u32;
+                for batch in &self.line_batches {
+                    let offset = slot * self.line_uniform_align;
+                    render_pass.set_bind_group(0, &self.line_bind_group, &[offset]);
+                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    slot += 1;
+                }
 
-            // 3. Render symbols on top
-            if let (Some(ref symbol_renderer), Some(ref symbol_bind_group)) =
-                (&self.symbol_renderer, &self.symbol_camera_bind_group)
-            {
-                symbol_renderer.render(&mut render_pass, symbol_bind_group);
+                // 3. Render symbols on top
+                if let (Some(ref symbol_renderer), Some(ref symbol_bind_group)) =
+                    (&self.symbol_renderer, &self.symbol_camera_bind_group)
+                {
+                    if debug_render_mode() == 3 {
+                        symbol_renderer.render_atlas_debug(&mut render_pass, symbol_bind_group);
+                    } else {
+                        symbol_renderer.render(&mut render_pass, symbol_bind_group);
+                    }
+                }
+
+                // 4. Render text/soundings on top of everything
+                if let (Some(ref text_renderer), Some(ref text_bind_group)) =
+                    (&self.text_renderer, &self.text_camera_bind_group)
+                {
+                    text_renderer.render(&mut render_pass, text_bind_group);
+                }
+
+                if debug_render_mode() != 0 {
+                    let line_vertex_count: u32 = self.line_batches.iter().map(|b| b.vertex_count).sum();
+                    let line_index_count: u32 = self.line_batches.iter().map(|b| b.index_count).sum();
+                    let symbol_instances = self.symbol_renderer.as_ref().map(|r| r.instance_count()).unwrap_or(0);
+                    let symbol_draws = if debug_render_mode() == 3 {
+                        if self.symbol_renderer.is_some() { 1 } else { 0 }
+                    } else {
+                        if symbol_instances > 0 { 1 } else { 0 }
+                    };
+                    log::info!(
+                        "debug_render: single lines vertices={} indices={} batches={} symbols={} draws={} mode={}",
+                        line_vertex_count,
+                        line_index_count,
+                        self.line_batches.len(),
+                        symbol_instances,
+                        symbol_draws,
+                        debug_render_mode()
+                    );
+                }
             }
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
+        self.needs_redraw = false;
+
         Ok(())
+    }
+
+    fn clamp_camera_to_catalog(&mut self) {
+        let Some(catalog) = self.catalog.as_deref() else { return };
+
+        // Allow some panning outside the chart area, but keep the view bounded.
+        let extent = catalog.combined_extent.expand(1.2);
+
+        let half_w = self.camera.viewport_width * self.camera.zoom / 2.0;
+        let half_h = self.camera.viewport_height * self.camera.zoom / 2.0;
+
+        let min_x = (extent.min_x as f32) + half_w;
+        let max_x = (extent.max_x as f32) - half_w;
+        let min_y = (extent.min_y as f32) + half_h;
+        let max_y = (extent.max_y as f32) - half_h;
+
+        // If the extent is smaller than the viewport at the current zoom, just center.
+        if min_x.is_finite() && max_x.is_finite() && min_x <= max_x {
+            self.camera.position.x = self.camera.position.x.clamp(min_x, max_x);
+        } else {
+            self.camera.position.x = ((extent.min_x + extent.max_x) / 2.0) as f32;
+        }
+
+        if min_y.is_finite() && max_y.is_finite() && min_y <= max_y {
+            self.camera.position.y = self.camera.position.y.clamp(min_y, max_y);
+        } else {
+            self.camera.position.y = ((extent.min_y + extent.max_y) / 2.0) as f32;
+        }
+    }
+
+    /// Build missing tiles (capped per frame to avoid stalls)
+    /// Must be called BEFORE render pass to avoid GPU stalls
+    /// Higher values fill viewport faster but may cause frame stutters on slow hardware
+    #[cfg(target_os = "macos")]
+    const MAX_TILES_PER_FRAME: usize = 16;
+
+    #[cfg(not(target_os = "macos"))]
+    const MAX_TILES_PER_FRAME: usize = 8;
+
+    fn build_visible_tiles(&mut self) {
+        // 1. Upload deferred tiles from last frame first
+        let mut uploads_this_frame = 0usize;
+        const MAX_UPLOADS_PER_FRAME: usize = 64;
+        let deferred = std::mem::take(&mut self.deferred_tile_results);
+        for response in deferred {
+            if uploads_this_frame >= MAX_UPLOADS_PER_FRAME {
+                self.deferred_tile_results.push(response);
+                continue;
+            }
+            match response.result {
+                Ok(packet) => {
+                    self.tile_cache.upload(&self.device, packet, self.style_hash);
+                    uploads_this_frame += 1;
+                    self.needs_redraw = true;
+                }
+                Err(e) => eprintln!("Tile {:?} failed: {}", response.tile_id, e),
+            }
+        }
+
+        // If there are still deferred tiles, request another frame to drain them
+        if !self.deferred_tile_results.is_empty() {
+            self.needs_redraw = true;
+        }
+
+        // 2. Poll worker for completed tile packets and upload to GPU (capped)
+        if let Some(ref worker) = self.tile_worker {
+            let results = worker.poll_results();
+            for response in results {
+                self.pending_tiles.remove(&response.tile_id);
+                if uploads_this_frame >= MAX_UPLOADS_PER_FRAME {
+                    // Defer excess results to next frame (avoid re-building)
+                    self.deferred_tile_results.push(response);
+                    continue;
+                }
+                match response.result {
+                    Ok(packet) => {
+                        self.tile_cache.upload(
+                            &self.device,
+                            packet,
+                            self.style_hash,
+                        );
+                        uploads_this_frame += 1;
+                        self.needs_redraw = true;
+                    }
+                    Err(e) => eprintln!("Tile {:?} failed: {}", response.tile_id, e),
+                }
+            }
+        }
+
+        // 2. Compute zoom level with hysteresis (prevents z-flip on small zoom changes)
+        let raw_z = zoom_from_camera_raw(self.camera.zoom);
+        let z = if self.current_z == 0 {
+            raw_z.round().clamp(6.0, 18.0) as u8
+        } else {
+            let diff = raw_z - self.current_z as f64;
+            if diff > 0.6 {
+                self.current_z + 1
+            } else if diff < -0.6 {
+                self.current_z.saturating_sub(1).max(6)
+            } else {
+                self.current_z
+            }
+        };
+        let prev_z = self.current_z;
+        self.current_z = z;
+
+        // If z changed, save current visible tiles as fallback (drawn until new tiles load)
+        if z != prev_z && prev_z != 0 {
+            self.previous_visible_tiles = std::mem::take(&mut self.visible_tiles_cache);
+            self.previous_style_hash = self.style_hash;
+        }
+
+        let view_bounds = self.camera.visible_bounds_tile();
+        self.visible_tiles_cache = visible_tiles(&view_bounds, z, 1.2);
+
+        // Diagnostic logging (first 5 frames only)
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
+        let frame = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+        if log::log_enabled!(log::Level::Debug) && frame < 5 {
+            log::debug!("=== FRAME {} BUILD_VISIBLE_TILES ===", frame);
+            log::debug!(
+                "  Camera: pos=({:.0},{:.0}), zoom={:.1} m/px",
+                self.camera.position.x,
+                self.camera.position.y,
+                self.camera.zoom
+            );
+        }
+
+        // Sort tiles by distance to camera center (closest first for faster first-paint)
+        let cam_x = self.camera.position.x as f64;
+        let cam_y = self.camera.position.y as f64;
+        self.visible_tiles_cache.sort_by(|a, b| {
+            let a_bounds = a.bounds();
+            let b_bounds = b.bounds();
+            let a_cx = (a_bounds.min_x + a_bounds.max_x) / 2.0;
+            let a_cy = (a_bounds.min_y + a_bounds.max_y) / 2.0;
+            let b_cx = (b_bounds.min_x + b_bounds.max_x) / 2.0;
+            let b_cy = (b_bounds.min_y + b_bounds.max_y) / 2.0;
+            let a_dist = (a_cx - cam_x).powi(2) + (a_cy - cam_y).powi(2);
+            let b_dist = (b_cx - cam_x).powi(2) + (b_cy - cam_y).powi(2);
+            a_dist.partial_cmp(&b_dist).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 3. Find missing tiles not in cache AND not already requested from worker
+        let mut missing = Vec::new();
+        for tile_id in &self.visible_tiles_cache {
+            let key = TileCacheKey::new(*tile_id, self.style_hash);
+            if !self.tile_cache.contains(&key)
+                && !self.tile_cache.is_known_empty(&key)
+                && !self.pending_tiles.contains(tile_id)
+            {
+                // Quick pre-filter: skip tiles with no intersecting charts
+                if let Some(ref catalog) = self.catalog {
+                    let tile_bounds = tile_id.bounds();
+                    if catalog.charts_for_tile(&tile_bounds).is_empty() {
+                        self.tile_cache.mark_empty(&key);
+                        continue;
+                    }
+                }
+                missing.push(*tile_id);
+                if missing.len() >= Self::MAX_TILES_PER_FRAME {
+                    break;
+                }
+            }
+        }
+
+        // 4. Send missing tiles to background worker
+        if !missing.is_empty() {
+            if let Some(ref worker) = self.tile_worker {
+                let view_params = crate::tiles::worker::ViewParams {
+                    meters_per_pixel: self.camera.zoom,
+                    ppmm: self.effective_ppmm,
+                    width_px: self.size.width as f32,
+                    height_px: self.size.height as f32,
+                    center_x: self.camera.position.x,
+                    center_y: self.camera.position.y,
+                };
+                for tid in &missing {
+                    self.pending_tiles.insert(*tid);
+                }
+                worker.request_tiles(missing, view_params);
+            }
+        }
+
+        // 5. Clear fallback when all new tiles are cached (transition complete)
+        if !self.previous_visible_tiles.is_empty() {
+            let all_cached = self.visible_tiles_cache.iter().all(|tid| {
+                let key = TileCacheKey::new(*tid, self.style_hash);
+                self.tile_cache.contains(&key) || self.tile_cache.is_known_empty(&key)
+            });
+            if all_cached {
+                self.previous_visible_tiles.clear();
+            }
+        }
+
+        // 6. Evict tiles over budget
+        self.tile_cache.evict_to_budget();
+    }
+
+    /// Draw tiles using cached visible_tiles from build_visible_tiles()
+    fn draw_tiles<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, line_style_offsets: &HashMap<LineStyleKey, u32>) {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static DRAW_FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
+        let draw_frame = DRAW_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+        let debug_mode = debug_render_mode();
+
+        // === Fallback: draw previous-z tiles underneath while new tiles load ===
+        if !self.previous_visible_tiles.is_empty() {
+            render_pass.set_pipeline(&self.pipeline);
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            for tile_id in &self.previous_visible_tiles {
+                let key = TileCacheKey::new(*tile_id, self.previous_style_hash);
+                if let Some(buffers) = self.tile_cache.get(&key) {
+                    // Draw all area priorities from fallback tile
+                    let total_verts = buffers.area_priority_offsets[10];
+                    if total_verts > 0 {
+                        render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
+                        render_pass.draw(0..total_verts, 0..1);
+                    }
+                }
+            }
+        }
+
+        // === Priority-ordered drawing ===
+        // S-52 requires interleaved draw order: for each priority level (0-9),
+        // draw areas → patterns → lines → symbols, then text on top.
+
+        // Pre-collect and sort all line batches by priority
+        let mut legacy_draws: Vec<(&LineBatchGpu, LineStyleKey)> = Vec::new();
+        for tile_id in &self.visible_tiles_cache {
+            let key = TileCacheKey::new(*tile_id, self.style_hash);
+            if let Some(buffers) = self.tile_cache.get(&key) {
+                for batch in &buffers.line_batches {
+                    if batch.index_count > 0 {
+                        legacy_draws.push((batch, batch.key.style.clone()));
+                    }
+                }
+            }
+        }
+        legacy_draws.sort_by(|a, b| a.0.key.cmp(&b.0.key));
+
+        let mut drew_tiles = 0usize;
+        let mut drew_line_batches = 0usize;
+        let mut uniform_updates = 0usize;
+        let mut drew_symbols = 0u32;
+        let mut symbol_draw_calls = 0u32;
+        let mut line_index_count = 0u32;
+        let mut line_vertex_count = 0u32;
+        let mut last_style: Option<LineStyleKey> = None;
+
+        // Pre-compute line batch index ranges per priority
+        let mut legacy_prio_ranges: [(usize, usize); 10] = [(0, 0); 10];
+        {
+            let mut start = 0;
+            for prio in 0..10u8 {
+                let end = legacy_draws.partition_point(|(b, _)| b.key.disp_prio <= prio);
+                legacy_prio_ranges[prio as usize] = (start, end);
+                start = end;
+            }
+        }
+
+        for priority in 0..10u8 {
+            let p = priority as usize;
+
+            // --- Areas at this priority ---
+            render_pass.set_pipeline(&self.pipeline);
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
+                if let Some(buffers) = self.tile_cache.get(&key) {
+                    let start = buffers.area_priority_offsets[p];
+                    let end = buffers.area_priority_offsets[p + 1];
+                    if end > start {
+                        render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
+                        render_pass.draw(start..end, 0..1);
+                        drew_tiles += 1;
+                    }
+                }
+            }
+
+            // --- Patterns at this priority ---
+            if let (Some(ref pattern_renderer), Some(ref pattern_bind_group)) =
+                (&self.pattern_renderer, &self.pattern_camera_bind_group)
+            {
+                let mut pattern_state_set = false;
+                for tile_id in &self.visible_tiles_cache {
+                    let key = TileCacheKey::new(*tile_id, self.style_hash);
+                    if let Some(buffers) = self.tile_cache.get(&key) {
+                        if let Some(ref pattern_buffer) = buffers.pattern_buffer {
+                            let start = buffers.pattern_priority_offsets[p];
+                            let end = buffers.pattern_priority_offsets[p + 1];
+                            if end > start {
+                                if !pattern_state_set {
+                                    pattern_renderer.set_state(render_pass, pattern_bind_group);
+                                    pattern_state_set = true;
+                                }
+                                pattern_renderer.draw_range(
+                                    render_pass,
+                                    pattern_buffer,
+                                    start,
+                                    end - start,
+                                );
+                                // drew_patterns += end - start;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // --- Lines at this priority ---
+            render_pass.set_pipeline(&self.line_pipeline);
+
+            let (l_start, l_end) = legacy_prio_ranges[p];
+            for (batch, style_key) in &legacy_draws[l_start..l_end] {
+                if last_style.as_ref() != Some(style_key) {
+                    last_style = Some(style_key.clone());
+                    uniform_updates += 1;
+                }
+                let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                render_pass.set_bind_group(0, &self.line_bind_group, &[offset]);
+                render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                drew_line_batches += 1;
+                line_index_count += batch.index_count;
+                line_vertex_count += batch.vertex_count;
+            }
+
+
+            // --- Symbols at this priority ---
+            if let (Some(ref symbol_renderer), Some(ref symbol_bind_group)) =
+                (&self.symbol_renderer, &self.symbol_camera_bind_group)
+            {
+                if debug_mode == 3 && priority == 0 {
+                    symbol_renderer.render_atlas_debug(render_pass, symbol_bind_group);
+                    symbol_draw_calls = 1;
+                } else if debug_mode != 3 {
+                    let mut symbol_state_set = false;
+                    for tile_id in &self.visible_tiles_cache {
+                        let key = TileCacheKey::new(*tile_id, self.style_hash);
+                        if let Some(buffers) = self.tile_cache.get(&key) {
+                            if let Some(ref symbol_buffer) = buffers.symbol_buffer {
+                                let start = buffers.symbol_priority_offsets[p];
+                                let end = buffers.symbol_priority_offsets[p + 1];
+                                if end > start {
+                                    if !symbol_state_set {
+                                        symbol_renderer.set_state(render_pass, symbol_bind_group);
+                                        symbol_state_set = true;
+                                    }
+                                    symbol_renderer.draw_range(
+                                        render_pass,
+                                        symbol_buffer,
+                                        start,
+                                        end - start,
+                                    );
+                                    drew_symbols += end - start;
+                                    symbol_draw_calls += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } // end priority loop
+
+        if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
+            log::debug!(
+                "draw_tiles: visible={}, area_draws={}, line_batches={} uniform_updates={} symbols={}",
+                self.visible_tiles_cache.len(),
+                drew_tiles,
+                drew_line_batches,
+                uniform_updates,
+                drew_symbols,
+            );
+        }
+        if debug_mode != 0 {
+            log::info!(
+                "debug_render: tile lines vertices={} indices={} batches={} symbols={} draws={} mode={}",
+                line_vertex_count,
+                line_index_count,
+                drew_line_batches,
+                drew_symbols,
+                symbol_draw_calls,
+                debug_mode
+            );
+        }
+
+        // 4) Text (soundings)
+        if let (Some(ref text_renderer), Some(ref text_bind_group)) =
+            (&self.text_renderer, &self.text_camera_bind_group)
+        {
+            let mut drew_text = 0u32;
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
+                if let Some(buffers) = self.tile_cache.get(&key) {
+                    if let Some(ref text_buffer) = buffers.text_buffer {
+                        if buffers.text_count > 0 {
+                            text_renderer.render_with_buffer(
+                                render_pass,
+                                text_bind_group,
+                                text_buffer,
+                                buffers.text_count,
+                            );
+                            drew_text += buffers.text_count;
+                        }
+                    }
+                }
+            }
+            if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
+                log::debug!("draw_tiles: text_drew={}", drew_text);
+            }
+        }
+
+        // 5) Labels (non-numeric text)
+        if let (Some(ref label_renderer), Some(ref label_bind_group)) =
+            (&self.label_renderer, &self.label_camera_bind_group)
+        {
+            let mut drew_labels = 0u32;
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
+                if let Some(buffers) = self.tile_cache.get(&key) {
+                    if let Some(ref label_buffer) = buffers.label_buffer {
+                        if buffers.label_count > 0 {
+                            label_renderer.render_with_buffer(
+                                render_pass,
+                                label_bind_group,
+                                label_buffer,
+                                buffers.label_count,
+                            );
+                            drew_labels += buffers.label_count;
+                        }
+                    }
+                }
+            }
+            if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
+                log::debug!("draw_tiles: labels_drew={}", drew_labels);
+            }
+        }
     }
 
     /// Get window reference for redraw requests
     pub fn window(&self) -> &Window {
         &self.window
     }
-}
 
-/// Determine color for a feature
-fn feature_color(feature: &Feature) -> Color {
-    if feature.is_land() {
-        LAND_COLOR
-    } else if feature.is_depth_area() {
-        depth_color(feature.drval1(), feature.drval2())
-    } else {
-        // Unknown areas - use transparent (skip rendering)
-        // or ocean background to not obscure land/depth
-        [0.0, 0.0, 0.0, 0.0]  // Fully transparent
+    /// Check if a redraw is needed
+    pub fn needs_redraw(&self) -> bool {
+        self.needs_redraw
+    }
+
+    /// Check if there are tiles still pending from the worker
+    pub fn pending_tiles_empty(&self) -> bool {
+        self.pending_tiles.is_empty()
+            && self.deferred_tile_results.is_empty()
+            && self.previous_visible_tiles.is_empty()
+    }
+
+    /// Mark that a redraw is needed (called on camera move, etc.)
+    pub fn mark_dirty(&mut self) {
+        self.needs_redraw = true;
     }
 }
 
-/// Build line vertices with adjacency data and arc-length for shader-based rendering.
-///
-/// Each point in the polyline produces 2 vertices (one for each side: +1.0, -1.0).
-/// At endpoints, prev/next are duplicated to handle caps correctly.
-/// Arc length is cumulative distance from the start of the polyline (in meters).
-/// Uses TriangleStrip topology.
-fn build_line_vertices(points: &[[f32; 2]]) -> Vec<LineVertex> {
-    let n = points.len();
-    if n < 2 {
-        return vec![];
-    }
-
-    let mut vertices = Vec::with_capacity(n * 2);
-    let mut arc_len: f32 = 0.0;
-
-    for i in 0..n {
-        // Accumulate arc length from previous point
-        if i > 0 {
-            let dx = points[i][0] - points[i - 1][0];
-            let dy = points[i][1] - points[i - 1][1];
-            arc_len += (dx * dx + dy * dy).sqrt();
-        }
-
-        let prev = if i == 0 { points[0] } else { points[i - 1] };
-        let curr = points[i];
-        let next = if i == n - 1 { points[n - 1] } else { points[i + 1] };
-
-        // Emit +side vertex
-        vertices.push(LineVertex {
-            prev,
-            curr,
-            next,
-            side: 1.0,
-            arc_len,
-        });
-        // Emit -side vertex
-        vertices.push(LineVertex {
-            prev,
-            curr,
-            next,
-            side: -1.0,
-            arc_len,
-        });
-    }
-    vertices
-}
-
-/// Build line vertices for multiple polylines, inserting degenerate vertices between them.
-///
-/// Degenerate vertices create zero-area triangles that effectively "break" the strip
-/// between separate polylines without requiring multiple draw calls.
-///
-/// To properly break a triangle strip, we need 4 degenerate vertices:
-/// - Repeat last vertex of previous strip TWICE (creates 2 degenerate triangles)
-/// - Repeat first vertex of new strip TWICE (creates 2 more degenerate triangles)
-/// This ensures no real triangle spans between polylines.
-fn build_line_vertices_multi(polylines: &[Vec<[f32; 2]>]) -> Vec<LineVertex> {
-    let total_points: usize = polylines.iter().map(|p| p.len()).sum();
-    // Each point = 2 vertices, plus 4 degenerate vertices between polylines
-    let estimated_capacity = total_points * 2 + polylines.len() * 4;
-    let mut vertices = Vec::with_capacity(estimated_capacity);
-
-    for points in polylines.iter() {
-        let line_verts = build_line_vertices(points);
-        if line_verts.is_empty() {
-            continue;
-        }
-
-        // Insert degenerate vertices to break the strip (except for first polyline)
-        if !vertices.is_empty() {
-            // Repeat last vertex of previous strip twice
-            let last = *vertices.last().unwrap();
-            vertices.push(last);
-            vertices.push(last);
-            // Repeat first vertex of new strip twice
-            vertices.push(line_verts[0]);
-            vertices.push(line_verts[0]);
-        }
-
-        vertices.extend(line_verts);
-    }
-    vertices
-}
+/// S-57 type codes for area features (used by legacy load_chart path)
+const BUAARE: u16 = 13;  // Built-up area
+const LAKARE: u16 = 69;  // Lake
 
 // Old tessellate_line_with_max and tessellate_polyline_continuous functions
 // have been DELETED as part of migration to shader-based polyline rendering.
 // See line.wgsl and build_line_vertices() for the new implementation.
+
+impl Drop for RenderState {
+    fn drop(&mut self) {
+        // Shut down background tile worker thread cleanly
+        if let Some(worker) = self.tile_worker.take() {
+            worker.shutdown();
+        }
+    }
+}

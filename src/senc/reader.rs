@@ -64,12 +64,22 @@ impl<R: Read> SencReader<R> {
         let raw_type = u16::from_le_bytes([header[0], header[1]]);
         let length = u32::from_le_bytes([header[2], header[3], header[4], header[5]]);
 
-        // Validate length
+        // type=0 + length=0 is the standard SENC EOF sentinel (6 zero bytes)
+        if raw_type == 0 && length == 0 {
+            return Ok(None);
+        }
+
+        // Graceful termination on invalid length (matches qutenav behavior)
         if length < 6 {
-            return Err(SencError::Format(format!(
-                "Invalid record length {} at position {}",
-                length, self.position
-            )));
+            log::warn!("Record length too small: {} (type={}) at position {}, stopping parse",
+                       length, raw_type, self.position);
+            return Ok(None);
+        }
+
+        // Sanity check: reject unreasonably large records (prevents OOM on corrupt data)
+        if length > 50_000_000 {
+            log::warn!("Record length too large: {} at position {}, stopping parse", length, self.position);
+            return Ok(None);
         }
 
         // Read payload
@@ -87,9 +97,12 @@ impl<R: Read> SencReader<R> {
         }))
     }
 
-    /// Read and parse the SENC header (version + cell info)
-    pub fn read_header(&mut self) -> Result<SencHeader> {
+    /// Read and parse the SENC header (version + cell info).
+    /// Returns (header, first_non_header_record) — the overflow record must be
+    /// processed by the caller so it isn't lost.
+    pub fn read_header(&mut self) -> Result<(SencHeader, Option<RawRecord>)> {
         let mut header = SencHeader::default();
+        let mut overflow: Option<RawRecord> = None;
 
         // First record must be version header
         let first = self.next_record()?.ok_or(SencError::UnexpectedEof)?;
@@ -118,12 +131,21 @@ impl<R: Read> SencReader<R> {
                 None => break,
             };
 
-            // DEBUG: Trace every record type to find unknown types
-            println!("DEBUG: Header record type {:?} (raw: {})", record.record_type, record.raw_type);
+            // Trace header records when debugging parsing issues.
+            log::debug!(
+                "Header record type {:?} (raw: {})",
+                record.record_type,
+                record.raw_type
+            );
 
             match record.record_type {
                 RecordType::CellName => {
                     header.cell_name = parse_string(&record.payload);
+                    log::debug!(
+                        "CellName payload len={}, first 20 bytes: {:?}",
+                        record.payload.len(),
+                        &record.payload[..record.payload.len().min(20)]
+                    );
                 }
                 RecordType::CellNativeScale => {
                     if record.payload.len() >= 4 {
@@ -146,12 +168,21 @@ impl<R: Read> SencReader<R> {
                 | RecordType::CellSoundingDatum => {
                     // Skip these header records - we don't need them for rendering
                 }
+                RecordType::CellCoverage
+                | RecordType::CellNoCoverage
+                | RecordType::CellTextDescInfo => {
+                    // Coverage/text-desc records are in the header section but we don't need them
+                }
                 RecordType::Unknown if record.raw_type < 64 => {
                     // Skip unknown header records (types 10-63 are reserved)
                     // Continue parsing until we hit feature records (64+)
                 }
-                // Feature record (64+) or other - header section done
-                _ => break,
+                // Feature record (64+) or other - header section done.
+                // Return it as overflow so the caller doesn't lose it.
+                _ => {
+                    overflow = Some(record);
+                    break;
+                }
             }
         }
 
@@ -161,14 +192,15 @@ impl<R: Read> SencReader<R> {
             header.ref_lon = (extent.max_lon + extent.min_lon) / 2.0;
         }
 
-        // Debug output to verify header parsing
-        println!("DEBUG: Parsed SENC header:");
-        println!("  cell_name: '{}'", header.cell_name);
-        println!("  native_scale: {}", header.native_scale);
-        println!("  extent: {:?}", header.extent);
-        println!("  ref_lat: {}, ref_lon: {}", header.ref_lat, header.ref_lon);
+        log::info!(
+            "SENC v{}: cell='{}' scale=1:{} features_start={}",
+            header.version,
+            header.cell_name,
+            header.native_scale,
+            if overflow.is_some() { "yes" } else { "no" }
+        );
 
-        Ok(header)
+        Ok((header, overflow))
     }
 }
 
@@ -176,6 +208,14 @@ impl SencReader<Cursor<Vec<u8>>> {
     /// Create a reader from a byte slice
     pub fn from_bytes(data: Vec<u8>) -> Self {
         Self::new(Cursor::new(data))
+    }
+
+    /// Parse just the header (version, cell info, extent) without consuming features.
+    /// Use this for catalog building when you don't need feature data.
+    pub fn parse_header_only(data: &[u8]) -> Result<SencHeader> {
+        let mut reader = Self::new(Cursor::new(data.to_vec()));
+        let (header, _overflow) = reader.read_header()?;
+        Ok(header)
     }
 }
 

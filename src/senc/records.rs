@@ -65,6 +65,24 @@ pub enum RecordType {
     /// Vector connected node (record_type=97)
     VectorConnectedNode = 97,
 
+    /// Area geometry extended (record_type=84)
+    AreaGeometryExt = 84,
+
+    /// Vector edge extended (record_type=85)
+    VectorEdgeExt = 85,
+
+    /// Vector connected node extended (record_type=86)
+    VectorConnectedNodeExt = 86,
+
+    /// Cell coverage (record_type=98)
+    CellCoverage = 98,
+
+    /// Cell no-coverage (record_type=99)
+    CellNoCoverage = 99,
+
+    /// Cell text description info (record_type=101)
+    CellTextDescInfo = 101,
+
     /// Server status (record_type=200)
     /// Contains decrypt_status and expire_status
     ServerStatus = 200,
@@ -92,8 +110,14 @@ impl From<u16> for RecordType {
             81 => RecordType::LineGeometry,
             82 => RecordType::AreaGeometry,
             83 => RecordType::MultipointGeometry,
+            84 => RecordType::AreaGeometryExt,
+            85 => RecordType::VectorEdgeExt,
+            86 => RecordType::VectorConnectedNodeExt,
             96 => RecordType::VectorEdge,
             97 => RecordType::VectorConnectedNode,
+            98 => RecordType::CellCoverage,
+            99 => RecordType::CellNoCoverage,
+            101 => RecordType::CellTextDescInfo,
             200 => RecordType::ServerStatus,
             _ => RecordType::Unknown,
         }
@@ -159,6 +183,8 @@ pub enum ObjectClass {
     // === AREA FEATURES ===
     /// Anchorage area (ACHARE) - code 3
     AnchorageArea,
+    /// Building, single (BUISGL) - code 12
+    Building,
     /// Built-up area (BUAARE) - code 13
     BuiltUpArea,
     /// Depth area (DEPARE) - code 42
@@ -297,6 +323,7 @@ impl ObjectClass {
 
             // Area features
             3 => ObjectClass::AnchorageArea,         // ACHARE
+            12 => ObjectClass::Building,             // BUISGL
             13 => ObjectClass::BuiltUpArea,          // BUAARE
             42 => ObjectClass::DepthArea,            // DEPARE
             46 => ObjectClass::DredgedArea,          // DRGARE
@@ -356,6 +383,7 @@ impl ObjectClass {
 
             // Area features
             "ACHARE" => ObjectClass::AnchorageArea,
+            "BUISGL" => ObjectClass::Building,
             "BUAARE" => ObjectClass::BuiltUpArea,
             "DEPARE" => ObjectClass::DepthArea,
             "DRGARE" => ObjectClass::DredgedArea,
@@ -415,6 +443,7 @@ impl ObjectClass {
 
             // Area features
             ObjectClass::AnchorageArea => "ACHARE",
+            ObjectClass::Building => "BUISGL",
             ObjectClass::BuiltUpArea => "BUAARE",
             ObjectClass::DepthArea => "DEPARE",
             ObjectClass::DredgedArea => "DRGARE",

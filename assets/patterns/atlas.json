@@ -1,0 +1,538 @@
+{
+  "version": 1,
+  "atlas_size": [
+    4096,
+    512
+  ],
+  "patterns": {
+    "AIRARE02": {
+      "rect": [
+        2,
+        2,
+        65,
+        56
+      ],
+      "tile_size": [
+        618,
+        528
+      ],
+      "pivot": [
+        2259,
+        2256
+      ],
+      "origin": [
+        435,
+        452
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "DIAMOND1": {
+      "rect": [
+        69,
+        2,
+        229,
+        435
+      ],
+      "tile_size": [
+        2250,
+        4313
+      ],
+      "pivot": [
+        2250,
+        2250
+      ],
+      "origin": [
+        1125,
+        93
+      ],
+      "fill_type": "L",
+      "min_dist": 0,
+      "max_dist": 0
+    },
+    "DQUALA11": {
+      "rect": [
+        300,
+        2,
+        173,
+        122
+      ],
+      "tile_size": [
+        1697,
+        1184
+      ],
+      "pivot": [
+        2423,
+        1417
+      ],
+      "origin": [
+        1570,
+        856
+      ],
+      "fill_type": "S",
+      "min_dist": 1400,
+      "max_dist": 10000
+    },
+    "DQUALA21": {
+      "rect": [
+        475,
+        2,
+        173,
+        122
+      ],
+      "tile_size": [
+        1697,
+        1184
+      ],
+      "pivot": [
+        2401,
+        1247
+      ],
+      "origin": [
+        1570,
+        856
+      ],
+      "fill_type": "S",
+      "min_dist": 1400,
+      "max_dist": 10000
+    },
+    "DQUALB01": {
+      "rect": [
+        650,
+        2,
+        173,
+        122
+      ],
+      "tile_size": [
+        1697,
+        1184
+      ],
+      "pivot": [
+        2401,
+        1247
+      ],
+      "origin": [
+        1570,
+        856
+      ],
+      "fill_type": "S",
+      "min_dist": 1400,
+      "max_dist": 10000
+    },
+    "DQUALC01": {
+      "rect": [
+        825,
+        2,
+        164,
+        47
+      ],
+      "tile_size": [
+        1604,
+        430
+      ],
+      "pivot": [
+        2407,
+        1062
+      ],
+      "origin": [
+        1591,
+        837
+      ],
+      "fill_type": "S",
+      "min_dist": 1600,
+      "max_dist": 10000
+    },
+    "DQUALD01": {
+      "rect": [
+        991,
+        2,
+        164,
+        47
+      ],
+      "tile_size": [
+        1604,
+        430
+      ],
+      "pivot": [
+        2268,
+        1078
+      ],
+      "origin": [
+        1466,
+        843
+      ],
+      "fill_type": "S",
+      "min_dist": 1600,
+      "max_dist": 10000
+    },
+    "DQUALU01": {
+      "rect": [
+        1157,
+        2,
+        164,
+        47
+      ],
+      "tile_size": [
+        1604,
+        430
+      ],
+      "pivot": [
+        2927,
+        1059
+      ],
+      "origin": [
+        2124,
+        841
+      ],
+      "fill_type": "S",
+      "min_dist": 1600,
+      "max_dist": 10000
+    },
+    "DRGARE01": {
+      "rect": [
+        1323,
+        2,
+        24,
+        24
+      ],
+      "tile_size": [
+        200,
+        200
+      ],
+      "pivot": [
+        1500,
+        1500
+      ],
+      "origin": [
+        1500,
+        1300
+      ],
+      "fill_type": "L",
+      "min_dist": 150,
+      "max_dist": 0
+    },
+    "FOULAR11": {
+      "rect": [
+        1349,
+        2,
+        61,
+        72
+      ],
+      "tile_size": [
+        570,
+        684
+      ],
+      "pivot": [
+        837,
+        728
+      ],
+      "origin": [
+        1020,
+        850
+      ],
+      "fill_type": "L",
+      "min_dist": 150,
+      "max_dist": 10000
+    },
+    "FSHFAC03": {
+      "rect": [
+        1412,
+        2,
+        64,
+        19
+      ],
+      "tile_size": [
+        604,
+        151
+      ],
+      "pivot": [
+        4643,
+        2168
+      ],
+      "origin": [
+        3135,
+        2173
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "FSHFAC04": {
+      "rect": [
+        1478,
+        2,
+        55,
+        47
+      ],
+      "tile_size": [
+        511,
+        438
+      ],
+      "pivot": [
+        1753,
+        189
+      ],
+      "origin": [
+        492,
+        416
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "FSHHAV02": {
+      "rect": [
+        1535,
+        2,
+        83,
+        36
+      ],
+      "tile_size": [
+        790,
+        320
+      ],
+      "pivot": [
+        2200,
+        1470
+      ],
+      "origin": [
+        710,
+        1335
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "ICEARE04": {
+      "rect": [
+        1620,
+        2,
+        147,
+        137
+      ],
+      "tile_size": [
+        1434,
+        1331
+      ],
+      "pivot": [
+        2250,
+        2250
+      ],
+      "origin": [
+        2381,
+        815
+      ],
+      "fill_type": "L",
+      "min_dist": 0,
+      "max_dist": 0
+    },
+    "MARCUL02": {
+      "rect": [
+        1769,
+        2,
+        74,
+        44
+      ],
+      "tile_size": [
+        705,
+        403
+      ],
+      "pivot": [
+        2409,
+        369
+      ],
+      "origin": [
+        416,
+        568
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "MARSHES1": {
+      "rect": [
+        1845,
+        2,
+        44,
+        43
+      ],
+      "tile_size": [
+        400,
+        393
+      ],
+      "pivot": [
+        750,
+        1016
+      ],
+      "origin": [
+        550,
+        499
+      ],
+      "fill_type": "S",
+      "min_dist": 1500,
+      "max_dist": 15000
+    },
+    "NODATA03": {
+      "rect": [
+        1891,
+        2,
+        64,
+        43
+      ],
+      "tile_size": [
+        602,
+        396
+      ],
+      "pivot": [
+        2942,
+        1040
+      ],
+      "origin": [
+        2342,
+        645
+      ],
+      "fill_type": "S",
+      "min_dist": 100,
+      "max_dist": 10000
+    },
+    "QUESMRK1": {
+      "rect": [
+        1957,
+        2,
+        26,
+        48
+      ],
+      "tile_size": [
+        220,
+        443
+      ],
+      "pivot": [
+        1676,
+        1501
+      ],
+      "origin": [
+        1568,
+        1227
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "RCKLDG01": {
+      "rect": [
+        1985,
+        2,
+        158,
+        137
+      ],
+      "tile_size": [
+        1541,
+        1332
+      ],
+      "pivot": [
+        2319,
+        2152
+      ],
+      "origin": [
+        2325,
+        814
+      ],
+      "fill_type": "L",
+      "min_dist": 0,
+      "max_dist": 0
+    },
+    "SNDWAV01": {
+      "rect": [
+        2145,
+        2,
+        121,
+        21
+      ],
+      "tile_size": [
+        1179,
+        179
+      ],
+      "pivot": [
+        29,
+        499
+      ],
+      "origin": [
+        37,
+        316
+      ],
+      "fill_type": "S",
+      "min_dist": 2000,
+      "max_dist": 10000
+    },
+    "TSSJCT02": {
+      "rect": [
+        2268,
+        2,
+        54,
+        54
+      ],
+      "tile_size": [
+        500,
+        500
+      ],
+      "pivot": [
+        750,
+        750
+      ],
+      "origin": [
+        750,
+        250
+      ],
+      "fill_type": "L",
+      "min_dist": 0,
+      "max_dist": 0
+    },
+    "VEGATN03": {
+      "rect": [
+        2324,
+        2,
+        40,
+        43
+      ],
+      "tile_size": [
+        362,
+        399
+      ],
+      "pivot": [
+        749,
+        746
+      ],
+      "origin": [
+        574,
+        348
+      ],
+      "fill_type": "S",
+      "min_dist": 1000,
+      "max_dist": 10000
+    },
+    "VEGATN04": {
+      "rect": [
+        2366,
+        2,
+        44,
+        34
+      ],
+      "tile_size": [
+        400,
+        300
+      ],
+      "pivot": [
+        750,
+        750
+      ],
+      "origin": [
+        550,
+        450
+      ],
+      "fill_type": "S",
+      "min_dist": 1000,
+      "max_dist": 10000
+    }
+  }
+}

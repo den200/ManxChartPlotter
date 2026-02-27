@@ -6,6 +6,7 @@
 use glam::{Mat4, Vec2, Vec3};
 
 use super::projection::MercatorBounds;
+use crate::tiles::TileBounds;
 
 /// 2D camera for chart viewing
 #[derive(Debug, Clone)]
@@ -145,6 +146,19 @@ impl Camera {
             min_y: (self.position.y - half_h) as f64,
             max_y: (self.position.y + half_h) as f64,
         }
+    }
+
+    /// Get visible bounds as TileBounds for tile system
+    pub fn visible_bounds_tile(&self) -> TileBounds {
+        let half_w = self.viewport_width * self.zoom / 2.0;
+        let half_h = self.viewport_height * self.zoom / 2.0;
+
+        TileBounds::new(
+            (self.position.x - half_w) as f64,
+            (self.position.x + half_w) as f64,
+            (self.position.y - half_h) as f64,
+            (self.position.y + half_h) as f64,
+        )
     }
 
     /// Get approximate zoom level (similar to OpenStreetMap)
