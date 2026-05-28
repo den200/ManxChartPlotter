@@ -6,7 +6,7 @@ use std::path::Path;
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
-use super::lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables};
+use super::lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables, TableName};
 
 /// Parse chartsymbols.xml and return lookup tables.
 pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, String> {
@@ -23,6 +23,7 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
     // State for current lookup entry
     let mut in_lookup = false;
     let mut current_name = String::new();
+    let mut current_table_name: Option<TableName> = None;
     let mut current_type: Option<GeometryType> = None;
     let mut current_prio: Option<DisplayPriority> = None;
     let mut current_cat: Option<DisplayCategory> = None;
@@ -54,6 +55,7 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
                     "lookup" => {
                         in_lookup = true;
                         current_name.clear();
+                        current_table_name = None;
                         current_type = None;
                         current_prio = None;
                         current_cat = None;
@@ -121,6 +123,9 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
                     let text = e.unescape().map(|s| s.to_string()).unwrap_or_default();
 
                     match current_element.as_str() {
+                        "table-name" => {
+                            current_table_name = TableName::from_str(&text);
+                        }
                         "type" => {
                             current_type = GeometryType::from_str(&text);
                         }
@@ -154,12 +159,13 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
                     }
                     "lookup" => {
                         // Save the entry if we have required fields
-                        if let (Some(geom_type), Some(prio), Some(cat)) =
-                            (current_type, current_prio, current_cat)
+                        if let (Some(table_name), Some(geom_type), Some(prio), Some(cat)) =
+                            (current_table_name, current_type, current_prio, current_cat)
                         {
                             if !current_name.is_empty() && !current_instruction.is_empty() {
                                 tables.add_entry(LookupEntry {
                                     object_class: current_name.clone(),
+                                    table_name,
                                     geometry_type: geom_type,
                                     display_priority: prio,
                                     display_category: cat,
@@ -227,7 +233,7 @@ mod tests {
 
         // Check a lookup entry
         let entries = tables
-            .lookup("SLCONS", GeometryType::Line)
+            .lookup("SLCONS", GeometryType::Line, TableName::Lines)
             .expect("SLCONS lookup missing");
         assert!(!entries.is_empty());
     }

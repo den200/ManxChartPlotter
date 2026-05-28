@@ -1,7 +1,10 @@
 //! WGPU render state and chart rendering pipeline.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 use winit::window::Window;
@@ -23,18 +26,20 @@ use crate::tiles::{TileId, visible_tiles, zoom_from_camera_raw};
 use crate::tiles::cache::{TileGpuCache, TileCacheKey, LineBatchGpu};
 
 
-/// Vertex with position and palette color index
+/// Vertex with position, color index, and display priority
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Vertex {
     pub position: [f32; 2],
     pub color_index: u32,
+    pub disp_prio: u32,
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
         0 => Float32x2,
         1 => Uint32,
+        2 => Uint32,
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -129,29 +134,37 @@ pub struct LineUniforms {
     pub line_width_px: f32,
     /// Miter limit (bevel fallback when exceeded)
     pub join_limit: f32,
-    /// Line color RGBA
-    pub color: [f32; 4],
-    /// Dash on length in screen pixels (0.0 = solid)
+    /// Line color index in palette
+    pub color_index: u32,
+    /// Dash ON length in pixels
     pub dash_on_px: f32,
-    /// Dash off (gap) length in screen pixels (0.0 = solid)
+    /// Dash OFF length in pixels
     pub dash_off_px: f32,
     /// Pixels per meter at current zoom (for arc_len conversion)
     pub px_per_meter: f32,
+    /// Display priority for depth sorting
+    pub disp_prio: f32,
+    /// Dot on length in screen pixels (>0 for DASD dash-dot pattern)
+    pub dot_on_px: f32,
     /// Padding for 16-byte alignment
-    pub _pad: f32,
+    pub _pad: [u32; 2],
 }
 
 /// Line style configuration for a batch of lines.
 #[derive(Clone, Copy, Debug)]
 pub struct LineStyle {
-    /// Line color RGBA
+    /// Line color RGBA (legacy fallback)
     pub color: Color,
+    /// Color index in the S-52 palette
+    pub color_index: u32,
     /// Line width in screen pixels
     pub width_px: f32,
     /// Dash on length in screen pixels (0.0 = solid)
     pub dash_on_px: f32,
     /// Dash off (gap) length in screen pixels (0.0 = solid)
     pub dash_off_px: f32,
+    /// Dot on length in screen pixels (>0 for DASD dash-dot pattern)
+    pub dot_on_px: f32,
 }
 
 impl LineStyle {
@@ -159,9 +172,11 @@ impl LineStyle {
     pub const fn solid(color: Color, width_px: f32) -> Self {
         Self {
             color,
+            color_index: 0,
             width_px,
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            dot_on_px: 0.0,
         }
     }
 
@@ -169,9 +184,11 @@ impl LineStyle {
     pub const fn dashed(color: Color, width_px: f32) -> Self {
         Self {
             color,
+            color_index: 0,
             width_px,
             dash_on_px: 6.0,
             dash_off_px: 6.0,
+            dot_on_px: 0.0,
         }
     }
 }
@@ -213,6 +230,10 @@ pub struct RenderState {
     pub palette_buffer: wgpu::Buffer,
     pub uniform_bind_group_layout: wgpu::BindGroupLayout,
 
+    // Depth buffer for layer priority
+    pub depth_texture: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
+
     // Geometry
     pub vertex_buffer: Option<wgpu::Buffer>,
     pub vertex_count: u32,
@@ -236,8 +257,16 @@ pub struct RenderState {
     pub label_renderer: Option<LabelRenderer>,
     pub label_camera_bind_group: Option<wgpu::BindGroup>,
 
+    // Stencil-write pipeline for coverage masking (background chart suppression)
+    pub stencil_pipeline: wgpu::RenderPipeline,
+
+    // Background area pipeline (stencil test: pass when stencil==0)
+    pub bg_pipeline: wgpu::RenderPipeline,
+
     // Line rendering (shader-based polylines with per-batch styling)
     pub line_pipeline: wgpu::RenderPipeline,
+    // Background line pipeline (stencil test: pass when stencil==0)
+    pub bg_line_pipeline: wgpu::RenderPipeline,
     pub line_bind_group_layout: wgpu::BindGroupLayout,
     pub line_uniform_buffer: wgpu::Buffer,
     pub line_bind_group: wgpu::BindGroup,
@@ -245,6 +274,12 @@ pub struct RenderState {
     pub line_uniform_align: u32,
     /// Line batches with different styles (coastlines, contours, etc.)
     pub line_batches: Vec<LineBatch>,
+
+    // Global dynamic buffers for decluttered text/labels
+    pub global_text_buffer: Option<wgpu::Buffer>,
+    pub global_text_count: u32,
+    pub global_label_buffer: Option<wgpu::Buffer>,
+    pub global_label_count: u32,
 
     // Tile-based rendering (for multi-chart mode)
     /// Chart catalog (metadata only) - None for single chart mode
@@ -279,6 +314,23 @@ pub struct RenderState {
     s52_engine: Option<S52Engine>,
     /// Dirty flag — set on camera move, tile upload, resize; cleared after render
     needs_redraw: bool,
+    /// Incremental key for visible-tile text layout inputs
+    last_text_layout_key: u64,
+    /// Cached unique visible line styles for the current visible tile set
+    cached_visible_line_styles: Vec<LineStyleKey>,
+    /// Key for cached visible line styles
+    cached_visible_line_styles_key: u64,
+    /// Key for the last uploaded line-uniform contents
+    last_line_uniforms_key: u64,
+}
+
+fn profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NAVCORE_PROFILE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 impl RenderState {
@@ -320,11 +372,17 @@ impl RenderState {
             .expect("Failed to create device");
 
         let surface_caps = surface.get_capabilities(&adapter);
+        // Prefer a NON-sRGB (UNORM) surface. S-52 palette colors (from
+        // chartsymbols.xml) are already authored as 8-bit sRGB display values,
+        // and the shaders emit them directly. With an sRGB surface, wgpu would
+        // sRGB-encode them a SECOND time, washing every color out (e.g. DEPMS
+        // 152,197,242 -> ~205,227,249). A UNORM surface stores the bytes
+        // verbatim, matching OpenCPN's direct-blit behaviour exactly.
         let surface_format = surface_caps
             .formats
             .iter()
             .copied()
-            .find(|f| f.is_srgb())
+            .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
         println!("DEBUG: Surface format: {:?}", surface_format);
@@ -383,7 +441,7 @@ impl RenderState {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::VERTEX,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
@@ -409,6 +467,23 @@ impl RenderState {
             ],
             label: Some("uniform_bind_group"),
         });
+
+        // Depth buffer
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width: size.width.max(1),
+                height: size.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -445,7 +520,13 @@ impl RenderState {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -503,7 +584,7 @@ impl RenderState {
 
         let line_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Line Pipeline Layout"),
-            bind_group_layouts: &[&line_bind_group_layout],
+            bind_group_layouts: &[&uniform_bind_group_layout, &line_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -536,7 +617,187 @@ impl RenderState {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Stencil-write pipeline: renders coverage triangles to set stencil=1,
+        // masking background chart geometry from rendering underneath foreground charts.
+        let stencil_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Stencil Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/shaders/stencil.wgsl").into()),
+        });
+
+        let stencil_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Stencil Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &stencil_shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[wgpu::VertexAttribute {
+                        offset: 0,
+                        shader_location: 0,
+                        format: wgpu::VertexFormat::Float32x2,
+                    }],
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &stencil_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::empty(), // Don't write color
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState {
+                    front: wgpu::StencilFaceState {
+                        compare: wgpu::CompareFunction::Always,
+                        fail_op: wgpu::StencilOperation::Keep,
+                        depth_fail_op: wgpu::StencilOperation::Keep,
+                        pass_op: wgpu::StencilOperation::Replace,
+                    },
+                    back: wgpu::StencilFaceState {
+                        compare: wgpu::CompareFunction::Always,
+                        fail_op: wgpu::StencilOperation::Keep,
+                        depth_fail_op: wgpu::StencilOperation::Keep,
+                        pass_op: wgpu::StencilOperation::Replace,
+                    },
+                    read_mask: 0xFF,
+                    write_mask: 0xFF,
+                },
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        // Background area pipeline: identical to main pipeline but with stencil test
+        // (pass when stencil==0 → only draws where no foreground coverage)
+        let bg_stencil_state = wgpu::StencilState {
+            front: wgpu::StencilFaceState {
+                compare: wgpu::CompareFunction::Equal,
+                fail_op: wgpu::StencilOperation::Keep,
+                depth_fail_op: wgpu::StencilOperation::Keep,
+                pass_op: wgpu::StencilOperation::Keep,
+            },
+            back: wgpu::StencilFaceState {
+                compare: wgpu::CompareFunction::Equal,
+                fail_op: wgpu::StencilOperation::Keep,
+                depth_fail_op: wgpu::StencilOperation::Keep,
+                pass_op: wgpu::StencilOperation::Keep,
+            },
+            read_mask: 0xFF,
+            write_mask: 0x00, // don't modify stencil
+        };
+
+        let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("BG Chart Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[Vertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: bg_stencil_state.clone(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        // Background line pipeline: identical to line_pipeline but with stencil test
+        let bg_line_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("BG Line Pipeline"),
+            layout: Some(&line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: "vs_main",
+                buffers: &[LineVertex::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                strip_index_format: Some(wgpu::IndexFormat::Uint32),
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: bg_stencil_state,
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -592,7 +853,8 @@ impl RenderState {
             &uniform_bind_group_layout,
         ) {
             Ok(renderer) => {
-                let bind_group = renderer.create_camera_bind_group(&device, &uniform_buffer);
+                let bind_group =
+                    renderer.create_camera_bind_group(&device, &uniform_buffer, &palette_buffer);
                 println!("DEBUG: Text renderer initialized");
                 (Some(renderer), Some(bind_group))
             }
@@ -609,7 +871,8 @@ impl RenderState {
             &uniform_bind_group_layout,
         ) {
             Ok(renderer) => {
-                let bind_group = renderer.create_camera_bind_group(&device, &uniform_buffer);
+                let bind_group =
+                    renderer.create_camera_bind_group(&device, &uniform_buffer, &palette_buffer);
                 println!("DEBUG: Label renderer initialized");
                 (Some(renderer), Some(bind_group))
             }
@@ -633,6 +896,8 @@ impl RenderState {
             uniform_bind_group,
             palette_buffer,
             uniform_bind_group_layout,
+            depth_texture,
+            depth_view,
             vertex_buffer: None,
             vertex_count: 0,
             camera,
@@ -644,7 +909,14 @@ impl RenderState {
             text_camera_bind_group,
             label_renderer,
             label_camera_bind_group,
+            global_text_buffer: None,
+            global_text_count: 0,
+            global_label_buffer: None,
+            global_label_count: 0,
+            stencil_pipeline,
+            bg_pipeline,
             line_pipeline,
+            bg_line_pipeline,
             line_bind_group_layout,
             line_uniform_buffer,
             line_bind_group,
@@ -667,6 +939,10 @@ impl RenderState {
             previous_style_hash: 0,
             s52_engine: None,
             needs_redraw: true,
+            last_text_layout_key: 0,
+            cached_visible_line_styles: Vec::new(),
+            cached_visible_line_styles_key: 0,
+            last_line_uniforms_key: 0,
         }
     }
 
@@ -738,6 +1014,7 @@ impl RenderState {
                     vertices.push(Vertex {
                         position: pos,
                         color_index,
+                        disp_prio: 0,
                     });
                 }
             }
@@ -954,9 +1231,9 @@ impl RenderState {
 
         // Simple triangle in NDC space
         let vertices = vec![
-            Vertex { position: [0.0, 0.5], color_index: 0 },   // Top
-            Vertex { position: [-0.5, -0.5], color_index: 0 }, // Bottom-left
-            Vertex { position: [0.5, -0.5], color_index: 0 },  // Bottom-right
+            Vertex { position: [0.0, 0.5], color_index: 0, disp_prio: 0 },   // Top
+            Vertex { position: [-0.5, -0.5], color_index: 0, disp_prio: 0 }, // Bottom-left
+            Vertex { position: [0.5, -0.5], color_index: 0, disp_prio: 0 },  // Bottom-right
         ];
 
         // Create vertex buffer
@@ -1013,6 +1290,21 @@ impl RenderState {
             label: Some("uniform_bind_group"),
         });
 
+        if let Some(ref text_renderer) = self.text_renderer {
+            self.text_camera_bind_group = Some(text_renderer.create_camera_bind_group(
+                &self.device,
+                &self.uniform_buffer,
+                &self.palette_buffer,
+            ));
+        }
+        if let Some(ref label_renderer) = self.label_renderer {
+            self.label_camera_bind_group = Some(label_renderer.create_camera_bind_group(
+                &self.device,
+                &self.uniform_buffer,
+                &self.palette_buffer,
+            ));
+        }
+
         log::info!("Uploaded palette with {} colors to GPU", palette_data.len());
     }
 
@@ -1027,6 +1319,15 @@ impl RenderState {
                     0,
                     bytemuck::cast_slice(&palette_data),
                 );
+                if let Some(ref mut symbol_renderer) = self.symbol_renderer {
+                    if let Err(err) = symbol_renderer.switch_palette(&self.queue, palette_name) {
+                        log::warn!(
+                            "Palette '{}' switched, but symbol atlas switch failed: {}",
+                            palette_name,
+                            err
+                        );
+                    }
+                }
                 log::info!("Switched palette to '{}' ({} colors)", palette_name, palette_data.len());
             }
         }
@@ -1057,6 +1358,29 @@ impl RenderState {
             center_x, center_y, zoom,
             self.size.width as f32, self.size.height as f32,
         );
+
+        // Optional override for debugging/screenshots: NAVCORE_VIEW="lat,lon,mpp"
+        // positions the camera at a specific WGS84 point with a given zoom
+        // (meters per pixel). Lets us reproduce a reference view exactly.
+        if let Ok(view) = std::env::var("NAVCORE_VIEW") {
+            let parts: Vec<f32> = view
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .collect();
+            if parts.len() == 3 {
+                let (mx, my) = crate::tiles::latlon_to_mercator(parts[0] as f64, parts[1] as f64);
+                self.camera = Camera::new(
+                    mx as f32, my as f32, parts[2],
+                    self.size.width as f32, self.size.height as f32,
+                );
+                println!(
+                    "NAVCORE_VIEW override: lat={} lon={} mpp={} -> Mercator ({:.0},{:.0})",
+                    parts[0], parts[1], parts[2], mx, my
+                );
+            } else {
+                eprintln!("NAVCORE_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
+            }
+        }
 
         println!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
             catalog.charts.len(), center_x, center_y, zoom);
@@ -1114,6 +1438,24 @@ impl RenderState {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+
+            // Recreate depth texture
+            self.depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Depth Texture"),
+                size: wgpu::Extent3d {
+                    width: self.config.width.max(1),
+                    height: self.config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
             self.camera.resize(new_size.width as f32, new_size.height as f32);
             self.needs_redraw = true;
         }
@@ -1125,7 +1467,59 @@ impl RenderState {
         self.effective_ppmm = 4.0 * scale_factor; // 96 DPI base = 4.0 ppmm
     }
 
+    fn current_text_layout_key(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.style_hash.hash(&mut hasher);
+        self.tile_cache.revision().hash(&mut hasher);
+        self.visible_tiles_cache.hash(&mut hasher);
+        self.size.width.hash(&mut hasher);
+        self.size.height.hash(&mut hasher);
+        self.camera.position.x.to_bits().hash(&mut hasher);
+        self.camera.position.y.to_bits().hash(&mut hasher);
+        self.camera.zoom.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn current_visible_line_styles_key(&self) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.style_hash.hash(&mut hasher);
+        self.tile_cache.revision().hash(&mut hasher);
+        self.visible_tiles_cache.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn current_line_uniforms_key(&self, styles_key: u64) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        styles_key.hash(&mut hasher);
+        self.size.width.hash(&mut hasher);
+        self.size.height.hash(&mut hasher);
+        self.effective_ppmm.to_bits().hash(&mut hasher);
+        self.camera.position.x.to_bits().hash(&mut hasher);
+        self.camera.position.y.to_bits().hash(&mut hasher);
+        self.camera.zoom.to_bits().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    fn collect_visible_line_styles(&self) -> Vec<LineStyleKey> {
+        let mut styles = Vec::new();
+        for tile_id in &self.visible_tiles_cache {
+            let key = TileCacheKey::new(*tile_id, self.style_hash);
+            if let Some(buffers) = self.tile_cache.get(&key) {
+                for batch in &buffers.line_batches {
+                    if batch.index_count > 0 {
+                        styles.push(batch.key.style.clone());
+                    }
+                }
+            }
+        }
+        styles.sort();
+        styles.dedup();
+        styles
+    }
+
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        let render_start = profile_enabled().then(Instant::now);
+
         // In tile mode, keep the camera near the loaded chart extent.
         // This prevents panning/gesture glitches from throwing the view outside the
         // valid Mercator range, which would yield empty tiles (ocean-only).
@@ -1144,7 +1538,24 @@ impl RenderState {
 
         // CRITICAL: Build tiles BEFORE starting render pass (avoid stalls during draw)
         if self.tile_mode {
+            let build_start = profile_enabled().then(Instant::now);
             self.build_visible_tiles();
+            if let Some(start) = build_start {
+                log::info!("profile.build_visible_tiles: {} ms", start.elapsed().as_millis());
+            }
+
+            let text_layout_key = self.current_text_layout_key();
+            if self.needs_redraw && self.last_text_layout_key != text_layout_key {
+                let text_start = profile_enabled().then(Instant::now);
+                self.build_global_text_buffers();
+                self.last_text_layout_key = text_layout_key;
+                if let Some(start) = text_start {
+                    log::info!(
+                        "profile.build_global_text_buffers: {} ms",
+                        start.elapsed().as_millis()
+                    );
+                }
+            }
         }
 
         // Pre-write line uniform styles to dynamic UBO BEFORE the render pass.
@@ -1154,37 +1565,50 @@ impl RenderState {
             let view_proj = self.camera.view_projection_matrix().to_cols_array_2d();
             let viewport_size = [self.size.width as f32, self.size.height as f32];
             let align = self.line_uniform_align;
+            let styles_key = self.current_visible_line_styles_key();
+            if self.cached_visible_line_styles_key != styles_key {
+                self.cached_visible_line_styles = self.collect_visible_line_styles();
+                self.cached_visible_line_styles_key = styles_key;
+            }
 
             let mut offsets: HashMap<LineStyleKey, u32> = HashMap::new();
-            let mut next_slot = 0u32;
-            for tile_id in &self.visible_tiles_cache {
-                let key = TileCacheKey::new(*tile_id, self.style_hash);
-                if let Some(buffers) = self.tile_cache.get(&key) {
-                    for batch in &buffers.line_batches {
-                        if batch.index_count > 0 && !offsets.contains_key(&batch.key.style) {
-                            let offset = next_slot * align;
-                            let tables = self.s52_engine.as_ref().map(|e| &e.tables);
-                            let style = style_for_key(&batch.key.style, self.effective_ppmm, tables);
-                            let line_uniforms = LineUniforms {
-                                view_proj,
-                                viewport_size,
-                                line_width_px: style.width_px,
-                                join_limit: 4.0,
-                                color: style.color,
-                                dash_on_px: style.dash_on_px,
-                                dash_off_px: style.dash_off_px,
-                                px_per_meter,
-                                _pad: 0.0,
-                            };
-                            self.queue.write_buffer(
-                                &self.line_uniform_buffer,
-                                offset as u64,
-                                bytemuck::cast_slice(&[line_uniforms]),
-                            );
-                            offsets.insert(batch.key.style.clone(), offset);
-                            next_slot += 1;
-                        }
-                    }
+            for (slot, style_key) in self.cached_visible_line_styles.iter().enumerate() {
+                offsets.insert(style_key.clone(), (slot as u32) * align);
+            }
+
+            let line_uniforms_key = self.current_line_uniforms_key(styles_key);
+            if self.last_line_uniforms_key != line_uniforms_key {
+                let uniform_start = profile_enabled().then(Instant::now);
+                let tables = self.s52_engine.as_ref().map(|e| &e.tables);
+                for (slot, style_key) in self.cached_visible_line_styles.iter().enumerate() {
+                    let offset = (slot as u32) * align;
+                    let style = style_for_key(style_key, self.effective_ppmm, tables);
+                    let line_uniforms = LineUniforms {
+                        view_proj,
+                        viewport_size,
+                        line_width_px: style.width_px,
+                        join_limit: 4.0,
+                        color_index: style.color_index,
+                        dash_on_px: style.dash_on_px,
+                        dash_off_px: style.dash_off_px,
+                        px_per_meter,
+                        disp_prio: 0.0,
+                        dot_on_px: style.dot_on_px,
+                        _pad: [0, 0],
+                    };
+                    self.queue.write_buffer(
+                        &self.line_uniform_buffer,
+                        offset as u64,
+                        bytemuck::cast_slice(&[line_uniforms]),
+                    );
+                }
+                self.last_line_uniforms_key = line_uniforms_key;
+                if let Some(start) = uniform_start {
+                    log::info!(
+                        "profile.line_uniform_upload: {} ms styles={}",
+                        start.elapsed().as_millis(),
+                        self.cached_visible_line_styles.len()
+                    );
                 }
             }
             offsets
@@ -1202,11 +1626,13 @@ impl RenderState {
                     viewport_size,
                     line_width_px: batch.style.width_px,
                     join_limit: 4.0,
-                    color: batch.style.color,
+                    color_index: batch.style.color_index,
                     dash_on_px: batch.style.dash_on_px,
                     dash_off_px: batch.style.dash_off_px,
                     px_per_meter,
-                    _pad: 0.0,
+                    disp_prio: 4.0,
+                    dot_on_px: batch.style.dot_on_px,
+                    _pad: [0, 0],
                 };
                 self.queue.write_buffer(
                     &self.line_uniform_buffer,
@@ -1240,14 +1666,28 @@ impl RenderState {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
 
             if self.tile_mode {
                 // Tile-based multi-chart rendering
+                let draw_start = profile_enabled().then(Instant::now);
                 self.draw_tiles(&mut render_pass, &line_style_offsets);
+                if let Some(start) = draw_start {
+                    log::info!("profile.draw_tiles: {} ms", start.elapsed().as_millis());
+                }
             } else {
                 // Single chart mode (existing code)
                 // 1. Render areas (land, depth)
@@ -1261,10 +1701,11 @@ impl RenderState {
 
                 // 2. Render lines (coastlines + depth contours) with shader-based pipeline
                 render_pass.set_pipeline(&self.line_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 let mut slot = 0u32;
                 for batch in &self.line_batches {
                     let offset = slot * self.line_uniform_align;
-                    render_pass.set_bind_group(0, &self.line_bind_group, &[offset]);
+                    render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
                     render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                     render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
@@ -1315,6 +1756,10 @@ impl RenderState {
         output.present();
 
         self.needs_redraw = false;
+
+        if let Some(start) = render_start {
+            log::info!("profile.render_total: {} ms", start.elapsed().as_millis());
+        }
 
         Ok(())
     }
@@ -1423,10 +1868,12 @@ impl RenderState {
         let prev_z = self.current_z;
         self.current_z = z;
 
-        // If z changed, save current visible tiles as fallback (drawn until new tiles load)
+        // If z changed, discard previous-z tiles instead of drawing them as fallback.
+        // The fallback rectangles create visible tile-aligned artifacts that diverge
+        // badly from OpenCPN.
         if z != prev_z && prev_z != 0 {
-            self.previous_visible_tiles = std::mem::take(&mut self.visible_tiles_cache);
-            self.previous_style_hash = self.style_hash;
+            self.previous_visible_tiles.clear();
+            self.previous_style_hash = 0;
         }
 
         let view_bounds = self.camera.visible_bounds_tile();
@@ -1502,40 +1949,74 @@ impl RenderState {
             }
         }
 
-        // 5. Clear fallback when all new tiles are cached (transition complete)
-        if !self.previous_visible_tiles.is_empty() {
-            let all_cached = self.visible_tiles_cache.iter().all(|tid| {
-                let key = TileCacheKey::new(*tid, self.style_hash);
-                self.tile_cache.contains(&key) || self.tile_cache.is_known_empty(&key)
-            });
-            if all_cached {
-                self.previous_visible_tiles.clear();
-            }
-        }
-
-        // 6. Evict tiles over budget
+        // 5. Evict tiles over budget
         self.tile_cache.evict_to_budget();
     }
 
     /// Draw tiles using cached visible_tiles from build_visible_tiles()
+    fn build_global_text_buffers(&mut self) {
+        use crate::render::{
+            text_layout::{declutter_and_layout_labels_ex, declutter_soundings, layout_sounding_labels},
+        };
+        use wgpu::util::DeviceExt;
+
+        let mut all_soundings = Vec::new();
+        let mut all_labels = Vec::new();
+
+        for tile_id in &self.visible_tiles_cache {
+            let key = crate::tiles::cache::TileCacheKey::new(*tile_id, self.style_hash);
+            if let Some(buffers) = self.tile_cache.get(&key) {
+                all_soundings.extend_from_slice(&buffers.text_instances);
+                all_labels.extend_from_slice(&buffers.label_candidates);
+            }
+        }
+
+        declutter_soundings(&mut all_soundings, &self.camera);
+        let sounding_glyphs = layout_sounding_labels(&all_soundings);
+        let important_only = self
+            .s52_engine
+            .as_ref()
+            .map(|e| e.settings.show_important_text_only)
+            .unwrap_or(false);
+        let mut decluttered_labels =
+            declutter_and_layout_labels_ex(&all_labels, &self.camera, important_only);
+        decluttered_labels.extend(sounding_glyphs);
+
+        self.global_text_buffer = None;
+        self.global_text_count = 0;
+
+        self.global_label_buffer = None;
+        self.global_label_count = decluttered_labels.len() as u32;
+        if self.global_label_count > 0 {
+            self.global_label_buffer = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Global Label Buffer"),
+                contents: bytemuck::cast_slice(&decluttered_labels),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            }));
+        }
+    }
+
     fn draw_tiles<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, line_style_offsets: &HashMap<LineStyleKey, u32>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static DRAW_FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
         let draw_frame = DRAW_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
         let debug_mode = debug_render_mode();
 
-        // === Fallback: draw previous-z tiles underneath while new tiles load ===
-        if !self.previous_visible_tiles.is_empty() {
-            render_pass.set_pipeline(&self.pipeline);
+        // === Stencil-write pass: coverage masking ===
+        // Render foreground chart coverage polygons to stencil (value=1).
+        // Background chart geometry will be suppressed where stencil==1.
+        {
+            render_pass.set_pipeline(&self.stencil_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            for tile_id in &self.previous_visible_tiles {
-                let key = TileCacheKey::new(*tile_id, self.previous_style_hash);
+            render_pass.set_stencil_reference(1);
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
                 if let Some(buffers) = self.tile_cache.get(&key) {
-                    // Draw all area priorities from fallback tile
-                    let total_verts = buffers.area_priority_offsets[10];
-                    if total_verts > 0 {
-                        render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
-                        render_pass.draw(0..total_verts, 0..1);
+                    if let Some(ref cov_buf) = buffers.coverage_buffer {
+                        if buffers.coverage_vertex_count > 0 {
+                            render_pass.set_vertex_buffer(0, cov_buf.slice(..));
+                            render_pass.draw(0..buffers.coverage_vertex_count, 0..1);
+                        }
                     }
                 }
             }
@@ -1582,7 +2063,26 @@ impl RenderState {
         for priority in 0..10u8 {
             let p = priority as usize;
 
-            // --- Areas at this priority ---
+            // --- Background areas at this priority (stencil test: pass when stencil==0) ---
+            render_pass.set_pipeline(&self.bg_pipeline);
+            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_stencil_reference(0);
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
+                if let Some(buffers) = self.tile_cache.get(&key) {
+                    if let Some(ref bg_buf) = buffers.bg_area_buffer {
+                        let start = buffers.bg_area_priority_offsets[p];
+                        let end = buffers.bg_area_priority_offsets[p + 1];
+                        if end > start {
+                            render_pass.set_vertex_buffer(0, bg_buf.slice(..));
+                            render_pass.draw(start..end, 0..1);
+                            drew_tiles += 1;
+                        }
+                    }
+                }
+            }
+
+            // --- Foreground areas at this priority (no stencil test) ---
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             for tile_id in &self.visible_tiles_cache {
@@ -1598,21 +2098,42 @@ impl RenderState {
                 }
             }
 
-            // --- Patterns at this priority ---
+            // --- Patterns at this priority (bg then fg) ---
             if let (Some(ref pattern_renderer), Some(ref pattern_bind_group)) =
                 (&self.pattern_renderer, &self.pattern_camera_bind_group)
             {
-                let mut pattern_state_set = false;
+                let mut bg_pattern_state_set = false;
+                let mut fg_pattern_state_set = false;
                 for tile_id in &self.visible_tiles_cache {
                     let key = TileCacheKey::new(*tile_id, self.style_hash);
                     if let Some(buffers) = self.tile_cache.get(&key) {
+                        // Draw bg patterns
+                        if let Some(ref bg_pat_buf) = buffers.bg_pattern_buffer {
+                            let start = buffers.bg_pattern_priority_offsets[p];
+                            let end = buffers.bg_pattern_priority_offsets[p + 1];
+                            if end > start {
+                                if !bg_pattern_state_set {
+                                    pattern_renderer
+                                        .set_background_state(render_pass, pattern_bind_group);
+                                    render_pass.set_stencil_reference(0);
+                                    bg_pattern_state_set = true;
+                                }
+                                pattern_renderer.draw_range(
+                                    render_pass,
+                                    bg_pat_buf,
+                                    start,
+                                    end - start,
+                                );
+                            }
+                        }
+                        // Draw fg patterns
                         if let Some(ref pattern_buffer) = buffers.pattern_buffer {
                             let start = buffers.pattern_priority_offsets[p];
                             let end = buffers.pattern_priority_offsets[p + 1];
                             if end > start {
-                                if !pattern_state_set {
+                                if !fg_pattern_state_set {
                                     pattern_renderer.set_state(render_pass, pattern_bind_group);
-                                    pattern_state_set = true;
+                                    fg_pattern_state_set = true;
                                 }
                                 pattern_renderer.draw_range(
                                     render_pass,
@@ -1620,7 +2141,6 @@ impl RenderState {
                                     start,
                                     end - start,
                                 );
-                                // drew_patterns += end - start;
                             }
                         }
                     }
@@ -1628,24 +2148,55 @@ impl RenderState {
             }
 
             // --- Lines at this priority ---
-            render_pass.set_pipeline(&self.line_pipeline);
-
+            // Legacy draws are sorted by LineBatchKey which puts bg before fg.
+            // Split the range into bg and fg sub-ranges.
             let (l_start, l_end) = legacy_prio_ranges[p];
-            for (batch, style_key) in &legacy_draws[l_start..l_end] {
-                if last_style.as_ref() != Some(style_key) {
-                    last_style = Some(style_key.clone());
-                    uniform_updates += 1;
+
+            // Find the split point: bg batches (is_background=true) sort first
+            let bg_end = legacy_draws[l_start..l_end]
+                .partition_point(|(b, _)| b.key.is_background)
+                + l_start;
+
+            // Background lines (stencil test: pass when stencil==0)
+            if bg_end > l_start {
+                render_pass.set_pipeline(&self.bg_line_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_stencil_reference(0);
+                for (batch, style_key) in &legacy_draws[l_start..bg_end] {
+                    if last_style.as_ref() != Some(style_key) {
+                        last_style = Some(style_key.clone());
+                        uniform_updates += 1;
+                    }
+                    let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
+                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    drew_line_batches += 1;
+                    line_index_count += batch.index_count;
+                    line_vertex_count += batch.vertex_count;
                 }
-                let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
-                render_pass.set_bind_group(0, &self.line_bind_group, &[offset]);
-                render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
-                drew_line_batches += 1;
-                line_index_count += batch.index_count;
-                line_vertex_count += batch.vertex_count;
             }
 
+            // Foreground lines (no stencil test)
+            if l_end > bg_end {
+                render_pass.set_pipeline(&self.line_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                for (batch, style_key) in &legacy_draws[bg_end..l_end] {
+                    if last_style.as_ref() != Some(style_key) {
+                        last_style = Some(style_key.clone());
+                        uniform_updates += 1;
+                    }
+                    let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
+                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    drew_line_batches += 1;
+                    line_index_count += batch.index_count;
+                    line_vertex_count += batch.vertex_count;
+                }
+            }
 
             // --- Symbols at this priority ---
             if let (Some(ref symbol_renderer), Some(ref symbol_bind_group)) =
@@ -1709,25 +2260,18 @@ impl RenderState {
         if let (Some(ref text_renderer), Some(ref text_bind_group)) =
             (&self.text_renderer, &self.text_camera_bind_group)
         {
-            let mut drew_text = 0u32;
-            for tile_id in &self.visible_tiles_cache {
-                let key = TileCacheKey::new(*tile_id, self.style_hash);
-                if let Some(buffers) = self.tile_cache.get(&key) {
-                    if let Some(ref text_buffer) = buffers.text_buffer {
-                        if buffers.text_count > 0 {
-                            text_renderer.render_with_buffer(
-                                render_pass,
-                                text_bind_group,
-                                text_buffer,
-                                buffers.text_count,
-                            );
-                            drew_text += buffers.text_count;
-                        }
+            if let Some(ref text_buffer) = self.global_text_buffer {
+                if self.global_text_count > 0 {
+                    text_renderer.render_with_buffer(
+                        render_pass,
+                        text_bind_group,
+                        text_buffer,
+                        self.global_text_count,
+                    );
+                    if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
+                        log::debug!("draw_tiles: text_drew={}", self.global_text_count);
                     }
                 }
-            }
-            if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
-                log::debug!("draw_tiles: text_drew={}", drew_text);
             }
         }
 
@@ -1735,25 +2279,18 @@ impl RenderState {
         if let (Some(ref label_renderer), Some(ref label_bind_group)) =
             (&self.label_renderer, &self.label_camera_bind_group)
         {
-            let mut drew_labels = 0u32;
-            for tile_id in &self.visible_tiles_cache {
-                let key = TileCacheKey::new(*tile_id, self.style_hash);
-                if let Some(buffers) = self.tile_cache.get(&key) {
-                    if let Some(ref label_buffer) = buffers.label_buffer {
-                        if buffers.label_count > 0 {
-                            label_renderer.render_with_buffer(
-                                render_pass,
-                                label_bind_group,
-                                label_buffer,
-                                buffers.label_count,
-                            );
-                            drew_labels += buffers.label_count;
-                        }
+            if let Some(ref label_buffer) = self.global_label_buffer {
+                if self.global_label_count > 0 {
+                    label_renderer.render_with_buffer(
+                        render_pass,
+                        label_bind_group,
+                        label_buffer,
+                        self.global_label_count,
+                    );
+                    if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
+                        log::debug!("draw_tiles: labels_drew={}", self.global_label_count);
                     }
                 }
-            }
-            if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
-                log::debug!("draw_tiles: labels_drew={}", drew_labels);
             }
         }
     }

@@ -3,9 +3,9 @@
 //! Determines depth area coloring based on DRVAL1/DRVAL2 attributes
 //! and the mariner's selected safety depth.
 
-use crate::s52::{MarinerSettings, DepthShadeMode};
+use crate::s52::instruction::{LinePattern, RenderInstruction};
+use crate::s52::{DepthShadeMode, MarinerSettings};
 use crate::senc::{Feature, ObjectClass};
-use crate::s52::instruction::{RenderInstruction, LinePattern};
 
 /// S-52 depth color tokens from chartsymbols.xml color table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,11 @@ pub fn depare02(feature: &Feature, settings: &MarinerSettings) -> DepthColorToke
     let drval2 = feature.drval2().unwrap_or(drval1 + 0.01);
 
     // Ensure drval2 > drval1 (OpenCPN does this for bad charts)
-    let drval2 = if drval2 <= drval1 { drval1 + 0.01 } else { drval2 };
+    let drval2 = if drval2 <= drval1 {
+        drval1 + 0.01
+    } else {
+        drval2
+    };
 
     let shallow = settings.shallow_contour as f64;
     let safety = settings.safety_contour as f64;
@@ -67,17 +71,19 @@ pub fn depare02(feature: &Feature, settings: &MarinerSettings) -> DepthColorToke
             token = DepthColorToken::DeepWater;
         }
     } else {
-        // Four-shade mode: Progressively upgrade based on contour thresholds
-        // Per spec: these checks ONLY use drval1
-        if drval1 >= shallow {
+        // Four-shade mode per OpenCPN SEABED01: only upgrade when BOTH endpoints
+        // of the depth range clear the threshold. Using drval1 alone is too
+        // permissive — a polygon with drval1=3, drval2=30 around the 2m shallow
+        // threshold would falsely promote all the way to deep-water shade.
+        if drval1 >= shallow && drval2 > shallow {
             token = DepthColorToken::MediumShallow;
         }
 
-        if drval1 >= safety {
+        if drval1 >= safety && drval2 > safety {
             token = DepthColorToken::MediumDeep;
         }
 
-        if drval1 >= deep {
+        if drval1 >= deep && drval2 > deep {
             token = DepthColorToken::DeepWater;
         }
     }
@@ -91,9 +97,12 @@ pub fn depare02_color_token(feature: &Feature, settings: &MarinerSettings) -> &'
 }
 
 /// Full DEPARE01/02 instructions including DRGARE logic
-pub fn depare02_instructions(feature: &Feature, settings: &MarinerSettings) -> Vec<RenderInstruction> {
+pub fn depare02_instructions(
+    feature: &Feature,
+    settings: &MarinerSettings,
+) -> Vec<RenderInstruction> {
     let mut instructions = Vec::new();
-    
+
     // 1. Get area color based on depth
     let color_token = depare02_color_token(feature, settings);
     instructions.push(RenderInstruction::AreaColor {
@@ -101,12 +110,11 @@ pub fn depare02_instructions(feature: &Feature, settings: &MarinerSettings) -> V
     });
 
     // 2. Special logic for DRGARE (Dredged Area)
-    // matches OpenCPN s52cnsy.cpp:640
+    //
+    // OpenCPN can emit AP(DRGARE01), but our current pattern fill path renders the
+    // hatch much heavier than the reference and dominates harbor basins. Keep the
+    // dredged boundary styling and defer the fill pattern until AP parity improves.
     if feature.object_class == ObjectClass::DredgedArea {
-        // Add hatching pattern
-        instructions.push(RenderInstruction::AreaPattern {
-            pattern: "DRGARE01".to_string(),
-        });
         // Add dashed boundary line
         instructions.push(RenderInstruction::LineStyle {
             pattern: LinePattern::Dashed,
@@ -164,7 +172,10 @@ mod tests {
     fn test_medium_shallow() {
         let feature = make_depare(2.5, 4.0);
         let settings = MarinerSettings::default();
-        assert_eq!(depare02(&feature, &settings), DepthColorToken::MediumShallow);
+        assert_eq!(
+            depare02(&feature, &settings),
+            DepthColorToken::MediumShallow
+        );
     }
 
     #[test]
@@ -190,9 +201,14 @@ mod tests {
 
     #[test]
     fn test_drval1_only_check() {
+        // Malformed chart where drval2<drval1; helper normalises drval2 = drval1+0.01,
+        // so behaviour is driven by drval1 alone.
         let feature = make_depare(5.0, 3.0);
         let settings = MarinerSettings::default();
-        assert_eq!(depare02(&feature, &settings), DepthColorToken::MediumShallow);
+        assert_eq!(
+            depare02(&feature, &settings),
+            DepthColorToken::MediumShallow
+        );
     }
 
     #[test]
@@ -226,16 +242,11 @@ mod tests {
         let feature = make_drgare(5.0, 10.0);
         let settings = MarinerSettings::default();
         let instrs = depare02_instructions(&feature, &settings);
-        
-        // Should have AC, AP, and LS
-        assert_eq!(instrs.len(), 3);
+
+        // Should have AC and LS
+        assert_eq!(instrs.len(), 2);
         assert!(matches!(instrs[0], RenderInstruction::AreaColor { .. }));
-        if let RenderInstruction::AreaPattern { pattern } = &instrs[1] {
-            assert_eq!(pattern, "DRGARE01");
-        } else {
-            panic!("Expected AreaPattern");
-        }
-        if let RenderInstruction::LineStyle { pattern, .. } = &instrs[2] {
+        if let RenderInstruction::LineStyle { pattern, .. } = &instrs[1] {
             assert_eq!(*pattern, LinePattern::Dashed);
         } else {
             panic!("Expected LineStyle");

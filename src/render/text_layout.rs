@@ -3,7 +3,9 @@
 //! Converts text strings with positioning parameters into LabelGlyphInstance
 //! arrays ready for GPU rendering.
 
+use super::camera::Camera;
 use super::label::{glyph_uv_rect, LabelGlyphInstance};
+use super::text::SoundingInstance;
 
 /// Glyph dimensions in pixels (matching label.rs font atlas)
 const _GLYPH_W: f32 = 5.0;
@@ -57,6 +59,8 @@ pub struct TextParams {
     pub text: String,
     /// Text color (RGBA)
     pub color: [f32; 4],
+    /// S-52 palette color index for dynamic Day/Dusk/Night switching.
+    pub color_index: u32,
     /// Font scale multiplier (1.0 = default size)
     pub scale: f32,
     /// Horizontal justification
@@ -67,6 +71,11 @@ pub struct TextParams {
     pub xoffs: i32,
     /// Y offset in character heights
     pub yoffs: i32,
+    /// S-52 display priority (0-9, higher = more important)
+    pub disp_prio: u8,
+    /// S-52 text display group / viewing group (dis field from TX/TE).
+    /// Lower = more important. Used by ShowImportantTextOnly filter (hides >= 20).
+    pub dis: u8,
 }
 
 impl Default for TextParams {
@@ -75,11 +84,14 @@ impl Default for TextParams {
             position: [0.0, 0.0],
             text: String::new(),
             color: [0.0, 0.0, 0.0, 1.0], // CHBLK default
+            color_index: 0,
             scale: 1.0,
             hjust: HJust::Left,
             vjust: VJust::Bottom,
             xoffs: 0,
             yoffs: 0,
+            disp_prio: 0,
+            dis: 10,
         }
     }
 }
@@ -141,6 +153,7 @@ pub fn layout_text(params: &TextParams) -> Vec<LabelGlyphInstance> {
             uv_max: [uvs[2], uvs[3]],
             rotation: 0.0,
             color: params.color,
+            color_index: params.color_index,
         });
 
         x_advance += CELL_W * params.scale;
@@ -160,12 +173,73 @@ pub fn layout_light_text(position: [f32; 2], text: &str, color: [f32; 4]) -> Vec
         position,
         text: text.to_string(),
         color,
+        color_index: 0,
         scale: 1.0,
+        dis: 24,
         hjust: HJust::Left,
         vjust: VJust::Center,
         xoffs: 2, // 2 char widths right of symbol
         yoffs: 0,
+        disp_prio: 0,
     })
+}
+
+fn sounding_text(instance: &SoundingInstance) -> String {
+    let flags = instance.flags;
+    let has_decimal = (flags & (1 << 4)) != 0;
+    let decimal_digit = ((flags >> 8) & 0xF) as u8;
+    let whole_part = (flags >> 12) & 0x1_FFFF;
+    let is_drying = (flags & (1 << 1)) != 0;
+    let show_uncertainty = (flags & (1 << 2)) != 0;
+    let is_swept = (flags & (1 << 3)) != 0;
+
+    let mut text = String::new();
+    if is_swept {
+        text.push('~');
+    }
+    if is_drying {
+        text.push('_');
+    }
+    text.push_str(&whole_part.to_string());
+    if has_decimal {
+        text.push('.');
+        text.push(char::from(b'0' + decimal_digit.min(9)));
+    }
+    if show_uncertainty {
+        text.push('?');
+    }
+    text
+}
+
+fn sounding_color(flags: u32) -> [f32; 4] {
+    if (flags & 1) != 0 {
+        [0.027, 0.027, 0.027, 1.0]
+    } else {
+        [0.490, 0.537, 0.549, 1.0]
+    }
+}
+
+pub fn layout_sounding_labels(soundings: &[SoundingInstance]) -> Vec<LabelGlyphInstance> {
+    let mut glyphs = Vec::new();
+
+    for sounding in soundings {
+        let params = TextParams {
+            position: sounding.position,
+            text: sounding_text(sounding),
+            color: sounding_color(sounding.flags),
+            color_index: sounding.color_index,
+            scale: sounding.scale,
+            hjust: HJust::Left,
+            vjust: VJust::Bottom,
+            xoffs: 0,
+            yoffs: 0,
+            disp_prio: 0,
+            dis: 10,
+        };
+        glyphs.extend(layout_text(&params));
+    }
+
+    glyphs
 }
 
 
@@ -195,7 +269,7 @@ impl LabelRect {
 /// approach used by OpenCPN's `CheckTextRectList`.
 ///
 /// Labels should be ordered by priority (highest priority first) before calling.
-pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>) {
+pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>, camera: &Camera) {
     if glyphs.len() < 2 {
         return;
     }
@@ -221,21 +295,30 @@ pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>) {
     }
 
     // 2. Compute AABB for each label group
-    let rects: Vec<LabelRect> = groups.iter().map(|&(start, count)| {
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-        for g in &glyphs[start..start + count] {
-            let gx = g.position[0] + g.offset_px[0];
-            let gy = g.position[1] + g.offset_px[1];
-            min_x = min_x.min(gx);
-            min_y = min_y.min(gy);
-            max_x = max_x.max(gx + g.size_px[0]);
-            max_y = max_y.max(gy + g.size_px[1]);
-        }
-        LabelRect { min_x, min_y, max_x, max_y }
-    }).collect();
+    let rects: Vec<LabelRect> = groups
+        .iter()
+        .map(|&(start, count)| {
+            let mut min_x = f32::MAX;
+            let mut min_y = f32::MAX;
+            let mut max_x = f32::MIN;
+            let mut max_y = f32::MIN;
+            for g in &glyphs[start..start + count] {
+                let anchor = camera.world_to_screen(g.position[0], g.position[1]);
+                let gx = anchor.x + g.offset_px[0];
+                let gy = anchor.y + g.offset_px[1];
+                min_x = min_x.min(gx);
+                min_y = min_y.min(gy);
+                max_x = max_x.max(gx + g.size_px[0]);
+                max_y = max_y.max(gy + g.size_px[1]);
+            }
+            LabelRect {
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            }
+        })
+        .collect();
 
     // 3. First-come-first-serve: keep labels that don't overlap earlier accepted labels
     let mut accepted_rects: Vec<LabelRect> = Vec::new();
@@ -278,7 +361,7 @@ pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>) {
 ///
 /// Uses text length * average character width instead of computing per-glyph
 /// metrics. Returns (width, height) in pixels.
-fn estimate_label_bounds(params: &TextParams) -> LabelRect {
+fn estimate_label_bounds(params: &TextParams, camera: &Camera) -> LabelRect {
     let char_count = params.text.chars().count() as f32;
     let total_width = char_count * CELL_W * params.scale;
     let char_height = CELL_H * params.scale;
@@ -300,8 +383,9 @@ fn estimate_label_bounds(params: &TextParams) -> LabelRect {
         VJust::Bottom => {}
     }
 
-    let x = params.position[0] + xadjust;
-    let y = params.position[1] + yadjust;
+    let anchor = camera.world_to_screen(params.position[0], params.position[1]);
+    let x = anchor.x + xadjust;
+    let y = anchor.y + yadjust;
 
     LabelRect {
         min_x: x,
@@ -319,18 +403,62 @@ fn estimate_label_bounds(params: &TextParams) -> LabelRect {
 ///
 /// This eliminates ~80% of `layout_text()` calls since most labels are rejected
 /// by AABB overlap.
-pub fn declutter_and_layout_labels(candidates: &[TextParams]) -> Vec<LabelGlyphInstance> {
+pub fn declutter_and_layout_labels(
+    candidates: &[TextParams],
+    camera: &Camera,
+) -> Vec<LabelGlyphInstance> {
+    declutter_and_layout_labels_ex(candidates, camera, false)
+}
+
+/// Declutter variant with the ShowImportantTextOnly filter.
+///
+/// Mirrors OpenCPN's `m_bShowS57ImportantTextOnly` (s52plib.cpp:2408-2411):
+/// when true, drop every candidate whose text display-group (dis) is >= 20.
+/// That cuts the overview label stampede (LNDRGN place names at dis=26 etc.)
+/// without affecting navigationally-important text (lights at dis=11 etc.).
+pub fn declutter_and_layout_labels_ex(
+    candidates: &[TextParams],
+    camera: &Camera,
+    important_text_only: bool,
+) -> Vec<LabelGlyphInstance> {
     if candidates.is_empty() {
         return Vec::new();
     }
 
-    // Phase 1: Cheap AABB pre-check using estimated bounds
-    let estimated_rects: Vec<LabelRect> = candidates.iter()
-        .map(|p| estimate_label_bounds(p))
+    // Optional pre-filter: drop low-importance labels outright so they don't
+    // consume layout cycles or collide with important ones during declutter.
+    let filtered: Vec<usize> = if important_text_only {
+        (0..candidates.len())
+            .filter(|&i| candidates[i].dis < 20)
+            .collect()
+    } else {
+        (0..candidates.len()).collect()
+    };
+    if filtered.is_empty() {
+        return Vec::new();
+    }
+
+    // Sort by importance so label-collision losers are the least critical.
+    //   1. Higher S-52 feature priority (disp_prio) wins first.
+    //   2. Within the same priority, lower text-display-group (dis) wins — OpenCPN
+    //      treats dis=11 ("navigationally important") as outranking dis=26
+    //      ("place name, low importance"). See s52plib.cpp:2408-2411.
+    let mut sorted_indices: Vec<usize> = filtered;
+    sorted_indices.sort_by(|&a, &b| {
+        candidates[b]
+            .disp_prio
+            .cmp(&candidates[a].disp_prio)
+            .then_with(|| candidates[a].dis.cmp(&candidates[b].dis))
+    });
+
+    // Phase 1: Cheap AABB pre-check using estimated bounds (in priority order)
+    let estimated_rects: Vec<LabelRect> = sorted_indices
+        .iter()
+        .map(|&i| estimate_label_bounds(&candidates[i], camera))
         .collect();
 
     let mut accepted_rects: Vec<LabelRect> = Vec::new();
-    let mut keep = vec![false; candidates.len()];
+    let mut keep = vec![false; sorted_indices.len()];
 
     for (i, rect) in estimated_rects.iter().enumerate() {
         let overlaps = accepted_rects.iter().any(|r| r.intersects(rect));
@@ -348,11 +476,11 @@ pub fn declutter_and_layout_labels(candidates: &[TextParams]) -> Vec<LabelGlyphI
         (1.0 - accepted_count as f64 / candidates.len() as f64) * 100.0
     );
 
-    // Phase 2: Full layout only for accepted labels
+    // Phase 2: Full layout only for accepted labels (map back to original indices)
     let mut glyphs = Vec::new();
-    for (i, params) in candidates.iter().enumerate() {
+    for (i, &orig_idx) in sorted_indices.iter().enumerate() {
         if keep[i] {
-            glyphs.extend(layout_text(params));
+            glyphs.extend(layout_text(&candidates[orig_idx]));
         }
     }
 
@@ -363,7 +491,7 @@ pub fn declutter_and_layout_labels(candidates: &[TextParams]) -> Vec<LabelGlyphI
 ///
 /// Shallow soundings (lower depth) have higher priority per S-52.
 /// Each sounding's AABB is estimated from its digit count.
-pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>) {
+pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>, camera: &Camera) {
     if soundings.len() < 2 {
         return;
     }
@@ -372,18 +500,22 @@ pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>) {
     soundings.sort_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap_or(std::cmp::Ordering::Equal));
 
     // Estimate AABB for each sounding (digit_count * cell_width, cell_height)
-    let sounding_rects: Vec<LabelRect> = soundings.iter().map(|s| {
-        let digit_count = ((s.flags >> 5) & 0x7) as f32;
-        let has_decimal = (s.flags & 0x10) != 0;
-        let width = (digit_count + if has_decimal { 1.5 } else { 0.0 }) * CELL_W;
-        let height = CELL_H;
-        LabelRect {
-            min_x: s.position[0],
-            min_y: s.position[1] - height,
-            max_x: s.position[0] + width,
-            max_y: s.position[1],
-        }
-    }).collect();
+    let sounding_rects: Vec<LabelRect> = soundings
+        .iter()
+        .map(|s| {
+            let digit_count = ((s.flags >> 5) & 0x7) as f32;
+            let has_decimal = (s.flags & 0x10) != 0;
+            let width = (digit_count + if has_decimal { 1.5 } else { 0.0 }) * CELL_W * s.scale;
+            let height = CELL_H * s.scale;
+            let anchor = camera.world_to_screen(s.position[0], s.position[1]);
+            LabelRect {
+                min_x: anchor.x,
+                min_y: anchor.y - height,
+                max_x: anchor.x + width,
+                max_y: anchor.y,
+            }
+        })
+        .collect();
 
     let mut accepted_rects: Vec<LabelRect> = Vec::new();
     let mut keep = vec![false; soundings.len()];
@@ -410,6 +542,7 @@ pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::Camera;
 
     #[test]
     fn test_layout_empty() {
@@ -427,11 +560,14 @@ mod tests {
             position: [100.0, 200.0],
             text: "A".to_string(),
             color: [1.0, 0.0, 0.0, 1.0],
+            color_index: 0,
             scale: 1.0,
             hjust: HJust::Left,
             vjust: VJust::Bottom,
             xoffs: 0,
             yoffs: 0,
+            disp_prio: 0,
+            dis: 10,
         };
         let glyphs = layout_text(&params);
         assert_eq!(glyphs.len(), 1);
@@ -446,11 +582,14 @@ mod tests {
             position: [0.0, 0.0],
             text: "AB".to_string(),
             color: [0.0, 0.0, 0.0, 1.0],
+            color_index: 0,
             scale: 1.0,
             hjust: HJust::Center,
             vjust: VJust::Bottom,
             xoffs: 0,
             yoffs: 0,
+            disp_prio: 0,
+            dis: 10,
         };
         let glyphs = layout_text(&params);
         assert_eq!(glyphs.len(), 2);
@@ -466,11 +605,14 @@ mod tests {
             position: [0.0, 0.0],
             text: "X".to_string(),
             color: [0.0, 0.0, 0.0, 1.0],
+            color_index: 0,
             scale: 1.0,
             hjust: HJust::Left,
             vjust: VJust::Bottom,
             xoffs: 2, // 2 char widths right
             yoffs: 0,
+            disp_prio: 0,
+            dis: 10,
         };
         let glyphs = layout_text(&params);
         assert_eq!(glyphs[0].offset_px[0], 16.0); // 2 * 8 = 16
@@ -493,11 +635,14 @@ mod tests {
             position: [0.0, 0.0],
             text: "AB".to_string(),
             color: [0.0, 0.0, 0.0, 1.0],
+            color_index: 0,
             scale: 2.0,
             hjust: HJust::Left,
             vjust: VJust::Bottom,
             xoffs: 0,
             yoffs: 0,
+            disp_prio: 0,
+            dis: 10,
         };
         let glyphs = layout_text(&params);
         assert_eq!(glyphs.len(), 2);
@@ -505,5 +650,49 @@ mod tests {
         assert_eq!(glyphs[0].size_px, [16.0, 16.0]); // 8 * 2
         // Scaled advance
         assert_eq!(glyphs[1].offset_px[0], 16.0); // 8 * 2
+    }
+
+    #[test]
+    fn test_declutter_labels_uses_projected_screen_space() {
+        let camera = Camera::new(0.0, 0.0, 1000.0, 800.0, 600.0);
+        let labels = vec![
+            TextParams {
+                position: [0.0, 0.0],
+                text: "A".to_string(),
+                ..Default::default()
+            },
+            TextParams {
+                position: [100.0, 0.0],
+                text: "B".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let glyphs = declutter_and_layout_labels(&labels, &camera);
+        assert_eq!(glyphs.len(), 1);
+    }
+
+    #[test]
+    fn test_declutter_soundings_uses_projected_screen_space() {
+        let camera = Camera::new(0.0, 0.0, 1000.0, 800.0, 600.0);
+        let mut soundings = vec![
+            super::super::text::SoundingInstance {
+                position: [0.0, 0.0],
+                depth: 5.0,
+                flags: 1 << 5,
+                scale: 1.0,
+                color_index: 0,
+            },
+            super::super::text::SoundingInstance {
+                position: [100.0, 0.0],
+                depth: 6.0,
+                flags: 1 << 5,
+                scale: 1.0,
+                color_index: 0,
+            },
+        ];
+
+        declutter_soundings(&mut soundings, &camera);
+        assert_eq!(soundings.len(), 1);
     }
 }

@@ -113,6 +113,14 @@ impl ChartInfo {
     pub fn intersects(&self, tile: &TileBounds) -> bool {
         self.extent_mercator.intersects(tile)
     }
+
+    /// Check whether this chart extent contains a Mercator point.
+    pub fn contains_point(&self, x: f64, y: f64) -> bool {
+        x >= self.extent_mercator.min_x
+            && x <= self.extent_mercator.max_x
+            && y >= self.extent_mercator.min_y
+            && y <= self.extent_mercator.max_y
+    }
 }
 
 /// Collection of chart metadata with spatial query support
@@ -262,14 +270,54 @@ impl ChartCatalog {
         })
     }
 
-    /// Get charts intersecting a tile, sorted by scale (small scale first = background)
+    /// Get charts relevant to a tile, sorted by scale (small scale first = background).
     ///
-    /// Returns references to ChartInfo for charts that overlap the tile bounds.
+    /// This performs a lightweight quilt selection pass instead of returning every
+    /// intersecting chart bbox. More-detailed charts are selected first; lower-scale
+    /// charts are only retained if they still contribute uncovered sample points
+    /// within the tile.
     pub fn charts_for_tile(&self, tile: &TileBounds) -> Vec<&ChartInfo> {
-        self.charts
-            .iter()
-            .filter(|c| c.intersects(tile))
-            .collect()
+        const SAMPLE_GRID: usize = 5;
+
+        let intersecting: Vec<&ChartInfo> = self.charts.iter().filter(|c| c.intersects(tile)).collect();
+        if intersecting.len() <= 1 {
+            return intersecting;
+        }
+
+        let mut sample_points = Vec::with_capacity(SAMPLE_GRID * SAMPLE_GRID);
+        let width = tile.max_x - tile.min_x;
+        let height = tile.max_y - tile.min_y;
+        for y in 0..SAMPLE_GRID {
+            for x in 0..SAMPLE_GRID {
+                let fx = (x as f64 + 0.5) / SAMPLE_GRID as f64;
+                let fy = (y as f64 + 0.5) / SAMPLE_GRID as f64;
+                sample_points.push((tile.min_x + width * fx, tile.min_y + height * fy));
+            }
+        }
+
+        let mut covered = vec![false; sample_points.len()];
+        let mut selected = Vec::new();
+
+        // Iterate most-detailed to least-detailed for quilt selection.
+        for chart in intersecting.iter().rev() {
+            let mut contributes = false;
+            for (idx, (x, y)) in sample_points.iter().copied().enumerate() {
+                if !covered[idx] && chart.contains_point(x, y) {
+                    covered[idx] = true;
+                    contributes = true;
+                }
+            }
+            if contributes || selected.is_empty() {
+                selected.push(*chart);
+            }
+            if covered.iter().all(|c| *c) {
+                break;
+            }
+        }
+
+        // Restore background->detail order expected by the renderer.
+        selected.sort_by(|a, b| b.native_scale.cmp(&a.native_scale));
+        selected
     }
 
     /// Number of charts in catalog
@@ -351,5 +399,47 @@ mod tests {
         // Non-overlapping tile
         let distant = TileBounds::new(5000.0, 6000.0, 5000.0, 6000.0);
         assert!(!info.intersects(&distant));
+    }
+
+    #[test]
+    fn charts_for_tile_prefers_more_detailed_coverage() {
+        let tile = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        let mut catalog = ChartCatalog::new();
+        catalog.charts = vec![
+            ChartInfo {
+                id: 1,
+                path: PathBuf::from("background.oesu"),
+                name: "BG".to_string(),
+                native_scale: 90000,
+                extent_wgs84: CellExtent {
+                    min_lat: 0.0,
+                    max_lat: 1.0,
+                    min_lon: 0.0,
+                    max_lon: 1.0,
+                },
+                extent_mercator: tile,
+                ref_lat: 0.5,
+                ref_lon: 0.5,
+            },
+            ChartInfo {
+                id: 2,
+                path: PathBuf::from("detail.oesu"),
+                name: "DETAIL".to_string(),
+                native_scale: 4000,
+                extent_wgs84: CellExtent {
+                    min_lat: 0.0,
+                    max_lat: 1.0,
+                    min_lon: 0.0,
+                    max_lon: 1.0,
+                },
+                extent_mercator: tile,
+                ref_lat: 0.5,
+                ref_lon: 0.5,
+            },
+        ];
+
+        let selected = catalog.charts_for_tile(&tile);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "DETAIL");
     }
 }

@@ -55,12 +55,15 @@ pub struct LineBatchKey {
     pub style: LineStyleKey,
     /// Lookup ID for debugging (0 if unknown)
     pub lookup_id: u32,
+    /// Whether this batch comes from a background chart (covered by a more-detailed chart).
+    /// Background batches are drawn with stencil test (pass when stencil==0).
+    pub is_background: bool,
 }
 
 impl LineBatchKey {
     /// Create a new batch key with full metadata
-    pub fn new_with_priority(disp_prio: u8, pass: u8, style: LineStyleKey, lookup_id: u32) -> Self {
-        Self { disp_prio, pass, style, lookup_id }
+    pub fn new_with_priority(disp_prio: u8, pass: u8, style: LineStyleKey, lookup_id: u32, is_background: bool) -> Self {
+        Self { disp_prio, pass, style, lookup_id, is_background }
     }
 
     /// Create a new batch key with default priority (for backward compatibility)
@@ -70,6 +73,7 @@ impl LineBatchKey {
             pass,
             style,
             lookup_id: 0,
+            is_background: false,
         }
     }
 
@@ -84,6 +88,8 @@ impl Ord for LineBatchKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.disp_prio
             .cmp(&other.disp_prio)
+            // Background before foreground at same priority (bg drawn first, then fg on top)
+            .then(self.is_background.cmp(&other.is_background).reverse())
             .then(self.pass.cmp(&other.pass))
             .then(self.style.cmp(&other.style))
             .then(self.lookup_id.cmp(&other.lookup_id))

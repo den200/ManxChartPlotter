@@ -26,6 +26,8 @@ struct InstanceInput {
     @location(0) position: vec2<f32>,  // World position (SM meters)
     @location(1) symbol_id: u32,       // Index into symbol_meta
     @location(2) rotation: f32,        // Rotation in radians
+    @location(3) disp_prio: u32,       // Display priority for depth sorting
+    @location(4) scale: f32,           // Scale factor for Soft SCAMIN
 }
 
 struct VertexOutput {
@@ -73,8 +75,8 @@ fn vs_main(
     // Offset from pivot (pivot is normalized [0,1] within symbol)
     let offset = corner - pivot;
 
-    // Symbol size - use atlas native size scaled by SYMBOL_SCALE
-    let scaled_size = size_px * SYMBOL_SCALE;
+    // Symbol size - use atlas native size scaled by SYMBOL_SCALE and instance soft SCAMIN scale
+    let scaled_size = size_px * SYMBOL_SCALE * instance.scale;
     let pixel_offset = offset * scaled_size;
 
     // Apply rotation
@@ -94,6 +96,7 @@ fn vs_main(
     let ndc_offset = rotated_offset / camera.view_size * 2.0;
     clip_pos.x += ndc_offset.x * clip_pos.w;
     clip_pos.y += ndc_offset.y * clip_pos.w;
+    clip_pos.z = 1.0 - (f32(instance.disp_prio) / 10.0);
 
     out.clip_position = clip_pos;
     out.tex_coord = uv;

@@ -3,8 +3,8 @@
 //! Matches OpenCPN symbol selection for flare vs all-round lights.
 //! Sector arcs and light-sector text are not rendered here.
 
-use crate::senc::Feature;
 use crate::s52::MarinerSettings;
+use crate::senc::Feature;
 
 /// Light symbol types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,7 +231,10 @@ pub fn light_sector_info(feature: &Feature) -> Option<LightSectorInfo> {
         20.0
     };
 
-    let sector_radius_mm = 25.0;
+    // OpenCPN emits 25mm sector legs, but that produces very cluttered results
+    // in our current label/line pipeline for dense bridge light clusters.
+    // Keep the same arc radius logic, but shorten the leg extent slightly.
+    let sector_radius_mm = (arc_radius_mm + 4.0_f64).min(22.0_f64);
 
     let mut colors = parse_color_list(feature.attribute_str("COLOUR"));
     if colors.is_empty() {
@@ -274,7 +277,11 @@ pub fn light_render_info(feature: &Feature, settings: &MarinerSettings) -> Light
             // ORIENT = direction FROM which light is visible (from seaward)
             // Rotation = direction light is POINTING (toward seaward)
             let rotation = orient_deg + 180.0;
-            let rotation = if rotation >= 360.0 { rotation - 360.0 } else { rotation };
+            let rotation = if rotation >= 360.0 {
+                rotation - 360.0
+            } else {
+                rotation
+            };
             return LightRenderInfo {
                 symbol_name: lights06_symbol(feature, settings),
                 rotation_deg: Some(rotation),
@@ -352,10 +359,10 @@ fn litchr_info(litchr: i32) -> Option<LitchrInfo> {
 /// From S-57 spec: 1=W, 3=R, 4=G, 6=Y, etc.
 fn colour_to_letter(colour: u8) -> Option<char> {
     match colour {
-        1 => Some('W'),  // White
-        3 => Some('R'),  // Red
-        4 => Some('G'),  // Green
-        6 => Some('Y'),  // Yellow
+        1 => Some('W'), // White
+        3 => Some('R'), // Red
+        4 => Some('G'), // Green
+        6 => Some('Y'), // Yellow
         _ => None,
     }
 }
@@ -468,7 +475,7 @@ pub fn litdsn01(feature: &Feature) -> Option<String> {
 
     // Phase 6: VALNMR (Nominal Range) - only for non-sectored lights
     if !is_sectored {
-            if let Some(valnmr) = feature.attribute_float("VALNMR") {
+        if let Some(valnmr) = feature.attribute_float("VALNMR") {
             if valnmr > 0.0 {
                 result.push(' ');
                 result.push_str(&format!("{:.0}Nm", valnmr));
@@ -504,7 +511,10 @@ mod tests {
             attributes.insert("VALNMR".to_string(), AttributeValue::Float(v));
         }
         if let Some(cat) = catlit {
-            attributes.insert("CATLIT".to_string(), AttributeValue::String(cat.to_string()));
+            attributes.insert(
+                "CATLIT".to_string(),
+                AttributeValue::String(cat.to_string()),
+            );
         }
         Feature {
             type_code: 0,
@@ -561,7 +571,10 @@ mod tests {
     #[test]
     fn test_sector_sweep_too_small_uses_all_round() {
         let mut feature = make_sector_light(10.0, 10.2);
-        feature.attributes.insert("COLOUR".to_string(), AttributeValue::String("3".to_string()));
+        feature.attributes.insert(
+            "COLOUR".to_string(),
+            AttributeValue::String("3".to_string()),
+        );
         let settings = MarinerSettings::default();
         assert_eq!(lights06(&feature, &settings), LightSymbol::RedAllRound);
         assert!(light_sector_info(&feature).is_none());
@@ -570,7 +583,10 @@ mod tests {
     #[test]
     fn test_sector_sweep_full_circle_uses_all_round() {
         let mut feature = make_sector_light(10.0, 370.0);
-        feature.attributes.insert("COLOUR".to_string(), AttributeValue::String("4".to_string()));
+        feature.attributes.insert(
+            "COLOUR".to_string(),
+            AttributeValue::String("4".to_string()),
+        );
         let settings = MarinerSettings::default();
         assert_eq!(lights06(&feature, &settings), LightSymbol::GreenAllRound);
         assert!(light_sector_info(&feature).is_none());
@@ -580,8 +596,14 @@ mod tests {
     // LITDSN01 Tests
     // ============================================================
 
-    fn make_full_light(litchr: Option<i32>, siggrp: Option<&str>, colour: Option<&str>,
-                       sigper: Option<f64>, height: Option<f64>, valnmr: Option<f64>) -> Feature {
+    fn make_full_light(
+        litchr: Option<i32>,
+        siggrp: Option<&str>,
+        colour: Option<&str>,
+        sigper: Option<f64>,
+        height: Option<f64>,
+        valnmr: Option<f64>,
+    ) -> Feature {
         let mut attributes = HashMap::new();
         if let Some(v) = litchr {
             attributes.insert("LITCHR".to_string(), AttributeValue::Integer(v));
@@ -617,12 +639,12 @@ mod tests {
     fn test_litdsn01_basic() {
         // Fl(3)G 10s 15m 10M
         let feature = make_full_light(
-            Some(2),        // LITCHR = Flashing
-            Some("(3)"),    // SIGGRP
-            Some("4"),      // COLOUR = Green
-            Some(10.0),     // SIGPER
-            Some(15.0),     // HEIGHT
-            Some(10.0),     // VALNMR
+            Some(2),     // LITCHR = Flashing
+            Some("(3)"), // SIGGRP
+            Some("4"),   // COLOUR = Green
+            Some(10.0),  // SIGPER
+            Some(15.0),  // HEIGHT
+            Some(10.0),  // VALNMR
         );
         let desc = litdsn01(&feature).unwrap();
         assert_eq!(desc, "Fl(3) G 10s 15m 10Nm");
@@ -632,11 +654,12 @@ mod tests {
     fn test_litdsn01_skip_siggrp_one() {
         // Single flash - "(1)" should be omitted
         let feature = make_full_light(
-            Some(2),        // LITCHR = Flashing
-            Some("(1)"),    // SIGGRP - should be skipped
-            Some("1"),      // COLOUR = White
-            Some(5.0),      // SIGPER
-            None, None,
+            Some(2),     // LITCHR = Flashing
+            Some("(1)"), // SIGGRP - should be skipped
+            Some("1"),   // COLOUR = White
+            Some(5.0),   // SIGPER
+            None,
+            None,
         );
         let desc = litdsn01(&feature).unwrap();
         assert_eq!(desc, "Fl W 5s");
@@ -645,11 +668,12 @@ mod tests {
     #[test]
     fn test_litdsn01_decimal_period() {
         let feature = make_full_light(
-            Some(7),        // LITCHR = Isophased
+            Some(7), // LITCHR = Isophased
             None,
-            Some("3"),      // COLOUR = Red
-            Some(4.5),      // SIGPER - decimal
-            None, None,
+            Some("3"), // COLOUR = Red
+            Some(4.5), // SIGPER - decimal
+            None,
+            None,
         );
         let desc = litdsn01(&feature).unwrap();
         assert_eq!(desc, "Iso R 4.5s");
@@ -659,15 +683,19 @@ mod tests {
     fn test_litdsn01_sector_skips_colour_and_range() {
         // Sectored light - should skip COLOUR and VALNMR
         let mut feature = make_full_light(
-            Some(2),        // LITCHR = Flashing
+            Some(2), // LITCHR = Flashing
             None,
-            Some("4"),      // COLOUR = Green (should be skipped)
-            Some(10.0),     // SIGPER
-            Some(20.0),     // HEIGHT
-            Some(15.0),     // VALNMR (should be skipped)
+            Some("4"),  // COLOUR = Green (should be skipped)
+            Some(10.0), // SIGPER
+            Some(20.0), // HEIGHT
+            Some(15.0), // VALNMR (should be skipped)
         );
-        feature.attributes.insert("SECTR1".to_string(), AttributeValue::Float(90.0));
-        feature.attributes.insert("SECTR2".to_string(), AttributeValue::Float(180.0));
+        feature
+            .attributes
+            .insert("SECTR1".to_string(), AttributeValue::Float(90.0));
+        feature
+            .attributes
+            .insert("SECTR2".to_string(), AttributeValue::Float(180.0));
 
         let desc = litdsn01(&feature).unwrap();
         assert_eq!(desc, "Fl 10s 20m"); // No G, no 15Nm
@@ -683,11 +711,12 @@ mod tests {
     #[test]
     fn test_litdsn01_morse() {
         let feature = make_full_light(
-            Some(12),       // LITCHR = Morse
-            Some("(A)"),    // SIGGRP
-            Some("1"),      // COLOUR = White
-            Some(30.0),     // SIGPER
-            None, None,
+            Some(12),    // LITCHR = Morse
+            Some("(A)"), // SIGGRP
+            Some("1"),   // COLOUR = White
+            Some(30.0),  // SIGPER
+            None,
+            None,
         );
         let desc = litdsn01(&feature).unwrap();
         assert_eq!(desc, "Mo(A) W 30s");

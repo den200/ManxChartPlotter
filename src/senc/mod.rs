@@ -12,7 +12,7 @@ mod catalog;
 pub mod symbol_lookup;
 
 pub use reader::{SencReader, SencError};
-pub use records::{RecordType, SencHeader, CellExtent, ObjectClass};
+pub use records::{RecordType, SencHeader, CellExtent, ObjectClass, s57_code_to_acronym};
 pub use geometry::{TriPrim, TriPrimType, AreaGeometry, LineGeometry, EdgeRef, EdgeTable, BBox, BBoxTileRelation};
 pub use features::{AttributeValue, Feature, FeatureType, ChartData};
 pub use catalog::{ChartCatalog, ChartInfo, CatalogError};

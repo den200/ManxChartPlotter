@@ -2,25 +2,27 @@
 //!
 //! Maps S-57 object classes and attributes to SymbolId for rendering.
 
-use crate::render::symbols::{SymbolId, SymbolInstance, symbol_id_from_s52_name, symbol_name_from_id};
-use crate::senc::features::{Feature, FeatureType, AttributeValue};
+use crate::render::symbols::{
+    symbol_id_from_s52_name, symbol_name_from_id, SymbolId, SymbolInstance,
+};
 use crate::s52::cs::lights06_symbol;
 use crate::s52::MarinerSettings;
+use crate::senc::features::{AttributeValue, Feature, FeatureType};
 
 /// S-57 object class codes for symbol features
 /// (From IHO S-57 spec, matching records.rs ObjectClass::from_code)
 pub mod s57_classes {
-    pub const BCNCAR: u16 = 5;   // Cardinal beacon
-    pub const BCNISD: u16 = 6;   // Isolated danger beacon
-    pub const BCNLAT: u16 = 7;   // Lateral beacon
-    pub const BCNSAW: u16 = 8;   // Safe water beacon
-    pub const BCNSPP: u16 = 9;   // Special purpose beacon
-    pub const BOYCAR: u16 = 14;  // Cardinal buoy
-    pub const BOYISD: u16 = 16;  // Isolated danger buoy
-    pub const BOYLAT: u16 = 17;  // Lateral buoy
-    pub const BOYSAW: u16 = 18;  // Safe water buoy
-    pub const BOYSPP: u16 = 19;  // Special purpose buoy
-    pub const LIGHTS: u16 = 75;  // Light
+    pub const BCNCAR: u16 = 5; // Cardinal beacon
+    pub const BCNISD: u16 = 6; // Isolated danger beacon
+    pub const BCNLAT: u16 = 7; // Lateral beacon
+    pub const BCNSAW: u16 = 8; // Safe water beacon
+    pub const BCNSPP: u16 = 9; // Special purpose beacon
+    pub const BOYCAR: u16 = 14; // Cardinal buoy
+    pub const BOYISD: u16 = 16; // Isolated danger buoy
+    pub const BOYLAT: u16 = 17; // Lateral buoy
+    pub const BOYSAW: u16 = 18; // Safe water buoy
+    pub const BOYSPP: u16 = 19; // Special purpose buoy
+    pub const LIGHTS: u16 = 75; // Light
     pub const UWTROC: u16 = 153; // Underwater rock
     pub const WRECKS: u16 = 159; // Wreck
 }
@@ -48,11 +50,11 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
 
             // Priority: CATLAM > COLOUR (CATLAM is more explicit)
             let is_port = match (catlam, colour) {
-                (1, _) | (3, _) => true,   // CATLAM port or preferred port
-                (2, _) | (4, _) => false,  // CATLAM starboard or preferred starboard
-                (_, 3) => true,            // Red = port (IALA-A)
-                (_, 4) => false,           // Green = starboard (IALA-A)
-                _ => true,                 // Default to port
+                (1, _) | (3, _) => true,  // CATLAM port or preferred port
+                (2, _) | (4, _) => false, // CATLAM starboard or preferred starboard
+                (_, 3) => true,           // Red = port (IALA-A)
+                (_, 4) => false,          // Green = starboard (IALA-A)
+                _ => true,                // Default to port
             };
 
             if is_port {
@@ -68,7 +70,7 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
             let catcam = get_attr_int(feature, "CATCAM").unwrap_or(1);
 
             match catcam {
-                1 => Some(SymbolId::BuoyCarNorth),  // Using buoy symbol for now
+                1 => Some(SymbolId::BuoyCarNorth), // Using buoy symbol for now
                 2 => Some(SymbolId::BuoyCarEast),
                 3 => Some(SymbolId::BuoyCarSouth),
                 4 => Some(SymbolId::BuoyCarWest),
@@ -84,11 +86,11 @@ pub fn lookup_symbol(feature: &Feature) -> Option<SymbolId> {
             let catlam = get_attr_int(feature, "CATLAM").unwrap_or(0);
 
             let is_port = match (catlam, colour) {
-                (1, _) | (3, _) => true,   // CATLAM port or preferred port
-                (2, _) | (4, _) => false,  // CATLAM starboard or preferred starboard
-                (_, 3) => true,            // Red = port (IALA-A)
-                (_, 4) => false,           // Green = starboard (IALA-A)
-                _ => true,                 // Default to port
+                (1, _) | (3, _) => true,  // CATLAM port or preferred port
+                (2, _) | (4, _) => false, // CATLAM starboard or preferred starboard
+                (_, 3) => true,           // Red = port (IALA-A)
+                (_, 4) => false,          // Green = starboard (IALA-A)
+                _ => true,                // Default to port
             };
 
             if is_port {
@@ -160,8 +162,7 @@ pub fn lookup_symbol_dynamic(feature: &Feature, settings: Option<&MarinerSetting
         }
 
         // For other types, fall back to static lookup
-        _ => lookup_symbol(feature)
-            .and_then(|id| symbol_id_from_s52_name(symbol_name_from_id(id))),
+        _ => lookup_symbol(feature).and_then(|id| symbol_id_from_s52_name(symbol_name_from_id(id))),
     }
 }
 
@@ -203,18 +204,29 @@ fn get_symbol_position_sm(feature: &Feature, ref_lat: f64, ref_lon: f64) -> Opti
 }
 
 /// Convert features to symbol instances with coordinate conversion
-pub fn features_to_instances(features: &[Feature], ref_lat: f64, ref_lon: f64) -> Vec<SymbolInstance> {
-    println!("DEBUG: features_to_instances called with ref_lat={}, ref_lon={}", ref_lat, ref_lon);
+pub fn features_to_instances(
+    features: &[Feature],
+    ref_lat: f64,
+    ref_lon: f64,
+) -> Vec<SymbolInstance> {
+    println!(
+        "DEBUG: features_to_instances called with ref_lat={}, ref_lon={}",
+        ref_lat, ref_lon
+    );
 
     // Debug: show ALL point feature type codes to identify what's available
-    let point_features: Vec<_> = features.iter()
+    let point_features: Vec<_> = features
+        .iter()
         .filter(|f| f.feature_type == FeatureType::Point)
         .collect();
     println!("DEBUG: Point features type codes:");
     for f in &point_features {
         println!("  type_code={} (symbols: BCNCAR=5, BCNLAT=7, BCNSPP=9, BOYCAR=14, BOYLAT=17, UWTROC=153)", f.type_code);
     }
-    println!("DEBUG: Total {} point features, checking for matching symbols...", point_features.len());
+    println!(
+        "DEBUG: Total {} point features, checking for matching symbols...",
+        point_features.len()
+    );
 
     let instances: Vec<SymbolInstance> = features
         .iter()
@@ -238,6 +250,8 @@ pub fn features_to_instances(features: &[Feature], ref_lat: f64, ref_lon: f64) -
                 position,
                 symbol_id: symbol_id as u32,
                 rotation: 0.0,
+                disp_prio: 8,
+                scale: 1.0,
             })
         })
         .collect();
@@ -256,25 +270,37 @@ pub fn features_to_instances(features: &[Feature], ref_lat: f64, ref_lon: f64) -
 
     for inst in &instances {
         match inst.symbol_id {
-            0 => port_count += 1,           // BuoyLatPort
-            1 => starboard_count += 1,      // BuoyLatStarboard
-            2 => beacon_port += 1,          // BeaconLatPort
-            3 => beacon_starboard += 1,     // BeaconLatStarboard
-            4 => rock_awash += 1,           // RockAwash
-            5 => rock_submerged += 1,       // RockSubmerged
-            6 => car_north += 1,            // BuoyCarNorth
-            7 => car_east += 1,             // BuoyCarEast
-            8 => car_south += 1,            // BuoyCarSouth
-            9 => car_west += 1,             // BuoyCarWest
+            0 => port_count += 1,       // BuoyLatPort
+            1 => starboard_count += 1,  // BuoyLatStarboard
+            2 => beacon_port += 1,      // BeaconLatPort
+            3 => beacon_starboard += 1, // BeaconLatStarboard
+            4 => rock_awash += 1,       // RockAwash
+            5 => rock_submerged += 1,   // RockSubmerged
+            6 => car_north += 1,        // BuoyCarNorth
+            7 => car_east += 1,         // BuoyCarEast
+            8 => car_south += 1,        // BuoyCarSouth
+            9 => car_west += 1,         // BuoyCarWest
             _ => {}
         }
     }
 
     println!("DEBUG: Symbol breakdown:");
-    println!("  Lateral Buoys - Port(red): {}, Starboard(green): {}", port_count, starboard_count);
-    println!("  Cardinal Buoys - N: {}, E: {}, S: {}, W: {}", car_north, car_east, car_south, car_west);
-    println!("  Beacons - Port: {}, Starboard: {}", beacon_port, beacon_starboard);
-    println!("  Rocks - Awash: {}, Submerged: {}", rock_awash, rock_submerged);
+    println!(
+        "  Lateral Buoys - Port(red): {}, Starboard(green): {}",
+        port_count, starboard_count
+    );
+    println!(
+        "  Cardinal Buoys - N: {}, E: {}, S: {}, W: {}",
+        car_north, car_east, car_south, car_west
+    );
+    println!(
+        "  Beacons - Port: {}, Starboard: {}",
+        beacon_port, beacon_starboard
+    );
+    println!(
+        "  Rocks - Awash: {}, Submerged: {}",
+        rock_awash, rock_submerged
+    );
     println!("  Total symbols: {}", instances.len());
 
     instances
@@ -304,7 +330,10 @@ pub const SOUNDG: u16 = 129;
 /// - Safety depth coloring (SNDG1 gray for safe, SNDG2 black for shallow)
 /// - QUASOU/TECSOU/QUAPOS uncertainty indicators
 /// - Drying height handling
-pub fn soundings_to_instances(features: &[Feature], settings: &MarinerSettings) -> Vec<SoundingInstance> {
+pub fn soundings_to_instances(
+    features: &[Feature],
+    settings: &MarinerSettings,
+) -> Vec<SoundingInstance> {
     let mut instances = Vec::new();
 
     for feature in features {
@@ -322,12 +351,13 @@ pub fn soundings_to_instances(features: &[Feature], settings: &MarinerSettings) 
 
                 // Use SNDFRM02 to compute flags based on safety depth and attributes
                 let render_info = sndfrm02(depth as f64, feature, settings);
-                let flags = render_info.to_flags();
 
                 instances.push(SoundingInstance {
                     position: [x, y],
                     depth: render_info.whole_part as f32,
-                    flags,
+                    flags: render_info.to_flags(),
+                    scale: 1.0,
+                    color_index: 0,
                 });
             }
         }

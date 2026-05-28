@@ -102,8 +102,8 @@ pub fn obstrn04(feature: &Feature, settings: &MarinerSettings) -> Obstrn04Result
     } else {
         // Infer depth from WATLEV when VALSOU is missing
         match watlev {
-            5 => Some(0.0),      // Subject to inundation
-            3 => Some(0.01),     // Covers and uncovers
+            5 => Some(0.0),           // Subject to inundation
+            3 => Some(0.01),          // Covers and uncovers
             1 | 2 | 4 => Some(-15.0), // Above water
             _ => {
                 // Check CATOBS for foul ground
@@ -261,7 +261,10 @@ fn obstrn04_area(
 }
 
 /// Generate render instructions for OBSTRN04
-pub fn obstrn04_instructions(feature: &Feature, settings: &MarinerSettings) -> Vec<RenderInstruction> {
+pub fn obstrn04_instructions(
+    feature: &Feature,
+    settings: &MarinerSettings,
+) -> Vec<RenderInstruction> {
     let result = obstrn04(feature, settings);
     let mut instructions = Vec::new();
 
@@ -274,7 +277,7 @@ pub fn obstrn04_instructions(feature: &Feature, settings: &MarinerSettings) -> V
     if result.show_sounding {
         let depth = result.depth_value.unwrap_or(0.0);
         let color = if depth <= 20.0 { "CHBLK" } else { "CHGRD" };
-        
+
         instructions.push(RenderInstruction::Text {
             attribute: "VALSOU".to_string(),
             format: Some("%4.1lf".to_string()),
@@ -283,6 +286,11 @@ pub fn obstrn04_instructions(feature: &Feature, settings: &MarinerSettings) -> V
             xoffs: 1,
             yoffs: 1,
             color: color.to_string(),
+            style: 1,
+            weight: 5,
+            width: 1,
+            bsize: 10,
+            dis: 11,
         });
     }
 
@@ -401,7 +409,7 @@ mod tests {
         let feature = make_obstrn(Some(15.0), Some(3));
         let settings = MarinerSettings::default();
         let instrs = obstrn04_instructions(&feature, &settings);
-        
+
         // Should have Symbol and Text
         assert!(instrs.len() >= 2);
         assert!(matches!(instrs[0], RenderInstruction::Symbol { .. }));

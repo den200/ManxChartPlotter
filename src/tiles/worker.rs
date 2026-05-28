@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -125,6 +126,10 @@ fn worker_loop(
 
         match request {
             TileRequest::Build { tiles, view_params } => {
+                let profile = std::env::var("NAVCORE_PROFILE")
+                    .map(|v| v != "0" && !v.is_empty())
+                    .unwrap_or(false);
+                let batch_start = profile.then(Instant::now);
                 // Build tiles in parallel using rayon.
                 // TileBuilder is Sync because chart_cache and decryptor are Mutex-wrapped.
                 let builder = TileBuilder::with_cache(
@@ -152,6 +157,14 @@ fn worker_loop(
                     let result = builder.build_cpu(tile_id).map_err(|e| e.to_string());
                     TileResponse { tile_id, result }
                 }).collect();
+
+                if let Some(start) = batch_start {
+                    log::info!(
+                        "profile.worker_batch: {} ms tiles={}",
+                        start.elapsed().as_millis(),
+                        results.len()
+                    );
+                }
 
                 for response in results {
                     if response_tx.send(response).is_err() {

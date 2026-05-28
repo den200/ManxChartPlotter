@@ -276,20 +276,33 @@ pub fn stamps_to_polylines(
     symbol: &LineStyleSymbol,
     config: &LcRenderConfig,
 ) -> Vec<Vec<[f32; 2]>> {
+    stamps_to_polylines_by_width(stamps, symbol, config)
+        .into_iter()
+        .flat_map(|(_, polylines)| polylines)
+        .collect()
+}
+
+/// Generates LC stamp polylines grouped by the HPGL `SW` primitive width.
+pub fn stamps_to_polylines_by_width(
+    stamps: &[LcStamp],
+    symbol: &LineStyleSymbol,
+    config: &LcRenderConfig,
+) -> Vec<(u8, Vec<Vec<[f32; 2]>>)> {
     let normalized = symbol.normalized_segments();
     if normalized.is_empty() {
         return vec![];
     }
 
     let (width_px, height_px) = symbol.size_pixels(config.ppmm);
-    let mut polylines = Vec::new();
+    let mut grouped: std::collections::BTreeMap<u8, Vec<Vec<[f32; 2]>>> =
+        std::collections::BTreeMap::new();
 
     for stamp in stamps {
         let cos_a = stamp.angle.cos();
         let sin_a = stamp.angle.sin();
 
         // Transform each segment into a 2-point polyline
-        for (nx0, ny0, nx1, ny1, _width) in &normalized {
+        for (nx0, ny0, nx1, ny1, width) in &normalized {
             // Scale to pixels, then to meters
             let sx0 = *nx0 * width_px * config.meters_per_pixel;
             let sy0 = *ny0 * height_px * config.meters_per_pixel;
@@ -308,11 +321,14 @@ pub fn stamps_to_polylines(
             let x1 = stamp.position[0] + rx1;
             let y1 = stamp.position[1] + ry1;
 
-            polylines.push(vec![[x0, y0], [x1, y1]]);
+            grouped
+                .entry((*width).max(1))
+                .or_default()
+                .push(vec![[x0, y0], [x1, y1]]);
         }
     }
 
-    polylines
+    grouped.into_iter().collect()
 }
 
 /// Generates line vertices from LC stamps using the existing line building pipeline.

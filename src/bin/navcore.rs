@@ -24,7 +24,7 @@ use winit::{
 use navcore2::{CachedDecryptor, ChartDecryptor, KeyStore};
 use navcore2::render::RenderState;
 use navcore2::s52::S52Engine;
-use navcore2::senc::{ChartData, ChartCatalog};
+use navcore2::senc::{ChartData, ChartCatalog, s57_code_to_acronym};
 use navcore2::tiles::{TileId, visible_tiles, zoom_from_camera, TileBounds};
 use navcore2::tiles::builder::TileBuilder;
 
@@ -63,6 +63,34 @@ fn main() {
     // Headless tile debug mode (no WGPU, no window)
     if args.len() >= 3 && args[1] == "--tile-debug" {
         tile_debug_mode(&args[2]);
+        return;
+    }
+
+    // Inspect one detailed-chart center tile and report masked/leaking features
+    if args.len() >= 4 && args[1] == "--inspect-tile" {
+        let zoom = args.get(4).and_then(|z| z.parse::<u8>().ok()).unwrap_or(15);
+        inspect_tile_mode(&args[2], &args[3], zoom);
+        return;
+    }
+
+    // Inspect a tile directly from lat/lon coordinates
+    if args.len() >= 5 && args[1] == "--inspect-latlon" {
+        let lat = match args[3].parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Invalid latitude: {}", args[3]);
+                return;
+            }
+        };
+        let lon = match args[4].parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Invalid longitude: {}", args[4]);
+                return;
+            }
+        };
+        let zoom = args.get(5).and_then(|z| z.parse::<u8>().ok()).unwrap_or(15);
+        inspect_latlon_mode(&args[2], lat, lon, zoom);
         return;
     }
 
@@ -367,6 +395,181 @@ fn tile_debug_mode(dir_path: &str) {
     }
 }
 
+fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
+    let dir = PathBuf::from(dir_path);
+    if !dir.is_dir() {
+        eprintln!("Error: {} is not a directory", dir_path);
+        return;
+    }
+
+    let mut keys = KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(&dir) {
+        eprintln!("Warning: Could not load keys: {}", e);
+    }
+
+    let base_decryptor = match ChartDecryptor::new("license") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to create decryptor: {}", e);
+            return;
+        }
+    };
+    let mut decryptor = CachedDecryptor::new(base_decryptor);
+
+    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build catalog: {}", e);
+            return;
+        }
+    };
+
+    let Some(info) = catalog
+        .charts
+        .iter()
+        .find(|c| c.name == chart_stem || c.path.file_stem().and_then(|s| s.to_str()) == Some(chart_stem))
+    else {
+        eprintln!("Chart '{}' not found in catalog", chart_stem);
+        return;
+    };
+
+    let center_lat = info.extent_wgs84.center_lat();
+    let center_lon = info.extent_wgs84.center_lon();
+    let (mx, my) = navcore2::tiles::latlon_to_mercator(center_lat, center_lon);
+    let tile_id = TileId::from_mercator(mx, my, z);
+
+    let chart_cache: Mutex<HashMap<u64, Arc<ChartData>>> = Mutex::new(HashMap::new());
+    let decryptor = Mutex::new(decryptor);
+
+    let s52_engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            eprintln!("Warning: Could not load S-52 engine: {}", e);
+            None
+        }
+    };
+
+    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache);
+    let builder = if let Some(ref engine) = s52_engine {
+        builder.with_s52_engine(engine)
+    } else {
+        builder
+    };
+
+    println!(
+        "Inspecting chart '{}' at center ({:.5}, {:.5}) -> tile {:?} z={}",
+        chart_stem, center_lat, center_lon, tile_id, z
+    );
+
+    match builder.inspect_tile_coverage(tile_id) {
+        Ok(report) => println!("{}", report),
+        Err(e) => eprintln!("inspect_tile_coverage failed: {}", e),
+    }
+}
+
+fn inspect_latlon_mode(dir_path: &str, lat: f64, lon: f64, z: u8) {
+    let dir = PathBuf::from(dir_path);
+    if !dir.is_dir() {
+        eprintln!("Error: {} is not a directory", dir_path);
+        return;
+    }
+
+    let mut keys = KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(&dir) {
+        eprintln!("Warning: Could not load keys: {}", e);
+    }
+
+    let base_decryptor = match ChartDecryptor::new("license") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to create decryptor: {}", e);
+            return;
+        }
+    };
+    let mut decryptor = CachedDecryptor::new(base_decryptor);
+
+    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build catalog: {}", e);
+            return;
+        }
+    };
+
+    let (mx, my) = navcore2::tiles::latlon_to_mercator(lat, lon);
+    let tile_id = TileId::from_mercator(mx, my, z);
+
+    let chart_cache: Mutex<HashMap<u64, Arc<ChartData>>> = Mutex::new(HashMap::new());
+    let decryptor = Mutex::new(decryptor);
+
+    let s52_engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            eprintln!("Warning: Could not load S-52 engine: {}", e);
+            None
+        }
+    };
+
+    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache);
+    let builder = if let Some(ref engine) = s52_engine {
+        builder.with_s52_engine(engine)
+    } else {
+        builder
+    };
+
+    println!(
+        "Inspecting lat/lon ({:.5}, {:.5}) -> tile {:?} z={}",
+        lat, lon, tile_id, z
+    );
+
+    // List every chart whose extent contains this point, finest scale first.
+    let mut covering: Vec<&navcore2::senc::ChartInfo> = catalog
+        .charts
+        .iter()
+        .filter(|c| c.contains_point(mx, my))
+        .collect();
+    covering.sort_by_key(|c| c.native_scale);
+    println!("Charts whose extent contains the point ({}):", covering.len());
+    for c in covering.iter().take(15) {
+        println!(
+            "  1:{:<8} {:<20} center=({:.4},{:.4})",
+            c.native_scale,
+            c.name,
+            c.extent_wgs84.center_lat(),
+            c.extent_wgs84.center_lon()
+        );
+    }
+
+    match builder.inspect_tile_coverage(tile_id) {
+        Ok(report) => println!("{}", report),
+        Err(e) => eprintln!("inspect_tile_coverage failed: {}", e),
+    }
+
+    // Build the actual GPU packet and report renderable element counts so we can
+    // see whether soundings / symbols / text glyphs are produced at this zoom.
+    match builder.build_cpu(tile_id) {
+        Ok(packet) => {
+            let mut color_hist: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+            for v in &packet.area_vertices {
+                *color_hist.entry(v.color_index).or_insert(0) += 1;
+            }
+            let mut colors: Vec<_> = color_hist.into_iter().collect();
+            colors.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            println!(
+                "PACKET COUNTS @z{}: area_verts={} line_batches={} line_verts={} symbols={} soundings(text_instances)={}",
+                z,
+                packet.area_vertices.len(),
+                packet.line_batches.len(),
+                packet.total_line_vertices(),
+                packet.symbol_instances.len(),
+                packet.text_instances.len(),
+            );
+            println!("  area color_index histogram (index:count): {:?}", colors);
+        }
+        Err(e) => eprintln!("build_cpu failed: {}", e),
+    }
+}
+
 /// Scan all charts in directory and output object class + attribute usage.
 /// This helps prioritize which S-57 object classes to implement in the Rust S-52 engine.
 fn scan_charts_mode(dir_path: &str) {
@@ -454,7 +657,7 @@ fn scan_charts_mode(dir_path: &str) {
 
         // Scan all features
         for feature in &chart.features {
-            let class_name = feature.object_class.acronym().to_string();
+            let class_name = s57_code_to_acronym(feature.type_code).to_string();
 
             // Count
             *class_counts.entry(class_name.clone()).or_insert(0) += 1;

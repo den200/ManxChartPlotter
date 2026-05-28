@@ -6,6 +6,7 @@ struct CameraUniform {
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
+@group(0) @binding(1) var<storage, read> palette: array<vec4<f32>>;
 @group(1) @binding(0) var t_atlas: texture_2d<f32>;
 @group(1) @binding(1) var s_atlas: sampler;
 
@@ -17,12 +18,14 @@ struct InstanceInput {
     @location(4) uv_max: vec2<f32>,
     @location(5) rotation: f32,
     @location(6) color: vec4<f32>,
+    @location(7) color_index: u32,
 }
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) @interpolate(flat) color_index: u32,
 }
 
 @vertex
@@ -59,10 +62,12 @@ fn vs_main(
     let ndc_offset = pixel_offset / camera.view_size * 2.0;
     clip_pos.x += ndc_offset.x * clip_pos.w;
     clip_pos.y += ndc_offset.y * clip_pos.w;
+    clip_pos.z = 0.0; // Draw labels on top of everything
 
     out.clip_position = clip_pos;
     out.uv = mix(instance.uv_min, instance.uv_max, uv_corner);
     out.color = instance.color;
+    out.color_index = instance.color_index;
 
     return out;
 }
@@ -70,8 +75,13 @@ fn vs_main(
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sample = textureSample(t_atlas, s_atlas, in.uv).r;
-    if (sample < 0.1) {
+    // Sharpen the bilinearly-filtered bitmap edges back toward binary ink so
+    // strokes stay visually thick across a wide range of scales. Preserves
+    // antialiased edges but restores the bold black core the user expects.
+    let sharpened = smoothstep(0.30, 0.60, sample);
+    if (sharpened < 0.02) {
         discard;
     }
-    return vec4<f32>(in.color.rgb, in.color.a * sample);
+    let color = palette[in.color_index];
+    return vec4<f32>(color.rgb, color.a * in.color.a * sharpened);
 }

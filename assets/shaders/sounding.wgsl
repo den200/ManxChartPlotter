@@ -10,11 +10,14 @@ struct CameraUniform {
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
+@group(0) @binding(1) var<storage, read> palette: array<vec4<f32>>;
 
 struct InstanceInput {
     @location(0) position: vec2<f32>,  // World position (SM meters)
     @location(1) depth: f32,           // Whole-part depth in display units
     @location(2) flags: u32,           // SNDFRM02 flags
+    @location(3) scale: f32,           // Soft-SCAMIN scale
+    @location(4) color_index: u32,     // SNDG1/SNDG2 palette index
 }
 
 struct VertexOutput {
@@ -22,6 +25,7 @@ struct VertexOutput {
     @location(0) local_uv: vec2<f32>,  // Local UV for digit rendering
     @location(1) depth_value: f32,     // Pass depth to fragment shader
     @location(2) sounding_flags: u32,  // Pass flags to fragment shader
+    @location(3) @interpolate(flat) color_index: u32,
 }
 
 // Flag bit definitions (from SoundingRenderInfo::to_flags)
@@ -31,9 +35,12 @@ const FLAG_UNCERTAINTY: u32 = 4u;     // Bit 2: show question mark
 const FLAG_IS_SWEPT: u32 = 8u;        // Bit 3: swept depth
 const FLAG_HAS_DECIMAL: u32 = 16u;    // Bit 4: decimal digit present
 
-// Sounding text size in screen pixels
-const TEXT_WIDTH: f32 = 40.0;
-const TEXT_HEIGHT: f32 = 14.0;
+// Sounding text size in screen pixels. Matched to openCPN's SOUNDG25 atlas
+// glyph (~6 × 10 px per digit) scaled up ~2× so a 2-digit reading is ~24 × 20 px
+// on screen — close enough in size and weight to pass as the same reference,
+// pending a full atlas-glyph rewrite.
+const TEXT_WIDTH: f32 = 44.0;
+const TEXT_HEIGHT: f32 = 20.0;
 
 @vertex
 fn vs_main(
@@ -57,7 +64,7 @@ fn vs_main(
     }
 
     // Scale to text size
-    let pixel_offset = corner * vec2<f32>(TEXT_WIDTH, TEXT_HEIGHT);
+    let pixel_offset = corner * vec2<f32>(TEXT_WIDTH, TEXT_HEIGHT) * instance.scale;
 
     // Transform world position to clip space
     let world_pos = vec4<f32>(instance.position, 0.0, 1.0);
@@ -67,11 +74,13 @@ fn vs_main(
     let ndc_offset = pixel_offset / camera.view_size * 2.0;
     clip_pos.x += ndc_offset.x * clip_pos.w;
     clip_pos.y += ndc_offset.y * clip_pos.w;
+    clip_pos.z = 0.0; // Draw soundings on top of everything
 
     out.clip_position = clip_pos;
     out.local_uv = uv;
     out.depth_value = instance.depth;
     out.sounding_flags = instance.flags;
+    out.color_index = instance.color_index;
 
     return out;
 }
@@ -94,31 +103,28 @@ fn get_digit_segments(digit: i32) -> u32 {
     }
 }
 
-// Check if a point is inside a segment box
+// Check if a point is inside a segment box. Segments are drawn as thicker slabs
+// so digits read as bold black numerals (closer to openCPN's SOUNDG25 glyphs)
+// rather than the previous hairline 7-segment readout.
 fn in_segment(uv: vec2<f32>, seg_id: u32, char_uv: vec2<f32>) -> bool {
-    // Normalize to [0,1] within character cell
     let x = char_uv.x;
     let y = char_uv.y;
 
-    // Segment dimensions
-    let seg_w = 0.15;
-    let seg_h = 0.08;
-
     switch (seg_id) {
         // Top horizontal
-        case 0u: { return x > 0.15 && x < 0.85 && y < 0.12; }
+        case 0u: { return x > 0.10 && x < 0.90 && y < 0.20; }
         // Top-right vertical
-        case 1u: { return x > 0.8 && y > 0.05 && y < 0.48; }
+        case 1u: { return x > 0.72 && y > 0.06 && y < 0.50; }
         // Bottom-right vertical
-        case 2u: { return x > 0.8 && y > 0.52 && y < 0.95; }
+        case 2u: { return x > 0.72 && y > 0.50 && y < 0.94; }
         // Bottom horizontal
-        case 3u: { return x > 0.15 && x < 0.85 && y > 0.88; }
+        case 3u: { return x > 0.10 && x < 0.90 && y > 0.80; }
         // Bottom-left vertical
-        case 4u: { return x < 0.2 && y > 0.52 && y < 0.95; }
+        case 4u: { return x < 0.28 && y > 0.50 && y < 0.94; }
         // Top-left vertical
-        case 5u: { return x < 0.2 && y > 0.05 && y < 0.48; }
+        case 5u: { return x < 0.28 && y > 0.06 && y < 0.50; }
         // Middle horizontal
-        case 6u: { return x > 0.15 && x < 0.85 && y > 0.46 && y < 0.54; }
+        case 6u: { return x > 0.10 && x < 0.90 && y > 0.40 && y < 0.60; }
         default: { return false; }
     }
 }
@@ -274,16 +280,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // S-52 SNDFRM02 coloring based on safety depth
-    // SNDG2 (black) for shallow/danger soundings (depth <= safety_depth)
-    // SNDG1 (gray) for safe/deep soundings (depth > safety_depth)
-    let is_shallow = (in.sounding_flags & FLAG_IS_SHALLOW) != 0u;
-
-    if (is_shallow) {
-        // SNDG2 - RGB(7, 7, 7) - black for shallow/danger
-        return vec4<f32>(0.027, 0.027, 0.027, 1.0);
-    } else {
-        // SNDG1 - RGB(125, 137, 140) - gray for safe/deep
-        return vec4<f32>(0.490, 0.537, 0.549, 1.0);
-    }
+    return palette[in.color_index];
 }

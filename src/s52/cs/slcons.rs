@@ -86,7 +86,10 @@ pub fn slcons03(feature: &Feature, _settings: &MarinerSettings) -> SlconsResult 
 }
 
 /// Render instructions for SLCONS03.
-pub fn slcons03_instructions(feature: &Feature, settings: &MarinerSettings) -> Vec<RenderInstruction> {
+pub fn slcons03_instructions(
+    feature: &Feature,
+    settings: &MarinerSettings,
+) -> Vec<RenderInstruction> {
     match slcons03(feature, settings) {
         SlconsResult::LineStyle(style) => vec![RenderInstruction::LineStyle {
             pattern: style.pattern(),
@@ -105,7 +108,12 @@ mod tests {
     use crate::senc::{AttributeValue, FeatureType, ObjectClass};
     use std::collections::HashMap;
 
-    fn make_slcons(catslc: Option<i32>, watlev: Option<i32>, condtn: Option<i32>, quapos: Option<i32>) -> Feature {
+    fn make_slcons(
+        catslc: Option<i32>,
+        watlev: Option<i32>,
+        condtn: Option<i32>,
+        quapos: Option<i32>,
+    ) -> Feature {
         let mut attributes = HashMap::new();
         if let Some(v) = catslc {
             attributes.insert("CATSLC".to_string(), AttributeValue::Integer(v));
@@ -136,7 +144,10 @@ mod tests {
         let feature = make_slcons(Some(6), None, None, None);
         let settings = MarinerSettings::default();
         let result = slcons03(&feature, &settings);
-        assert!(matches!(result, SlconsResult::LineStyle(SlconsStyle::MajorStructure)));
+        assert!(matches!(
+            result,
+            SlconsResult::LineStyle(SlconsStyle::MajorStructure)
+        ));
     }
 
     #[test]
@@ -144,7 +155,10 @@ mod tests {
         let feature = make_slcons(None, None, None, None);
         let settings = MarinerSettings::default();
         let result = slcons03(&feature, &settings);
-        assert!(matches!(result, SlconsResult::LineStyle(SlconsStyle::MinorStructure)));
+        assert!(matches!(
+            result,
+            SlconsResult::LineStyle(SlconsStyle::MinorStructure)
+        ));
     }
 
     #[test]
@@ -152,7 +166,10 @@ mod tests {
         let feature = make_slcons(None, Some(3), None, None);
         let settings = MarinerSettings::default();
         let result = slcons03(&feature, &settings);
-        assert!(matches!(result, SlconsResult::LineStyle(SlconsStyle::Submerged)));
+        assert!(matches!(
+            result,
+            SlconsResult::LineStyle(SlconsStyle::Submerged)
+        ));
     }
 
     #[test]

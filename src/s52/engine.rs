@@ -5,11 +5,11 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::senc::{Feature, ObjectClass};
+use crate::senc::{Feature, s57_code_to_acronym};
 
 use super::cs::execute_cs;
 use super::instruction::RenderInstruction;
-use super::lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables};
+use super::lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables, TableName};
 use super::parser::parse_chartsymbols;
 use super::settings::MarinerSettings;
 
@@ -20,6 +20,34 @@ struct CsCacheKey {
     object_class: u16,
     procedure: String,
     attr_hash: u64,
+}
+
+#[derive(Clone, Eq, PartialEq, Hash)]
+struct ResolveCacheKey {
+    object_class: u16,
+    geom_type: GeometryType,
+    attr_hash: u64,
+    settings_hash: u64,
+}
+
+fn settings_hash(settings: &MarinerSettings) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    settings.show_displaybase.hash(&mut hasher);
+    settings.show_standard.hash(&mut hasher);
+    settings.show_other.hash(&mut hasher);
+    settings.show_text.hash(&mut hasher);
+    settings.show_soundings.hash(&mut hasher);
+    settings.safety_depth.to_bits().hash(&mut hasher);
+    settings.safety_contour.to_bits().hash(&mut hasher);
+    settings.shallow_contour.to_bits().hash(&mut hasher);
+    settings.deep_contour.to_bits().hash(&mut hasher);
+    settings.depth_unit.hash(&mut hasher);
+    settings.depth_shade_mode.hash(&mut hasher);
+    settings.symbolized_boundaries.hash(&mut hasher);
+    settings.simplified_points.hash(&mut hasher);
+    settings.show_important_text_only.hash(&mut hasher);
+    settings.show_chart_boundaries.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Compute a fast hash of a feature's integer attribute map.
@@ -45,6 +73,8 @@ pub struct S52Engine {
     /// Cache for CS procedure results: (class, procedure, attr_hash) → instructions.
     /// Uses Mutex instead of RefCell to allow sharing across rayon threads.
     cs_cache: Mutex<HashMap<CsCacheKey, Vec<RenderInstruction>>>,
+    /// Cache for fully resolved portrayal results.
+    resolve_cache: Mutex<HashMap<ResolveCacheKey, Option<ResolvedFeature>>>,
 }
 
 /// Result of resolving a feature through the S-52 lookup + CS pipeline.
@@ -60,6 +90,16 @@ pub struct ResolvedFeature {
 }
 
 impl S52Engine {
+    fn bypass_display_category_filter(type_code: u16) -> bool {
+        // M_CSCL (compilation scale, code 301) is metadata used by SCAMIN and
+        // cross-chart cell selection. It carries no visible portrayal, so
+        // letting it pass the category filter is harmless and keeps the
+        // meta-feature book-keeping live. Do NOT bypass M_COVR (302) or Lake
+        // (69): those are visible features and must honour the user's display
+        // category setting the same way OpenCPN does.
+        matches!(type_code, 301)
+    }
+
     /// Create engine by loading chartsymbols.xml
     pub fn load<P: AsRef<Path>>(chartsymbols_path: P) -> Result<Self, String> {
         let tables = parse_chartsymbols(chartsymbols_path)?;
@@ -78,6 +118,7 @@ impl S52Engine {
             tables,
             settings: MarinerSettings::default(),
             cs_cache: Mutex::new(HashMap::new()),
+            resolve_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -87,6 +128,7 @@ impl S52Engine {
             tables,
             settings: MarinerSettings::default(),
             cs_cache: Mutex::new(HashMap::new()),
+            resolve_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -94,6 +136,7 @@ impl S52Engine {
     pub fn set_settings(&mut self, settings: MarinerSettings) {
         self.settings = settings;
         self.cs_cache.lock().unwrap().clear();
+        self.resolve_cache.lock().unwrap().clear();
     }
 
     /// Unified feature resolution: lookup + CS expansion.
@@ -110,12 +153,35 @@ impl S52Engine {
         feature: &Feature,
         geom_type: GeometryType,
     ) -> Option<ResolvedFeature> {
-        let acronym = feature.object_class.acronym();
+        let acronym = s57_code_to_acronym(feature.type_code);
+        let attr_hash = feature_attr_hash(feature);
+        let resolve_key = ResolveCacheKey {
+            object_class: feature.type_code,
+            geom_type,
+            attr_hash,
+            settings_hash: settings_hash(&self.settings),
+        };
 
-        let entry = self.tables.lookup_best_fast(acronym, geom_type, feature)?;
+        if let Some(cached) = self.resolve_cache.lock().unwrap().get(&resolve_key).cloned() {
+            return cached;
+        }
+
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
+        let entry = self.tables.lookup_best_fast(acronym, geom_type, table, feature)?;
+
+        log::debug!(
+            "RESOLVE: {} geom={:?} table={:?} → instr='{}'",
+            acronym, geom_type, table, entry.instruction
+        );
 
         // Display category check
-        if !self.settings.should_show(entry.display_category) {
+        if !self.settings.should_show(entry.display_category)
+            && !Self::bypass_display_category_filter(feature.type_code)
+        {
             return None;
         }
 
@@ -123,12 +189,12 @@ impl S52Engine {
         let raw_instructions = RenderInstruction::parse_all(&entry.instruction);
         let mut expanded = Vec::with_capacity(raw_instructions.len());
         // Lazy: only compute attr hash if we hit a CS instruction
-        let mut attr_hash: Option<u64> = None;
+        let mut cached_attr_hash: Option<u64> = Some(attr_hash);
 
         for instr in raw_instructions {
             match &instr {
                 RenderInstruction::ConditionalSymbology { procedure } => {
-                    let hash = *attr_hash.get_or_insert_with(|| feature_attr_hash(feature));
+                    let hash = *cached_attr_hash.get_or_insert_with(|| feature_attr_hash(feature));
                     let cache_key = CsCacheKey {
                         object_class: feature.type_code,
                         procedure: procedure.clone(),
@@ -154,11 +220,16 @@ impl S52Engine {
             }
         }
 
-        Some(ResolvedFeature {
+        let resolved = Some(ResolvedFeature {
             priority: entry.display_priority.as_u8(),
             category: entry.display_category,
             instructions: expanded,
-        })
+        });
+        self.resolve_cache
+            .lock()
+            .unwrap()
+            .insert(resolve_key, resolved.clone());
+        resolved
     }
 
     /// Get display priority for a feature from its best matching lookup entry.
@@ -168,9 +239,14 @@ impl S52Engine {
         feature: &Feature,
         geom_type: GeometryType,
     ) -> u8 {
-        let acronym = feature.object_class.acronym();
+        let acronym = s57_code_to_acronym(feature.type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
         self.tables
-            .lookup_best_fast(acronym, geom_type, feature)
+            .lookup_best_fast(acronym, geom_type, table, feature)
             .map(|e| e.display_priority.as_u8())
             .unwrap_or(0)
     }
@@ -186,8 +262,13 @@ impl S52Engine {
         view_scale: f64,
     ) -> Option<&LookupEntry> {
         // 1. Lookup in chartsymbols.xml first (need category for SCAMIN bypass)
-        let acronym = feature.object_class.acronym();
-        let entry = self.tables.lookup_best_fast(acronym, geom_type, feature)?;
+        let acronym = s57_code_to_acronym(feature.type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
+        let entry = self.tables.lookup_best_fast(acronym, geom_type, table, feature)?;
 
         // 2. SCAMIN/SCAMAX check - bypass for safety-critical features
         let is_safety = entry.display_category == DisplayCategory::Displaybase
@@ -207,25 +288,33 @@ impl S52Engine {
         }
 
         // 3. Display category check
-        if !self.settings.should_show(entry.display_category) {
+        if !self.settings.should_show(entry.display_category)
+            && !Self::bypass_display_category_filter(feature.type_code)
+        {
             return None;
         }
 
         Some(entry)
     }
 
-    /// Check if an ObjectClass should be rendered (quick check without attributes)
+    /// Check if an object class should be rendered (quick check without attributes)
     pub fn should_render_class(
         &self,
-        object_class: ObjectClass,
+        type_code: u16,
         geom_type: GeometryType,
     ) -> bool {
-        let acronym = object_class.acronym();
+        let acronym = s57_code_to_acronym(type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
 
         // Look up first entry for this class
-        if let Some(entries) = self.tables.lookup(acronym, geom_type) {
+        if let Some(entries) = self.tables.lookup(acronym, geom_type, table) {
             if let Some(entry) = entries.first() {
-                return self.settings.should_show(entry.display_category);
+                return self.settings.should_show(entry.display_category)
+                    || Self::bypass_display_category_filter(type_code);
             }
         }
 
@@ -233,15 +322,20 @@ impl S52Engine {
         true
     }
 
-    /// Get display category for an object class
+    /// Get display category for an object class by type code
     pub fn get_display_category(
         &self,
-        object_class: ObjectClass,
+        type_code: u16,
         geom_type: GeometryType,
     ) -> Option<DisplayCategory> {
-        let acronym = object_class.acronym();
+        let acronym = s57_code_to_acronym(type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
         self.tables
-            .lookup(acronym, geom_type)?
+            .lookup(acronym, geom_type, table)?
             .first()
             .map(|e| e.display_category)
     }
@@ -288,8 +382,13 @@ impl S52Engine {
         feature: &Feature,
         geom_type: GeometryType,
     ) -> Option<Vec<super::instruction::RenderInstruction>> {
-        let acronym = feature.object_class.acronym();
-        let entry = self.tables.lookup_best_fast(acronym, geom_type, feature)?;
+        let acronym = s57_code_to_acronym(feature.type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
+        let entry = self.tables.lookup_best_fast(acronym, geom_type, table, feature)?;
         Some(super::instruction::RenderInstruction::parse_all(&entry.instruction))
     }
 
@@ -369,16 +468,23 @@ mod tests {
         let engine = S52Engine::load(path).expect("Failed to load");
         println!("{}", engine.summary());
 
-        // Check display category for ROADWY (should be "Other")
-        let cat = engine.get_display_category(ObjectClass::Road, GeometryType::Line);
+        // Check display category for ROADWY (code 116, should be "Other")
+        let cat = engine.get_display_category(116, GeometryType::Line);
         assert_eq!(cat, Some(DisplayCategory::Other));
 
-        // With default settings (show_other=false), roads should not render
-        assert!(!engine.should_render_class(ObjectClass::Road, GeometryType::Line));
+        // Default settings (STANDARD mode, show_other=false) hide Other-category
+        // features like roads. Enabling show_other opts back in.
+        assert!(!engine.should_render_class(116, GeometryType::Line));
+        let mut engine_all = engine;
+        let mut settings = engine_all.settings.clone();
+        settings.show_other = true;
+        engine_all.set_settings(settings);
+        assert!(engine_all.should_render_class(116, GeometryType::Line));
+        let engine = engine_all;
 
-        // Coastlines should always render (Displaybase)
-        let cat = engine.get_display_category(ObjectClass::Coastline, GeometryType::Line);
+        // Coastlines (code 30) should always render (Displaybase)
+        let cat = engine.get_display_category(30, GeometryType::Line);
         assert_eq!(cat, Some(DisplayCategory::Displaybase));
-        assert!(engine.should_render_class(ObjectClass::Coastline, GeometryType::Line));
+        assert!(engine.should_render_class(30, GeometryType::Line));
     }
 }

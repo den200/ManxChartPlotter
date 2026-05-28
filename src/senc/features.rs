@@ -4,43 +4,96 @@
 //! - LNDARE (land area) - renders as tan
 //! - DEPARE (depth area) - renders with depth-based blue gradient
 
+use byteorder::{LittleEndian, ReadBytesExt};
 use std::collections::HashMap;
 use std::io::Cursor;
-use byteorder::{LittleEndian, ReadBytesExt};
 
 use super::geometry::{AreaGeometry, EdgeTable, LineGeometry, MultipointGeometry, PointGeometry};
 use super::reader::{RawRecord, SencError, SencReader};
 use super::records::{ObjectClass, RecordType, SencHeader};
 
-/// Convert S-57 attribute code to attribute name
-/// Only the attributes we care about for MVP (depth values)
+/// Convert S-57 attribute code to attribute name.
+/// Codes from IHO S-57 Ed 3.1 Appendix A (verified against s57attributes.csv).
 fn s57_attribute_name(code: u16) -> String {
     match code {
-        // Category/condition attributes used by S-52 lookups/procedures
-        15 => "CATCOA".to_string(),   // Category of coastline
-        60 => "CATSLC".to_string(),   // Category of shoreline construction
-        81 => "CONDTN".to_string(),   // Condition
+        // Shape/structure attributes
+        2 => "BCNSHP".to_string(),  // Beacon shape
+        4 => "BOYSHP".to_string(),  // Buoy shape
+
+        // Category attributes (used by S-52 lookups and CS procedures)
+        13 => "CATCAM".to_string(), // Category of cardinal mark
+        15 => "CATCOA".to_string(), // Category of coastline
+        18 => "CATCOV".to_string(), // Category of coverage
+        36 => "CATLAM".to_string(), // Category of lateral mark
+        37 => "CATLIT".to_string(), // Category of light
+        40 => "CATMOR".to_string(), // Category of mooring/warping facility
+        42 => "CATOBS".to_string(), // Category of obstruction
+        56 => "CATREA".to_string(), // Category of restricted area
+        60 => "CATSLC".to_string(), // Category of shoreline construction
+        71 => "CATWRK".to_string(), // Category of wreck
+
+        // Colour/appearance attributes
+        75 => "COLOUR".to_string(), // Colour
+        76 => "COLPAT".to_string(), // Colour pattern
+        81 => "CONDTN".to_string(), // Condition
+        82 => "CONRAD".to_string(), // Conspicuous, radar
+        83 => "CONVIS".to_string(), // Conspicuous, visually
 
         // Depth-related attributes
-        87 => "DRVAL1".to_string(),   // Depth range value 1 (shallow)
-        88 => "DRVAL2".to_string(),   // Depth range value 2 (deep)
-        174 => "VALDCO".to_string(),  // Value of depth contour
-        179 => "VALSOU".to_string(),  // Value of sounding
+        87 => "DRVAL1".to_string(),  // Depth range value 1 (shallow)
+        88 => "DRVAL2".to_string(),  // Depth range value 2 (deep)
+        174 => "VALDCO".to_string(), // Value of depth contour
+        179 => "VALSOU".to_string(), // Value of sounding
 
-        // Symbol-related attributes (for buoys, beacons, etc.)
-        36 => "CATLAM".to_string(),   // Category of lateral mark (1=port, 2=starboard)
-        75 => "COLOUR".to_string(),   // Colour (3=red, 4=green)
-        187 => "WATLEV".to_string(),  // Water level effect (for rocks)
+        // Exposure/exhibition attributes
+        92 => "EXCLIT".to_string(), // Exhibition condition of light
+        93 => "EXPSOU".to_string(), // Exposition of sounding
+        94 => "FUNCTN".to_string(), // Function
 
-        // Position quality attribute (for QUAPOS01)
-        402 => "QUAPOS".to_string(),  // Quality of position (1=surveyed, 4+=low accuracy)
+        // Physical attributes
+        95 => "HEIGHT".to_string(),  // Height
+        109 => "MARSYS".to_string(), // Marks navigational system (IALA)
 
-        // Other common attributes
-        102 => "INFORM".to_string(),  // Information
-        116 => "OBJNAM".to_string(),  // Object name
-        132 => "SCAMAX".to_string(),  // Scale maximum
-        133 => "SCAMIN".to_string(),  // Scale minimum
-        300 => "NINFOM".to_string(),  // Information in national language
+        // Light attributes
+        107 => "LITCHR".to_string(), // Light characteristic
+        108 => "LITVIS".to_string(), // Light visibility
+        117 => "ORIENT".to_string(), // Orientation
+        136 => "SECTR1".to_string(), // Sector limit one
+        137 => "SECTR2".to_string(), // Sector limit two
+        141 => "SIGGRP".to_string(), // Signal group
+        142 => "SIGPER".to_string(), // Signal period
+
+        // Sounding quality attributes (used by SNDFRM02, OBSTRN04, WRECKS02)
+        125 => "QUASOU".to_string(), // Quality of sounding measurement
+        149 => "STATUS".to_string(), // Status
+        156 => "TECSOU".to_string(), // Technique of sounding measurement
+
+        // Restriction attribute (used by RESTRN01, RESARE02)
+        131 => "RESTRN".to_string(), // Restriction
+
+        // Topmark attribute (used by TOPMAR01)
+        171 => "TOPSHP".to_string(), // Topmark/daymark shape
+
+        // Vertical clearance attributes (used in TX/TE text)
+        181 => "VERCLR".to_string(), // Vertical clearance
+        182 => "VERCCL".to_string(), // Vertical clearance, closed
+        183 => "VERCOP".to_string(), // Vertical clearance, open
+        185 => "VERDAT".to_string(), // Vertical datum
+
+        // Water level
+        187 => "WATLEV".to_string(), // Water level effect
+
+        // Position quality (extended attribute)
+        402 => "QUAPOS".to_string(), // Quality of position
+
+        // Text/name attributes
+        102 => "INFORM".to_string(), // Information
+        116 => "OBJNAM".to_string(), // Object name
+        132 => "SCAMAX".to_string(), // Scale maximum
+        133 => "SCAMIN".to_string(), // Scale minimum
+        178 => "VALNMR".to_string(), // Value of nominal range
+        300 => "NINFOM".to_string(), // Information in national language
+        301 => "NOBJNM".to_string(), // Object name in national language
 
         // Return numeric code as string for unknown attributes
         _ => format!("ATTR_{}", code),
@@ -122,11 +175,16 @@ impl Feature {
         }
     }
 
-    /// Get a float attribute by name
+    /// Get a float attribute by name.
+    ///
+    /// Accepts Float, Integer, and numeric Strings. Some SENC encoders stringify
+    /// float attributes (e.g. SECTR1/SECTR2 in lights); fall back to `str::parse`
+    /// so sector arcs and similar features don't silently disappear.
     pub fn attribute_float(&self, name: &str) -> Option<f64> {
         match self.attributes.get(name) {
             Some(AttributeValue::Float(v)) => Some(*v),
             Some(AttributeValue::Integer(v)) => Some(*v as f64),
+            Some(AttributeValue::String(s)) => s.trim().parse::<f64>().ok(),
             _ => None,
         }
     }
@@ -199,7 +257,7 @@ impl Feature {
 
     /// Check if this is a depth area
     pub fn is_depth_area(&self) -> bool {
-        self.object_class == ObjectClass::DepthArea
+        self.object_class == ObjectClass::DepthArea || self.object_class == ObjectClass::DredgedArea
     }
 
     /// Check if this is a depth contour
@@ -234,7 +292,10 @@ impl Feature {
 
     /// Check if this is any type of cable
     pub fn is_cable(&self) -> bool {
-        matches!(self.object_class, ObjectClass::CableOverhead | ObjectClass::CableSubmarine)
+        matches!(
+            self.object_class,
+            ObjectClass::CableOverhead | ObjectClass::CableSubmarine
+        )
     }
 
     /// Check if this is a traffic separation line
@@ -291,9 +352,10 @@ impl ChartData {
 
         // Helper closure to process a single record
         let process_record = |record: &RawRecord,
-                                   current_feature: &mut Option<PartialFeature>,
-                                   features: &mut Vec<Feature>,
-                                   edge_table: &mut EdgeTable| -> Result<(), SencError> {
+                              current_feature: &mut Option<PartialFeature>,
+                              features: &mut Vec<Feature>,
+                              edge_table: &mut EdgeTable|
+         -> Result<(), SencError> {
             match record.record_type {
                 RecordType::FeatureId => {
                     // Save previous feature if complete
@@ -357,7 +419,12 @@ impl ChartData {
 
         // Parse remaining records
         while let Some(record) = reader.next_record()? {
-            process_record(&record, &mut current_feature, &mut features, &mut edge_table)?;
+            process_record(
+                &record,
+                &mut current_feature,
+                &mut features,
+                &mut edge_table,
+            )?;
         }
 
         // Don't forget the last feature
@@ -375,7 +442,11 @@ impl ChartData {
             edge_table.node_count(),
         );
 
-        Ok(Self { header, features, edge_table })
+        Ok(Self {
+            header,
+            features,
+            edge_table,
+        })
     }
 
     /// Get all land area features
@@ -421,7 +492,9 @@ impl ChartData {
 
     /// Get all shoreline construction features (piers, jetties, seawalls)
     pub fn shoreline_constructions(&self) -> impl Iterator<Item = &Feature> {
-        self.features.iter().filter(|f| f.is_shoreline_construction())
+        self.features
+            .iter()
+            .filter(|f| f.is_shoreline_construction())
     }
 
     /// Get all road features
@@ -459,7 +532,9 @@ impl ChartData {
         let contour_count = self.depth_contours().count();
         let coastline_count = self.coastlines().count();
         let sounding_count = self.soundings().count();
-        let multipoint_count = self.features.iter()
+        let multipoint_count = self
+            .features
+            .iter()
             .filter(|f| f.feature_type == FeatureType::Multipoint)
             .count();
         let total = self.features.len();
@@ -518,7 +593,8 @@ impl PartialFeature {
 
         if payload.len() < 5 {
             return Err(SencError::Format(format!(
-                "FeatureId payload too short: {} bytes (need 5)", payload.len()
+                "FeatureId payload too short: {} bytes (need 5)",
+                payload.len()
             )));
         }
 
@@ -602,7 +678,10 @@ impl PartialFeature {
             4 => {
                 // String (null-terminated UTF-8)
                 let str_bytes = &payload[value_start..];
-                let end = str_bytes.iter().position(|&b| b == 0).unwrap_or(str_bytes.len());
+                let end = str_bytes
+                    .iter()
+                    .position(|&b| b == 0)
+                    .unwrap_or(str_bytes.len());
                 let s = String::from_utf8_lossy(&str_bytes[..end]).to_string();
                 AttributeValue::String(s)
             }
@@ -613,7 +692,11 @@ impl PartialFeature {
         Ok(())
     }
 
-    fn set_area_geometry(&mut self, record: &RawRecord, senc_version: u16) -> Result<(), SencError> {
+    fn set_area_geometry(
+        &mut self,
+        record: &RawRecord,
+        senc_version: u16,
+    ) -> Result<(), SencError> {
         self.feature_type = Some(FeatureType::Area);
         self.area_geometry = Some(
             AreaGeometry::parse(&record.payload, senc_version)
@@ -625,13 +708,16 @@ impl PartialFeature {
     fn set_point_geometry(&mut self, record: &RawRecord) -> Result<(), SencError> {
         self.feature_type = Some(FeatureType::Point);
         self.point_geometry = Some(
-            PointGeometry::parse(&record.payload)
-                .map_err(|e| SencError::Format(e.to_string()))?,
+            PointGeometry::parse(&record.payload).map_err(|e| SencError::Format(e.to_string()))?,
         );
         Ok(())
     }
 
-    fn set_line_geometry(&mut self, record: &RawRecord, senc_version: u16) -> Result<(), SencError> {
+    fn set_line_geometry(
+        &mut self,
+        record: &RawRecord,
+        senc_version: u16,
+    ) -> Result<(), SencError> {
         self.feature_type = Some(FeatureType::Line);
         self.line_geometry = Some(
             LineGeometry::parse(&record.payload, senc_version)
@@ -662,5 +748,53 @@ impl PartialFeature {
             line_geometry: self.line_geometry,
             multipoint_geometry: self.multipoint_geometry,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::s57_attribute_name;
+
+    #[test]
+    fn maps_light_attributes_needed_for_open_cpn_portrayal() {
+        assert_eq!(s57_attribute_name(37), "CATLIT");
+        assert_eq!(s57_attribute_name(95), "HEIGHT");
+        assert_eq!(s57_attribute_name(107), "LITCHR");
+        assert_eq!(s57_attribute_name(108), "LITVIS");
+        assert_eq!(s57_attribute_name(117), "ORIENT");
+        assert_eq!(s57_attribute_name(136), "SECTR1");
+        assert_eq!(s57_attribute_name(137), "SECTR2");
+        assert_eq!(s57_attribute_name(141), "SIGGRP");
+        assert_eq!(s57_attribute_name(142), "SIGPER");
+        assert_eq!(s57_attribute_name(178), "VALNMR");
+    }
+
+    #[test]
+    fn maps_cs_procedure_attributes() {
+        // Codes verified against doc/reference projects/OpenCPN/data/s57data/s57attributes.csv
+        assert_eq!(s57_attribute_name(71), "CATWRK");  // wrecks.rs
+        assert_eq!(s57_attribute_name(42), "CATOBS");  // obstrn.rs
+        assert_eq!(s57_attribute_name(171), "TOPSHP"); // topmar.rs
+        assert_eq!(s57_attribute_name(125), "QUASOU"); // sndfrm.rs, wrecks.rs
+        assert_eq!(s57_attribute_name(156), "TECSOU"); // sndfrm.rs
+        assert_eq!(s57_attribute_name(149), "STATUS"); // sndfrm.rs
+        assert_eq!(s57_attribute_name(131), "RESTRN"); // restrn.rs, resare.rs
+        assert_eq!(s57_attribute_name(93), "EXPSOU");  // obstrn.rs, wrecks.rs
+        assert_eq!(s57_attribute_name(82), "CONRAD");  // qualin.rs, quapos.rs
+        assert_eq!(s57_attribute_name(56), "CATREA");  // LUP matching
+    }
+
+    #[test]
+    fn maps_buoy_beacon_shape_attributes() {
+        assert_eq!(s57_attribute_name(2), "BCNSHP");
+        assert_eq!(s57_attribute_name(4), "BOYSHP");
+        assert_eq!(s57_attribute_name(13), "CATCAM");
+    }
+
+    #[test]
+    fn maps_vertical_clearance_attributes() {
+        assert_eq!(s57_attribute_name(181), "VERCLR");
+        assert_eq!(s57_attribute_name(182), "VERCCL");
+        assert_eq!(s57_attribute_name(183), "VERCOP");
     }
 }

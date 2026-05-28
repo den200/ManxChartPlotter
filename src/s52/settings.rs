@@ -3,7 +3,7 @@
 use super::DisplayCategory;
 
 /// Depth unit display modes for soundings
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum DepthUnit {
     #[default]
     Meters = 0,
@@ -12,7 +12,7 @@ pub enum DepthUnit {
 }
 
 /// Depth shade mode per S52_MAR_TWO_SHADES
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub enum DepthShadeMode {
     /// Two shades: safe (DEPMD) and unsafe (DEPVS)
     TwoShades,
@@ -47,6 +47,19 @@ pub struct MarinerSettings {
     pub depth_unit: DepthUnit,
     /// Depth shade mode: 2 or 4 shades (S52_MAR_TWO_SHADES)
     pub depth_shade_mode: DepthShadeMode,
+    /// Use symbolized area boundaries (LC patterns) vs plain (LS lines).
+    /// Corresponds to S52_MAR_SYMBOLIZED_BND. Default: true (matches OpenCPN).
+    pub symbolized_boundaries: bool,
+    /// Suppress non-critical text labels (OpenCPN m_bShowS57ImportantTextOnly).
+    /// When true, text with display-group (dis) >= 20 is filtered out.
+    pub show_important_text_only: bool,
+    /// Draw the chart coverage (M_COVR) outline rectangle. OpenCPN does not draw
+    /// this in STANDARD display; gate it behind a separate setting rather than
+    /// bypassing the category filter.
+    pub show_chart_boundaries: bool,
+    /// Prefer the Simplified point-symbol table over Paper Chart.
+    /// Corresponds to OpenCPN's "simplified symbols" toggle.
+    pub simplified_points: bool,
 }
 
 impl Default for MarinerSettings {
@@ -55,7 +68,7 @@ impl Default for MarinerSettings {
         Self {
             show_displaybase: true,  // Always on (safety)
             show_standard: true,     // Default on
-            show_other: false,       // Default off (matches OpenCPN)
+            show_other: false,       // OpenCPN on-screen default is STANDARD, not SHOW_ALL
             safety_depth: 10.0,      // 10 meters (S52_MAR_SAFETY_DEPTH) - per spec
             safety_contour: 10.0,    // 10 meters (S52_MAR_SAFETY_CONTOUR) - per spec
             shallow_contour: 2.0,    // 2 meters (S52_MAR_SHALLOW_CONTOUR)
@@ -64,6 +77,15 @@ impl Default for MarinerSettings {
             show_soundings: true,
             depth_unit: DepthUnit::default(), // Meters
             depth_shade_mode: DepthShadeMode::default(), // FourShades per spec
+            symbolized_boundaries: true, // Symbolized boundaries (LC patterns) by default
+            // Default ON: until navcore has proper LOD / per-feature SCAMIN for
+            // labels, leaving every dis>=20 label visible at overview zooms
+            // produces an unreadable text stampede. OpenCPN's default is off,
+            // but its labels are also culled by a proper chart-scale filter we
+            // don't yet match.
+            show_important_text_only: true,
+            show_chart_boundaries: false,
+            simplified_points: false,
         }
     }
 }

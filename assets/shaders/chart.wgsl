@@ -16,6 +16,7 @@ var<storage, read> palette: array<vec4<f32>>;
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) color_index: u32,
+    @location(2) disp_prio: u32,
 }
 
 struct VertexOutput {
@@ -27,6 +28,7 @@ struct VertexOutput {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = uniforms.view_proj * vec4<f32>(in.position, 0.0, 1.0);
+    out.clip_position.z = 1.0 - (f32(in.disp_prio) / 10.0);
     out.color = palette[in.color_index];
     return out;
 }

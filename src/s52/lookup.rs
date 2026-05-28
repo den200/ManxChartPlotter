@@ -95,6 +95,66 @@ impl DisplayPriority {
     }
 }
 
+/// S-52 lookup table type from `<table-name>` in chartsymbols.xml.
+/// Controls which set of entries is used for a given geometry type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TableName {
+    /// Point symbols — simplified mode
+    Simplified,
+    /// Point symbols — paper chart mode
+    Paper,
+    /// Line features
+    Lines,
+    /// Area boundaries — simple LS() lines
+    Plain,
+    /// Area boundaries — complex LC() patterns
+    Symbolized,
+}
+
+impl TableName {
+    /// Parse from XML `<table-name>` text
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim() {
+            "Simplified" => Some(Self::Simplified),
+            "Paper" => Some(Self::Paper),
+            "Lines" => Some(Self::Lines),
+            "Plain" => Some(Self::Plain),
+            "Symbolized" => Some(Self::Symbolized),
+            _ => None,
+        }
+    }
+
+    /// Select the preferred table name for a geometry type based on settings.
+    pub fn preferred(geom_type: GeometryType, symbolized_boundaries: bool) -> Self {
+        Self::preferred_ext(geom_type, symbolized_boundaries, false)
+    }
+
+    /// Extended variant that also honors the Simplified-points mariner setting.
+    pub fn preferred_ext(
+        geom_type: GeometryType,
+        symbolized_boundaries: bool,
+        simplified_points: bool,
+    ) -> Self {
+        match geom_type {
+            GeometryType::Point => {
+                if simplified_points {
+                    TableName::Simplified
+                } else {
+                    TableName::Paper
+                }
+            }
+            GeometryType::Line => TableName::Lines,
+            GeometryType::Area => {
+                if symbolized_boundaries {
+                    TableName::Symbolized
+                } else {
+                    TableName::Plain
+                }
+            }
+        }
+    }
+}
+
 /// Geometry type for lookup table
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GeometryType {
@@ -120,6 +180,8 @@ impl GeometryType {
 pub struct LookupEntry {
     /// S-57 object class name (e.g., "ACHARE", "SLCONS")
     pub object_class: String,
+    /// Which lookup table this entry belongs to
+    pub table_name: TableName,
     /// Geometry type this entry applies to
     pub geometry_type: GeometryType,
     /// Display priority (draw order)
@@ -170,9 +232,24 @@ impl LookupEntry {
                 continue;
             }
 
-            // Parse expected value
+            // "?" is S-52 negative filter: attribute must NOT be present.
+            // E.g. the DEPARE LUP "DRVAL1? DRVAL2?" matches only unsurveyed
+            // depth areas that carry no depth attributes. Without this branch
+            // the filter silently fell through (parse::<i32>() fails → continue)
+            // and every DEPARE was misclassified as NODTA+PRTSUR01, deleting
+            // water fills across the chart.
+            if value_str == "?" {
+                if attributes.contains_key(attr_name) {
+                    return false;
+                }
+                continue;
+            }
+
+            // Parse expected value. Unknown filter syntax is treated as a
+            // non-match rather than silently accepted, so any new LUP syntax
+            // we don't yet understand fails loud instead of quiet.
             let Ok(expected_value) = value_str.parse::<i32>() else {
-                continue; // Can't parse value, skip
+                return false;
             };
 
             // Check if attribute exists and matches any of its values
@@ -193,9 +270,9 @@ impl LookupEntry {
 /// Complete lookup tables loaded from chartsymbols.xml
 #[derive(Debug, Default)]
 pub struct LookupTables {
-    /// Lookup entries indexed by (object_class, geometry_type)
+    /// Lookup entries indexed by (object_class, geometry_type, table_name)
     /// Multiple entries can exist per key (for attribute filtering)
-    entries: HashMap<(String, GeometryType), Vec<LookupEntry>>,
+    entries: HashMap<(String, GeometryType, TableName), Vec<LookupEntry>>,
     /// Active color table (color_name -> [r, g, b]) — DAY_BRIGHT by default
     pub colors: HashMap<String, [u8; 3]>,
     /// All palettes: palette_name -> (token_index -> [r, g, b])
@@ -217,7 +294,7 @@ impl LookupTables {
 
     /// Add a lookup entry
     pub fn add_entry(&mut self, entry: LookupEntry) {
-        let key = (entry.object_class.clone(), entry.geometry_type);
+        let key = (entry.object_class.clone(), entry.geometry_type, entry.table_name);
         self.entries.entry(key).or_default().push(entry);
     }
 
@@ -323,39 +400,57 @@ impl LookupTables {
         self.palettes.keys().map(|s| s.as_str()).collect()
     }
 
-    /// Look up entries for an object class and geometry type.
+    /// Look up entries for an object class, geometry type, and table name.
     /// Returns all matching entries (caller should filter by attributes).
-    pub fn lookup(&self, object_class: &str, geom_type: GeometryType) -> Option<&[LookupEntry]> {
+    pub fn lookup(&self, object_class: &str, geom_type: GeometryType, table_name: TableName) -> Option<&[LookupEntry]> {
         self.entries
-            .get(&(object_class.to_string(), geom_type))
+            .get(&(object_class.to_string(), geom_type, table_name))
             .map(|v| v.as_slice())
     }
 
-    /// Find the best matching entry for a feature.
-    /// Tries attribute-filtered entries first, falls back to generic.
+    /// Find the best matching entry for a feature using OpenCPN-style scoring.
+    ///
+    /// Among all entries whose attribute filters the feature satisfies, prefer the
+    /// one with the most attribute codes (most specific). Ties keep insertion
+    /// order. Falls back to the no-attr default, then to the first entry.
+    ///
+    /// Mirrors `FindBestLUP` in `s52plib.cpp:306`: an entry with filters
+    /// `CATLAM1 COLOUR3` is preferred over one with just `CATLAM1` when both
+    /// match, because the first is more specific.
     pub fn lookup_best(
         &self,
         object_class: &str,
         geom_type: GeometryType,
+        table_name: TableName,
         attributes: &HashMap<&str, Vec<i32>>,
     ) -> Option<&LookupEntry> {
-        let entries = self.lookup(object_class, geom_type)?;
+        let entries = self.lookup(object_class, geom_type, table_name)?;
 
-        // First try to find an entry with matching attribute filter
-        for entry in entries {
-            if !entry.attribute_codes.is_empty() && entry.matches_attributes(attributes) {
-                return Some(entry);
-            }
-        }
+        let mut best: Option<(&LookupEntry, usize)> = None;
+        let mut generic_fallback: Option<&LookupEntry> = None;
 
-        // Fall back to entry without filter
         for entry in entries {
             if entry.attribute_codes.is_empty() {
-                return Some(entry);
+                if generic_fallback.is_none() {
+                    generic_fallback = Some(entry);
+                }
+                continue;
+            }
+            if entry.matches_attributes(attributes) {
+                let specificity = entry.attribute_codes.len();
+                match best {
+                    Some((_, best_spec)) if specificity <= best_spec => {}
+                    _ => best = Some((entry, specificity)),
+                }
             }
         }
 
-        // Return first entry as last resort
+        if let Some((entry, _)) = best {
+            return Some(entry);
+        }
+        if let Some(entry) = generic_fallback {
+            return Some(entry);
+        }
         entries.first()
     }
 
@@ -371,9 +466,10 @@ impl LookupTables {
         &'a self,
         object_class: &str,
         geom_type: GeometryType,
+        table_name: TableName,
         feature: &crate::senc::Feature,
     ) -> Option<&'a LookupEntry> {
-        let entries = self.lookup(object_class, geom_type)?;
+        let entries = self.lookup(object_class, geom_type, table_name)?;
 
         // Check if ANY entry has attribute filters
         let has_filtered = entries.iter().any(|e| !e.attribute_codes.is_empty());
@@ -385,7 +481,7 @@ impl LookupTables {
 
         // Some entries need attribute matching — build map and do full lookup
         let attrs = feature.attributes_as_map();
-        self.lookup_best(object_class, geom_type, &attrs)
+        self.lookup_best(object_class, geom_type, table_name, &attrs)
     }
 
     /// Get color RGB values by name

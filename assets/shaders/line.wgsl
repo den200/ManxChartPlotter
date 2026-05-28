@@ -9,15 +9,21 @@ struct LineUniforms {
     viewport_size: vec2<f32>,    // window size in pixels (8 bytes)
     line_width_px: f32,          // stroke width in pixels, e.g., 2.0 (4 bytes)
     join_limit: f32,             // miter limit, e.g., 4.0 (4 bytes)
-    color: vec4<f32>,            // RGBA line color (16 bytes)
+    color_index: u32,            // index into palette (4 bytes)
     dash_on_px: f32,             // dash on length in screen pixels (4 bytes)
     dash_off_px: f32,            // dash off (gap) length in screen pixels (4 bytes)
     px_per_meter: f32,           // pixels per meter at current zoom (4 bytes)
-    _pad: f32,                   // padding for alignment (4 bytes)
+    disp_prio: f32,              // display priority for depth sorting (4 bytes)
+    dot_on_px: f32,              // dot length in gap for DASD pattern (4 bytes)
+    _pad2: u32,
+    _pad3: u32,
     // Total: 112 bytes, 16-byte aligned
 }
 
-@group(0) @binding(0) var<uniform> u: LineUniforms;
+@group(0) @binding(1)
+var<storage, read> palette: array<vec4<f32>>;
+
+@group(1) @binding(0) var<uniform> u: LineUniforms;
 
 struct VertexInput {
     @location(0) prev: vec2<f32>,
@@ -101,7 +107,8 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let final_pos = ndc_curr + offset;
 
     var out: VertexOutput;
-    out.position = vec4<f32>(final_pos, 0.5, 1.0);
+    out.position = vec4<f32>(final_pos, 0.0, 1.0);
+    out.position.z = 1.0 - (u.disp_prio / 10.0);
     out.arc_len = in.arc_len;
     return out;
 }
@@ -116,9 +123,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if pattern_len > 0.0 && u.dash_off_px > 0.0 {
         let pos_in_pattern = arc_px % pattern_len;
         if pos_in_pattern > u.dash_on_px {
-            discard;
+            // In the gap portion
+            if u.dot_on_px > 0.0 {
+                // DASD: check if we're in the centered dot within the gap
+                let gap_pos = pos_in_pattern - u.dash_on_px;
+                let gap_center = u.dash_off_px * 0.5;
+                let half_dot = u.dot_on_px * 0.5;
+                if gap_pos < gap_center - half_dot || gap_pos > gap_center + half_dot {
+                    discard;
+                }
+                // else: inside the dot, draw it
+            } else {
+                discard;
+            }
         }
     }
 
-    return u.color;
+    return palette[u.color_index];
 }

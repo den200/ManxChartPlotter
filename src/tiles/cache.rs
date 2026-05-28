@@ -5,11 +5,9 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use wgpu::util::DeviceExt;
 
-use super::{LineBatchKey, TileId};
 use super::builder::TilePacket;
+use super::{LineBatchKey, TileId};
 use crate::render::text::SoundingInstance;
-use crate::render::LabelGlyphInstance;
-
 
 /// Complete cache key (includes style_hash for invalidation on palette change)
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
@@ -20,7 +18,10 @@ pub struct TileCacheKey {
 
 impl TileCacheKey {
     pub fn new(tile_id: TileId, style_hash: u64) -> Self {
-        Self { tile_id, style_hash }
+        Self {
+            tile_id,
+            style_hash,
+        }
     }
 }
 
@@ -50,20 +51,32 @@ pub struct TileGpuBuffers {
     pub symbol_count: u32,
     /// Symbol instance offsets per priority level
     pub symbol_priority_offsets: [u32; 11],
-    /// Text instance buffer (numeric-only for now)
-    pub text_buffer: Option<wgpu::Buffer>,
-    /// Number of text instances
-    pub text_count: u32,
-    /// Label glyph buffer for non-numeric text
-    pub label_buffer: Option<wgpu::Buffer>,
-    /// Number of label glyphs
-    pub label_count: u32,
+    /// Text instances (numeric soundings) stored on CPU for global decluttering
+    pub text_instances: Vec<SoundingInstance>,
+    /// Label candidates (TextParams) stored on CPU for global layout and decluttering
+    pub label_candidates: Vec<crate::render::TextParams>,
     /// Pattern-filled area vertex buffer (AP instruction)
     pub pattern_buffer: Option<wgpu::Buffer>,
     /// Number of pattern vertices
     pub pattern_vertex_count: u32,
     /// Pattern vertex offsets per priority level
     pub pattern_priority_offsets: [u32; 11],
+    /// Coverage stencil buffer — triangulated M_COVR polygons from foreground charts
+    pub coverage_buffer: Option<wgpu::Buffer>,
+    /// Number of coverage vertices (triangle list)
+    pub coverage_vertex_count: u32,
+    /// Background area buffer (stencil-tested, pass when stencil==0)
+    pub bg_area_buffer: Option<wgpu::Buffer>,
+    /// Number of background area vertices
+    pub bg_area_vertex_count: u32,
+    /// Background area vertex offsets per priority level
+    pub bg_area_priority_offsets: [u32; 11],
+    /// Background pattern buffer (stencil-tested)
+    pub bg_pattern_buffer: Option<wgpu::Buffer>,
+    /// Number of background pattern vertices
+    pub bg_pattern_vertex_count: u32,
+    /// Background pattern vertex offsets per priority level
+    pub bg_pattern_priority_offsets: [u32; 11],
     /// Byte size for cache budgeting
     pub byte_size: usize,
 }
@@ -74,8 +87,8 @@ impl TileGpuBuffers {
         self.area_vertex_count == 0
             && self.line_batches.is_empty()
             && self.symbol_count == 0
-            && self.text_count == 0
-            && self.label_count == 0
+            && self.text_instances.is_empty()
+            && self.label_candidates.is_empty()
             && self.pattern_vertex_count == 0
     }
 
@@ -91,6 +104,7 @@ pub struct TileGpuCache {
     lru_order: VecDeque<TileCacheKey>,
     total_bytes: usize,
     max_bytes: usize,
+    revision: u64,
     /// Tiles known to contain no renderable geometry (ocean-only).
     /// Prevents re-requesting them every frame.
     empty_tiles: HashSet<TileCacheKey>,
@@ -104,6 +118,7 @@ impl TileGpuCache {
             lru_order: VecDeque::new(),
             total_bytes: 0,
             max_bytes,
+            revision: 0,
             empty_tiles: HashSet::new(),
         }
     }
@@ -141,7 +156,9 @@ impl TileGpuCache {
 
     /// Mark a tile as known-empty without building it (e.g. no charts intersect)
     pub fn mark_empty(&mut self, key: &TileCacheKey) {
-        self.empty_tiles.insert(*key);
+        if self.empty_tiles.insert(*key) {
+            self.revision = self.revision.wrapping_add(1);
+        }
     }
 
     /// Get cached tile buffers
@@ -150,12 +167,11 @@ impl TileGpuCache {
     }
 
     /// Upload a tile packet to GPU and cache it
-    pub fn upload(
-        &mut self,
-        device: &wgpu::Device,
-        packet: TilePacket,
-        style_hash: u64,
-    ) {
+    pub fn upload(&mut self, device: &wgpu::Device, packet: TilePacket, style_hash: u64) {
+        let profile = std::env::var("NAVCORE_PROFILE")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
+        let upload_start = profile.then(std::time::Instant::now);
         let key = TileCacheKey::new(packet.tile_id, style_hash);
 
         if log::log_enabled!(log::Level::Debug) {
@@ -181,11 +197,13 @@ impl TileGpuCache {
             && packet.line_batches.is_empty()
             && packet.symbol_instances.is_empty()
             && packet.text_instances.is_empty()
-            && packet.label_glyphs.is_empty()
+            && packet.label_candidates.is_empty()
             && packet.pattern_vertices.is_empty()
         {
             log::debug!("  -> empty packet, marking as known-empty");
-            self.empty_tiles.insert(key);
+            if self.empty_tiles.insert(key) {
+                self.revision = self.revision.wrapping_add(1);
+            }
             return;
         }
 
@@ -250,31 +268,6 @@ impl TileGpuCache {
             (None, 0)
         };
 
-        let text_instances: Vec<SoundingInstance> = packet.text_instances;
-        let label_instances: Vec<LabelGlyphInstance> = packet.label_glyphs;
-
-        let (text_buffer, text_count) = if !text_instances.is_empty() {
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&text_instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            (Some(buffer), text_instances.len() as u32)
-        } else {
-            (None, 0)
-        };
-
-        let (label_buffer, label_count) = if !label_instances.is_empty() {
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&label_instances),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            (Some(buffer), label_instances.len() as u32)
-        } else {
-            (None, 0)
-        };
-
         // Create GPU buffer for pattern vertices (AP instruction areas)
         let (pattern_buffer, pattern_vertex_count) = if !packet.pattern_vertices.is_empty() {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -287,9 +280,43 @@ impl TileGpuCache {
             (None, 0)
         };
 
-        let mut byte_size = packet.byte_size;
-        byte_size += text_count as usize * std::mem::size_of::<SoundingInstance>();
-        byte_size += label_count as usize * std::mem::size_of::<LabelGlyphInstance>();
+        // Create GPU buffer for coverage stencil triangles
+        let (coverage_buffer, coverage_vertex_count) = if !packet.coverage_vertices.is_empty() {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&packet.coverage_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            (Some(buffer), packet.coverage_vertices.len() as u32)
+        } else {
+            (None, 0)
+        };
+
+        // Create GPU buffers for background area vertices (stencil-tested)
+        let (bg_area_buffer, bg_area_vertex_count) = if !packet.bg_area_vertices.is_empty() {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&packet.bg_area_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            (Some(buffer), packet.bg_area_vertices.len() as u32)
+        } else {
+            (None, 0)
+        };
+
+        // Create GPU buffers for background pattern vertices (stencil-tested)
+        let (bg_pattern_buffer, bg_pattern_vertex_count) = if !packet.bg_pattern_vertices.is_empty() {
+            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&packet.bg_pattern_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            (Some(buffer), packet.bg_pattern_vertices.len() as u32)
+        } else {
+            (None, 0)
+        };
+
+        let byte_size = packet.byte_size;
 
         let buffers = TileGpuBuffers {
             area_buffer,
@@ -299,13 +326,19 @@ impl TileGpuCache {
             symbol_buffer,
             symbol_count,
             symbol_priority_offsets: packet.symbol_priority_offsets,
-            text_buffer,
-            text_count,
-            label_buffer,
-            label_count,
+            text_instances: packet.text_instances,
+            label_candidates: packet.label_candidates,
             pattern_buffer,
             pattern_vertex_count,
             pattern_priority_offsets: packet.pattern_priority_offsets,
+            coverage_buffer,
+            coverage_vertex_count,
+            bg_area_buffer,
+            bg_area_vertex_count,
+            bg_area_priority_offsets: packet.bg_area_priority_offsets,
+            bg_pattern_buffer,
+            bg_pattern_vertex_count,
+            bg_pattern_priority_offsets: packet.bg_pattern_priority_offsets,
             byte_size,
         };
 
@@ -313,6 +346,16 @@ impl TileGpuCache {
         self.total_bytes += byte_size;
         self.tiles.insert(key, buffers);
         self.lru_order.push_back(key);
+        self.revision = self.revision.wrapping_add(1);
+        if let Some(start) = upload_start {
+            log::info!(
+                "profile.tile_upload: {} ms tile={:?} line_batches={} bytes={}",
+                start.elapsed().as_millis(),
+                key.tile_id,
+                self.tiles.get(&key).map(|b| b.line_batches.len()).unwrap_or(0),
+                byte_size
+            );
+        }
     }
 
     /// Evict oldest tiles until under budget
@@ -321,6 +364,7 @@ impl TileGpuCache {
             if let Some(key) = self.lru_order.pop_front() {
                 if let Some(buffers) = self.tiles.remove(&key) {
                     self.total_bytes -= buffers.byte_size;
+                    self.revision = self.revision.wrapping_add(1);
                 }
             }
         }
@@ -332,6 +376,7 @@ impl TileGpuCache {
         self.lru_order.clear();
         self.total_bytes = 0;
         self.empty_tiles.clear();
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Current cache size in bytes
@@ -342,6 +387,11 @@ impl TileGpuCache {
     /// Number of cached tiles
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
+    }
+
+    /// Monotonic cache revision for incremental render-state invalidation.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Touch a tile (move to end of LRU)

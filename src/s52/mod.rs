@@ -23,7 +23,7 @@ pub use cs::{sndfrm02, sounding_color, sounding_color_rgb, SoundingRenderInfo};
 pub use engine::{S52Engine, ResolvedFeature};
 pub use instruction::{LineOp, LinePattern, LineStyleKey, RenderInstruction, parse_instructions};
 pub use lc::{LineStyleSymbol, LineStyleTable};
-pub use lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables};
+pub use lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables, TableName};
 
 pub use parser::parse_chartsymbols;
 pub use settings::{DepthShadeMode, DepthUnit, MarinerSettings};

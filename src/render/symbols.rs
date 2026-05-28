@@ -5,12 +5,12 @@
 //!
 //! Supports 1000+ S-52 symbols via dynamic atlas lookup.
 
+use crate::render::debug_render_mode;
+use image::GenericImageView;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use wgpu::util::DeviceExt;
-use serde::Deserialize;
-use image::GenericImageView;
-use crate::render::debug_render_mode;
 
 /// Symbol identifier - kept for backwards compatibility but now uses dynamic index
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,8 +53,8 @@ static SYMBOL_LOOKUP: OnceLock<HashMap<String, u32>> = OnceLock::new();
 pub fn get_symbol_lookup() -> &'static HashMap<String, u32> {
     SYMBOL_LOOKUP.get_or_init(|| {
         let atlas_json = include_str!("../../assets/symbols/atlas.json");
-        let atlas_data: AtlasJson = serde_json::from_str(atlas_json)
-            .expect("Failed to parse atlas.json");
+        let atlas_data: AtlasJson =
+            serde_json::from_str(atlas_json).expect("Failed to parse atlas.json");
 
         // Build lookup from symbol name to index
         let mut lookup = HashMap::with_capacity(atlas_data.symbols.len());
@@ -82,13 +82,19 @@ pub struct SymbolInstance {
     pub symbol_id: u32,
     /// Rotation in radians (0 = north up)
     pub rotation: f32,
+    /// Display priority for depth sorting
+    pub disp_prio: u32,
+    /// Scale factor for Soft SCAMIN (1.0 = normal, 0.5 = half size)
+    pub scale: f32,
 }
 
 impl SymbolInstance {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
         0 => Float32x2,  // position
         1 => Uint32,     // symbol_id
         2 => Float32,    // rotation
+        3 => Uint32,     // disp_prio
+        4 => Float32,    // scale
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -116,11 +122,11 @@ struct AtlasJson {
     #[allow(dead_code)]
     version: u32,
     #[allow(dead_code)]
-    format: Option<String>,  // "direct" for v2
+    format: Option<String>, // "direct" for v2
     #[allow(dead_code)]
     atlas_size: [u32; 2],
     #[serde(default)]
-    cell_size: Option<[u32; 2]>,  // v1 only
+    cell_size: Option<[u32; 2]>, // v1 only
     symbols: HashMap<String, SymbolEntry>,
 }
 
@@ -156,11 +162,27 @@ pub struct SymbolRenderer {
     pipeline_no_depth: wgpu::RenderPipeline,
     pipeline_atlas_debug: wgpu::RenderPipeline,
     atlas_bind_group: wgpu::BindGroup,
+    atlas_texture: wgpu::Texture,
+    atlas_size: [u32; 2],
     instance_buffer: wgpu::Buffer,
     instance_count: u32,
     // Bind group for camera (set from RenderState)
     camera_bind_group_layout: wgpu::BindGroupLayout,
     metadata_buffer: wgpu::Buffer,
+}
+
+fn atlas_png_for_palette(palette_name: &str) -> (&'static [u8], &'static str) {
+    match palette_name {
+        "DUSK" => (
+            include_bytes!("../../assets/symbols/atlas-dusk.png"),
+            "atlas-dusk.png",
+        ),
+        "NIGHT" => (
+            include_bytes!("../../assets/symbols/atlas-dark.png"),
+            "atlas-dark.png",
+        ),
+        _ => (include_bytes!("../../assets/symbols/atlas.png"), "atlas.png"),
+    }
 }
 
 impl SymbolRenderer {
@@ -171,7 +193,7 @@ impl SymbolRenderer {
         _camera_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Load atlas PNG
-        let atlas_png = include_bytes!("../../assets/symbols/atlas.png");
+        let (atlas_png, _) = atlas_png_for_palette("DAY_BRIGHT");
         let atlas_json = include_str!("../../assets/symbols/atlas.json");
 
         // Parse JSON
@@ -183,20 +205,28 @@ impl SymbolRenderer {
         let (width, height) = img.dimensions();
 
         // Create texture
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+        let atlas_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("symbol_atlas"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // UNORM (not sRGB): the surface is now UNORM and shaders pass colours
+            // through verbatim. The atlas PNG bytes are sRGB display values; an
+            // sRGB texture would be linearised on sample and then stored darkened
+            // on the UNORM surface. Keep it UNORM so symbol colours pass through.
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
         queue.write_texture(
             wgpu::ImageCopyTexture {
-                texture: &texture,
+                texture: &atlas_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -207,10 +237,14 @@ impl SymbolRenderer {
                 bytes_per_row: Some(4 * width),
                 rows_per_image: Some(height),
             },
-            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
 
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = atlas_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("symbol_sampler"),
@@ -231,10 +265,13 @@ impl SymbolRenderer {
         let symbol_names = ordered_symbol_names(&atlas_data);
         let symbol_count = symbol_names.len().min(MAX_SYMBOL_TYPES);
 
-        let mut metadata = vec![SymbolMetaGpu {
-            uv_rect: [0.0; 4],
-            pivot_size: [0.5, 0.5, 32.0, 32.0],
-        }; MAX_SYMBOL_TYPES];
+        let mut metadata = vec![
+            SymbolMetaGpu {
+                uv_rect: [0.0; 4],
+                pivot_size: [0.5, 0.5, 32.0, 32.0],
+            };
+            MAX_SYMBOL_TYPES
+        ];
 
         for (idx, name) in symbol_names.iter().enumerate() {
             if idx >= MAX_SYMBOL_TYPES {
@@ -245,10 +282,20 @@ impl SymbolRenderer {
             // Handle both v1 (cell-based) and v2 (direct rect) formats
             let (x, y, w, h) = if let Some(rect) = entry.rect {
                 // v2: direct pixel coordinates [x, y, width, height]
-                (rect[0] as f32, rect[1] as f32, rect[2] as f32, rect[3] as f32)
+                (
+                    rect[0] as f32,
+                    rect[1] as f32,
+                    rect[2] as f32,
+                    rect[3] as f32,
+                )
             } else if let (Some(cell), Some(size)) = (entry.cell, entry.size) {
                 // v1: cell-based
-                (cell[0] as f32 * cell_w, cell[1] as f32 * cell_h, size[0] as f32, size[1] as f32)
+                (
+                    cell[0] as f32 * cell_w,
+                    cell[1] as f32 * cell_h,
+                    size[0] as f32,
+                    size[1] as f32,
+                )
             } else {
                 // Fallback to default
                 (0.0, 0.0, 32.0, 32.0)
@@ -256,17 +303,12 @@ impl SymbolRenderer {
 
             metadata[idx] = SymbolMetaGpu {
                 uv_rect: [
-                    x / atlas_w,           // uv_min_x
-                    y / atlas_h,           // uv_min_y
-                    (x + w) / atlas_w,     // uv_max_x
-                    (y + h) / atlas_h,     // uv_max_y
+                    x / atlas_w,       // uv_min_x
+                    y / atlas_h,       // uv_min_y
+                    (x + w) / atlas_w, // uv_max_x
+                    (y + h) / atlas_h, // uv_max_y
                 ],
-                pivot_size: [
-                    entry.pivot[0],
-                    entry.pivot[1],
-                    w,
-                    h,
-                ],
+                pivot_size: [entry.pivot[0], entry.pivot[1], w, h],
             };
         }
 
@@ -280,27 +322,28 @@ impl SymbolRenderer {
         });
 
         // Atlas bind group layout
-        let atlas_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("symbol_atlas_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let atlas_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("symbol_atlas_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("symbol_atlas_bind_group"),
@@ -318,45 +361,48 @@ impl SymbolRenderer {
         });
 
         // Create extended camera bind group layout that includes metadata
-        let symbol_camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("symbol_camera_layout"),
-            entries: &[
-                // Camera uniforms (same as main camera)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let symbol_camera_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("symbol_camera_layout"),
+                entries: &[
+                    // Camera uniforms (same as main camera)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                // Symbol metadata (storage buffer)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    // Symbol metadata (storage buffer)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         // Load shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("symbol_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/shaders/symbol.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../assets/shaders/symbol.wgsl").into(),
+            ),
         });
 
         // Pipeline layout
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("symbol_pipeline_layout"),
             bind_group_layouts: &[
-                &symbol_camera_layout,   // @group(0) - camera + metadata
+                &symbol_camera_layout,    // @group(0) - camera + metadata
                 &atlas_bind_group_layout, // @group(1) - atlas texture
             ],
             push_constant_ranges: &[],
@@ -404,12 +450,21 @@ impl SymbolRenderer {
         };
 
         let symbol_instance_layout = [SymbolInstance::desc()];
+
+        let depth_stencil = Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth24PlusStencil8,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        });
+
         let pipeline = make_pipeline(
             "symbol_pipeline",
             "vs_main",
             "fs_main",
             &symbol_instance_layout,
-            None,
+            depth_stencil.clone(),
             None,
         );
 
@@ -418,7 +473,7 @@ impl SymbolRenderer {
             "vs_main",
             "fs_solid",
             &symbol_instance_layout,
-            None,
+            depth_stencil.clone(),
             None,
         );
 
@@ -454,11 +509,55 @@ impl SymbolRenderer {
             pipeline_no_depth,
             pipeline_atlas_debug,
             atlas_bind_group,
+            atlas_texture,
+            atlas_size: [width, height],
             instance_buffer,
             instance_count: 0,
             camera_bind_group_layout: symbol_camera_layout,
             metadata_buffer,
         })
+    }
+
+    pub fn switch_palette(
+        &mut self,
+        queue: &wgpu::Queue,
+        palette_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (atlas_png, atlas_label) = atlas_png_for_palette(palette_name);
+        let img = image::load_from_memory(atlas_png)?;
+        let rgba = img.to_rgba8();
+        let (width, height) = img.dimensions();
+
+        if [width, height] != self.atlas_size {
+            return Err(format!(
+                "symbol atlas '{}' is {}x{}, expected {}x{}",
+                atlas_label, width, height, self.atlas_size[0], self.atlas_size[1]
+            )
+            .into());
+        }
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        log::info!("Switched symbol atlas to {}", atlas_label);
+        Ok(())
     }
 
     /// Update symbol instances from features

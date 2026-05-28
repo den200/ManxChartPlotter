@@ -5,7 +5,7 @@
 //! Otherwise uses solid coastline styling.
 
 use crate::s52::instruction::RenderInstruction;
-use crate::senc::Feature;
+use crate::senc::{Feature, s57_code_to_acronym};
 
 /// Generate render instructions for QUALIN01 conditional symbology.
 ///
@@ -25,7 +25,7 @@ pub fn qualin01_instructions(feature: &Feature) -> Vec<RenderInstruction> {
     }
 
     // Check if coastline with construction
-    let acronym = feature.object_class.acronym();
+    let acronym = s57_code_to_acronym(feature.type_code);
     if acronym == "COALNE" {
         let conrad = feature.attribute_int("CONRAD").unwrap_or(0);
         if conrad == 1 {

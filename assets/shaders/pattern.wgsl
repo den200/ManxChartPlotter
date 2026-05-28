@@ -15,6 +15,8 @@ struct PatternMeta {
     uv_rect: vec4<f32>,
     // [tile_width_px, tile_height_px, stagger_factor, _pad]
     tile_info: vec4<f32>,
+    // [origin_x_px - pivot_x_px, origin_y_px - pivot_y_px, _pad, _pad]
+    offset_info: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -28,6 +30,7 @@ struct VertexInput {
     @location(0) position: vec2<f32>,      // World position (SM meters)
     @location(1) pattern_id: u32,           // Index into pattern_meta
     @location(2) offset: vec2<f32>,         // Pattern offset from object position
+    @location(3) disp_prio: u32,            // Display priority for depth sorting
 }
 
 struct VertexOutput {
@@ -44,6 +47,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     // Transform world position to clip space
     let world_pos = vec4<f32>(in.position, 0.0, 1.0);
     out.clip_position = camera.view_proj * world_pos;
+    out.clip_position.z = 1.0 - (f32(in.disp_prio) / 10.0);
 
     // Pass through data to fragment shader
     out.world_pos = in.position;
@@ -67,8 +71,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let frag_y = in.clip_position.y;
 
     // Apply object offset for seamless tiling across features
-    let offset_x = in.offset.x;
-    let offset_y = in.offset.y;
+    let offset_x = in.offset.x + pat_info.offset_info.x;
+    let offset_y = in.offset.y + pat_info.offset_info.y;
 
     // Calculate which row we're in for stagger
     // yOffM is the un-modded y offset (same as offset_y here)

@@ -10,7 +10,10 @@ use crate::s52::MarinerSettings;
 use crate::senc::{Feature, ObjectClass};
 
 /// QUAPOS01 - Position accuracy styling per OpenCPN.
-pub fn quapos01_instructions(feature: &Feature, _settings: &MarinerSettings) -> Vec<RenderInstruction> {
+pub fn quapos01_instructions(
+    feature: &Feature,
+    _settings: &MarinerSettings,
+) -> Vec<RenderInstruction> {
     let quapos = feature.attribute_int("QUAPOS").unwrap_or(0);
 
     if (2..10).contains(&quapos) {

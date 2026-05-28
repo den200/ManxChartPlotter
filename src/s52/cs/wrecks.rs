@@ -95,10 +95,10 @@ pub fn wrecks02(feature: &Feature, settings: &MarinerSettings) -> Wrecks02Result
     } else {
         // Infer depth from WATLEV when VALSOU is missing
         match watlev {
-            5 => Some(0.0),      // Subject to inundation
-            3 => Some(0.01),     // Covers and uncovers
+            5 => Some(0.0),           // Subject to inundation
+            3 => Some(0.01),          // Covers and uncovers
             1 | 2 | 4 => Some(-15.0), // Above water
-            _ => Some(-15.0),    // Default: above water
+            _ => Some(-15.0),         // Default: above water
         }
     };
 
@@ -210,7 +210,10 @@ fn wrecks02_area(
 }
 
 /// Generate render instructions for WRECKS02
-pub fn wrecks02_instructions(feature: &Feature, settings: &MarinerSettings) -> Vec<RenderInstruction> {
+pub fn wrecks02_instructions(
+    feature: &Feature,
+    settings: &MarinerSettings,
+) -> Vec<RenderInstruction> {
     let result = wrecks02(feature, settings);
 
     vec![RenderInstruction::Symbol {
@@ -285,7 +288,10 @@ mod tests {
     fn test_wreck_quasou_7() {
         // QUASOU=7 (least depth unknown) gets special symbol
         let mut feature = make_wreck(Some(5.0), Some(3), None);
-        feature.attributes.insert("QUASOU".to_string(), AttributeValue::String("7".to_string()));
+        feature.attributes.insert(
+            "QUASOU".to_string(),
+            AttributeValue::String("7".to_string()),
+        );
         let settings = MarinerSettings::default();
         let result = wrecks02(&feature, &settings);
         assert_eq!(result.symbol, WrecksSymbol::Wrecks07);

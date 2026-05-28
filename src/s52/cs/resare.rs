@@ -26,7 +26,10 @@ use crate::senc::Feature;
 ///  10 = dredging restricted
 ///  13 = no wake
 ///  14 = area to be avoided
-pub fn resare02_instructions(feature: &Feature, _settings: &MarinerSettings) -> Vec<RenderInstruction> {
+pub fn resare02_instructions(
+    feature: &Feature,
+    settings: &MarinerSettings,
+) -> Vec<RenderInstruction> {
     let mut instructions = Vec::new();
 
     // Check RESTRN attribute (may be comma-separated list)
@@ -55,12 +58,18 @@ pub fn resare02_instructions(feature: &Feature, _settings: &MarinerSettings) -> 
         });
     }
 
-    // Boundary line: magenta dashed for all restricted areas
-    instructions.push(RenderInstruction::LineStyle {
-        pattern: LinePattern::Dashed,
-        width: 2,
-        color: "CHMGD".to_string(),
-    });
+    // Boundary line: symbolized (LC pattern) or plain (LS dashed) per settings
+    if settings.symbolized_boundaries {
+        instructions.push(RenderInstruction::LineComplex {
+            name: "RESARE51".to_string(),
+        });
+    } else {
+        instructions.push(RenderInstruction::LineStyle {
+            pattern: LinePattern::Dashed,
+            width: 2,
+            color: "CHMGD".to_string(),
+        });
+    }
 
     instructions
 }
@@ -75,7 +84,8 @@ fn get_restrn_values(feature: &Feature) -> Vec<i32> {
 
     // Try string attribute (comma-separated list)
     if let Some(s) = feature.attribute_str("RESTRN") {
-        return s.split(',')
+        return s
+            .split(',')
             .filter_map(|v| v.trim().parse::<i32>().ok())
             .collect();
     }

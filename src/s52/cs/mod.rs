@@ -12,6 +12,7 @@
 //! - LIGHTS05/06: Light symbol selection based on color and range
 //! - SNDFRM02: Sounding formatting and safety depth coloring
 
+mod datcvr;
 mod depare;
 mod depcnt;
 mod lights;
@@ -25,21 +26,22 @@ mod sndfrm;
 mod topmar;
 mod wrecks;
 
+pub use datcvr::datcvr01_instructions;
 pub use depare::{depare02, depare02_color_token, depare02_instructions, DepthColorToken};
 pub use depcnt::{depcnt02, depcnt02_params, is_safety_contour, DepthContourStyle};
 pub use lights::{
     light_render_info, light_sector_info, lights06, lights06_symbol, litdsn01, LightRenderInfo,
     LightSectorInfo, LightSymbol,
 };
-pub use obstrn::{obstrn04, obstrn04_instructions, obstrn04_symbol, ObstrnSymbol, Obstrn04Result};
+pub use obstrn::{obstrn04, obstrn04_instructions, obstrn04_symbol, Obstrn04Result, ObstrnSymbol};
 pub use qualin::qualin01_instructions;
 pub use quapos::quapos01_instructions;
+pub use resare::resare02_instructions;
 pub use restrn::restrn01_instructions;
 pub use slcons::slcons03_instructions;
 pub use sndfrm::{sndfrm02, sounding_color, sounding_color_rgb, SoundingRenderInfo};
-pub use resare::resare02_instructions;
 pub use topmar::topmar01_instructions;
-pub use wrecks::{wrecks02, wrecks02_instructions, wrecks02_symbol, WrecksSymbol, Wrecks02Result};
+pub use wrecks::{wrecks02, wrecks02_instructions, wrecks02_symbol, Wrecks02Result, WrecksSymbol};
 
 use crate::s52::instruction::RenderInstruction;
 use crate::s52::MarinerSettings;
@@ -60,6 +62,7 @@ pub fn execute_cs(
     settings: &MarinerSettings,
 ) -> Option<Vec<RenderInstruction>> {
     match procedure {
+        "DATCVR01" => Some(datcvr01_instructions(feature)),
         "DEPARE01" | "DEPARE02" => Some(depare02_instructions(feature, settings)),
         "DEPCNT02" => {
             let (pattern, width, color_token) = depcnt02_params(feature, settings);
@@ -158,7 +161,12 @@ mod tests {
         let settings = MarinerSettings::default();
         let instructions = execute_cs("DEPCNT02", &feature, &settings).unwrap();
         assert_eq!(instructions.len(), 1);
-        if let RenderInstruction::LineStyle { pattern, width, color } = &instructions[0] {
+        if let RenderInstruction::LineStyle {
+            pattern,
+            width,
+            color,
+        } = &instructions[0]
+        {
             assert_eq!(*pattern, LinePattern::Solid); // Accurate position = solid
             assert_eq!(*width, 2); // Thick for safety
             assert_eq!(color, "DEPSC");
@@ -190,7 +198,12 @@ mod tests {
         let settings = MarinerSettings::default();
         let instructions = execute_cs("DEPCNT02", &feature, &settings).unwrap();
         assert_eq!(instructions.len(), 1);
-        if let RenderInstruction::LineStyle { pattern, width, color } = &instructions[0] {
+        if let RenderInstruction::LineStyle {
+            pattern,
+            width,
+            color,
+        } = &instructions[0]
+        {
             assert_eq!(*pattern, LinePattern::Dashed); // Low accuracy = dashed
             assert_eq!(*width, 2); // Still thick for safety
             assert_eq!(color, "DEPSC");
@@ -256,7 +269,12 @@ mod tests {
         let settings = MarinerSettings::default();
         let instructions = execute_cs("SLCONS03", &feature, &settings).unwrap();
         assert_eq!(instructions.len(), 1);
-        if let RenderInstruction::LineStyle { pattern, width, color } = &instructions[0] {
+        if let RenderInstruction::LineStyle {
+            pattern,
+            width,
+            color,
+        } = &instructions[0]
+        {
             assert_eq!(*pattern, LinePattern::Solid);
             assert_eq!(*width, 2); // Minor structure (only 6/15/16 are major)
             assert_eq!(color, "CSTLN");

@@ -85,20 +85,24 @@ pub const SNDG2: Color = [0.027, 0.027, 0.027, 1.0];
 const PPMM: f32 = 4.0;
 
 // DASH pattern: 3mm period, 0.66 on fraction
-const DASH_PERIOD: f32 = 3.0 * PPMM;      // 12 px
-const DASH_ON: f32 = DASH_PERIOD * 0.66;  // ~8 px
+const DASH_PERIOD: f32 = 3.0 * PPMM; // 12 px
+const DASH_ON: f32 = DASH_PERIOD * 0.66; // ~8 px
 const DASH_OFF: f32 = DASH_PERIOD * 0.34; // ~4 px
 
 // DOT pattern: 1mm period, 0.5 on fraction
-const DOT_PERIOD: f32 = 1.0 * PPMM;       // 4 px
-const DOT_ON: f32 = DOT_PERIOD * 0.5;     // 2 px
-const DOT_OFF: f32 = DOT_PERIOD * 0.5;    // 2 px
+const DOT_PERIOD: f32 = 1.0 * PPMM; // 4 px
+const DOT_ON: f32 = DOT_PERIOD * 0.5; // 2 px
+const DOT_OFF: f32 = DOT_PERIOD * 0.5; // 2 px
 
 /// Convert S-52 width units to pixels.
 /// OpenCPN uses width values directly as pixel widths (not 0.3mm per unit from spec K.3).
 /// This matches OpenCPN's RenderLS behavior: `glLineWidth(wxMax(m_GLMinCartographicLineWidth, w))`
 const fn width(w: u8) -> f32 {
-    if w == 0 { 1.0 } else { w as f32 }
+    if w == 0 {
+        1.0
+    } else {
+        w as f32
+    }
 }
 
 // ============================================================
@@ -113,6 +117,8 @@ pub const COALNE: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// DEPCNT normal: LS(SOLD,1,DEPCN) - Depth contour: solid, width 1, gray-blue
@@ -121,6 +127,8 @@ pub const DEPCNT: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// DEPCNT safety: LS(SOLD,2,DEPSC) - Safety contour: solid, width 2, dark gray
@@ -129,6 +137,8 @@ pub const DEPCNT_SAFETY: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// DEPCNT low accuracy: LS(DASH,1,DEPCN) - Low accuracy contour: dashed
@@ -137,6 +147,8 @@ pub const DEPCNT_LOWACC: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// SLCONS default: LS(SOLD,2,CSTLN) - Shoreline construction: solid, width 2
@@ -145,6 +157,8 @@ pub const SLCONS: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// SLCONS wharf: LS(SOLD,4,CSTLN) - Wharf/pier: solid, width 4
@@ -153,6 +167,8 @@ pub const SLCONS_WHARF: LineStyle = LineStyle {
     width_px: width(4),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// RIVBNK: LS(DOTT,2,CSTLN) - River bank: dotted, width 2
@@ -161,6 +177,8 @@ pub const RIVBNK: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: DOT_ON,
     dash_off_px: DOT_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// CBLOHD: LS(DASH,4,CHGRD) - Overhead cable: dashed, width 4, gray
@@ -169,6 +187,8 @@ pub const CBLOHD: LineStyle = LineStyle {
     width_px: width(4),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// CBLSUB: LS(DASH,1,CHMGD) - Submarine cable: dashed, width 1, magenta
@@ -177,6 +197,8 @@ pub const CBLSUB: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// CHNWIR: LS(DASH,1,CHBLK) - Chain/wire: dashed, width 1, black
@@ -185,6 +207,8 @@ pub const CHNWIR: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// NAVLNE: LS(DASH,1,CHGRD) - Navigation line: dashed, width 1, gray
@@ -193,6 +217,8 @@ pub const NAVLNE: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// TSELNE: LS(SOLD,6,TRFCF) - Traffic separation line: solid, width 6, light magenta
@@ -201,6 +227,8 @@ pub const TSELNE: LineStyle = LineStyle {
     width_px: width(6),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// TSSBND: LS(DASH,2,TRFCD) - TSS boundary: dashed, width 2, dark magenta
@@ -209,6 +237,8 @@ pub const TSSBND: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// ROADWY: LS(SOLD,2,LANDF) - Road: solid, width 2, brown
@@ -217,6 +247,8 @@ pub const ROADWY: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// RAILWY: LS(SOLD,2,LANDF) - Railway: solid, width 2, brown
@@ -225,6 +257,8 @@ pub const RAILWY: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// PIPSOL: solid medium gray (LC texture placeholder)
@@ -233,6 +267,8 @@ pub const PIPSOL: LineStyle = LineStyle {
     width_px: width(2),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// LAKSHR: LS(SOLD,1,CSTLN) - Lake shore: solid, width 1
@@ -241,6 +277,8 @@ pub const LAKSHR: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: 0.0,
     dash_off_px: 0.0,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// VEGATN: LS(DASH,1,LANDF) - Vegetation: dashed, width 1, brown
@@ -249,6 +287,8 @@ pub const VEGATN: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// TUNNEL: LS(DASH,1,CHGRD) - Tunnel: dashed, width 1, gray
@@ -257,6 +297,8 @@ pub const TUNNEL: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 /// OBSTRN: LS(DASH,1,CHMGD) - Obstruction: dashed, width 1, magenta
@@ -265,6 +307,8 @@ pub const OBSTRN: LineStyle = LineStyle {
     width_px: width(1),
     dash_on_px: DASH_ON,
     dash_off_px: DASH_OFF,
+    color_index: 0,
+    dot_on_px: 0.0,
 };
 
 // ============================================================
@@ -305,13 +349,13 @@ fn width_scaled(w: u8, ppmm: f32) -> f32 {
 
 /// Compute dash pattern for given ppmm
 fn dash_pattern(ppmm: f32) -> (f32, f32) {
-    let period = 3.0 * ppmm;  // 3mm period
+    let period = 3.0 * ppmm; // 3mm period
     (period * 0.66, period * 0.34)
 }
 
 /// Compute dot pattern for given ppmm
 fn dot_pattern(ppmm: f32) -> (f32, f32) {
-    let period = 1.0 * ppmm;  // 1mm period
+    let period = 1.0 * ppmm; // 1mm period
     (period * 0.5, period * 0.5)
 }
 
@@ -324,68 +368,90 @@ pub fn style_for_id(id: LineStyleId, ppmm: f32) -> LineStyle {
         LineStyleId::Coastline => LineStyle {
             color: CSTLN,
             width_px: width_scaled(1, ppmm),
-            dash_on_px: 0.0,  // SOLD per spec Appendix N
+            dash_on_px: 0.0, // SOLD per spec Appendix N
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::ShorelineConstruction => LineStyle {
             color: CSTLN,
             width_px: width_scaled(2, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::ShorelineConstructionWharf => LineStyle {
             color: CSTLN,
             width_px: width_scaled(4, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::DepthContour => LineStyle {
             color: DEPCN,
             width_px: width_scaled(1, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::DepthContourSafety => LineStyle {
             color: DEPSC,
             width_px: width_scaled(2, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::CableOverhead => LineStyle {
             color: CHGRD,
             width_px: width_scaled(4, ppmm),
             dash_on_px: dash_on,
             dash_off_px: dash_off,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::CableSubmarine => LineStyle {
             color: CHMGD,
             width_px: width_scaled(1, ppmm),
             dash_on_px: dash_on,
             dash_off_px: dash_off,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::TrafficSeparationLine => LineStyle {
             color: TRFCF,
             width_px: width_scaled(6, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::Road => LineStyle {
             color: LANDF,
             width_px: width_scaled(2, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::RiverBank => LineStyle {
             color: CSTLN,
             width_px: width_scaled(2, ppmm),
             dash_on_px: dot_on,
             dash_off_px: dot_off,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
         LineStyleId::Pipeline => LineStyle {
             color: CHGRD,
             width_px: width_scaled(2, ppmm),
             dash_on_px: 0.0,
             dash_off_px: 0.0,
+            color_index: 0,
+            dot_on_px: 0.0,
         },
     }
 }
@@ -420,17 +486,17 @@ pub fn color_for_token(token: &str, tables: Option<&LookupTables>) -> Color {
         "LANDF" => LANDF,
         "LANDA" => LANDA,
         "TRFCD" => TRFCD,
-        "ATRFCD" => TRFCD,   // compound ref: foreground traffic route color
+        "ATRFCD" => TRFCD, // compound ref: foreground traffic route color
         "TRFCF" => TRFCF,
         "CURSR" => CURSR,
         "SNDG1" => SNDG1,
         "SNDG2" => SNDG2,
         // Depth area colors (fallback)
-        "DEPIT" => [0.514, 0.698, 0.584, 1.0],  // Intertidal
-        "DEPVS" => [0.451, 0.714, 0.937, 1.0],  // Very shallow
-        "DEPMS" => [0.596, 0.773, 0.949, 1.0],  // Medium shallow
-        "DEPMD" => [0.729, 0.835, 0.882, 1.0],  // Medium deep
-        "DEPDW" => [0.831, 0.918, 0.933, 1.0],  // Deep water
+        "DEPIT" => [0.514, 0.698, 0.584, 1.0], // Intertidal
+        "DEPVS" => [0.451, 0.714, 0.937, 1.0], // Very shallow
+        "DEPMS" => [0.596, 0.773, 0.949, 1.0], // Medium shallow
+        "DEPMD" => [0.729, 0.835, 0.882, 1.0], // Medium deep
+        "DEPDW" => [0.831, 0.918, 0.933, 1.0], // Deep water
         _ => {
             // Unknown token - log and return black
             log::trace!("Unknown S-52 color token: {}", token);
@@ -446,21 +512,34 @@ pub fn color_for_token(token: &str, tables: Option<&LookupTables>) -> Color {
 pub fn style_for_key(key: &LineStyleKey, ppmm: f32, tables: Option<&LookupTables>) -> LineStyle {
     // Resolve color token to RGB
     let color = color_for_token(&key.color_token, tables);
+    // Resolve color token to palette index
+    let color_index = tables
+        .and_then(|t| t.get_color_index(&key.color_token))
+        .unwrap_or(0); // Default to first color if not found
 
     // Convert S-52 width units to pixels using OpenCPN-compatible formula
     let width_px = width_scaled(key.width, ppmm);
 
     // Convert pattern to dash/dot parameters
-    let (dash_on_px, dash_off_px) = match key.pattern {
-        LinePattern::Solid => (0.0, 0.0),
-        LinePattern::Dashed => dash_pattern(ppmm),
-        LinePattern::Dotted => dot_pattern(ppmm),
+    let (dash_on_px, dash_off_px, dot_on_px) = match key.pattern {
+        LinePattern::Solid => (0.0, 0.0, 0.0),
+        LinePattern::Dashed => { let (on, off) = dash_pattern(ppmm); (on, off, 0.0) },
+        LinePattern::Dotted => { let (on, off) = dot_pattern(ppmm); (on, off, 0.0) },
+        LinePattern::DashDot => {
+            // DASD: dash (2mm) + gap with centered dot. Total period = 4.5mm
+            let dash = 2.0 * ppmm;      // 2mm dash
+            let gap = 2.5 * ppmm;       // 2.5mm gap (contains a dot in the center)
+            let dot = 0.5 * ppmm;       // 0.5mm dot
+            (dash, gap, dot)
+        },
     };
 
     LineStyle {
         color,
+        color_index: color_index as u32,
         width_px,
         dash_on_px,
         dash_off_px,
+        dot_on_px,
     }
 }

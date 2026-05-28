@@ -97,7 +97,8 @@ pub fn sndfrm02(
     settings: &MarinerSettings,
 ) -> SoundingRenderInfo {
     // Convert depth based on unit preference (OpenCPN s52cnsy.cpp:2675-2700)
-    let (depth_value, safety_depth) = convert_depth_units(depth_meters, settings.safety_depth as f64, settings);
+    let (depth_value, safety_depth) =
+        convert_depth_units(depth_meters, settings.safety_depth as f64, settings);
 
     // Determine if shallow (danger) or deep (safe)
     // OpenCPN s52cnsy.cpp:2712-2715
@@ -175,7 +176,11 @@ fn format_depth_parts(
         let fraction = (depth_value.abs() - leading_digit as f64).abs();
         let decimal_digit = if !b_2digit && fraction != 0.0 {
             let frac = (fraction * 10.0) as u8;
-            if frac > 0 { Some(frac) } else { None }
+            if frac > 0 {
+                Some(frac)
+            } else {
+                None
+            }
         } else {
             None
         };

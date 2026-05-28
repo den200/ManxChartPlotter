@@ -12,6 +12,8 @@ pub enum LinePattern {
     Dashed,
     /// DOTT - dotted line
     Dotted,
+    /// DASD - dash-dot line
+    DashDot,
 }
 
 /// Hashable key for a line style (for batching lines with identical styles)
@@ -50,6 +52,7 @@ impl LinePattern {
             "SOLD" => Self::Solid,
             "DASH" => Self::Dashed,
             "DOTT" => Self::Dotted,
+            "DASD" => Self::DashDot,
             _ => Self::Solid, // Default to solid
         }
     }
@@ -83,6 +86,17 @@ pub enum RenderInstruction {
         xoffs: i16,        // X offset in chars
         yoffs: i16,        // Y offset in chars
         color: String,     // Text color token
+        /// Font style code (CHARS[0]). 1 = standard alphabetic.
+        style: u8,
+        /// Font weight code (CHARS[1]). 4 = light, 5 = normal, 6 = bold, 7 = heavy.
+        weight: u8,
+        /// Font width code (CHARS[2]). 1 = normal.
+        width: u8,
+        /// Body size in points (CHARS[3..]). Typical 8-20.
+        bsize: u8,
+        /// Text display group (last TX/TE argument). 21-29, lower = more important.
+        /// Filtered by ShowImportantTextOnly (hide dis >= 20).
+        dis: u8,
     },
 
     /// LC(line_class) - Line complex (predefined line style)
@@ -148,29 +162,43 @@ impl RenderInstruction {
                 procedure: args[0].trim().to_string(),
             }),
 
-            // TX(attribute, hjust, vjust, space, chars, xoffs, yoffs, color, size)
-            // TX has 9 args: attr, hjust, vjust, space, chars, xoffs, yoffs, color, size
-            "TX" if args.len() >= 9 => Some(Self::Text {
-                attribute: args[0].trim().trim_matches('\'').to_string(),
-                format: None,
-                hjust: args[1].trim().parse().unwrap_or(1),
-                vjust: args[2].trim().parse().unwrap_or(1),
-                xoffs: args[5].trim().parse().unwrap_or(0),
-                yoffs: args[6].trim().parse().unwrap_or(0),
-                color: args[7].trim().to_string(),
-            }),
+            // TX(attribute, hjust, vjust, space, chars, xoffs, yoffs, color, dis)
+            "TX" if args.len() >= 9 => {
+                let (style, weight, width, bsize) = parse_chars(&args[4]);
+                Some(Self::Text {
+                    attribute: args[0].trim().trim_matches('\'').to_string(),
+                    format: None,
+                    hjust: args[1].trim().parse().unwrap_or(1),
+                    vjust: args[2].trim().parse().unwrap_or(1),
+                    xoffs: args[5].trim().parse().unwrap_or(0),
+                    yoffs: args[6].trim().parse().unwrap_or(0),
+                    color: args[7].trim().to_string(),
+                    style,
+                    weight,
+                    width,
+                    bsize,
+                    dis: args[8].trim().parse().unwrap_or(21),
+                })
+            }
 
-            // TE('format', attribute, hjust, vjust, space, chars, xoffs, yoffs, color, size)
-            // TE has 10 args: format, attr, hjust, vjust, space, chars, xoffs, yoffs, color, size
-            "TE" if args.len() >= 10 => Some(Self::Text {
-                attribute: args[1].trim().trim_matches('\'').to_string(),
-                format: Some(args[0].trim().trim_matches('\'').to_string()),
-                hjust: args[2].trim().parse().unwrap_or(1),
-                vjust: args[3].trim().parse().unwrap_or(1),
-                xoffs: args[6].trim().parse().unwrap_or(0),
-                yoffs: args[7].trim().parse().unwrap_or(0),
-                color: args[8].trim().to_string(),
-            }),
+            // TE('format', attribute, hjust, vjust, space, chars, xoffs, yoffs, color, dis)
+            "TE" if args.len() >= 10 => {
+                let (style, weight, width, bsize) = parse_chars(&args[5]);
+                Some(Self::Text {
+                    attribute: args[1].trim().trim_matches('\'').to_string(),
+                    format: Some(args[0].trim().trim_matches('\'').to_string()),
+                    hjust: args[2].trim().parse().unwrap_or(1),
+                    vjust: args[3].trim().parse().unwrap_or(1),
+                    xoffs: args[6].trim().parse().unwrap_or(0),
+                    yoffs: args[7].trim().parse().unwrap_or(0),
+                    color: args[8].trim().to_string(),
+                    style,
+                    weight,
+                    width,
+                    bsize,
+                    dis: args[9].trim().parse().unwrap_or(21),
+                })
+            }
 
             _ => None, // Unknown instruction type
         }
@@ -245,6 +273,29 @@ pub fn parse_instructions(instruction: &str) -> Vec<LineOp> {
     }
 
     ops
+}
+
+/// Parse the CHARS field of a TX/TE instruction (e.g. '15110').
+/// Returns (style, weight, width, bsize). Defaults to (1,5,1,11) on parse failure
+/// — matching OpenCPN's default alphabetic normal-weight 11pt font.
+fn parse_chars(raw: &str) -> (u8, u8, u8, u8) {
+    let trimmed: &str = raw.trim().trim_matches('\'');
+    let digits: Vec<u8> = trimmed
+        .chars()
+        .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+        .collect();
+    // Expected: [style, weight, width, bsize_tens, bsize_ones, ...]
+    let style = digits.first().copied().unwrap_or(1);
+    let weight = digits.get(1).copied().unwrap_or(5);
+    let width = digits.get(2).copied().unwrap_or(1);
+    let bsize = if digits.len() >= 5 {
+        digits[3] * 10 + digits[4]
+    } else if digits.len() == 4 {
+        digits[3]
+    } else {
+        11
+    };
+    (style, weight, width, bsize)
 }
 
 /// Parse comma-separated arguments, handling quoted strings
@@ -333,13 +384,36 @@ mod tests {
         let instr =
             RenderInstruction::parse_single("TE('clr %4.1lf',VERCLR,3,1,2,'15110',1,1,CHBLK,11)");
         assert!(instr.is_some());
-        if let Some(RenderInstruction::Text { attribute, color, format, hjust, vjust, .. }) = instr {
+        if let Some(RenderInstruction::Text {
+            attribute,
+            color,
+            format,
+            hjust,
+            vjust,
+            weight,
+            bsize,
+            dis,
+            ..
+        }) = instr
+        {
             assert_eq!(attribute, "VERCLR");
             assert_eq!(color, "CHBLK");
             assert_eq!(format, Some("clr %4.1lf".to_string()));
             assert_eq!(hjust, 3);
             assert_eq!(vjust, 1);
+            assert_eq!(weight, 5);
+            assert_eq!(bsize, 10);
+            assert_eq!(dis, 11);
         }
+    }
+
+    #[test]
+    fn test_parse_chars_field() {
+        assert_eq!(parse_chars("'15110'"), (1, 5, 1, 10));
+        assert_eq!(parse_chars("15110"), (1, 5, 1, 10));
+        assert_eq!(parse_chars("'16120'"), (1, 6, 1, 20));
+        assert_eq!(parse_chars("'14108'"), (1, 4, 1, 8));
+        assert_eq!(parse_chars(""), (1, 5, 1, 11));
     }
 
     #[test]
@@ -347,6 +421,7 @@ mod tests {
         assert_eq!(LinePattern::from_str("SOLD"), LinePattern::Solid);
         assert_eq!(LinePattern::from_str("DASH"), LinePattern::Dashed);
         assert_eq!(LinePattern::from_str("DOTT"), LinePattern::Dotted);
+        assert_eq!(LinePattern::from_str("DASD"), LinePattern::DashDot);
         assert_eq!(LinePattern::from_str("UNKNOWN"), LinePattern::Solid);
     }
 

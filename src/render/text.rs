@@ -23,13 +23,19 @@ pub struct SoundingInstance {
     /// - Bits 8-11: decimal_digit value (0-9)
     /// - Bits 12-28: whole_part value (0-99999)
     pub flags: u32,
+    /// Scale factor for Soft SCAMIN (1.0 = normal, 0.5 = half size)
+    pub scale: f32,
+    /// S-52 palette color index (SNDG1/SNDG2)
+    pub color_index: u32,
 }
 
 impl SoundingInstance {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
         0 => Float32x2,  // position
         1 => Float32,    // depth
         2 => Uint32,     // flags
+        3 => Float32,    // scale
+        4 => Uint32,     // color_index
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -59,26 +65,39 @@ impl TextRenderer {
         _camera_bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // Create our own camera bind group layout (same as main)
-        let text_camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("text_camera_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let text_camera_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("text_camera_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         // Load shader
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sounding_shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/shaders/sounding.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("../../assets/shaders/sounding.wgsl").into(),
+            ),
         });
 
         // Pipeline layout
@@ -117,7 +136,13 @@ impl TextRenderer {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
             cache: None,
@@ -157,6 +182,7 @@ impl TextRenderer {
         &self,
         device: &wgpu::Device,
         camera_buffer: &wgpu::Buffer,
+        palette_buffer: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("text_camera_bind_group"),
@@ -165,6 +191,10 @@ impl TextRenderer {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: palette_buffer.as_entire_binding(),
                 },
             ],
         })
