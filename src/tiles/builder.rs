@@ -2,7 +2,7 @@
 //!
 //! Builds TilePackets (CPU-side) from chart data, ready for GPU upload.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -1277,6 +1277,13 @@ impl<'a> TileBuilder<'a> {
         let mut logged_first_bbox = false;
         let before_verts = packet.area_vertices.len();
 
+        // Edges owned by the high-priority coastline-formers (land area, coastline,
+        // shoreline construction). Lower-priority area boundaries (e.g. the
+        // magenta CTNARE caution boundary, prio 2) that share these edges are
+        // suppressed so the coast is drawn once as the coastline — OpenCPN's
+        // PrioritizeLineFeature shared-edge rule. Edge indices are per-chart.
+        let coast_edges = collect_coast_edges(chart);
+
         for feature in chart.areas() {
             stats.total_features += 1;
 
@@ -1643,6 +1650,10 @@ impl<'a> TileBuilder<'a> {
                             [min_x, max_y],
                             [min_x, min_y],
                         ]]
+                    } else if !coast_edges.is_empty() && (boundary_priority as i32) < 7 {
+                        // Suppress boundary segments that coincide with the coast
+                        // (shared with a higher-priority coastline-former).
+                        geom.resolve_rings_excluding(&chart.edge_table, &coast_edges)
                     } else {
                         geom.resolve_rings(&chart.edge_table)
                     };
@@ -2930,6 +2941,30 @@ fn sanitize_bitmap_text(input: &str) -> String {
             _ => ' ',
         })
         .collect()
+}
+
+/// Collect the per-chart edge indices belonging to the coastline-forming
+/// features — land areas (LNDARE), coastlines (COALNE) and shoreline
+/// constructions (SLCONS). These edges are drawn at high priority as the coast;
+/// lower-priority area boundaries that share them are suppressed (OpenCPN's
+/// PrioritizeLineFeature shared-edge rule).
+fn collect_coast_edges(chart: &ChartData) -> HashSet<u32> {
+    let mut edges = HashSet::new();
+    for feature in chart.areas() {
+        if feature.is_land() {
+            if let Some(geom) = &feature.area_geometry {
+                edges.extend(geom.edge_refs.iter().map(|e| e.index()));
+            }
+        }
+    }
+    for feature in chart.lines() {
+        if feature.is_coastline() || feature.is_shoreline_construction() {
+            if let Some(geom) = &feature.line_geometry {
+                edges.extend(geom.edge_refs.iter().map(|e| e.index()));
+            }
+        }
+    }
+    edges
 }
 
 fn close_ring_if_needed(points: &mut Vec<[f64; 2]>) {

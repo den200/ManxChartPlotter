@@ -489,6 +489,27 @@ impl AreaGeometry {
     ///
     /// Returns polylines as Vec<[f32; 2]>; the caller can close/transform as needed.
     pub fn resolve_rings(&self, edge_table: &EdgeTable) -> Vec<Vec<[f32; 2]>> {
+        self.resolve_rings_impl(edge_table, None)
+    }
+
+    /// Like [`resolve_rings`](Self::resolve_rings) but omits any edge whose index
+    /// is in `exclude`, breaking the polyline at that point. Used to drop
+    /// area-boundary segments that coincide with a higher-priority feature
+    /// (e.g. the coastline), matching OpenCPN's shared-edge priority rule
+    /// (`PrioritizeLineFeature`).
+    pub fn resolve_rings_excluding(
+        &self,
+        edge_table: &EdgeTable,
+        exclude: &std::collections::HashSet<u32>,
+    ) -> Vec<Vec<[f32; 2]>> {
+        self.resolve_rings_impl(edge_table, Some(exclude))
+    }
+
+    fn resolve_rings_impl(
+        &self,
+        edge_table: &EdgeTable,
+        exclude: Option<&std::collections::HashSet<u32>>,
+    ) -> Vec<Vec<[f32; 2]>> {
         if self.edge_refs.is_empty() {
             return Vec::new();
         }
@@ -498,6 +519,20 @@ impl AreaGeometry {
         let mut prev_end_node: Option<u32> = None;
 
         for edge_ref in &self.edge_refs {
+            // Drop edges owned by a higher-priority feature (e.g. the coast):
+            // break the current polyline so the segment is simply not emitted.
+            if let Some(ex) = exclude {
+                if ex.contains(&edge_ref.index()) {
+                    if current.len() >= 2 {
+                        rings.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                    prev_end_node = None;
+                    continue;
+                }
+            }
+
             let (start_id, end_id) = if edge_ref.is_reversed() {
                 (edge_ref.end_node, edge_ref.start_node)
             } else {

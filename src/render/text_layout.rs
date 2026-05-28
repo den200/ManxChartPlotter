@@ -236,7 +236,7 @@ fn layout_sounding_glyphs(s: &SoundingInstance) -> Vec<LabelGlyphInstance> {
 
     let mut glyphs = Vec::new();
     let mut x = 0.0_f32;
-    let mut push_glyph = |glyphs: &mut Vec<LabelGlyphInstance>, c: char, ox: f32, oy: f32, size: [f32; 2]| {
+    let push_glyph = |glyphs: &mut Vec<LabelGlyphInstance>, c: char, ox: f32, oy: f32, size: [f32; 2]| {
         let uv = glyph_uv_rect(c).unwrap_or_else(|| glyph_uv_rect(' ').unwrap());
         glyphs.push(LabelGlyphInstance {
             position: s.position,
