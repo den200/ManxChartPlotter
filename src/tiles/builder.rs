@@ -416,10 +416,25 @@ impl<'a> TileBuilder<'a> {
     /// Check whether a TX/TE label with the given text-display-group (dis) should
     /// be suppressed by the user's ShowImportantTextOnly setting. Mirrors
     /// OpenCPN's `m_bShowS57ImportantTextOnly && text->dis >= 20`.
+    /// Effective zoom level at/above which low-priority (dis >= 20) labels —
+    /// place names, light descriptions, etc. — are shown despite
+    /// ShowImportantTextOnly. Below this they are suppressed to avoid a text
+    /// stampede at overview scales. Mirrors how OpenCPN's labels only surface
+    /// once zoomed into harbour/approach scales.
+    const TEXT_DETAIL_ZOOM: u8 = 14;
+
     #[inline]
     fn should_skip_text(&self, dis: u8) -> bool {
         self.s52_engine
-            .map(|e| e.settings.show_important_text_only && dis >= 20)
+            .map(|e| {
+                if !e.settings.show_important_text_only || dis < 20 {
+                    return false;
+                }
+                // Scale-aware LOD: keep the dis >= 20 labels once zoomed into
+                // detail (harbour/marina), suppress them at overview zooms.
+                let z = super::zoom_from_camera(self.view_meters_per_pixel);
+                z < Self::TEXT_DETAIL_ZOOM
+            })
             .unwrap_or(false)
     }
 

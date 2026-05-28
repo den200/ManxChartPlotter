@@ -1973,11 +1973,16 @@ impl RenderState {
 
         declutter_soundings(&mut all_soundings, &self.camera);
         let sounding_glyphs = layout_sounding_labels(&all_soundings);
+        // Scale-aware ShowImportantTextOnly: suppress dis >= 20 labels (place
+        // names, light descriptions) only at overview zooms. Once zoomed into
+        // harbour/approach detail (z >= 14) show them, matching OpenCPN. Mirrors
+        // the builder-side TileBuilder::TEXT_DETAIL_ZOOM gate.
         let important_only = self
             .s52_engine
             .as_ref()
             .map(|e| e.settings.show_important_text_only)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && crate::tiles::zoom_from_camera(self.camera.zoom) < 14;
         let mut decluttered_labels =
             declutter_and_layout_labels_ex(&all_labels, &self.camera, important_only);
         decluttered_labels.extend(sounding_glyphs);
