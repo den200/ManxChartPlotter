@@ -417,7 +417,20 @@ impl LineStyleTable {
                         "name" => current_name = text,
                         "description" => current_description = text,
                         "HPGL" => current_hpgl = text,
-                        "color-ref" => current_color_ref = text,
+                        "color-ref" => {
+                            // S-52 vector color-ref is <penLetter><5-char palette
+                            // token>[...]. The leading pen letter maps to HPGL
+                            // "SPx" pen-selects (which we ignore); the palette
+                            // token is the next 5 chars. Strip the pen letter so
+                            // the token resolves against the colour table, e.g.
+                            // "ACHMGD" -> "CHMGD" (magenta). Without this, every
+                            // LC() complex line fell back to black.
+                            current_color_ref = if text.len() >= 6 {
+                                text[1..6].to_string()
+                            } else {
+                                text
+                            };
+                        }
                         _ => {}
                     }
                 }
