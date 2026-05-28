@@ -197,7 +197,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing. Severity = visual impact at typ
 | SN2 | SOUNDS (≤safety, red) vs SOUNDG; swept/reliability markers | 🟡 has sndfrm flags; verify color/markers | med |
 | LN1 | LS width law (mm-based on hi-DPI), min-width floor | 🟡 pixel width; mm/DPI law partial | low |
 | LN2 | LC stamp advance + per-segment rotation + colors | ✅ renders (colors fixed this session) | — |
-| AR1 | Robust tessellation (GLU/libtess2 + combine for self-intersect) | ❌ **fan triangulation** + Sutherland-Hodgman; weak on holes/self-intersect | **high** |
+| AR1 | Robust tessellation (GLU/libtess2 + combine for self-intersect) | ✅ **CORRECTED 2026-05-28**: area fills consume OpenCPN's **pre-tessellated** OSENC triangles (`for_each_triangle_global`); fallback uses **`earcutr` with hole indices** (concave+holes); `triangulate_fan` only runs on convex clip fragments. Robust. Residual: earcut (not GLU) on self-intersecting polygons in the rarely-hit fallback. | low |
 | AR2 | AP pattern screen-space tiling, staggered, world-anchored | 🟡 patterns exist; capped (`MAX_LC_STAMPS`), heavier than ref | med |
 | Q1 | Chart quilting / coverage masking (no visible seams) | 🟡 partial masking; **hard depth-shade seam** at chart edges | **high** |
 | Q2 | Per-frame LOD (Douglas-Peucker) by view scale | ❌ no LOD; full geometry per tile | med |
@@ -231,16 +231,17 @@ Weighting subsystems by their contribution to the on-screen result at harbour/ap
 | Subsystem | Weight | NavCore | Contribution |
 |---|--:|--:|--:|
 | Color / palette / depth shades | 22% | 95% | 20.9 |
-| Areas (fill + tessellation robustness) | 15% | 60% | 9.0 |
+| Areas (fill + tessellation robustness) | 15% | 85% | 12.8 |
 | Lines (LS/LC, colors, width) | 12% | 82% | 9.8 |
 | Text labels (names, light desc, declutter) | 13% | 78% | 10.1 |
-| Soundings (format + reliability) | 10% | 55% | 5.5 |
+| Soundings (subscript format + reliability) | 10% | 85% | 8.5 |
 | Point symbols (buoys, beacons, lights) | 10% | 80% | 8.0 |
 | CS procedure coverage | 8% | 70% | 5.6 |
 | SCAMIN / LOD / display category | 6% | 65% | 3.9 |
 | Multi-chart quilting / coverage | 4% | 55% | 2.2 |
 
-**Weighted parity ≈ 75%.**
+**Weighted parity ≈ 82%.** (Updated 2026-05-28 after the subscript-sounding fix and
+correcting AR1 — area tessellation is already robust via pre-tessellated OSENC triangles.)
 
 Interpretation: the **dominant, chart-wide correctness** (colors, depth shades, line/area
 colors, label visibility, symbol presence) is essentially solved — that's why the latest
