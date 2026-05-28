@@ -184,33 +184,6 @@ pub fn layout_light_text(position: [f32; 2], text: &str, color: [f32; 4]) -> Vec
     })
 }
 
-fn sounding_text(instance: &SoundingInstance) -> String {
-    let flags = instance.flags;
-    let has_decimal = (flags & (1 << 4)) != 0;
-    let decimal_digit = ((flags >> 8) & 0xF) as u8;
-    let whole_part = (flags >> 12) & 0x1_FFFF;
-    let is_drying = (flags & (1 << 1)) != 0;
-    let show_uncertainty = (flags & (1 << 2)) != 0;
-    let is_swept = (flags & (1 << 3)) != 0;
-
-    let mut text = String::new();
-    if is_swept {
-        text.push('~');
-    }
-    if is_drying {
-        text.push('_');
-    }
-    text.push_str(&whole_part.to_string());
-    if has_decimal {
-        text.push('.');
-        text.push(char::from(b'0' + decimal_digit.min(9)));
-    }
-    if show_uncertainty {
-        text.push('?');
-    }
-    text
-}
-
 fn sounding_color(flags: u32) -> [f32; 4] {
     if (flags & 1) != 0 {
         [0.027, 0.027, 0.027, 1.0]
@@ -219,26 +192,93 @@ fn sounding_color(flags: u32) -> [f32; 4] {
     }
 }
 
-pub fn layout_sounding_labels(soundings: &[SoundingInstance]) -> Vec<LabelGlyphInstance> {
-    let mut glyphs = Vec::new();
+/// Size of the fractional (subscript) digit relative to the main number.
+const SUBSCRIPT_SCALE: f32 = 0.62;
+/// How far below the main number's vertical center the subscript is dropped,
+/// in fractions of a full glyph cell. Mirrors OpenCPN's SNDFRM02 digit
+/// position groups, where the fractional digit uses a lower pivot
+/// (`pivotHeight/5` vs `pivotHeight/2`, s52plib.cpp RenderSoundingSymbol).
+const SUBSCRIPT_DROP: f32 = 0.30;
 
-    for sounding in soundings {
-        let params = TextParams {
-            position: sounding.position,
-            text: sounding_text(sounding),
-            color: sounding_color(sounding.flags),
-            color_index: sounding.color_index,
-            scale: sounding.scale,
-            hjust: HJust::Left,
-            vjust: VJust::Bottom,
-            xoffs: 0,
-            yoffs: 0,
-            disp_prio: 0,
-            dis: 10,
-        };
-        glyphs.extend(layout_text(&params));
+/// Lay out one sounding the OpenCPN way: the whole-number part on the baseline
+/// and the fractional digit rendered smaller and lowered as a subscript, with
+/// NO decimal point — e.g. depth 2.5 renders as a full-size "2" with a small,
+/// low "5" tucked to its lower right (chart convention "2₅").
+fn layout_sounding_glyphs(s: &SoundingInstance) -> Vec<LabelGlyphInstance> {
+    let flags = s.flags;
+    let has_decimal = (flags & (1 << 4)) != 0;
+    let decimal_digit = ((flags >> 8) & 0xF) as u8;
+    let whole_part = (flags >> 12) & 0x1_FFFF;
+    let is_drying = (flags & (1 << 1)) != 0;
+    let show_uncertainty = (flags & (1 << 2)) != 0;
+    let is_swept = (flags & (1 << 3)) != 0;
+
+    let color = sounding_color(flags);
+    let color_index = s.color_index;
+    let scale = s.scale;
+    let cell = CELL_W * scale;
+    let cell_h = CELL_H * scale;
+    let full_size = [cell, cell_h];
+
+    // Baseline matches layout_text() for HJust::Left / VJust::Bottom so the
+    // sounding sits exactly where it always has.
+    let base_y = -(cell_h * 10.0 / 8.0);
+
+    // Main (full-size) part: optional swept/drying markers + whole digits.
+    let mut main = String::new();
+    if is_swept {
+        main.push('~');
+    }
+    if is_drying {
+        main.push('_');
+    }
+    main.push_str(&whole_part.to_string());
+
+    let mut glyphs = Vec::new();
+    let mut x = 0.0_f32;
+    let mut push_glyph = |glyphs: &mut Vec<LabelGlyphInstance>, c: char, ox: f32, oy: f32, size: [f32; 2]| {
+        let uv = glyph_uv_rect(c).unwrap_or_else(|| glyph_uv_rect(' ').unwrap());
+        glyphs.push(LabelGlyphInstance {
+            position: s.position,
+            offset_px: [ox, oy],
+            size_px: size,
+            uv_min: [uv[0], uv[1]],
+            uv_max: [uv[2], uv[3]],
+            rotation: 0.0,
+            color,
+            color_index,
+        });
+    };
+
+    for c in main.chars() {
+        push_glyph(&mut glyphs, c, x, base_y, full_size);
+        x += cell;
     }
 
+    // Fractional digit as a subscript: smaller, dropped below the baseline,
+    // tucked slightly under the trailing whole digit, and with no '.'.
+    if has_decimal {
+        let sub_size = [cell * SUBSCRIPT_SCALE, cell_h * SUBSCRIPT_SCALE];
+        let sub_x = x - cell * 0.12;
+        let sub_y = base_y - cell_h * SUBSCRIPT_DROP;
+        let c = char::from(b'0' + decimal_digit.min(9));
+        push_glyph(&mut glyphs, c, sub_x, sub_y, sub_size);
+        x = sub_x + sub_size[0];
+    }
+
+    // Uncertainty marker stays full size after the value.
+    if show_uncertainty {
+        push_glyph(&mut glyphs, '?', x, base_y, full_size);
+    }
+
+    glyphs
+}
+
+pub fn layout_sounding_labels(soundings: &[SoundingInstance]) -> Vec<LabelGlyphInstance> {
+    let mut glyphs = Vec::new();
+    for sounding in soundings {
+        glyphs.extend(layout_sounding_glyphs(sounding));
+    }
     glyphs
 }
 
