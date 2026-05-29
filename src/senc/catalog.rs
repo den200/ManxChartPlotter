@@ -309,7 +309,12 @@ impl ChartCatalog {
         }
 
         // Drop charts whose native scale is much finer than this tile needs.
-        let min_native = tile_scale_denom / MAX_OVERZOOM_OUT;
+        // A non-finite scale means "no scale filtering" (keep all intersecting).
+        let min_native = if tile_scale_denom.is_finite() {
+            tile_scale_denom / MAX_OVERZOOM_OUT
+        } else {
+            0.0
+        };
         let mut candidates: Vec<&ChartInfo> = intersecting
             .iter()
             .copied()

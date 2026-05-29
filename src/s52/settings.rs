@@ -48,7 +48,11 @@ pub struct MarinerSettings {
     /// Depth shade mode: 2 or 4 shades (S52_MAR_TWO_SHADES)
     pub depth_shade_mode: DepthShadeMode,
     /// Use symbolized area boundaries (LC patterns) vs plain (LS lines).
-    /// Corresponds to S52_MAR_SYMBOLIZED_BND. Default: true (matches OpenCPN).
+    /// Corresponds to S52_MAR_SYMBOLIZED_BND. Default: false — matches OpenCPN's
+    /// `m_nBoundaryStyle = PLAIN_BOUNDARIES` (s52plib.cpp:308). With symbolized
+    /// boundaries, area classes like CTNARE resolve to a stamped LC() boundary
+    /// (e.g. magenta CTNARE51 caution symbols along the whole coast); PLAIN
+    /// resolves them to a single dashed LS() line, as OpenCPN shows by default.
     pub symbolized_boundaries: bool,
     /// Suppress non-critical text labels (OpenCPN m_bShowS57ImportantTextOnly).
     /// When true, text with display-group (dis) >= 20 is filtered out.
@@ -77,7 +81,7 @@ impl Default for MarinerSettings {
             show_soundings: true,
             depth_unit: DepthUnit::default(), // Meters
             depth_shade_mode: DepthShadeMode::default(), // FourShades per spec
-            symbolized_boundaries: true, // Symbolized boundaries (LC patterns) by default
+            symbolized_boundaries: false, // PLAIN boundaries by default (matches OpenCPN)
             // Default ON: until navcore has proper LOD / per-feature SCAMIN for
             // labels, leaving every dis>=20 label visible at overview zooms
             // produces an unreadable text stampede. OpenCPN's default is off,
