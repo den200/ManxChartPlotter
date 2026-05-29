@@ -199,7 +199,7 @@ Legend: ✅ done · 🟡 partial · ❌ missing. Severity = visual impact at typ
 | LN2 | LC stamp advance + per-segment rotation + colors | ✅ renders (colors fixed this session) | — |
 | AR1 | Robust tessellation (GLU/libtess2 + combine for self-intersect) | ✅ **CORRECTED 2026-05-28**: area fills consume OpenCPN's **pre-tessellated** OSENC triangles (`for_each_triangle_global`); fallback uses **`earcutr` with hole indices** (concave+holes); `triangulate_fan` only runs on convex clip fragments. Robust. Residual: earcut (not GLU) on self-intersecting polygons in the rarely-hit fallback. | low |
 | AR2 | AP pattern screen-space tiling, staggered, world-anchored | 🟡 patterns exist; capped (`MAX_LC_STAMPS`), heavier than ref | med |
-| Q1 | Chart quilting / coverage masking (no visible seams) | 🟡 partial masking; **hard depth-shade seam** at chart edges | **high** |
+| Q1 | Chart quilting / coverage masking (no visible seams) | 🟡 GPU-stencil masking works; **scale-aware selection added 2026-05-29** (was aggregating all chart scales → blank zoom-out, now fixed). Residual: hard depth-shade seam at chart edges; single-best-per-region not yet done | med |
 | Q2 | Per-frame LOD (Douglas-Peucker) by view scale | ❌ no LOD; full geometry per tile | med |
 
 ---
