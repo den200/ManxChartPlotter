@@ -277,12 +277,56 @@ impl ChartCatalog {
     /// charts are only retained if they still contribute uncovered sample points
     /// within the tile.
     pub fn charts_for_tile(&self, tile: &TileBounds) -> Vec<&ChartInfo> {
+        self.charts_for_tile_scaled(tile, f64::INFINITY)
+    }
+
+    /// Scale-aware variant of [`charts_for_tile`](Self::charts_for_tile).
+    ///
+    /// `tile_scale_denom` is the tile's nominal display scale (the N in 1:N).
+    /// Charts far more detailed than that scale warrants are excluded, so a
+    /// zoomed-out tile does not aggregate the full ungeneralised detail of
+    /// every overlapping large-scale chart — that produced multi-megabyte,
+    /// slow-to-build tiles that never finished, leaving the view blank/white at
+    /// low zoom. Mirrors OpenCPN's scale-based quilt selection. If every
+    /// intersecting chart is too detailed (e.g. zoomed out past the coarsest
+    /// available chart) the coarsest is kept so something still renders.
+    pub fn charts_for_tile_scaled(
+        &self,
+        tile: &TileBounds,
+        tile_scale_denom: f64,
+    ) -> Vec<&ChartInfo> {
         const SAMPLE_GRID: usize = 5;
+        // A chart overzoomed out by more than this factor relative to the tile
+        // scale is dropped (its detail is wasted and bloats the tile). Kept
+        // generous so zoomed-out tiles still retain a coarse chart for coverage
+        // (we only want to drop the truly over-detailed large-scale cells that
+        // made low-zoom tiles enormous), while preserving overview land/water.
+        const MAX_OVERZOOM_OUT: f64 = 16.0;
 
         let intersecting: Vec<&ChartInfo> = self.charts.iter().filter(|c| c.intersects(tile)).collect();
         if intersecting.len() <= 1 {
             return intersecting;
         }
+
+        // Drop charts whose native scale is much finer than this tile needs.
+        let min_native = tile_scale_denom / MAX_OVERZOOM_OUT;
+        let mut candidates: Vec<&ChartInfo> = intersecting
+            .iter()
+            .copied()
+            .filter(|c| (c.native_scale as f64) >= min_native)
+            .collect();
+        if candidates.is_empty() {
+            // All intersecting charts are finer than the view warrants (zoomed
+            // out past the coarsest chart). Keep the coarsest so it still draws.
+            if let Some(coarsest) = intersecting.iter().copied().max_by_key(|c| c.native_scale) {
+                candidates.push(coarsest);
+            }
+        }
+        if candidates.len() <= 1 {
+            return candidates;
+        }
+        // `candidates` retains the catalog's coarsest-first order.
+        let intersecting = candidates;
 
         let mut sample_points = Vec::with_capacity(SAMPLE_GRID * SAMPLE_GRID);
         let width = tile.max_x - tile.min_x;

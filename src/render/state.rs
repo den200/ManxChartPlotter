@@ -1916,10 +1916,17 @@ impl RenderState {
                 && !self.tile_cache.is_known_empty(&key)
                 && !self.pending_tiles.contains(tile_id)
             {
-                // Quick pre-filter: skip tiles with no intersecting charts
+                // Quick pre-filter: skip tiles with no scale-appropriate charts.
+                // Must match the builder's selection (charts_for_tile_scaled).
                 if let Some(ref catalog) = self.catalog {
                     let tile_bounds = tile_id.bounds();
-                    if catalog.charts_for_tile(&tile_bounds).is_empty() {
+                    let tile_scale_denom = crate::tiles::meters_per_pixel(tile_id.z)
+                        * (self.effective_ppmm as f64)
+                        * 1000.0;
+                    if catalog
+                        .charts_for_tile_scaled(&tile_bounds, tile_scale_denom)
+                        .is_empty()
+                    {
                         self.tile_cache.mark_empty(&key);
                         continue;
                     }
@@ -2239,10 +2246,14 @@ impl RenderState {
             }
         } // end priority loop
 
-        if log::log_enabled!(log::Level::Debug) && draw_frame < 5 {
+        if log::log_enabled!(log::Level::Debug) && (draw_frame < 5 || draw_frame % 120 == 0) {
+            let cached = self.visible_tiles_cache.iter().filter(|t| {
+                self.tile_cache.contains(&TileCacheKey::new(**t, self.style_hash))
+            }).count();
             log::debug!(
-                "draw_tiles: visible={}, area_draws={}, line_batches={} uniform_updates={} symbols={}",
+                "draw_tiles: visible={}, cached={}, area_draws={}, line_batches={} uniform_updates={} symbols={}",
                 self.visible_tiles_cache.len(),
+                cached,
                 drew_tiles,
                 drew_line_batches,
                 uniform_updates,

@@ -730,7 +730,12 @@ impl<'a> TileBuilder<'a> {
             .unwrap_or(false);
         let build_start = profile.then(Instant::now);
         let bounds = tile_id.bounds();
-        let charts = self.catalog.charts_for_tile(&bounds);
+        // Select charts appropriate to this tile's display scale so zoomed-out
+        // tiles don't aggregate the full detail of every overlapping large-scale
+        // chart (see ChartCatalog::charts_for_tile_scaled).
+        let tile_scale_denom =
+            super::meters_per_pixel(tile_id.z) * (self.view_ppmm as f64) * 1000.0;
+        let charts = self.catalog.charts_for_tile_scaled(&bounds, tile_scale_denom);
 
         if log::log_enabled!(log::Level::Debug) {
             log::debug!("=== TILE {:?} ===", tile_id);
