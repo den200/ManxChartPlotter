@@ -18,7 +18,7 @@ mkdir -p "$OUT"
 
 shot() { # name view size
     echo "=> $1"
-    NAVCORE_VIEW="$2" NAVCORE_SIZE="$3" NAVCORE_SHOT="$OUT/$1.png" \
+    NAVCORE_UI=0 NAVCORE_VIEW="$2" NAVCORE_SIZE="$3" NAVCORE_SHOT="$OUT/$1.png" \
         cargo run --release -- "$CHARTS" >/dev/null 2>&1
 }
 

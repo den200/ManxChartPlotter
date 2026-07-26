@@ -21,6 +21,32 @@ use egui_wgpu::ScreenDescriptor;
 pub enum UiAction {
     /// Close the object-query bubble.
     DismissPick,
+    /// Sign in to the chart shop and list what the account owns.
+    ShopSignIn { email: String, password: String },
+    /// Re-read the entitlement list.
+    ShopRefresh,
+    /// Forget the session.
+    ShopSignOut,
+}
+
+/// What the shop panel is showing.
+///
+/// Lives here because egui needs somewhere to keep the text a user is typing;
+/// the renderer fills in the rest as the worker answers.
+#[derive(Default)]
+pub struct ShopView {
+    pub open: bool,
+    pub email: String,
+    /// Kept only for as long as it takes to send. Never written to disk.
+    pub password: String,
+    pub status: String,
+    pub busy: bool,
+    pub signed_in: bool,
+    pub system_name: Option<String>,
+    pub systems: Vec<String>,
+    pub charts: Vec<crate::shop::types::Chart>,
+    /// Editions already installed, by chart id.
+    pub installed: std::collections::HashMap<String, crate::shop::types::Edition>,
 }
 
 /// What the UI is allowed to see.
@@ -37,6 +63,10 @@ pub struct Ui {
     renderer: egui_wgpu::Renderer,
     /// Collected during a frame, drained by the caller.
     actions: Vec<UiAction>,
+    /// egui asked to be drawn again, and how soon.
+    repaint_after: Option<std::time::Duration>,
+    /// The chart shop panel's own state.
+    pub shop: ShopView,
 }
 
 impl Ui {
@@ -63,7 +93,20 @@ impl Ui {
             state,
             renderer,
             actions: Vec::new(),
+            repaint_after: None,
+            shop: ShopView::default(),
         }
+    }
+
+    /// Does egui still have work to finish?
+    ///
+    /// It animates — a window fades in, a hover highlight grows — and it
+    /// reports how soon it wants the next frame. navcore only redraws on
+    /// demand, so ignoring this froze every animation part-way: a panel that
+    /// had faded to a third of its opacity simply stayed there, looking like a
+    /// rendering fault rather than an unfinished fade.
+    pub fn wants_repaint(&self) -> bool {
+        matches!(self.repaint_after, Some(d) if d < std::time::Duration::from_millis(100))
     }
 
     /// Offer an event to the UI. `true` means the UI consumed it and the chart
@@ -104,11 +147,16 @@ impl Ui {
         self.actions.clear();
         let input = self.state.take_egui_input(window);
         let actions = &mut self.actions;
+        let shop = &mut self.shop;
         let output = self.ctx.run(input, |ctx| {
-            super::ui_panels::build(ctx, &state, actions);
+            super::ui_panels::build(ctx, &state, shop, actions);
         });
         self.state
             .handle_platform_output(window, output.platform_output);
+        self.repaint_after = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|v| v.repaint_delay);
 
         let jobs = self
             .ctx

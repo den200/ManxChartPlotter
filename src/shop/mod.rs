@@ -25,6 +25,7 @@
 //! 6. `request_download` — a signed link to the package and to its keys
 
 pub mod protocol;
+pub mod service;
 pub mod types;
 
 use std::path::Path;

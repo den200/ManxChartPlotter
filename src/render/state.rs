@@ -313,6 +313,9 @@ pub struct RenderState {
     pub label_renderer: Option<LabelRenderer>,
     /// egui. Optional only so a headless capture can run without it.
     ui: Option<crate::render::ui::Ui>,
+    /// The chart shop, on its own thread. Created on first use, because most
+    /// sessions never open it.
+    shop: Option<crate::shop::service::ShopService>,
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
@@ -970,6 +973,7 @@ impl RenderState {
             text_camera_bind_group,
             label_renderer,
             ui: None,
+            shop: None,
             pick_anchor: None,
             pick_objects: Vec::new(),
             pick_pending: None,
@@ -1903,6 +1907,8 @@ impl RenderState {
             }
         }
 
+        self.poll_shop();
+
         // The UI, in its own pass over the resolved surface. After this point
         // the chart is finished with the frame.
         let ui_actions = if let Some(mut ui) = self.ui.take() {
@@ -1931,6 +1937,15 @@ impl RenderState {
         for action in ui_actions {
             match action {
                 crate::render::ui::UiAction::DismissPick => self.dismiss_pick(),
+                crate::render::ui::UiAction::ShopSignIn { email, password } => {
+                    self.shop_sign_in(email, password);
+                }
+                crate::render::ui::UiAction::ShopRefresh => {
+                    self.shop_send(crate::shop::service::Request::Refresh);
+                }
+                crate::render::ui::UiAction::ShopSignOut => {
+                    self.shop_send(crate::shop::service::Request::SignOut);
+                }
             }
         }
 
@@ -2749,13 +2764,27 @@ impl RenderState {
     }
 
     /// Create the UI. Separate from `new` because it needs the window.
+    ///
+    /// `NAVCORE_UI=0` leaves it out entirely, which is how the parity captures
+    /// get a frame of chart with no interface over it.
     pub fn init_ui(&mut self) {
+        if std::env::var("NAVCORE_UI").is_ok_and(|v| v == "0") {
+            return;
+        }
         if self.ui.is_none() {
             self.ui = Some(crate::render::ui::Ui::new(
                 &self.device,
                 &self.window,
                 self.config.format,
             ));
+            // `NAVCORE_SHOP=1` opens the chart shop at startup, so it can be
+            // captured without a click.
+            if let Some(ui) = self.ui.as_mut() {
+                if std::env::var("NAVCORE_SHOP").is_ok_and(|v| v != "0") {
+                    ui.shop.open = true;
+                    ui.shop.email = std::env::var("NAVCORE_SHOP_EMAIL").unwrap_or_default();
+                }
+            }
         }
     }
 
@@ -2822,6 +2851,79 @@ impl RenderState {
     /// Is the info bubble showing?
     pub fn pick_active(&self) -> bool {
         self.pick_anchor.is_some() || self.pick_pending.is_some()
+    }
+
+    fn shop_send(&mut self, request: crate::shop::service::Request) {
+        let shop = self
+            .shop
+            .get_or_insert_with(crate::shop::service::ShopService::new);
+        shop.send(request);
+        if let Some(ref mut ui) = self.ui {
+            ui.shop.busy = true;
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Sign in, sending this machine's fingerprint so the listing can say which
+    /// charts are usable here rather than merely owned.
+    fn shop_sign_in(&mut self, email: String, password: String) {
+        let fingerprint = crate::decrypt::ChartDecryptor::new("license")
+            .ok()
+            .and_then(|d| crate::shop::Fingerprint::load(d.fpr_path()).ok());
+        if fingerprint.is_none() {
+            if let Some(ref mut ui) = self.ui {
+                ui.shop.status =
+                    "No chart licence found on this machine; charts can be listed but not \
+                     assigned here."
+                        .into();
+            }
+        }
+        self.shop_send(crate::shop::service::Request::SignIn {
+            email,
+            password,
+            fingerprint,
+        });
+    }
+
+    /// Drain the shop worker into the panel.
+    fn poll_shop(&mut self) {
+        use crate::shop::service::Event;
+        let (Some(shop), Some(ui)) = (self.shop.as_ref(), self.ui.as_mut()) else {
+            return;
+        };
+        for event in shop.poll() {
+            match event {
+                Event::Status(text) => ui.shop.status = text,
+                Event::SignedIn { system_name } => {
+                    ui.shop.signed_in = true;
+                    ui.shop.system_name = system_name;
+                    ui.shop.password.clear();
+                }
+                Event::Charts { charts, systems } => {
+                    ui.shop.charts = charts;
+                    ui.shop.systems = systems;
+                    ui.shop.busy = false;
+                    ui.shop.status = String::new();
+                }
+                Event::SignedOut => {
+                    ui.shop.signed_in = false;
+                    ui.shop.charts.clear();
+                    ui.shop.system_name = None;
+                    ui.shop.busy = false;
+                    ui.shop.status = String::new();
+                }
+                Event::Failed(text) => {
+                    ui.shop.busy = false;
+                    ui.shop.status = text;
+                }
+            }
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Does the interface still have a frame it wants to draw?
+    pub fn ui_wants_repaint(&self) -> bool {
+        self.ui.as_ref().is_some_and(|u| u.wants_repaint())
     }
 
     /// Get window reference for redraw requests

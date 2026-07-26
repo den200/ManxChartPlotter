@@ -5,14 +5,191 @@
 
 use egui::{Align2, Context, RichText, ScrollArea, Window};
 
-use super::ui::{UiAction, UiState};
+use super::ui::{ShopView, UiAction, UiState};
+use crate::shop::protocol::choose_download;
 use crate::pick::PickedObject;
 use crate::senc::FeatureType;
 
-pub fn build(ctx: &Context, state: &UiState<'_>, actions: &mut Vec<UiAction>) {
+pub fn build(
+    ctx: &Context,
+    state: &UiState<'_>,
+    shop: &mut ShopView,
+    actions: &mut Vec<UiAction>,
+) {
+    menu_bar(ctx, shop);
     if let Some(objects) = state.picked {
         object_query(ctx, objects, state.pick_anchor, actions);
     }
+    if shop.open {
+        chart_shop(ctx, shop, actions);
+    }
+}
+
+/// A thin strip along the top. Deliberately thin: the chart is the instrument,
+/// and every row of pixels the interface takes is a row of sea it does not show.
+fn menu_bar(ctx: &Context, shop: &mut ShopView) {
+    egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            if ui.button("Charts").clicked() {
+                shop.open = !shop.open;
+            }
+            ui.separator();
+            ui.label(
+                RichText::new("tap the chart to identify an object")
+                    .small()
+                    .weak(),
+            );
+        });
+    });
+}
+
+/// The chart shop: sign in, see what the account owns, see what is stale.
+fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
+    let mut open = shop.open;
+    Window::new("Charts")
+        .open(&mut open)
+        .default_size([560.0, 460.0])
+        .collapsible(false)
+        .show(ctx, |ui| {
+            if !shop.signed_in {
+                ui.label("Sign in with your o-charts account.");
+                ui.add_space(6.0);
+                egui::Grid::new("shop-login")
+                    .num_columns(2)
+                    .spacing([10.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("Email");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut shop.email)
+                                .hint_text("you@example.com")
+                                .desired_width(280.0),
+                        );
+                        ui.end_row();
+                        ui.label("Password");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut shop.password)
+                                .password(true)
+                                .desired_width(280.0),
+                        );
+                        ui.end_row();
+                    });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let ready = !shop.email.trim().is_empty() && !shop.password.is_empty();
+                    if ui
+                        .add_enabled(ready && !shop.busy, egui::Button::new("Sign in"))
+                        .clicked()
+                    {
+                        actions.push(UiAction::ShopSignIn {
+                            email: shop.email.trim().to_string(),
+                            password: std::mem::take(&mut shop.password),
+                        });
+                    }
+                    if shop.busy {
+                        ui.spinner();
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Your password is sent to o-charts over TLS to sign in, and is \
+                         not stored on this computer.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            } else {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(&shop.email).strong());
+                    if let Some(name) = &shop.system_name {
+                        ui.label(RichText::new(format!("on \"{name}\"")).weak().small());
+                    } else {
+                        ui.label(
+                            RichText::new("this machine is not registered yet")
+                                .weak()
+                                .small(),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Sign out").clicked() {
+                            actions.push(UiAction::ShopSignOut);
+                        }
+                        if ui.add_enabled(!shop.busy, egui::Button::new("Refresh")).clicked() {
+                            actions.push(UiAction::ShopRefresh);
+                        }
+                        if shop.busy {
+                            ui.spinner();
+                        }
+                    });
+                });
+                ui.separator();
+                chart_table(ui, shop);
+            }
+
+            if !shop.status.is_empty() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(RichText::new(&shop.status).small());
+            }
+        });
+    shop.open = open;
+}
+
+fn chart_table(ui: &mut egui::Ui, shop: &ShopView) {
+    if shop.charts.is_empty() {
+        ui.label(if shop.busy {
+            "Fetching your charts…"
+        } else {
+            "No charts on this account."
+        });
+        return;
+    }
+    ui.label(
+        RichText::new(format!("{} chart set(s)", shop.charts.len()))
+            .small()
+            .weak(),
+    );
+    ScrollArea::vertical().show(ui, |ui| {
+        egui::Grid::new("shop-charts")
+            .num_columns(4)
+            .striped(true)
+            .spacing([14.0, 6.0])
+            .show(ui, |ui| {
+                ui.label(RichText::new("Chart set").strong());
+                ui.label(RichText::new("Edition").strong());
+                ui.label(RichText::new("State").strong());
+                ui.label(RichText::new("This machine").strong());
+                ui.end_row();
+
+                for c in &shop.charts {
+                    let installed = shop.installed.get(&c.id).copied();
+                    let target = choose_download(installed, c.edition);
+                    ui.label(&c.name);
+                    ui.label(RichText::new(c.edition.to_string()).monospace().small());
+                    let state = if c.expired {
+                        RichText::new("Expired").color(egui::Color32::from_rgb(180, 60, 60))
+                    } else {
+                        RichText::new(target.label())
+                    };
+                    ui.label(state);
+                    let assigned = shop
+                        .system_name
+                        .as_deref()
+                        .and_then(|n| c.slot_for(n))
+                        .is_some();
+                    ui.label(
+                        RichText::new(if assigned {
+                            "assigned".to_string()
+                        } else {
+                            format!("free slots {}", c.max_slots)
+                        })
+                        .small()
+                        .weak(),
+                    );
+                    ui.end_row();
+                }
+            });
+    });
 }
 
 /// The object-query bubble.
@@ -70,7 +247,7 @@ fn object_query(
                     ui.add_space(4.0);
                     ui.separator();
                 }
-                object(ui, o);
+                object(ui, o, i);
             }
         });
     });
@@ -80,7 +257,7 @@ fn object_query(
     }
 }
 
-fn object(ui: &mut egui::Ui, o: &PickedObject) {
+fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&o.title).strong());
         ui.label(RichText::new(format!("({})", o.acronym)).weak().small());
@@ -97,7 +274,10 @@ fn object(ui: &mut egui::Ui, o: &PickedObject) {
     );
 
     if !o.attributes.is_empty() {
-        egui::Grid::new(format!("attrs-{}-{}", o.acronym, o.chart))
+        // Keyed by position, not by content: a tap routinely finds two lights
+        // of the same class in the same cell, and two grids with one id is an
+        // egui collision — which is what those red boxes were.
+        egui::Grid::new(("pick-attrs", index))
             .num_columns(2)
             .spacing([12.0, 2.0])
             .show(ui, |ui| {

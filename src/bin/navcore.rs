@@ -1620,7 +1620,10 @@ impl ApplicationHandler for App {
             if state.needs_redraw() {
                 // Immediate redraw for user interaction
                 state.window().request_redraw();
-            } else if !state.pending_tiles_empty() || state.pick_in_flight() {
+            } else if !state.pending_tiles_empty()
+                || state.pick_in_flight()
+                || state.ui_wants_repaint()
+            {
                 // Fast polling while tiles load — ~60fps for responsive tile appearance
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
                     std::time::Instant::now() + std::time::Duration::from_millis(16),
