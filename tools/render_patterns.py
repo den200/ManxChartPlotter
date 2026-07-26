@@ -224,6 +224,12 @@ class HPGLRenderer:
                             self.add_polygon_point(x, y)
                         else:
                             self.pen_down(x, y)
+                elif not in_polygon:
+                    # Bare `PD;` puts the pen down where it already is: a dot.
+                    # Skipping it rasterised DRGARE01 — whose whole definition is
+                    # `PU1500,1300;PD;PU1700,1500;PD;` — as an empty tile, so
+                    # every dredged area lost its stipple.
+                    self.pen_down(*self.pos)
 
             elif op == 'CI':
                 # Circle
