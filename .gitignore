@@ -9,6 +9,12 @@
 # history entirely.
 /charts/
 
+# The o-charts licence fingerprint (this machine's, and what authorises
+# decryption) and the vendor's decryption binaries for four platforms. Neither
+# is ours to redistribute. Removed from history along with the charts.
+/license/
+/oeserverd/
+
 # Reference material kept locally rather than vendored: OpenCPN and the other
 # renderers we read for a second opinion, plus profiling captures.
 /doc/openCPN/
@@ -40,3 +46,6 @@
 /.claude/
 /.serena/memories/
 /.mcp.json
+
+# macOS directory metadata
+.DS_Store
