@@ -67,6 +67,12 @@ fn main() {
         return;
     }
 
+    // The o-charts chart shop: what does this account own, and what is stale.
+    if args.len() >= 3 && args[1] == "--shop-list" {
+        shop_list_mode(&args[2], args.get(3).map(String::as_str));
+        return;
+    }
+
     // Handle --catalog mode (scan directory, show catalog)
     if args.len() >= 3 && args[1] == "--catalog" {
         catalog_mode(&args[2]);
@@ -956,6 +962,124 @@ fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
         Ok(report) => println!("{}", report),
         Err(e) => eprintln!("inspect_tile_coverage failed: {}", e),
     }
+}
+
+/// `navcore --shop-list <email> [charts_dir]`
+///
+/// Signs in to o-charts and lists what the account owns, marking what is
+/// installed in `charts_dir` and what has a newer edition waiting. The password
+/// comes from `NAVCORE_SHOP_PASSWORD` or, failing that, is read from stdin —
+/// never from the command line, where it would land in the shell history and in
+/// every process listing on the machine.
+fn shop_list_mode(email: &str, charts_dir: Option<&str>) {
+    use navcore2::shop::{protocol, types::Edition, Fingerprint, ShopClient};
+
+    let password = match std::env::var("NAVCORE_SHOP_PASSWORD") {
+        Ok(p) if !p.is_empty() => p,
+        _ => {
+            eprint!("o-charts password for {email}: ");
+            use std::io::Write;
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                eprintln!("could not read the password");
+                return;
+            }
+            line.trim_end_matches(['\n', '\r']).to_string()
+        }
+    };
+
+    let client = ShopClient::new();
+    println!("Signing in as {email} (client version {})", protocol::client_version());
+    let session = match client.login(email, &password) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Sign-in failed: {e}");
+            return;
+        }
+    };
+
+    // Identify this machine, so the listing can say which charts are usable here.
+    let mut system_name = None;
+    match ChartDecryptor::new("license") {
+        Ok(d) => match Fingerprint::load(d.fpr_path()) {
+            Ok(fpr) => match client.identify_system(&session, &fpr.bytes, &fpr.name) {
+                Ok(Some(name)) => {
+                    println!("This machine is registered as \"{name}\"");
+                    system_name = Some(name);
+                }
+                Ok(None) => println!("This machine is not yet registered with the account"),
+                Err(e) => eprintln!("Could not identify this machine: {e}"),
+            },
+            Err(e) => eprintln!("Could not read the fingerprint: {e}"),
+        },
+        Err(e) => eprintln!("No chart licence on this machine: {e}"),
+    }
+
+    // What is installed already, by chart-set directory name.
+    let installed = charts_dir
+        .map(|d| installed_editions(std::path::Path::new(d)))
+        .unwrap_or_default();
+
+    let (charts, systems) = match client.list_charts(&session) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Could not list charts: {e}");
+            return;
+        }
+    };
+    if !systems.is_empty() {
+        println!("Machines on this account: {}", systems.join(", "));
+    }
+    println!("\n{} chart set(s):\n", charts.len());
+    for c in &charts {
+        let here = installed.get(&c.id).copied();
+        let target = protocol::choose_download(here, c.edition);
+        let assigned = system_name
+            .as_deref()
+            .and_then(|n| c.slot_for(n))
+            .is_some();
+        println!(
+            "{:<28} {:<10} shop {:<12} {}{}{}",
+            c.name,
+            c.id,
+            c.edition.to_string(),
+            target.label(),
+            if let Some(e) = here { format!(" (have {e})") } else { String::new() },
+            match (assigned, c.expired) {
+                (_, true) => "  [EXPIRED]",
+                (false, _) => "  [not assigned to this machine]",
+                _ => "",
+            }
+        );
+    }
+    let _ = Edition::default();
+}
+
+/// Editions already on disk, keyed by chart id, read from each set's ChartList.XML.
+fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::types::Edition> {
+    let mut out = HashMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for entry in entries.flatten() {
+        let list = entry.path().join("ChartList.XML");
+        let list = if list.exists() { list } else { entry.path() };
+        if list.file_name().and_then(|n| n.to_str()) != Some("ChartList.XML") {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&list) {
+            // The set's own name is the directory; the edition is per chart.
+            if let Some(id) = list.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+                if let Some(ed) = text
+                    .split("<RE>")
+                    .nth(1)
+                    .and_then(|s| s.split("</RE>").next())
+                {
+                    out.insert(id.to_string(), navcore2::shop::types::Edition::parse(ed));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `navcore --pick <charts> <lat,lon> [tolerance_m]`

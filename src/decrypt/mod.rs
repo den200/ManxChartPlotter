@@ -86,6 +86,14 @@ impl ChartDecryptor {
     }
 
     /// Decrypts a single chart and returns the SENC TLV payload (starting with record type 1).
+    /// The fingerprint file this decryptor resolved to.
+    ///
+    /// It identifies the machine to o-charts, so the chart shop sends its
+    /// contents when asking which cells this computer may download.
+    pub fn fpr_path(&self) -> &Path {
+        &self.fpr_path
+    }
+
     pub fn decrypt_chart<P: AsRef<Path>>(
         &mut self,
         chart_path: P,

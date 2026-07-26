@@ -123,6 +123,15 @@ fn multipoint_hit(feature: &Feature, ref_mx: f64, ref_my: f64, at: [f64; 2], tol
     (best <= tol).then_some(best)
 }
 
+/// How much more generous the grab is for a line than for a point.
+///
+/// A line is a hairline; a fingertip is nine millimetres. Aiming at a depth
+/// contour with the same tolerance that finds a buoy is a game of darts. The
+/// answer is a list ranked by distance rather than a single hit, so a fat grab
+/// costs nothing: the line joins the list, and a point that is genuinely under
+/// the finger still sorts above it.
+const LINE_GRAB: f64 = 4.0;
+
 fn line_hit(
     feature: &Feature,
     chart: &ChartData,
@@ -131,6 +140,7 @@ fn line_hit(
     at: [f64; 2],
     tol: f64,
 ) -> Option<f64> {
+    let tol = tol * LINE_GRAB;
     let geom = feature.line_geometry.as_ref()?;
     let mut best = f64::MAX;
     for ring in geom.resolve(&chart.edge_table) {
