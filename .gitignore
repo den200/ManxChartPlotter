@@ -1,1 +1,36 @@
 /target
+
+# Build output of the S-52 oracle. tools/s52oracle/src is tracked; its build is not.
+/tools/s52oracle/build/
+
+# Reference material kept locally rather than vendored: OpenCPN and the other
+# renderers we read for a second opinion, plus profiling captures.
+/doc/openCPN/
+/doc/reference projects/
+/doc/OpenCPN time tracer.trace/
+/doc/31Main.pdf
+/.tmp-avnav/
+/opencpn_profile.xml
+
+# Captures produced by tools/reference_views.sh and the parity tooling —
+# regenerable, and large.
+/doc/reference-views/
+/doc/*.png
+
+# Scratch
+/.tmp/
+/navcore_out.txt
+/debug1.log.save
+/debug_colors
+/debug_colors.rs
+/patch_global_text.py
+/test_brondby.sh
+/test_dredge
+/test_dredge.rs
+/test_scamin
+/test_scamin.rs
+
+# Agent and editor state (.serena/project.yml is tracked deliberately)
+/.claude/
+/.serena/memories/
+/.mcp.json
