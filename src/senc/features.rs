@@ -13,124 +13,345 @@ use super::reader::{RawRecord, SencError, SencReader};
 use super::records::{ObjectClass, RecordType, SencHeader};
 
 /// Convert S-57 attribute code to attribute name.
-/// The S-57 attributes navcore understands, code and acronym.
+/// Every S-57 attribute, code and acronym, from IHO S-57 Ed 3.1 Appendix A
+/// (`s57attributes.csv` as shipped with OpenCPN).
 ///
-/// Codes from IHO S-57 Ed 3.1 Appendix A (verified against s57attributes.csv).
-/// One source, two orderings: a feature stores the *code* the SENC gave it and
-/// every lookup by name goes through [`s57_attribute_code`]. A test asserts the
-/// two tables hold the same pairs, so they cannot disagree about what "CATCOV"
-/// means.
+/// A feature stores the *code* the SENC gave it; lookups arrive as an acronym
+/// and go through [`s57_attribute_code`]. The table must stay sorted by code —
+/// a test asserts it, and both lookups binary-search.
+///
+/// Completeness matters more than it looks. navcore named 51 of these, and 34
+/// of the 60 acronyms the lookup tables key on were among the missing: every
+/// LUP row selecting on CATLMK, CATSPM, CATHAF, NATSUR and the rest could
+/// never match, so those features fell through to their class default symbol.
+/// The conformance harness could not see it either, because it feeds the
+/// OpenCPN oracle the attributes navcore parsed — both engines agreed, on the
+/// same incomplete input.
 const S57_ATTRIBUTES: &[(u16, &str)] = &[
+    (1, "AGENCY"), // Agency responsible for production
     (2, "BCNSHP"), // Beacon shape
+    (3, "BUISHP"), // Building shape
     (4, "BOYSHP"), // Buoy shape
+    (5, "BURDEP"), // Buried depth
+    (6, "CALSGN"), // Call sign
+    (7, "CATAIR"), // Category of airport/airfield
+    (8, "CATACH"), // Category of anchorage
+    (9, "CATBRG"), // Category of bridge
+    (10, "CATBUA"), // Category of built-up area
+    (11, "CATCBL"), // Category of cable
+    (12, "CATCAN"), // Category of canal
     (13, "CATCAM"), // Category of cardinal mark
+    (14, "CATCHP"), // Category of checkpoint
     (15, "CATCOA"), // Category of coastline
+    (16, "CATCTR"), // Category of control point
+    (17, "CATCON"), // Category of conveyor
     (18, "CATCOV"), // Category of coverage
+    (19, "CATCRN"), // Category of crane
+    (20, "CATDAM"), // Category of dam
+    (21, "CATDIS"), // Category of distance mark
+    (22, "CATDOC"), // Category of dock
+    (23, "CATDPG"), // Category of dumping ground
+    (24, "CATFNC"), // Category of fence/wall
+    (25, "CATFRY"), // Category of ferry
+    (26, "CATFIF"), // Category of fishing facility
+    (27, "CATFOG"), // Category of fog signal
+    (28, "CATFOR"), // Category of fortified structure
+    (29, "CATGAT"), // Category of gate
+    (30, "CATHAF"), // Category of harbour facility
+    (31, "CATHLK"), // Category of hulk
+    (32, "CATICE"), // Category of ice
+    (33, "CATINB"), // Category of installation buoy
+    (34, "CATLND"), // Category of land region
+    (35, "CATLMK"), // Category of landmark
     (36, "CATLAM"), // Category of lateral mark
     (37, "CATLIT"), // Category of light
+    (38, "CATMFA"), // Category of marine farm/culture
+    (39, "CATMPA"), // Category of military practice area
     (40, "CATMOR"), // Category of mooring/warping facility
+    (41, "CATNAV"), // Category of navigation line
     (42, "CATOBS"), // Category of obstruction
+    (43, "CATOFP"), // Category of offshore platform
+    (44, "CATOLB"), // Category of oil barrier
+    (45, "CATPLE"), // Category of pile
+    (46, "CATPIL"), // Category of pilot boarding place
+    (47, "CATPIP"), // Category of pipeline / pipe
+    (48, "CATPRA"), // Category of production area
+    (49, "CATPYL"), // Category of pylon
+    (50, "CATQUA"), // Category of quality of data
+    (51, "CATRAS"), // Category of radar station
+    (52, "CATRTB"), // Category of radar transponder beacon
+    (53, "CATROS"), // Category of radio station
+    (54, "CATTRK"), // Category of recommended track
+    (55, "CATRSC"), // Category of rescue station
     (56, "CATREA"), // Category of restricted area
+    (57, "CATROD"), // Category of road
+    (58, "CATRUN"), // Category of runway
+    (59, "CATSEA"), // Category of sea area
     (60, "CATSLC"), // Category of shoreline construction
+    (61, "CATSIT"), // Category of signal station - traffic
+    (62, "CATSIW"), // Category of signal station - warning
+    (63, "CATSIL"), // Category of silo/tank
+    (64, "CATSLO"), // Category of slope
+    (65, "CATSCF"), // Category of small craft facility
+    (66, "CATSPM"), // Category of special purpose mark
+    (67, "CATTSS"), // Category of Traffic Separation Scheme
+    (68, "CATVEG"), // Category of vegetation
+    (69, "CATWAT"), // Category of water turbulence
+    (70, "CATWED"), // Category of weed/kelp
     (71, "CATWRK"), // Category of wreck
+    (72, "CATZOC"), // Category of zone of confidence data
+    (73, "$SPACE"), // Character spacing
+    (74, "$CHARS"), // Character specification
     (75, "COLOUR"), // Colour
     (76, "COLPAT"), // Colour pattern
+    (77, "COMCHA"), // Communication channel
+    (78, "$CSIZE"), // Compass size
+    (79, "CPDATE"), // Compilation date
+    (80, "CSCALE"), // Compilation scale
     (81, "CONDTN"), // Condition
-    (82, "CONRAD"), // Conspicuous, radar
-    (83, "CONVIS"), // Conspicuous, visually
-    (87, "DRVAL1"), // Depth range value 1 (shallow)
-    (88, "DRVAL2"), // Depth range value 2 (deep)
+    (82, "CONRAD"), // Conspicuous - Radar
+    (83, "CONVIS"), // Conspicuous - Visual
+    (84, "CURVEL"), // Current velocity
+    (85, "DATEND"), // Date end
+    (86, "DATSTA"), // Date start
+    (87, "DRVAL1"), // Depth range value 1
+    (88, "DRVAL2"), // Depth range value 2
+    (89, "DUNITS"), // Depth units
+    (90, "ELEVAT"), // Elevation
+    (91, "ESTRNG"), // Estimated range of transmission
     (92, "EXCLIT"), // Exhibition condition of light
     (93, "EXPSOU"), // Exposition of sounding
     (94, "FUNCTN"), // Function
     (95, "HEIGHT"), // Height
+    (96, "HUNITS"), // Height/length units
+    (97, "HORACC"), // Horizontal accuracy
+    (98, "HORCLR"), // Horizontal clearance
+    (99, "HORLEN"), // Horizontal length
+    (100, "HORWID"), // Horizontal width
+    (101, "ICEFAC"), // Ice factor
     (102, "INFORM"), // Information
+    (103, "JRSDTN"), // Jurisdiction
+    (104, "$JUSTH"), // Justification - horizontal
+    (105, "$JUSTV"), // Justification - vertical
+    (106, "LIFCAP"), // Lifting capacity
     (107, "LITCHR"), // Light characteristic
     (108, "LITVIS"), // Light visibility
-    (109, "MARSYS"), // Marks navigational system (IALA)
+    (109, "MARSYS"), // Marks navigational - System of
+    (110, "MLTYLT"), // Multiplicity of lights
+    (111, "NATION"), // Nationality
+    (112, "NATCON"), // Nature of construction
+    (113, "NATSUR"), // Nature of surface
+    (114, "NATQUA"), // Nature of surface - qualifying terms
+    (115, "NMDATE"), // Notice to Mariners date
     (116, "OBJNAM"), // Object name
     (117, "ORIENT"), // Orientation
+    (118, "PEREND"), // Periodic date end
+    (119, "PERSTA"), // Periodic date start
+    (120, "PICREP"), // Pictorial representation
+    (121, "PILDST"), // Pilot district
+    (122, "PRCTRY"), // Producing country
+    (123, "PRODCT"), // Product
+    (124, "PUBREF"), // Publication reference
     (125, "QUASOU"), // Quality of sounding measurement
+    (126, "RADWAL"), // Radar wave length
+    (127, "RADIUS"), // Radius
+    (128, "RECDAT"), // Recording date
+    (129, "RECIND"), // Recording indication
+    (130, "RYRMGV"), // Reference year for magnetic variation
     (131, "RESTRN"), // Restriction
     (132, "SCAMAX"), // Scale maximum
     (133, "SCAMIN"), // Scale minimum
+    (134, "SCVAL1"), // Scale value one
+    (135, "SCVAL2"), // Scale value two
     (136, "SECTR1"), // Sector limit one
     (137, "SECTR2"), // Sector limit two
+    (138, "SHIPAM"), // Shift parameters
+    (139, "SIGFRQ"), // Signal frequency
+    (140, "SIGGEN"), // Signal generation
     (141, "SIGGRP"), // Signal group
     (142, "SIGPER"), // Signal period
+    (143, "SIGSEQ"), // Signal sequence
+    (144, "SOUACC"), // Sounding accuracy
+    (145, "SDISMX"), // Sounding distance - maximum
+    (146, "SDISMN"), // Sounding distance - minimum
+    (147, "SORDAT"), // Source date
+    (148, "SORIND"), // Source indication
     (149, "STATUS"), // Status
+    (150, "SURATH"), // Survey authority
+    (151, "SUREND"), // Survey date - end
+    (152, "SURSTA"), // Survey date - start
+    (153, "SURTYP"), // Survey type
+    (154, "$SCALE"), // Symbol scaling factor
+    (155, "$SCODE"), // Symbolization code
     (156, "TECSOU"), // Technique of sounding measurement
+    (157, "$TXSTR"), // Text string
+    (158, "TXTDSC"), // Textual description
+    (159, "TS_TSP"), // Tidal stream - panel values
+    (160, "TS_TSV"), // Tidal stream current - time series values
+    (161, "T_ACWL"), // Tide - accuracy of water level
+    (162, "T_HWLW"), // Tide - high and low water values
+    (163, "T_MTOD"), // Tide - method of tidal prediction
+    (164, "T_THDF"), // Tide - time and height differences
+    (165, "T_TINT"), // Tide current - time interval of values
+    (166, "T_TSVL"), // Tide - time series values
+    (167, "T_VAHC"), // Tide - value of harmonic constituents
+    (168, "TIMEND"), // Time end
+    (169, "TIMSTA"), // Time start
+    (170, "$TINTS"), // Tint
     (171, "TOPSHP"), // Topmark/daymark shape
+    (172, "TRAFIC"), // Traffic flow
+    (173, "VALACM"), // Value of annual change in magnetic variation
     (174, "VALDCO"), // Value of depth contour
+    (175, "VALLMA"), // Value of local magnetic anomaly
+    (176, "VALMAG"), // Value of magnetic variation
+    (177, "VALMXR"), // Value of maximum range
     (178, "VALNMR"), // Value of nominal range
     (179, "VALSOU"), // Value of sounding
+    (180, "VERACC"), // Vertical accuracy
     (181, "VERCLR"), // Vertical clearance
-    (182, "VERCCL"), // Vertical clearance, closed
-    (183, "VERCOP"), // Vertical clearance, open
+    (182, "VERCCL"), // Vertical clearance - closed
+    (183, "VERCOP"), // Vertical clearance - open
+    (184, "VERCSA"), // Vertical clearance - safe
     (185, "VERDAT"), // Vertical datum
+    (186, "VERLEN"), // Vertical length
     (187, "WATLEV"), // Water level effect
+    (188, "CAT_TS"), // Category of Tidal stream
+    (189, "PUNITS"), // Positional accuracy units
+    (190, "CLSDEF"), // Object class definition
+    (191, "CLSNAM"), // Object class name
+    (192, "SYMINS"), // Symbol instruction
     (300, "NINFOM"), // Information in national language
     (301, "NOBJNM"), // Object name in national language
+    (302, "NPLDST"), // Pilot district in national language
+    (303, "$NTXST"), // Text string in national language
+    (304, "NTXTDS"), // Textual description in national language
+    (400, "HORDAT"), // Horizontal datum
+    (401, "POSACC"), // Positional Accuracy
     (402, "QUAPOS"), // Quality of position
+    (17000, "catach"), // Category of anchorage
+    (17001, "catdis"), // Category of distance mark
+    (17002, "catsit"), // Category of signal station. traffic
+    (17003, "catsiw"), // Category of signal station. warning
+    (17004, "restrn"), // Restriction
+    (17005, "verdat"), // Vertical datum
+    (17006, "catbrg"), // Category of bridge
+    (17007, "catfry"), // Category of ferry
+    (17008, "cathaf"), // Category of harbour facility
+    (17009, "marsys"), // Marks navigational - System of
+    (17010, "catchp"), // Category of checkpoint
+    (17011, "catlam"), // Category of lateral mark
+    (17012, "catslc"), // Category of shoreline construction
+    (17050, "addmrk"), // additional mark
+    (17051, "catbnk"), // Category of bank
+    (17052, "catnmk"), // category of notice mark
+    (17055, "clsdng"), // class of dangerous cargo
+    (17056, "dirimp"), // direction of impact
+    (17057, "disbk1"), // Distance from notice mark. first
+    (17058, "disbk2"), // Distance from notice mark. second
+    (17059, "disipu"), // Distance of impact. upstream
+    (17060, "disipd"), // Distance of impact. downstream
+    (17061, "eleva1"), // Elevation 1 of surface (m)
+    (17062, "eleva2"), // Elevation 2 of surface (m)
+    (17063, "fnctnm"), // Function of notice mark
+    (17064, "wtwdis"), // waterway distance
+    (17065, "bunves"), // bunker vessel. availability
+    (17066, "catbrt"), // category of berth
+    (17067, "catbun"), // category of bunker station
+    (17068, "catccl"), // category of CEMT class
+    (17069, "catcom"), // Category of communication
+    (17070, "cathbr"), // category of harbour area
+    (17071, "catrfd"), // category of refuse dump
+    (17072, "cattml"), // Category of terminal
+    (17073, "comctn"), // Communication
+    (17074, "horcll"), // Horizontal clearance length
+    (17075, "horclw"), // Horizontal clearance width
+    (17076, "trshgd"), // transshipping goods
+    (17077, "unlocd"), // UN location code
+    (17078, "catgag"), // Category of waterway gauge
+    (17080, "higwat"), // Value at relevant high water level
+    (17081, "hignam"), // Name of relevant high water level
+    (17082, "lowwat"), // Value at relevant low water level
+    (17083, "lownam"), // Name of relevant low water level
+    (17084, "meawat"), // Value at relevant mean water level
+    (17085, "meanam"), // Name of relevant mean water level
+    (17086, "othwat"), // Value at other locally relevant water level
+    (17087, "othnam"), // Name of other locally relevant water level
+    (17088, "reflev"), // Reference gravitational level
+    (17089, "sdrlev"), // Name of Sounding datum reference level
+    (17090, "vcrlev"), // Name of vertical river datum reference level
+    (17091, "catvtr"), // Category of vehicle transfer
+    (17092, "cattab"), // Category of time and behaviour
+    (17093, "schref"), // Time Schedule Reference
+    (17094, "useshp"), // Use of Ship
+    (17095, "curvhw"), // Current velocity at high water level
+    (17096, "curvlw"), // Current velocity at low water level
+    (17097, "curvmw"), // Current velocity at mean water level
+    (17098, "curvow"), // Current velocity at other water level
+    (17099, "aptref"), // Average Passing Time Reference
+    (17100, "catexs"), // Category of exceptional structure
+    (17101, "catcbl"), // Category of cable
+    (17102, "cathlk"), // Category of hulk
+    (17103, "hunits"), // Height/length units
+    (17104, "watlev"), // Water level effect
+    (17112, "catwwm"), // Category of waterway mark
+    (18001, "lg_spd"), // Maximal permitted speed
+    (18002, "lg_spr"), // speed reference
+    (18003, "lg_bme"), // Maximal permitted beam
+    (18004, "lg_lgs"), // Maximal permitted length
+    (18005, "lg_drt"), // Maximal permitted draught
+    (18006, "lg_wdp"), // Maximal permitted water displacement
+    (18007, "lg_wdu"), // water displacement unit
+    (18008, "lg_rel"), // related issue
+    (18009, "lg_fnc"), // Function of legal conditions
+    (18010, "lg_des"), // Description of legal conditions
+    (18011, "lg_pbr"), // Publication reference
+    (18012, "lc_csi"), // category of ship (including)
+    (18013, "lc_cse"), // category of ship (excluding)
+    (18014, "lc_asi"), // Assemblies of ship (including)
+    (18015, "lc_ase"), // Assemblies of ship (excluding)
+    (18016, "lc_cci"), // Category of cargo (including)
+    (18017, "lc_cce"), // Category of cargo (excluding)
+    (18018, "lc_bm1"), // Beam range value 1
+    (18019, "lc_bm2"), // Beam range value 2
+    (18020, "lc_lg1"), // Length range value 1
+    (18021, "lc_lg2"), // Length range value 2
+    (18022, "lc_dr1"), // Draught range value 1
+    (18023, "lc_dr2"), // Draught range value 2
+    (18024, "lc_sp1"), // Speed range value 1
+    (18025, "lc_sp2"), // Speed range value 2
+    (18026, "lc_wd1"), // Water displacement range value 1
+    (18027, "lc_wd2"), // Water displacement value 2
+    (22031, "ANATR1"), // Annotation Attribute 1
+    (22032, "ANATR2"), // Annotation Attribute 2
+    (22033, "ANATR3"), // Annotation Attribute 3
+    (22034, "ANATR4"), // Annotation Attribute 4
+    (22035, "ANATR5"), // Annotation Attribute 5
+    (22036, "ANATR6"), // Annotation Attribute 6
+    (22037, "ANATR7"), // Annotation Attribute 7
+    (22038, "ANATR8"), // Annotation Attribute 8
+    (22039, "ANATR9"), // Annotation Attribute 9
+    (22040, "ANATRA"), // Annotation Attribute a
+    (22076, "ANTXT1"), // Annotation Text
+    (22135, "ANLYR1"), // Annotation Layer
+    (22227, "NEWTY1"), // New type 1
+    (33066, "shptyp"), // Type of Ship
+    (40000, "updmsg"), // Update message
+    (50000, "catgeo"), // Geometry Primitive Category
 ];
 
-/// The same table keyed by acronym, so both directions are a binary
-/// search. One linear scan of 51 entries per attribute was enough to
-/// triple the cost of building a tile: `s57_attribute_name` sits inside
-/// the conditional-symbology cache key, which is computed per feature.
-const S57_ATTRIBUTES_BY_NAME: &[(&str, u16)] = &[
-    ("BCNSHP", 2),
-    ("BOYSHP", 4),
-    ("CATCAM", 13),
-    ("CATCOA", 15),
-    ("CATCOV", 18),
-    ("CATLAM", 36),
-    ("CATLIT", 37),
-    ("CATMOR", 40),
-    ("CATOBS", 42),
-    ("CATREA", 56),
-    ("CATSLC", 60),
-    ("CATWRK", 71),
-    ("COLOUR", 75),
-    ("COLPAT", 76),
-    ("CONDTN", 81),
-    ("CONRAD", 82),
-    ("CONVIS", 83),
-    ("DRVAL1", 87),
-    ("DRVAL2", 88),
-    ("EXCLIT", 92),
-    ("EXPSOU", 93),
-    ("FUNCTN", 94),
-    ("HEIGHT", 95),
-    ("INFORM", 102),
-    ("LITCHR", 107),
-    ("LITVIS", 108),
-    ("MARSYS", 109),
-    ("NINFOM", 300),
-    ("NOBJNM", 301),
-    ("OBJNAM", 116),
-    ("ORIENT", 117),
-    ("QUAPOS", 402),
-    ("QUASOU", 125),
-    ("RESTRN", 131),
-    ("SCAMAX", 132),
-    ("SCAMIN", 133),
-    ("SECTR1", 136),
-    ("SECTR2", 137),
-    ("SIGGRP", 141),
-    ("SIGPER", 142),
-    ("STATUS", 149),
-    ("TECSOU", 156),
-    ("TOPSHP", 171),
-    ("VALDCO", 174),
-    ("VALNMR", 178),
-    ("VALSOU", 179),
-    ("VERCCL", 182),
-    ("VERCLR", 181),
-    ("VERCOP", 183),
-    ("VERDAT", 185),
-    ("WATLEV", 187),
-];
+/// The same table ordered by acronym, built once.
+///
+/// Derived rather than written out a second time: two hand-maintained tables
+/// can disagree, and this one cannot.
+fn s57_attributes_by_name() -> &'static [(&'static str, u16)] {
+    static BY_NAME: std::sync::OnceLock<Vec<(&'static str, u16)>> = std::sync::OnceLock::new();
+    BY_NAME.get_or_init(|| {
+        let mut v: Vec<(&'static str, u16)> =
+            S57_ATTRIBUTES.iter().map(|(c, n)| (*n, *c)).collect();
+        v.sort_unstable_by_key(|(n, _)| *n);
+        v
+    })
+}
 
 /// Acronym for an S-57 attribute code, or `None` if navcore has no name for it.
 pub fn s57_attribute_name(code: u16) -> Option<&'static str> {
@@ -150,10 +371,11 @@ pub fn s57_attribute_name(code: u16) -> Option<&'static str> {
 /// table does not name was stored under a placeholder key that no lookup could
 /// match either.
 pub fn s57_attribute_code(name: &str) -> Option<u16> {
-    S57_ATTRIBUTES_BY_NAME
+    let by_name = s57_attributes_by_name();
+    by_name
         .binary_search_by(|(n, _)| (*n).cmp(name))
         .ok()
-        .map(|i| S57_ATTRIBUTES_BY_NAME[i].1)
+        .map(|i| by_name[i].1)
 }
 
 /// A feature's S-57 attributes, keyed by code.
@@ -894,10 +1116,10 @@ mod tests {
         for pair in S57_ATTRIBUTES.windows(2) {
             assert!(pair[0].0 < pair[1].0, "{} then {}", pair[0].0, pair[1].0);
         }
-        for pair in S57_ATTRIBUTES_BY_NAME.windows(2) {
+        for pair in s57_attributes_by_name().windows(2) {
             assert!(pair[0].0 < pair[1].0, "{} then {}", pair[0].0, pair[1].0);
         }
-        assert_eq!(S57_ATTRIBUTES.len(), S57_ATTRIBUTES_BY_NAME.len());
+        assert_eq!(S57_ATTRIBUTES.len(), s57_attributes_by_name().len());
         for &(code, name) in S57_ATTRIBUTES {
             assert_eq!(s57_attribute_code(name), Some(code), "{name}");
             assert_eq!(s57_attribute_name(code), Some(name), "{code}");

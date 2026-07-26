@@ -39,8 +39,20 @@ CHARTSYMBOLS = os.path.join(ROOT, "assets/s52/chartsymbols.xml")
 RASTERSHEET = os.path.join(
     ROOT, "doc/reference projects/OpenCPN/data/s57data/rastersymbols-day.png"
 )
-OUT_PNG = os.path.join(ROOT, "assets/symbols/atlas.png")
 OUT_JSON = os.path.join(ROOT, "assets/symbols/atlas.json")
+
+# The three palettes navcore can switch between at runtime, each written into
+# the *same* layout so one atlas.json describes all of them.
+#
+# They have to be generated together. atlas-dusk.png and atlas-dark.png were
+# last built months before the day atlas was re-packed, so every symbol in Dusk
+# and Night was sampling whatever happened to be at the day symbol's rectangle.
+PALETTES = [
+    ("DAY_BRIGHT", "rastersymbols-day.png", "atlas.png"),
+    ("DUSK", "rastersymbols-dusk.png", "atlas-dusk.png"),
+    ("NIGHT", "rastersymbols-dark.png", "atlas-dark.png"),
+]
+S57DATA = os.path.join(ROOT, "doc/reference projects/OpenCPN/data/s57data")
 
 # Bitmap pixels per HPGL unit. The HPGL is in 0.01mm and the symbol library is
 # drawn for 3.125 px/mm — the S-52 nominal display density — so one nominal
@@ -261,44 +273,54 @@ def render_vector(sym, pal):
 def agreement(vector_img, raster_img):
     """How well a vector render matches the raster the sheet holds for it.
 
-    Coverage overlap and colour, on the raster's own grid. The raster sheet is
-    the appearance OpenCPN ships and the reference captures show, so it is the
-    ground truth for *what the symbol looks like*; the vector is the same art at
-    a resolution worth having. Where they disagree, the disagreement is mine —
-    an HPGL opcode read wrongly — or the definitions genuinely differ, and
-    either way the known-good raster is the safer pick.
+    Returns (shape, colour_distance).
+
+    Shape is coverage overlap on the raster's own grid, and it is the only thing
+    worth gating on. It catches the errors that actually happen — an HPGL
+    opcode read wrongly, a y-flip, a pivot off by the origin — because those
+    move ink somewhere it should not be.
+
+    Colour is reported but never gates, because the raster sheet is not
+    authoritative about it. `<color-ref>` in chartsymbols.xml is: CTNARE51
+    declares TRFCF, a pale magenta, and the sheet draws it in TRFCD, the
+    saturated one. OpenCPN renders a `<definition>V</definition>` symbol from
+    the same HPGL and the same table we do, so following the sheet there would
+    move us *away* from OpenCPN, not toward it.
+
+    Coverage counts any ink at all, not ink above half opacity. HPGL `ST3` sets
+    alpha 64 — OpenCPN's own formula, `(4 - n) * 64` — so a threshold of 96
+    scored every ST3 symbol at zero however perfect its shape. That alone was
+    most of the rejections.
     """
     w, h = raster_img.size
     if w < 2 or h < 2:
-        return 0.0
+        return 0.0, 255.0
     v = vector_img.resize((w, h), Image.LANCZOS)
     va, ra = v.split()[3], raster_img.split()[3]
     vp, rp = list(va.getdata()), list(ra.getdata())
-    inter = sum(1 for a, b in zip(vp, rp) if a > 96 and b > 96)
-    union = sum(1 for a, b in zip(vp, rp) if a > 96 or b > 96)
-    if not union:
-        return 0.0
-    iou = inter / union
-    if not inter:
-        return 0.0
+    ink = 16
+    inter = sum(1 for a, b in zip(vp, rp) if a > ink and b > ink)
+    union = sum(1 for a, b in zip(vp, rp) if a > ink or b > ink)
+    if not union or not inter:
+        return 0.0, 255.0
+    shape = inter / union
     vrgb, rrgb = list(v.convert("RGB").getdata()), list(raster_img.convert("RGB").getdata())
     diff = [
         sum(abs(x - y) for x, y in zip(vrgb[i], rrgb[i])) / 3
         for i in range(len(vp))
-        if vp[i] > 96 and rp[i] > 96
+        if vp[i] > ink and rp[i] > ink
     ]
-    colour = sum(diff) / len(diff)
-    # Colour agreement folded in as a 0..1 factor so one number decides.
-    return iou * max(0.0, 1.0 - colour / 96.0)
+    return shape, sum(diff) / len(diff)
 
 
-def main():
-    symbols, pal = parse_symbols()
-    sheet = Image.open(RASTERSHEET).convert("RGBA")
-
+def build_cells(symbols, pal, sheet, accept, report):
+    """One cell per symbol: the vector render if it is trustworthy, else the
+    raster tile. `accept` fixes which symbols use their vector, so every
+    palette lays out identically."""
     cells = []
     n_vec = 0
     rejected = []
+    recoloured = []
     for sym in symbols:
         img, disp, pivot = (None, None, None)
         if sym.get("hpgl") and sym.get("vw"):
@@ -307,10 +329,14 @@ def main():
                 raster = sheet.crop(
                     (sym["bx"], sym["by"], sym["bx"] + sym["bw"], sym["by"] + sym["bh"])
                 )
-                score = agreement(img, raster)
-                if score < 0.55:
+                score, colour = agreement(img, raster)
+                if accept is not None and sym["name"] not in accept:
+                    img = None
+                elif score < 0.55:
                     rejected.append((sym["name"], round(score, 2)))
                     img = None
+                elif colour > 48.0:
+                    recoloured.append((sym["name"], round(colour)))
                 else:
                     # Agreement means the two depict the same symbol in the same
                     # box, so keep the raster's display size and pivot and swap
@@ -335,6 +361,28 @@ def main():
                 1.0 - (sym["bpy"] / h if h else 0.5),
             ]
         cells.append((sym["name"], img, disp, pivot))
+    if report is not None:
+        report.update(n_vec=n_vec, rejected=rejected, recoloured=recoloured)
+    return cells
+
+
+def main():
+    symbols, pal_day = parse_symbols()
+
+    # Pass one fixes the layout and which symbols use their vector, from the
+    # day palette. Every other palette then reuses both, so one atlas.json
+    # describes all three sheets.
+    report = {}
+    day_sheet = Image.open(os.path.join(S57DATA, PALETTES[0][1])).convert("RGBA")
+    cells = build_cells(symbols, pal_day, day_sheet, None, report)
+    n_vec = report["n_vec"]
+    rejected = report["rejected"]
+    recoloured = report["recoloured"]
+    accept = {
+        name
+        for name, img, _, _ in cells
+        if name not in {r[0] for r in rejected}
+    }
 
     # Shelf-pack, tallest first.
     cells.sort(key=lambda c: -c[1].height)
@@ -348,11 +396,32 @@ def main():
         shelf = max(shelf, h)
     height = (y + shelf + 3) & ~3
 
-    atlas = Image.new("RGBA", (ATLAS_W, height), (0, 0, 0, 0))
-    for name, img, _, _ in cells:
-        px, py = placed[name][0], placed[name][1]
-        atlas.paste(img, (px, py))
-    atlas.save(OUT_PNG)
+    written = []
+    root = ET.parse(CHARTSYMBOLS).getroot()
+    for table, sheet_name, out_name in PALETTES:
+        sheet_path = os.path.join(S57DATA, sheet_name)
+        if not os.path.exists(sheet_path):
+            print(f"    (skipping {out_name}: {sheet_name} not found)")
+            continue
+        if table == PALETTES[0][0]:
+            pal_cells = cells
+        else:
+            pal_cells = build_cells(
+                symbols,
+                palette(root, table),
+                Image.open(sheet_path).convert("RGBA"),
+                accept,
+                None,
+            )
+        by_name = {name: img for name, img, _, _ in pal_cells}
+        atlas = Image.new("RGBA", (ATLAS_W, height), (0, 0, 0, 0))
+        for name, p in placed.items():
+            img = by_name.get(name)
+            if img is not None:
+                atlas.paste(img, (p[0], p[1]))
+        out_path = os.path.join(ROOT, "assets/symbols", out_name)
+        atlas.save(out_path)
+        written.append(out_name)
 
     meta = {
         "version": 2,
@@ -371,7 +440,7 @@ def main():
         json.dump(meta, f, separators=(",", ":"), sort_keys=True)
 
     print(
-        f"{OUT_PNG}: {ATLAS_W}x{height}, {len(placed)} symbols "
+        f"{', '.join(written)}: {ATLAS_W}x{height}, {len(placed)} symbols "
         f"({n_vec} rendered from HPGL at {OVERSAMPLE}x, {len(placed) - n_vec} from the raster sheet)"
     )
     if rejected:
@@ -382,6 +451,15 @@ def main():
         )
         for name, score in rejected[:12]:
             print(f"    {score:.2f}  {name}")
+    if recoloured:
+        recoloured.sort(key=lambda r: -r[1])
+        print(
+            f"{len(recoloured)} vector renders match in shape but not in colour. "
+            f"chartsymbols.xml is authoritative and the sheet is not, so these "
+            f"use the vector; listed for review:"
+        )
+        for name, dist in recoloured[:12]:
+            print(f"    {dist:3d}  {name}")
     return 0
 
 

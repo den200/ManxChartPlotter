@@ -1485,6 +1485,26 @@ impl RenderState {
             }
         }
 
+        // NAVCORE_PALETTE=day|dusk|night. `switch_palette` existed and nothing
+        // ever called it, so Dusk and Night were unreachable — which is how
+        // atlas-dusk.png and atlas-dark.png came to be months out of date with
+        // the layout atlas.json describes without anyone noticing.
+        if let Ok(p) = std::env::var("NAVCORE_PALETTE") {
+            let name = match p.to_ascii_lowercase().as_str() {
+                "day" | "day_bright" => Some("DAY_BRIGHT"),
+                "dusk" => Some("DUSK"),
+                "night" | "dark" => Some("NIGHT"),
+                other => {
+                    eprintln!("NAVCORE_PALETTE: unknown value {:?}", other);
+                    None
+                }
+            };
+            if let Some(name) = name {
+                self.switch_palette(name);
+            }
+        }
+
+
         // Spawn background tile worker thread
         // Worker takes ownership of decryptor and chart_cache
         let worker = crate::tiles::worker::spawn_tile_worker(
