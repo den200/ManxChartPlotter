@@ -13,7 +13,7 @@ use super::text::SoundingInstance;
 /// the unit `scale` is expressed in, and the unit S-52's `xoffs`/`yoffs` count
 /// in, so every caller and the tuned `s52_text_scale` keep working unchanged.
 const CELL_W: f32 = 8.0;
-const CELL_H: f32 = 8.0;
+pub(crate) const CELL_H: f32 = 8.0;
 
 /// Cap height, as a fraction of the cell, that the proportional font is sized
 /// to. The 5x7 bitmap it replaces inked 8 of its 8 cell rows, so matching that

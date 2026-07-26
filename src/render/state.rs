@@ -317,6 +317,13 @@ pub struct RenderState {
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
     pick_objects: Vec<crate::pick::PickedObject>,
+    /// Sequence number of a query the worker has not answered yet.
+    ///
+    /// Until it comes back there is nothing to show, and the event loop has to
+    /// keep waking or the answer sits in the channel until the next input —
+    /// which is what made the first click report an empty result and the second
+    /// one reveal it.
+    pick_pending: Option<u64>,
     pick_glyph_buffer: Option<wgpu::Buffer>,
     pick_glyph_count: u32,
     pub label_camera_bind_group: Option<wgpu::BindGroup>,
@@ -973,6 +980,7 @@ impl RenderState {
             overlay_renderer,
             pick_anchor: None,
             pick_objects: Vec::new(),
+            pick_pending: None,
             pick_glyph_buffer: None,
             pick_glyph_count: 0,
             label_camera_bind_group,
@@ -2067,9 +2075,15 @@ impl RenderState {
 
         if let Some(ref worker) = self.tile_worker {
             if let Some(answer) = worker.poll_pick() {
-                self.pick_anchor = Some([answer.position[0] as f32, answer.position[1] as f32]);
-                self.pick_objects = answer.objects;
-                self.needs_redraw = true;
+                // Only the query still outstanding may open the bubble; an
+                // answer to one the user has already dismissed is discarded.
+                if self.pick_pending == Some(answer.seq) {
+                    self.pick_pending = None;
+                    self.pick_anchor =
+                        Some([answer.position[0] as f32, answer.position[1] as f32]);
+                    self.pick_objects = answer.objects;
+                    self.needs_redraw = true;
+                }
             }
         }
 
@@ -2745,21 +2759,32 @@ impl RenderState {
     /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
     /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
     pub fn pick_at_world(&mut self, x: f32, y: f32) {
-        const PICK_RADIUS_PX: f32 = 8.0;
-        self.pick_anchor = Some([x, y]);
+        // A fingertip is about 9 mm across; a mouse pointer is exact. Sizing
+        // the tolerance in millimetres rather than pixels makes the same tap
+        // work on a plotter's touchscreen and on a desktop, at any density.
+        let radius_px = 2.0 * self.effective_ppmm.max(1.0);
+        self.pick_anchor = None;
         self.pick_objects.clear();
         self.pick_glyph_count = 0;
         if let Some(ref worker) = self.tile_worker {
-            worker.request_pick(
+            self.pick_pending = Some(worker.request_pick(
                 [x as f64, y as f64],
-                (PICK_RADIUS_PX * self.camera.zoom) as f64,
-            );
+                (radius_px * self.camera.zoom) as f64,
+            ));
         }
         self.needs_redraw = true;
     }
 
+    /// Is a query still with the worker?
+    pub fn pick_in_flight(&self) -> bool {
+        self.pick_pending.is_some()
+    }
+
     /// Close the info bubble.
     pub fn dismiss_pick(&mut self) {
+        // Also drops any answer still in flight, or a query the user cancelled
+        // would re-open the bubble when it landed.
+        self.pick_pending = None;
         if self.pick_anchor.is_some() {
             self.pick_anchor = None;
             self.pick_objects.clear();
@@ -2771,7 +2796,7 @@ impl RenderState {
 
     /// Is the info bubble showing?
     pub fn pick_active(&self) -> bool {
-        self.pick_anchor.is_some()
+        self.pick_anchor.is_some() || self.pick_pending.is_some()
     }
 
     /// Rebuild the bubble's geometry for the current camera.
@@ -2808,6 +2833,7 @@ impl RenderState {
             [screen.x, screen.y],
             [self.size.width as f32, self.size.height as f32],
             color_index,
+            self.effective_ppmm,
         );
 
         if let Some(ref mut overlay) = self.overlay_renderer {

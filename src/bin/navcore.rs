@@ -1292,6 +1292,8 @@ struct App {
     mouse_pressed: bool,
     /// Where the left button went down, so a click can be told from a drag.
     drag_start: Option<PhysicalPosition<f64>>,
+    /// The same, for a single finger.
+    touch_start: Option<PhysicalPosition<f64>>,
     // Touch state for pinch-zoom
     touches: HashMap<u64, PhysicalPosition<f64>>,
     pinch_start_distance: Option<f32>,
@@ -1311,6 +1313,7 @@ impl App {
             last_mouse_pos: PhysicalPosition::new(0.0, 0.0),
             mouse_pressed: false,
             drag_start: None,
+            touch_start: None,
             touches: HashMap::new(),
             pinch_start_distance: None,
             shot_path: std::env::var("NAVCORE_SHOT").ok().filter(|s| !s.is_empty()),
@@ -1493,7 +1496,7 @@ impl ApplicationHandler for App {
             if state.needs_redraw() {
                 // Immediate redraw for user interaction
                 state.window().request_redraw();
-            } else if !state.pending_tiles_empty() {
+            } else if !state.pending_tiles_empty() || state.pick_in_flight() {
                 // Fast polling while tiles load — ~60fps for responsive tile appearance
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
                     std::time::Instant::now() + std::time::Duration::from_millis(16),
@@ -1665,6 +1668,13 @@ impl ApplicationHandler for App {
                 match phase {
                     TouchPhase::Started => {
                         self.touches.insert(id, location);
+                        // Where a single finger went down, so a tap can be told
+                        // from a pan on release.
+                        if self.touches.len() == 1 {
+                            self.touch_start = Some(location);
+                        } else {
+                            self.touch_start = None;
+                        }
                         if self.touches.len() == 2 {
                             // Inline distance calculation to avoid borrow conflicts
                             let positions: Vec<_> = self.touches.values().collect();
@@ -1705,6 +1715,27 @@ impl ApplicationHandler for App {
                         }
                     }
                     TouchPhase::Ended | TouchPhase::Cancelled => {
+                        // A tap identifies what is under the finger; a drag
+                        // pans. Ten pixels of slop, because a finger on glass
+                        // never lifts from exactly where it landed.
+                        if phase == TouchPhase::Ended {
+                            if let Some(start) = self.touch_start.take() {
+                                let moved = ((location.x - start.x).powi(2)
+                                    + (location.y - start.y).powi(2))
+                                .sqrt();
+                                if moved <= 10.0 && self.touches.len() == 1 {
+                                    if state.pick_active() {
+                                        state.dismiss_pick();
+                                    } else {
+                                        state.pick_at_screen(
+                                            location.x as f32,
+                                            location.y as f32,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        self.touch_start = None;
                         self.touches.remove(&id);
                         self.pinch_start_distance = None;
                     }
