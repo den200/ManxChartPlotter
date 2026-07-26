@@ -26,6 +26,7 @@
 
 pub mod cache;
 pub mod decrypt;
+pub mod pick;
 pub mod render;
 pub mod s52;
 pub mod senc;

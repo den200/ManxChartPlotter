@@ -55,6 +55,18 @@ fn main() {
         return;
     }
 
+    // Identify the chart objects at a position, the way the info bubble does.
+    if args.len() >= 4 && args[1] == "--pick" {
+        let parts: Vec<f64> = args[3].split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if parts.len() != 2 {
+            eprintln!("--pick: position must be 'lat,lon'");
+            return;
+        }
+        let tol = args.get(4).and_then(|v| v.parse::<f64>().ok()).unwrap_or(50.0);
+        pick_mode(&args[2], parts[0], parts[1], tol);
+        return;
+    }
+
     // Handle --catalog mode (scan directory, show catalog)
     if args.len() >= 3 && args[1] == "--catalog" {
         catalog_mode(&args[2]);
@@ -946,6 +958,60 @@ fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
     }
 }
 
+/// `navcore --pick <charts> <lat,lon> [tolerance_m]`
+///
+/// The same query the info bubble runs, on the command line, so the picking can
+/// be checked against a chart without a window in the way.
+fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
+    let dir = PathBuf::from(dir_path);
+    let mut keys = KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(&dir) {
+        eprintln!("Warning: Could not load keys: {}", e);
+    }
+    let Ok(base) = ChartDecryptor::new("license") else {
+        eprintln!("Failed to create decryptor");
+        return;
+    };
+    let mut decryptor = CachedDecryptor::new(base);
+    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build catalog: {}", e);
+            return;
+        }
+    };
+
+    let (mx, my) = navcore2::tiles::latlon_to_mercator(lat, lon);
+    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let decryptor = Mutex::new(decryptor);
+    let builder =
+        TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
+
+    let mut found = Vec::new();
+    for info in catalog.charts.iter().filter(|c| c.contains_point(mx, my)) {
+        match builder.load_chart(info) {
+            Ok(chart) => found.extend(navcore2::pick::pick_at(&chart, info, [mx, my], tolerance_m)),
+            Err(e) => eprintln!("  (skipping {}: {})", info.name, e),
+        }
+    }
+    navcore2::pick::sort_picks(&mut found);
+
+    println!("{} object(s) within {:.0} m of {:.5},{:.5}\n", found.len(), tolerance_m, lat, lon);
+    for o in &found {
+        println!("{} ({})   1:{} {}", o.title, o.acronym, o.chart_scale, o.chart);
+        for (k, v) in &o.attributes {
+            println!("    {:<8} {}", k, v);
+        }
+        for n in &o.notes {
+            for line in n.lines() {
+                println!("    | {}", line);
+            }
+        }
+        println!();
+    }
+}
+
 fn inspect_latlon_mode(dir_path: &str, lat: f64, lon: f64, z: u8) {
     let dir = PathBuf::from(dir_path);
     if !dir.is_dir() {
@@ -1224,6 +1290,8 @@ struct App {
     // Mouse state for pan
     last_mouse_pos: PhysicalPosition<f64>,
     mouse_pressed: bool,
+    /// Where the left button went down, so a click can be told from a drag.
+    drag_start: Option<PhysicalPosition<f64>>,
     // Touch state for pinch-zoom
     touches: HashMap<u64, PhysicalPosition<f64>>,
     pinch_start_distance: Option<f32>,
@@ -1242,6 +1310,7 @@ impl App {
             keys: Arc::new(KeyStore::new()),
             last_mouse_pos: PhysicalPosition::new(0.0, 0.0),
             mouse_pressed: false,
+            drag_start: None,
             touches: HashMap::new(),
             pinch_start_distance: None,
             shot_path: std::env::var("NAVCORE_SHOT").ok().filter(|s| !s.is_empty()),
@@ -1515,6 +1584,10 @@ impl ApplicationHandler for App {
                         *tilt = 0.0;
                         true
                     }
+                    Key::Named(NamedKey::Escape) => {
+                        state.dismiss_pick();
+                        false
+                    }
                     _ => false,
                 };
                 if changed {
@@ -1524,7 +1597,26 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state: btn_state, button, .. } => {
                 if button == MouseButton::Left {
-                    self.mouse_pressed = btn_state == ElementState::Pressed;
+                    let pressed = btn_state == ElementState::Pressed;
+                    if pressed {
+                        self.drag_start = Some(self.last_mouse_pos);
+                    } else if let Some(start) = self.drag_start.take() {
+                        // A click identifies what is under it; a drag pans. The
+                        // two arrive as the same pair of events, so they are
+                        // told apart by how far the pointer moved in between.
+                        let moved = ((self.last_mouse_pos.x - start.x).powi(2)
+                            + (self.last_mouse_pos.y - start.y).powi(2))
+                        .sqrt();
+                        if moved <= 4.0 {
+                            let (x, y) = (self.last_mouse_pos.x as f32, self.last_mouse_pos.y as f32);
+                            if state.pick_active() {
+                                state.dismiss_pick();
+                            } else {
+                                state.pick_at_screen(x, y);
+                            }
+                        }
+                    }
+                    self.mouse_pressed = pressed;
                 }
             }
 

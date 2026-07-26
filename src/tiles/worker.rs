@@ -38,8 +38,26 @@ pub enum TileRequest {
         view_params: ViewParams,
         generation: u64,
     },
+    /// Identify the chart objects at a position, for the info bubble.
+    ///
+    /// Answered on this thread because it is where the parsed charts live; the
+    /// main thread would otherwise have to re-parse a cell on every click.
+    Pick {
+        mercator: [f64; 2],
+        tolerance_m: f64,
+        seq: u64,
+    },
     /// Shut down the worker thread
     Shutdown,
+}
+
+/// Answer to a [`TileRequest::Pick`].
+pub struct PickResponse {
+    /// Echoes the request, so a stale answer to an earlier click is discarded
+    /// rather than replacing the panel the user is looking at.
+    pub seq: u64,
+    pub position: [f64; 2],
+    pub objects: Vec<crate::pick::PickedObject>,
 }
 
 /// Response from worker to main thread
@@ -52,6 +70,8 @@ pub struct TileResponse {
 pub struct TileWorkerHandle {
     request_tx: mpsc::Sender<TileRequest>,
     response_rx: mpsc::Receiver<TileResponse>,
+    pick_rx: mpsc::Receiver<PickResponse>,
+    pick_seq: AtomicU64,
     /// Bumped on every request. The worker compares it per tile and abandons
     /// the rest of a batch once it is stale, so a zoom does not wait behind a
     /// screenful of tiles for the view the user has already left.
@@ -60,6 +80,28 @@ pub struct TileWorkerHandle {
 }
 
 impl TileWorkerHandle {
+    /// Ask what chart objects are at a position. The answer arrives through
+    /// [`poll_pick`](Self::poll_pick); the returned sequence number identifies it.
+    pub fn request_pick(&self, mercator: [f64; 2], tolerance_m: f64) -> u64 {
+        let seq = self.pick_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let _ = self.request_tx.send(TileRequest::Pick {
+            mercator,
+            tolerance_m,
+            seq,
+        });
+        seq
+    }
+
+    /// The most recent pick answer, if one has arrived. Earlier answers are
+    /// dropped: only the latest click matters.
+    pub fn poll_pick(&self) -> Option<PickResponse> {
+        let mut latest = None;
+        while let Ok(r) = self.pick_rx.try_recv() {
+            latest = Some(r);
+        }
+        latest
+    }
+
     /// Send a batch of tile build requests
     pub fn request_tiles(&self, tiles: Vec<TileId>, view_params: ViewParams) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -99,6 +141,7 @@ pub fn spawn_tile_worker(
 ) -> TileWorkerHandle {
     let (request_tx, request_rx) = mpsc::channel::<TileRequest>();
     let (response_tx, response_rx) = mpsc::channel::<TileResponse>();
+    let (pick_tx, pick_rx) = mpsc::channel::<PickResponse>();
     let generation = Arc::new(AtomicU64::new(0));
     let worker_generation = Arc::clone(&generation);
 
@@ -112,6 +155,7 @@ pub fn spawn_tile_worker(
                 s52_engine,
                 request_rx,
                 response_tx,
+                pick_tx,
                 worker_generation,
             );
         })
@@ -120,6 +164,8 @@ pub fn spawn_tile_worker(
     TileWorkerHandle {
         request_tx,
         response_rx,
+        pick_rx,
+        pick_seq: AtomicU64::new(0),
         generation,
         _thread: thread,
     }
@@ -134,6 +180,7 @@ fn worker_loop(
     s52_engine: Option<S52Engine>,
     request_rx: mpsc::Receiver<TileRequest>,
     response_tx: mpsc::Sender<TileResponse>,
+    pick_tx: mpsc::Sender<PickResponse>,
     generation: Arc<AtomicU64>,
 ) {
     // Wrap mutable resources in Mutex for thread-safe parallel access
@@ -264,6 +311,36 @@ fn worker_loop(
                 }
 
 
+            }
+            TileRequest::Pick {
+                mercator,
+                tolerance_m,
+                seq,
+            } => {
+                // Answered here because this is where the parsed charts live;
+                // on the main thread every click would re-parse a cell.
+                let builder = TileBuilder::with_cache(
+                    &catalog, &keys, &decryptor, &chart_cache, &coverage_cache,
+                );
+                let mut objects = Vec::new();
+                for info in catalog
+                    .charts
+                    .iter()
+                    .filter(|c| c.contains_point(mercator[0], mercator[1]))
+                {
+                    match builder.load_chart(info) {
+                        Ok(chart) => objects.extend(crate::pick::pick_at(
+                            &chart, info, mercator, tolerance_m,
+                        )),
+                        Err(e) => log::warn!("pick: skipping {}: {}", info.name, e),
+                    }
+                }
+                crate::pick::sort_picks(&mut objects);
+                let _ = pick_tx.send(PickResponse {
+                    seq,
+                    position: mercator,
+                    objects,
+                });
             }
             TileRequest::Shutdown => break,
         }

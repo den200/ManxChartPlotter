@@ -51,6 +51,8 @@ pub fn choose_msaa_samples(info: &wgpu::AdapterInfo) -> u32 {
 }
 
 mod camera;
+pub mod overlay;
+pub mod pick_panel;
 pub use camera::MAX_TILT;
 pub mod font;
 mod colors;

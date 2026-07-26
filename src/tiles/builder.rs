@@ -1460,7 +1460,7 @@ impl<'a> TileBuilder<'a> {
     ///
     /// Concurrent callers for the same chart wait for the first one rather than
     /// each parsing their own copy — see [`ChartCache`].
-    pub(crate) fn load_chart(&self, info: &ChartInfo) -> Result<Arc<ChartData>, BuildError> {
+    pub fn load_chart(&self, info: &ChartInfo) -> Result<Arc<ChartData>, BuildError> {
         let slot = {
             let mut cache = self.chart_cache.lock().unwrap();
             Arc::clone(cache.entry(info.id).or_default())

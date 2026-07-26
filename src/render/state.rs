@@ -311,6 +311,14 @@ pub struct RenderState {
 
     // Label rendering (text atlas)
     pub label_renderer: Option<LabelRenderer>,
+    /// Screen-space panels: today only the object-query bubble.
+    overlay_renderer: Option<crate::render::overlay::OverlayRenderer>,
+    /// The world position the bubble is pinned to, so it tracks the object as
+    /// the chart pans rather than sitting still on the glass.
+    pick_anchor: Option<[f32; 2]>,
+    pick_objects: Vec<crate::pick::PickedObject>,
+    pick_glyph_buffer: Option<wgpu::Buffer>,
+    pick_glyph_count: u32,
     pub label_camera_bind_group: Option<wgpu::BindGroup>,
 
     // Stencil-write pipeline for coverage masking (background chart suppression)
@@ -923,6 +931,13 @@ impl RenderState {
             }
         };
 
+        let overlay_renderer = Some(crate::render::overlay::OverlayRenderer::new(
+            &device,
+            surface_format,
+            wgpu::TextureFormat::Depth24PlusStencil8,
+            super::msaa_samples(),
+        ));
+
         Self {
             // NAVCORE_DUMP_DRAW=<path> records what the draw pass issued.
             draw_log: std::env::var("NAVCORE_DUMP_DRAW")
@@ -955,6 +970,11 @@ impl RenderState {
             text_renderer,
             text_camera_bind_group,
             label_renderer,
+            overlay_renderer,
+            pick_anchor: None,
+            pick_objects: Vec::new(),
+            pick_glyph_buffer: None,
+            pick_glyph_count: 0,
             label_camera_bind_group,
             global_text_buffer: None,
             global_text_count: 0,
@@ -1518,6 +1538,18 @@ impl RenderState {
         self.deferred_tile_results.clear();
         println!("Background tile worker spawned");
 
+        // NAVCORE_PICK=lat,lon opens the info bubble at a position, so a
+        // headless capture can show it.
+        if let Ok(spec) = std::env::var("NAVCORE_PICK") {
+            let parts: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+            if parts.len() == 2 {
+                let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
+                self.pick_at_world(mx as f32, my as f32);
+            } else {
+                eprintln!("NAVCORE_PICK must be 'lat,lon'; ignoring {:?}", spec);
+            }
+        }
+
         self.catalog = Some(catalog_arc);
         self.keys = Some(keys_arc);
         // decryptor is now owned by worker - clear main thread reference
@@ -1651,6 +1683,10 @@ impl RenderState {
             if let Some(start) = build_start {
                 log::info!("profile.build_visible_tiles: {} ms", start.elapsed().as_millis());
             }
+
+            // The bubble is positioned in screen space from a world anchor, so
+            // it has to follow the camera; rebuilt every frame it is showing.
+            self.refresh_pick_panel();
 
             let text_layout_key = self.current_text_layout_key();
             if self.needs_redraw && self.last_text_layout_key != text_layout_key {
@@ -2028,6 +2064,14 @@ impl RenderState {
 
         let ms_upload = t_upload.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let t_select = profile_enabled().then(Instant::now);
+
+        if let Some(ref worker) = self.tile_worker {
+            if let Some(answer) = worker.poll_pick() {
+                self.pick_anchor = Some([answer.position[0] as f32, answer.position[1] as f32]);
+                self.pick_objects = answer.objects;
+                self.needs_redraw = true;
+            }
+        }
 
         // 2. Compute zoom level with hysteresis (prevents z-flip on small zoom changes)
         let raw_z = zoom_from_camera_raw(self.camera.zoom);
@@ -2666,6 +2710,123 @@ impl RenderState {
                 }
             }
         }
+
+        // 6) The object-query bubble, on the glass above everything: panel
+        // first, then its text.
+        if let Some(ref overlay) = self.overlay_renderer {
+            overlay.draw(render_pass);
+        }
+        if let (Some(ref label_renderer), Some(ref label_bind_group), Some(ref buffer)) = (
+            &self.label_renderer,
+            &self.label_camera_bind_group,
+            &self.pick_glyph_buffer,
+        ) {
+            if self.pick_glyph_count > 0 {
+                label_renderer.render_with_buffer(
+                    render_pass,
+                    label_bind_group,
+                    buffer,
+                    self.pick_glyph_count,
+                );
+            }
+        }
+    }
+
+    /// Ask what chart objects are under a screen position, for the info bubble.
+    ///
+    /// The answer comes back from the tile worker, which already holds the
+    /// parsed cells. The tolerance is a fixed number of screen pixels turned
+    /// into metres, so clicking near a buoy finds it at any zoom.
+    pub fn pick_at_screen(&mut self, x: f32, y: f32) {
+        let world = self.camera.screen_to_world(x, y);
+        self.pick_at_world(world.x, world.y);
+    }
+
+    /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
+    /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
+    pub fn pick_at_world(&mut self, x: f32, y: f32) {
+        const PICK_RADIUS_PX: f32 = 8.0;
+        self.pick_anchor = Some([x, y]);
+        self.pick_objects.clear();
+        self.pick_glyph_count = 0;
+        if let Some(ref worker) = self.tile_worker {
+            worker.request_pick(
+                [x as f64, y as f64],
+                (PICK_RADIUS_PX * self.camera.zoom) as f64,
+            );
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Close the info bubble.
+    pub fn dismiss_pick(&mut self) {
+        if self.pick_anchor.is_some() {
+            self.pick_anchor = None;
+            self.pick_objects.clear();
+            self.pick_glyph_count = 0;
+            self.pick_glyph_buffer = None;
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Is the info bubble showing?
+    pub fn pick_active(&self) -> bool {
+        self.pick_anchor.is_some()
+    }
+
+    /// Rebuild the bubble's geometry for the current camera.
+    ///
+    /// Run every frame while a pick is showing: the panel is positioned in
+    /// screen space but anchored to a world point, so panning and zooming move
+    /// it. It is a handful of quads and a few hundred glyphs, so rebuilding is
+    /// cheaper than tracking what invalidates it.
+    fn refresh_pick_panel(&mut self) {
+        use wgpu::util::DeviceExt;
+
+        let Some(anchor) = self.pick_anchor else {
+            if let Some(ref mut overlay) = self.overlay_renderer {
+                overlay.upload(
+                    &self.device,
+                    &self.queue,
+                    [self.size.width as f32, self.size.height as f32],
+                    &[],
+                );
+            }
+            self.pick_glyph_count = 0;
+            return;
+        };
+
+        let screen = self.camera.world_to_screen(anchor[0], anchor[1]);
+        let color_index = self
+            .s52_engine
+            .as_ref()
+            .and_then(|e| e.get_color_index("CHBLK"))
+            .unwrap_or(0) as u32;
+        let panel = crate::render::pick_panel::build(
+            &self.pick_objects,
+            anchor,
+            [screen.x, screen.y],
+            [self.size.width as f32, self.size.height as f32],
+            color_index,
+        );
+
+        if let Some(ref mut overlay) = self.overlay_renderer {
+            overlay.upload(
+                &self.device,
+                &self.queue,
+                [self.size.width as f32, self.size.height as f32],
+                &panel.overlay,
+            );
+        }
+        self.pick_glyph_count = panel.glyphs.len() as u32;
+        self.pick_glyph_buffer = (!panel.glyphs.is_empty()).then(|| {
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Pick Panel Glyphs"),
+                    contents: bytemuck::cast_slice(&panel.glyphs),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
     }
 
     /// Get window reference for redraw requests

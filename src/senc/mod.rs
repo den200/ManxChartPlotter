@@ -14,6 +14,7 @@ pub mod symbol_lookup;
 pub use reader::{SencReader, SencError};
 pub use records::{RecordType, SencHeader, CellExtent, ObjectClass, s57_code_to_acronym};
 pub use geometry::{TriPrim, TriPrimType, AreaGeometry, LineGeometry, EdgeRef, EdgeTable, BBox, BBoxTileRelation};
+pub mod s57_names;
 pub use features::{AttributeValue, Attributes, Feature, FeatureType, ChartData};
 pub use catalog::{ChartCatalog, ChartInfo, CatalogError};
 pub use symbol_lookup::{features_to_instances, soundings_to_instances};
