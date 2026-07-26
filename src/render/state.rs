@@ -1946,6 +1946,33 @@ impl RenderState {
                 crate::render::ui::UiAction::ShopSignOut => {
                     self.shop_send(crate::shop::service::Request::SignOut);
                 }
+                crate::render::ui::UiAction::ShopRegister { system_name } => {
+                    match Self::machine_fingerprint() {
+                        Some(fingerprint) => self.shop_send(
+                            crate::shop::service::Request::Register {
+                                system_name,
+                                fingerprint,
+                            },
+                        ),
+                        None => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.shop.status = "No chart licence on this machine, so it \
+                                                  cannot be registered."
+                                    .into();
+                            }
+                        }
+                    }
+                }
+                crate::render::ui::UiAction::ShopDownload { chart_id } => {
+                    let installed = self
+                        .ui
+                        .as_ref()
+                        .and_then(|u| u.shop.installed.get(&chart_id).copied());
+                    self.shop_send(crate::shop::service::Request::Download {
+                        chart_id,
+                        installed,
+                    });
+                }
             }
         }
 
@@ -2864,12 +2891,17 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
+    /// This machine's o-charts fingerprint, if it has a licence at all.
+    fn machine_fingerprint() -> Option<crate::shop::Fingerprint> {
+        crate::decrypt::ChartDecryptor::new("license")
+            .ok()
+            .and_then(|d| crate::shop::Fingerprint::load(d.fpr_path()).ok())
+    }
+
     /// Sign in, sending this machine's fingerprint so the listing can say which
     /// charts are usable here rather than merely owned.
     fn shop_sign_in(&mut self, email: String, password: String) {
-        let fingerprint = crate::decrypt::ChartDecryptor::new("license")
-            .ok()
-            .and_then(|d| crate::shop::Fingerprint::load(d.fpr_path()).ok());
+        let fingerprint = Self::machine_fingerprint();
         if fingerprint.is_none() {
             if let Some(ref mut ui) = self.ui {
                 ui.shop.status =
@@ -2909,6 +2941,11 @@ impl RenderState {
                     ui.shop.signed_in = false;
                     ui.shop.charts.clear();
                     ui.shop.system_name = None;
+                    ui.shop.busy = false;
+                    ui.shop.status = String::new();
+                }
+                Event::Grant { chart_id, summary } => {
+                    ui.shop.grants.insert(chart_id, summary);
                     ui.shop.busy = false;
                     ui.shop.status = String::new();
                 }

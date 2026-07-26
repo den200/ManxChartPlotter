@@ -48,7 +48,13 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
     let mut open = shop.open;
     Window::new("Charts")
         .open(&mut open)
-        .default_size([560.0, 460.0])
+        .default_size([620.0, 460.0])
+        .default_pos([60.0, 80.0])
+        // Kept inside the screen, and never repositioned by anything but a
+        // drag: an area that egui re-places from an anchor each frame cannot
+        // be moved by hand, and one that is free to leave the screen can be
+        // dragged somewhere it cannot be dragged back from.
+        .constrain(true)
         .collapsible(false)
         .show(ctx, |ui| {
             if !shop.signed_in {
@@ -122,8 +128,41 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                         }
                     });
                 });
+                // A machine has to be named before the shop will hand it a
+                // chart: a slot is an assignment to a named computer, not to
+                // an account.
+                if shop.system_name.is_none() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Name this machine:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut shop.new_system_name)
+                                .hint_text("e.g. saloon-mac")
+                                .desired_width(180.0),
+                        );
+                        let ready = !shop.new_system_name.trim().is_empty();
+                        if ui
+                            .add_enabled(ready && !shop.busy, egui::Button::new("Register"))
+                            .clicked()
+                        {
+                            actions.push(UiAction::ShopRegister {
+                                system_name: shop.new_system_name.trim().to_string(),
+                            });
+                        }
+                    });
+                    if !shop.systems.is_empty() {
+                        ui.label(
+                            RichText::new(format!(
+                                "Already on this account: {}",
+                                shop.systems.join(", ")
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
+                }
                 ui.separator();
-                chart_table(ui, shop);
+                chart_table(ui, shop, actions);
             }
 
             if !shop.status.is_empty() {
@@ -135,7 +174,7 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
     shop.open = open;
 }
 
-fn chart_table(ui: &mut egui::Ui, shop: &ShopView) {
+fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) {
     if shop.charts.is_empty() {
         ui.label(if shop.busy {
             "Fetching your charts…"
@@ -151,7 +190,7 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView) {
     );
     ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("shop-charts")
-            .num_columns(4)
+            .num_columns(5)
             .striped(true)
             .spacing([14.0, 6.0])
             .show(ui, |ui| {
@@ -159,6 +198,7 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView) {
                 ui.label(RichText::new("Edition").strong());
                 ui.label(RichText::new("State").strong());
                 ui.label(RichText::new("This machine").strong());
+                ui.label("");
                 ui.end_row();
 
                 for c in &shop.charts {
@@ -186,7 +226,32 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView) {
                         .small()
                         .weak(),
                     );
+                    // Offered even for an expired subscription. Whether the
+                    // last edition it covered may still be fetched is the
+                    // shop's decision, and the only way to learn it is to ask.
+                    let can_ask = shop.system_name.is_some() && !shop.busy;
+                    if ui
+                        .add_enabled(can_ask, egui::Button::new("Download"))
+                        .on_disabled_hover_text(if shop.system_name.is_none() {
+                            "register this machine first"
+                        } else {
+                            "busy"
+                        })
+                        .clicked()
+                    {
+                        actions.push(UiAction::ShopDownload {
+                            chart_id: c.id.clone(),
+                        });
+                    }
                     ui.end_row();
+                    if let Some(answer) = shop.grants.get(&c.id) {
+                        ui.label("");
+                        ui.label("");
+                        ui.label(RichText::new(answer).small().weak());
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                    }
                 }
             });
     });

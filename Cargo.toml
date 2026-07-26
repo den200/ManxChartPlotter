@@ -52,7 +52,10 @@ rayon = "1.10"
 # event loop and no part of the chart pipeline.
 egui = "0.29"
 egui-wgpu = "0.29"
-egui-winit = { version = "0.29", default-features = false, features = ["links", "wayland", "x11"] }
+# `clipboard` is one of egui-winit's default features and turning defaults off
+# took paste with it — a password field you cannot paste into is not a small
+# annoyance when the password is 30 random characters.
+egui-winit = { version = "0.29", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 
 # The o-charts shop client. Blocking HTTP on a worker thread rather than an
 # async runtime: the shop is a handful of requests at the dock, not a hot path,

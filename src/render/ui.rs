@@ -27,6 +27,10 @@ pub enum UiAction {
     ShopRefresh,
     /// Forget the session.
     ShopSignOut,
+    /// Register this machine with the account under a name.
+    ShopRegister { system_name: String },
+    /// Claim a slot for a chart and ask the shop for a download.
+    ShopDownload { chart_id: String },
 }
 
 /// What the shop panel is showing.
@@ -47,6 +51,10 @@ pub struct ShopView {
     pub charts: Vec<crate::shop::types::Chart>,
     /// Editions already installed, by chart id.
     pub installed: std::collections::HashMap<String, crate::shop::types::Edition>,
+    /// A name being typed for this machine.
+    pub new_system_name: String,
+    /// What the shop said about the last download request, per chart id.
+    pub grants: std::collections::HashMap<String, String>,
 }
 
 /// What the UI is allowed to see.

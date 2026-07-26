@@ -23,6 +23,17 @@ pub enum Request {
     Refresh,
     /// Forget the session.
     SignOut,
+    /// Register this machine with the account under a name of the user's choosing.
+    Register {
+        system_name: String,
+        fingerprint: Fingerprint,
+    },
+    /// Claim a slot and ask the shop for a download link.
+    Download {
+        chart_id: String,
+        /// What is on disk already, if anything.
+        installed: Option<super::types::Edition>,
+    },
 }
 
 /// What the shop tells the UI.
@@ -39,6 +50,8 @@ pub enum Event {
         systems: Vec<String>,
     },
     SignedOut,
+    /// The shop's answer to a download request, for one chart.
+    Grant { chart_id: String, summary: String },
     Failed(String),
 }
 
@@ -126,11 +139,152 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>) {
                     }
                 }
             }
+            Request::Register {
+                system_name,
+                fingerprint,
+            } => {
+                let _ = events.send(Event::Status(format!("Registering as \"{system_name}\"…")));
+                match session.as_ref() {
+                    Some(s) => match client.register_system(
+                        s,
+                        &system_name,
+                        &fingerprint.bytes,
+                        &fingerprint.name,
+                    ) {
+                        Ok(()) => {
+                            if let Some(s) = session.as_mut() {
+                                s.system_name = Some(system_name.clone());
+                            }
+                            let _ = events.send(Event::SignedIn {
+                                system_name: Some(system_name),
+                            });
+                            list(&client, session.as_ref(), &events);
+                        }
+                        Err(e) => {
+                            let _ = events.send(Event::Failed(e.to_string()));
+                        }
+                    },
+                    None => {
+                        let _ = events.send(Event::Failed("not signed in".into()));
+                    }
+                }
+            }
+            Request::Download {
+                chart_id,
+                installed,
+            } => download(&client, session.as_ref(), &chart_id, installed, &events),
             Request::Refresh => list(&client, session.as_ref(), &events),
             Request::SignOut => {
                 session = None;
                 let _ = events.send(Event::SignedOut);
             }
+        }
+    }
+}
+
+/// Claim a slot for a chart, then ask the shop what it will give us.
+///
+/// Stops at the grant rather than fetching: what the shop is willing to hand
+/// over for a lapsed subscription is its decision, and the useful thing is to
+/// see the answer in its own words.
+fn download(
+    client: &ShopClient,
+    session: Option<&Session>,
+    chart_id: &str,
+    installed: Option<super::types::Edition>,
+    events: &Sender<Event>,
+) {
+    let Some(session) = session else {
+        let _ = events.send(Event::Failed("not signed in".into()));
+        return;
+    };
+    let Some(system_name) = session.system_name.clone() else {
+        let _ = events.send(Event::Failed(
+            "register this machine with the account first".into(),
+        ));
+        return;
+    };
+
+    let _ = events.send(Event::Status("Looking up the chart…".into()));
+    let (charts, _) = match client.list_charts(session) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = events.send(Event::Failed(e.to_string()));
+            return;
+        }
+    };
+    let Some(chart) = charts.iter().find(|c| c.id == chart_id) else {
+        let _ = events.send(Event::Failed(format!("chart {chart_id} is no longer listed")));
+        return;
+    };
+
+    // A slot is this machine's claim on one copy of the chart. If we already
+    // hold one, reuse it; the shop counts assignments, and burning a second is
+    // a real cost to the user.
+    let slot_uuid = match chart.slot_for(&system_name) {
+        Some((_, slot)) => slot.uuid.clone(),
+        None => {
+            let Some(quantity) = chart.free_quantity() else {
+                let _ = events.send(Event::Failed(format!(
+                    "no free slot for {}: all {} are assigned to other machines",
+                    chart.name, chart.max_slots
+                )));
+                return;
+            };
+            let _ = events.send(Event::Status("Claiming a slot for this machine…".into()));
+            match client.assign(session, chart, &quantity.id, &system_name) {
+                Ok(uuid) => uuid,
+                Err(e) => {
+                    let _ = events.send(Event::Failed(e.to_string()));
+                    return;
+                }
+            }
+        }
+    };
+
+    let target = super::protocol::choose_download(installed, chart.edition);
+    let _ = events.send(Event::Status(format!(
+        "Asking for the {} package…",
+        target.requested_file().unwrap_or("nothing")
+    )));
+    match client.request_download(
+        session,
+        &slot_uuid,
+        &system_name,
+        target,
+        chart.edition,
+        installed,
+    ) {
+        Ok(grant) if grant.files.is_empty() => {
+            let _ = events.send(Event::Grant {
+                chart_id: chart_id.to_string(),
+                summary: "the shop granted no files".into(),
+            });
+        }
+        Ok(grant) => {
+            let summary = grant
+                .files
+                .iter()
+                .map(|f| {
+                    format!(
+                        "{} MB, edition {}{}",
+                        f.size / 1_000_000,
+                        if f.edition_result.is_empty() { "?" } else { &f.edition_result },
+                        if f.substituted_base() { " (full set)" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let _ = events.send(Event::Grant {
+                chart_id: chart_id.to_string(),
+                summary,
+            });
+        }
+        Err(e) => {
+            let _ = events.send(Event::Grant {
+                chart_id: chart_id.to_string(),
+                summary: format!("refused: {e}"),
+            });
         }
     }
 }
