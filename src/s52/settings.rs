@@ -165,6 +165,7 @@ impl MarinerSettings {
     /// - `NAVCORE_DEPTH_SHADES=2|4` — two-shade display (safe/unsafe only)
     /// - `NAVCORE_DEPTH_UNIT=m|ft|fm`
     /// - `NAVCORE_DEPTH_RELIEF=1` — shade depth-area edges (not S-52)
+    /// - `NAVCORE_SYMBOLS=simplified|paper` — OpenCPN's symbol-style switch
     pub fn from_env() -> Self {
         let mut s = Self::default();
         let on = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
@@ -196,6 +197,13 @@ impl MarinerSettings {
         }
         if on("NAVCORE_DEPTH_RELIEF") {
             s.depth_relief = true;
+        }
+        if let Ok(style) = std::env::var("NAVCORE_SYMBOLS") {
+            match style.to_ascii_lowercase().as_str() {
+                "simplified" | "simple" => s.simplified_points = true,
+                "paper" | "paperchart" | "paper_chart" => s.simplified_points = false,
+                other => log::warn!("NAVCORE_SYMBOLS: unknown value {:?}", other),
+            }
         }
 
         // The mariner's depth settings. These are the navigationally important

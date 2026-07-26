@@ -1,6 +1,7 @@
 // Area Pattern Fill Shader
 // Renders tiled patterns for S-52 area features (AP instruction)
-// Uses screen-space fragment coordinates with object-based offset for seamless tiling
+// The grid is anchored to the chart; the cell and glyph are a fixed size in
+// pixels, as S-52 states pattern spacing in millimetres on the display.
 
 struct CameraUniform {
     view_proj: mat4x4<f32>,
@@ -66,9 +67,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let tile_h = pat_info.tile_info.y;
     let stagger = pat_info.tile_info.z;  // 0.0 for linear, 0.5 for staggered
 
-    // Screen-space position (use clip_position which is in screen pixels after viewport transform)
-    let frag_x = in.clip_position.x;
-    let frag_y = in.clip_position.y;
+    // Where this fragment sits on the pattern grid, in pixels.
+    //
+    // Anchored to the chart, not to the window. S-52 states a pattern's symbol
+    // size and its minimum spacing in millimetres on the display, so the cell
+    // stays a fixed number of pixels at every zoom — but the *grid* has to be
+    // pinned to the ground, or the symbols sit still while the chart slides
+    // under them. Taking the fragment's screen coordinate did exactly that: the
+    // fish of a fish-haven area never moved, at any zoom or pan, as if they
+    // were painted on the glass.
+    //
+    // Mercator metres times pixels-per-metre gives the same units the cell size
+    // is in, and using the world origin as the anchor makes neighbouring tiles
+    // agree on the grid, so a pattern crosses a tile boundary without a seam.
+    // Screen y runs down and world y runs north, hence the negation.
+    let grid = vec2<f32>(in.world_pos.x, -in.world_pos.y) * camera.pixels_per_meter;
+    let frag_x = grid.x;
+    let frag_y = grid.y;
 
     // Apply object offset for seamless tiling across features
     let offset_x = in.offset.x + pat_info.offset_info.x;
