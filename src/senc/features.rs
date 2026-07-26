@@ -13,90 +13,223 @@ use super::reader::{RawRecord, SencError, SencReader};
 use super::records::{ObjectClass, RecordType, SencHeader};
 
 /// Convert S-57 attribute code to attribute name.
+/// The S-57 attributes navcore understands, code and acronym.
+///
 /// Codes from IHO S-57 Ed 3.1 Appendix A (verified against s57attributes.csv).
-fn s57_attribute_name(code: u16) -> String {
-    match code {
-        // Shape/structure attributes
-        2 => "BCNSHP".to_string(),  // Beacon shape
-        4 => "BOYSHP".to_string(),  // Buoy shape
+/// One source, two orderings: a feature stores the *code* the SENC gave it and
+/// every lookup by name goes through [`s57_attribute_code`]. A test asserts the
+/// two tables hold the same pairs, so they cannot disagree about what "CATCOV"
+/// means.
+const S57_ATTRIBUTES: &[(u16, &str)] = &[
+    (2, "BCNSHP"), // Beacon shape
+    (4, "BOYSHP"), // Buoy shape
+    (13, "CATCAM"), // Category of cardinal mark
+    (15, "CATCOA"), // Category of coastline
+    (18, "CATCOV"), // Category of coverage
+    (36, "CATLAM"), // Category of lateral mark
+    (37, "CATLIT"), // Category of light
+    (40, "CATMOR"), // Category of mooring/warping facility
+    (42, "CATOBS"), // Category of obstruction
+    (56, "CATREA"), // Category of restricted area
+    (60, "CATSLC"), // Category of shoreline construction
+    (71, "CATWRK"), // Category of wreck
+    (75, "COLOUR"), // Colour
+    (76, "COLPAT"), // Colour pattern
+    (81, "CONDTN"), // Condition
+    (82, "CONRAD"), // Conspicuous, radar
+    (83, "CONVIS"), // Conspicuous, visually
+    (87, "DRVAL1"), // Depth range value 1 (shallow)
+    (88, "DRVAL2"), // Depth range value 2 (deep)
+    (92, "EXCLIT"), // Exhibition condition of light
+    (93, "EXPSOU"), // Exposition of sounding
+    (94, "FUNCTN"), // Function
+    (95, "HEIGHT"), // Height
+    (102, "INFORM"), // Information
+    (107, "LITCHR"), // Light characteristic
+    (108, "LITVIS"), // Light visibility
+    (109, "MARSYS"), // Marks navigational system (IALA)
+    (116, "OBJNAM"), // Object name
+    (117, "ORIENT"), // Orientation
+    (125, "QUASOU"), // Quality of sounding measurement
+    (131, "RESTRN"), // Restriction
+    (132, "SCAMAX"), // Scale maximum
+    (133, "SCAMIN"), // Scale minimum
+    (136, "SECTR1"), // Sector limit one
+    (137, "SECTR2"), // Sector limit two
+    (141, "SIGGRP"), // Signal group
+    (142, "SIGPER"), // Signal period
+    (149, "STATUS"), // Status
+    (156, "TECSOU"), // Technique of sounding measurement
+    (171, "TOPSHP"), // Topmark/daymark shape
+    (174, "VALDCO"), // Value of depth contour
+    (178, "VALNMR"), // Value of nominal range
+    (179, "VALSOU"), // Value of sounding
+    (181, "VERCLR"), // Vertical clearance
+    (182, "VERCCL"), // Vertical clearance, closed
+    (183, "VERCOP"), // Vertical clearance, open
+    (185, "VERDAT"), // Vertical datum
+    (187, "WATLEV"), // Water level effect
+    (300, "NINFOM"), // Information in national language
+    (301, "NOBJNM"), // Object name in national language
+    (402, "QUAPOS"), // Quality of position
+];
 
-        // Category attributes (used by S-52 lookups and CS procedures)
-        13 => "CATCAM".to_string(), // Category of cardinal mark
-        15 => "CATCOA".to_string(), // Category of coastline
-        18 => "CATCOV".to_string(), // Category of coverage
-        36 => "CATLAM".to_string(), // Category of lateral mark
-        37 => "CATLIT".to_string(), // Category of light
-        40 => "CATMOR".to_string(), // Category of mooring/warping facility
-        42 => "CATOBS".to_string(), // Category of obstruction
-        56 => "CATREA".to_string(), // Category of restricted area
-        60 => "CATSLC".to_string(), // Category of shoreline construction
-        71 => "CATWRK".to_string(), // Category of wreck
+/// The same table keyed by acronym, so both directions are a binary
+/// search. One linear scan of 51 entries per attribute was enough to
+/// triple the cost of building a tile: `s57_attribute_name` sits inside
+/// the conditional-symbology cache key, which is computed per feature.
+const S57_ATTRIBUTES_BY_NAME: &[(&str, u16)] = &[
+    ("BCNSHP", 2),
+    ("BOYSHP", 4),
+    ("CATCAM", 13),
+    ("CATCOA", 15),
+    ("CATCOV", 18),
+    ("CATLAM", 36),
+    ("CATLIT", 37),
+    ("CATMOR", 40),
+    ("CATOBS", 42),
+    ("CATREA", 56),
+    ("CATSLC", 60),
+    ("CATWRK", 71),
+    ("COLOUR", 75),
+    ("COLPAT", 76),
+    ("CONDTN", 81),
+    ("CONRAD", 82),
+    ("CONVIS", 83),
+    ("DRVAL1", 87),
+    ("DRVAL2", 88),
+    ("EXCLIT", 92),
+    ("EXPSOU", 93),
+    ("FUNCTN", 94),
+    ("HEIGHT", 95),
+    ("INFORM", 102),
+    ("LITCHR", 107),
+    ("LITVIS", 108),
+    ("MARSYS", 109),
+    ("NINFOM", 300),
+    ("NOBJNM", 301),
+    ("OBJNAM", 116),
+    ("ORIENT", 117),
+    ("QUAPOS", 402),
+    ("QUASOU", 125),
+    ("RESTRN", 131),
+    ("SCAMAX", 132),
+    ("SCAMIN", 133),
+    ("SECTR1", 136),
+    ("SECTR2", 137),
+    ("SIGGRP", 141),
+    ("SIGPER", 142),
+    ("STATUS", 149),
+    ("TECSOU", 156),
+    ("TOPSHP", 171),
+    ("VALDCO", 174),
+    ("VALNMR", 178),
+    ("VALSOU", 179),
+    ("VERCCL", 182),
+    ("VERCLR", 181),
+    ("VERCOP", 183),
+    ("VERDAT", 185),
+    ("WATLEV", 187),
+];
 
-        // Colour/appearance attributes
-        75 => "COLOUR".to_string(), // Colour
-        76 => "COLPAT".to_string(), // Colour pattern
-        81 => "CONDTN".to_string(), // Condition
-        82 => "CONRAD".to_string(), // Conspicuous, radar
-        83 => "CONVIS".to_string(), // Conspicuous, visually
+/// Acronym for an S-57 attribute code, or `None` if navcore has no name for it.
+pub fn s57_attribute_name(code: u16) -> Option<&'static str> {
+    S57_ATTRIBUTES
+        .binary_search_by_key(&code, |(c, _)| *c)
+        .ok()
+        .map(|i| S57_ATTRIBUTES[i].1)
+}
 
-        // Depth-related attributes
-        87 => "DRVAL1".to_string(),  // Depth range value 1 (shallow)
-        88 => "DRVAL2".to_string(),  // Depth range value 2 (deep)
-        174 => "VALDCO".to_string(), // Value of depth contour
-        179 => "VALSOU".to_string(), // Value of sounding
+/// Code for an S-57 attribute acronym, or `None` if it is not in the table.
+///
+/// The table is sorted by acronym so this is a binary search: six string
+/// comparisons, no allocation and no hashing, against a `HashMap<String, _>`
+/// that had to allocate the key at parse time and hash it at every lookup.
+///
+/// Returning `None` is the same answer navcore gave before: an attribute the
+/// table does not name was stored under a placeholder key that no lookup could
+/// match either.
+pub fn s57_attribute_code(name: &str) -> Option<u16> {
+    S57_ATTRIBUTES_BY_NAME
+        .binary_search_by(|(n, _)| (*n).cmp(name))
+        .ok()
+        .map(|i| S57_ATTRIBUTES_BY_NAME[i].1)
+}
 
-        // Exposure/exhibition attributes
-        92 => "EXCLIT".to_string(), // Exhibition condition of light
-        93 => "EXPSOU".to_string(), // Exposition of sounding
-        94 => "FUNCTN".to_string(), // Function
+/// A feature's S-57 attributes, keyed by code.
+///
+/// A `HashMap<String, AttributeValue>` cost an allocated key per attribute and
+/// a `HashMap` per feature — for a 3800-feature cell, tens of thousands of
+/// allocations to parse and a string hash on every lookup afterwards. The SENC
+/// hands us a numeric code; keeping it is both smaller and faster, and a
+/// feature carries so few attributes that a linear scan beats any index.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Attributes(Vec<(u16, AttributeValue)>);
 
-        // Physical attributes
-        95 => "HEIGHT".to_string(),  // Height
-        109 => "MARSYS".to_string(), // Marks navigational system (IALA)
+impl Attributes {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
 
-        // Light attributes
-        107 => "LITCHR".to_string(), // Light characteristic
-        108 => "LITVIS".to_string(), // Light visibility
-        117 => "ORIENT".to_string(), // Orientation
-        136 => "SECTR1".to_string(), // Sector limit one
-        137 => "SECTR2".to_string(), // Sector limit two
-        141 => "SIGGRP".to_string(), // Signal group
-        142 => "SIGPER".to_string(), // Signal period
+    /// Look up by S-57 acronym. Unknown acronyms have no value, as before.
+    pub fn get(&self, name: &str) -> Option<&AttributeValue> {
+        self.get_code(s57_attribute_code(name)?)
+    }
 
-        // Sounding quality attributes (used by SNDFRM02, OBSTRN04, WRECKS02)
-        125 => "QUASOU".to_string(), // Quality of sounding measurement
-        149 => "STATUS".to_string(), // Status
-        156 => "TECSOU".to_string(), // Technique of sounding measurement
+    pub fn get_code(&self, code: u16) -> Option<&AttributeValue> {
+        self.0.iter().find(|(c, _)| *c == code).map(|(_, v)| v)
+    }
 
-        // Restriction attribute (used by RESTRN01, RESARE02)
-        131 => "RESTRN".to_string(), // Restriction
+    /// Set an attribute by acronym.
+    ///
+    /// An acronym missing from [`S57_ATTRIBUTES`] cannot be stored, because
+    /// nothing could look it up again; that is a bug in the caller rather than
+    /// a runtime condition, so it trips a debug assertion.
+    pub fn insert(&mut self, name: &str, value: AttributeValue) {
+        match s57_attribute_code(name) {
+            Some(code) => self.insert_code(code, value),
+            None => debug_assert!(false, "unknown S-57 attribute acronym: {name}"),
+        }
+    }
 
-        // Topmark attribute (used by TOPMAR01)
-        171 => "TOPSHP".to_string(), // Topmark/daymark shape
+    pub fn insert_code(&mut self, code: u16, value: AttributeValue) {
+        match self.0.iter_mut().find(|(c, _)| *c == code) {
+            Some(slot) => slot.1 = value,
+            None => self.0.push((code, value)),
+        }
+    }
 
-        // Vertical clearance attributes (used in TX/TE text)
-        181 => "VERCLR".to_string(), // Vertical clearance
-        182 => "VERCCL".to_string(), // Vertical clearance, closed
-        183 => "VERCOP".to_string(), // Vertical clearance, open
-        185 => "VERDAT".to_string(), // Vertical datum
+    pub fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
 
-        // Water level
-        187 => "WATLEV".to_string(), // Water level effect
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 
-        // Position quality (extended attribute)
-        402 => "QUAPOS".to_string(), // Quality of position
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
-        // Text/name attributes
-        102 => "INFORM".to_string(), // Information
-        116 => "OBJNAM".to_string(), // Object name
-        132 => "SCAMAX".to_string(), // Scale maximum
-        133 => "SCAMIN".to_string(), // Scale minimum
-        178 => "VALNMR".to_string(), // Value of nominal range
-        300 => "NINFOM".to_string(), // Information in national language
-        301 => "NOBJNM".to_string(), // Object name in national language
+    /// Attributes as (code, value) pairs, in the order the cell listed them.
+    pub fn iter_codes(&self) -> impl Iterator<Item = (u16, &AttributeValue)> {
+        self.0.iter().map(|(c, v)| (*c, v))
+    }
 
-        // Return numeric code as string for unknown attributes
-        _ => format!("ATTR_{}", code),
+    /// Attributes navcore has a name for, as (acronym, value). Anything the
+    /// table does not name is skipped — it was unreachable by name anyway.
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &AttributeValue)> {
+        self.0
+            .iter()
+            .filter_map(|(c, v)| s57_attribute_name(*c).map(|n| (n, v)))
+    }
+}
+
+impl<'a> IntoIterator for &'a Attributes {
+    type Item = (&'static str, &'a AttributeValue);
+    type IntoIter = Box<dyn Iterator<Item = (&'static str, &'a AttributeValue)> + 'a>;
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
     }
 }
 
@@ -118,8 +251,8 @@ pub struct Feature {
     pub object_class: ObjectClass,
     /// Geometry type
     pub feature_type: FeatureType,
-    /// Parsed attributes (key -> value)
-    pub attributes: HashMap<String, AttributeValue>,
+    /// Parsed attributes, keyed by S-57 attribute code
+    pub attributes: Attributes,
     /// Area geometry (if feature_type == Area)
     pub area_geometry: Option<AreaGeometry>,
     /// Point geometry (if feature_type == Point)
@@ -131,7 +264,7 @@ pub struct Feature {
 }
 
 /// Attribute value types
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AttributeValue {
     Integer(i32),
     Float(f64),
@@ -207,13 +340,13 @@ impl Feature {
     /// lists to preserve attribute presence checks.
     pub fn attributes_as_map(&self) -> HashMap<&str, Vec<i32>> {
         let mut map = HashMap::new();
-        for (name, value) in &self.attributes {
+        for (name, value) in self.attributes.iter() {
             match value {
                 AttributeValue::Integer(v) => {
-                    map.insert(name.as_str(), vec![*v]);
+                    map.insert(name, vec![*v]);
                 }
                 AttributeValue::Float(v) => {
-                    map.insert(name.as_str(), vec![*v as i32]);
+                    map.insert(name, vec![*v as i32]);
                 }
                 AttributeValue::String(s) => {
                     let mut values = Vec::new();
@@ -222,7 +355,7 @@ impl Feature {
                             values.push(v);
                         }
                     }
-                    map.insert(name.as_str(), values);
+                    map.insert(name, values);
                 }
             }
         }
@@ -574,7 +707,7 @@ struct PartialFeature {
     type_code: u16,
     object_class: ObjectClass,
     feature_type: Option<FeatureType>,
-    attributes: HashMap<String, AttributeValue>,
+    attributes: Attributes,
     area_geometry: Option<AreaGeometry>,
     point_geometry: Option<PointGeometry>,
     line_geometry: Option<LineGeometry>,
@@ -618,7 +751,7 @@ impl PartialFeature {
             type_code,
             object_class,
             feature_type,
-            attributes: HashMap::new(),
+            attributes: Attributes::new(),
             area_geometry: None,
             point_geometry: None,
             line_geometry: None,
@@ -646,8 +779,6 @@ impl PartialFeature {
         let attr_code = u16::from_le_bytes([payload[0], payload[1]]);
         let value_type = payload[2];
 
-        // Convert S-57 attribute code to name
-        let name = s57_attribute_name(attr_code);
 
         let value_start = 3;
         let value = match value_type {
@@ -688,7 +819,7 @@ impl PartialFeature {
             _ => return Ok(()),
         };
 
-        self.attributes.insert(name, value);
+        self.attributes.insert_code(attr_code, value);
         Ok(())
     }
 
@@ -753,48 +884,97 @@ impl PartialFeature {
 
 #[cfg(test)]
 mod tests {
-    use super::s57_attribute_name;
+    use super::*;
+
+    #[test]
+    fn attribute_table_is_sorted_and_bijective() {
+        // `s57_attribute_code` binary-searches, so the table must stay sorted
+        // by acronym; and the two directions must agree, because a feature is
+        // stored by code and every lookup arrives as a name.
+        for pair in S57_ATTRIBUTES.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} then {}", pair[0].0, pair[1].0);
+        }
+        for pair in S57_ATTRIBUTES_BY_NAME.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} then {}", pair[0].0, pair[1].0);
+        }
+        assert_eq!(S57_ATTRIBUTES.len(), S57_ATTRIBUTES_BY_NAME.len());
+        for &(code, name) in S57_ATTRIBUTES {
+            assert_eq!(s57_attribute_code(name), Some(code), "{name}");
+            assert_eq!(s57_attribute_name(code), Some(name), "{code}");
+        }
+        assert_eq!(s57_attribute_code("NOSUCH"), None);
+        assert_eq!(s57_attribute_name(60000), None);
+    }
+
+    #[test]
+    fn attributes_written_by_cs_procedures_are_in_the_table() {
+        // `Attributes::insert` cannot store an acronym the table does not know,
+        // so anything a conditional-symbology procedure synthesises has to be
+        // there or it would vanish silently.
+        for name in [
+            "COLOUR", "VALNMR", "CATLIT", "SECTR1", "SECTR2", "LITVIS", "ORIENT",
+        ] {
+            assert!(s57_attribute_code(name).is_some(), "{name} missing");
+        }
+    }
+
+    #[test]
+    fn attributes_round_trip_by_name_and_code() {
+        let mut a = Attributes::new();
+        a.insert("DRVAL1", AttributeValue::Float(3.5));
+        a.insert_code(s57_attribute_code("SCAMIN").unwrap(), AttributeValue::Integer(45000));
+        assert_eq!(a.get("DRVAL1"), Some(&AttributeValue::Float(3.5)));
+        assert_eq!(a.get("SCAMIN"), Some(&AttributeValue::Integer(45000)));
+        assert_eq!(a.get("DRVAL2"), None);
+        assert_eq!(a.len(), 2);
+        // Re-inserting replaces rather than duplicating.
+        a.insert("DRVAL1", AttributeValue::Float(9.0));
+        assert_eq!(a.len(), 2);
+        assert_eq!(a.get("DRVAL1"), Some(&AttributeValue::Float(9.0)));
+        let names: Vec<&str> = a.iter().map(|(n, _)| n).collect();
+        assert_eq!(names, vec!["DRVAL1", "SCAMIN"]);
+    }
 
     #[test]
     fn maps_light_attributes_needed_for_open_cpn_portrayal() {
-        assert_eq!(s57_attribute_name(37), "CATLIT");
-        assert_eq!(s57_attribute_name(95), "HEIGHT");
-        assert_eq!(s57_attribute_name(107), "LITCHR");
-        assert_eq!(s57_attribute_name(108), "LITVIS");
-        assert_eq!(s57_attribute_name(117), "ORIENT");
-        assert_eq!(s57_attribute_name(136), "SECTR1");
-        assert_eq!(s57_attribute_name(137), "SECTR2");
-        assert_eq!(s57_attribute_name(141), "SIGGRP");
-        assert_eq!(s57_attribute_name(142), "SIGPER");
-        assert_eq!(s57_attribute_name(178), "VALNMR");
+        assert_eq!(s57_attribute_name(37), Some("CATLIT"));
+        assert_eq!(s57_attribute_name(95), Some("HEIGHT"));
+        assert_eq!(s57_attribute_name(107), Some("LITCHR"));
+        assert_eq!(s57_attribute_name(108), Some("LITVIS"));
+        assert_eq!(s57_attribute_name(117), Some("ORIENT"));
+        assert_eq!(s57_attribute_name(136), Some("SECTR1"));
+        assert_eq!(s57_attribute_name(137), Some("SECTR2"));
+        assert_eq!(s57_attribute_name(141), Some("SIGGRP"));
+        assert_eq!(s57_attribute_name(142), Some("SIGPER"));
+        assert_eq!(s57_attribute_name(178), Some("VALNMR"));
     }
 
     #[test]
     fn maps_cs_procedure_attributes() {
         // Codes verified against doc/reference projects/OpenCPN/data/s57data/s57attributes.csv
-        assert_eq!(s57_attribute_name(71), "CATWRK");  // wrecks.rs
-        assert_eq!(s57_attribute_name(42), "CATOBS");  // obstrn.rs
-        assert_eq!(s57_attribute_name(171), "TOPSHP"); // topmar.rs
-        assert_eq!(s57_attribute_name(125), "QUASOU"); // sndfrm.rs, wrecks.rs
-        assert_eq!(s57_attribute_name(156), "TECSOU"); // sndfrm.rs
-        assert_eq!(s57_attribute_name(149), "STATUS"); // sndfrm.rs
-        assert_eq!(s57_attribute_name(131), "RESTRN"); // restrn.rs, resare.rs
-        assert_eq!(s57_attribute_name(93), "EXPSOU");  // obstrn.rs, wrecks.rs
-        assert_eq!(s57_attribute_name(82), "CONRAD");  // qualin.rs, quapos.rs
-        assert_eq!(s57_attribute_name(56), "CATREA");  // LUP matching
+        assert_eq!(s57_attribute_name(71), Some("CATWRK"));  // wrecks.rs
+        assert_eq!(s57_attribute_name(42), Some("CATOBS"));  // obstrn.rs
+        assert_eq!(s57_attribute_name(171), Some("TOPSHP")); // topmar.rs
+        assert_eq!(s57_attribute_name(125), Some("QUASOU")); // sndfrm.rs, wrecks.rs
+        assert_eq!(s57_attribute_name(156), Some("TECSOU")); // sndfrm.rs
+        assert_eq!(s57_attribute_name(149), Some("STATUS")); // sndfrm.rs
+        assert_eq!(s57_attribute_name(131), Some("RESTRN")); // restrn.rs, resare.rs
+        assert_eq!(s57_attribute_name(93), Some("EXPSOU"));  // obstrn.rs, wrecks.rs
+        assert_eq!(s57_attribute_name(82), Some("CONRAD"));  // qualin.rs, quapos.rs
+        assert_eq!(s57_attribute_name(56), Some("CATREA"));  // LUP matching
     }
 
     #[test]
     fn maps_buoy_beacon_shape_attributes() {
-        assert_eq!(s57_attribute_name(2), "BCNSHP");
-        assert_eq!(s57_attribute_name(4), "BOYSHP");
-        assert_eq!(s57_attribute_name(13), "CATCAM");
+        assert_eq!(s57_attribute_name(2), Some("BCNSHP"));
+        assert_eq!(s57_attribute_name(4), Some("BOYSHP"));
+        assert_eq!(s57_attribute_name(13), Some("CATCAM"));
     }
 
     #[test]
     fn maps_vertical_clearance_attributes() {
-        assert_eq!(s57_attribute_name(181), "VERCLR");
-        assert_eq!(s57_attribute_name(182), "VERCCL");
-        assert_eq!(s57_attribute_name(183), "VERCOP");
+        assert_eq!(s57_attribute_name(181), Some("VERCLR"));
+        assert_eq!(s57_attribute_name(182), Some("VERCCL"));
+        assert_eq!(s57_attribute_name(183), Some("VERCOP"));
     }
 }

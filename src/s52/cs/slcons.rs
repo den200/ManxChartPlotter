@@ -90,23 +90,52 @@ pub fn slcons03_instructions(
     feature: &Feature,
     settings: &MarinerSettings,
 ) -> Vec<RenderInstruction> {
-    match slcons03(feature, settings) {
-        SlconsResult::LineStyle(style) => vec![RenderInstruction::LineStyle {
+    use crate::senc::FeatureType;
+    let mut out = Vec::new();
+
+    // A *point* shoreline construction (a mooring facility, say) gets only the
+    // low-accuracy marker, never edge styling — s52cnsy.cpp SLCONS03 handles
+    // GEO_POINT in its own branch and leaves the command word otherwise empty.
+    if feature.feature_type == FeatureType::Point
+        || feature.feature_type == FeatureType::Multipoint
+    {
+        let quapos = feature.attribute_int("QUAPOS").unwrap_or(0);
+        if (2..10).contains(&quapos) {
+            out.push(RenderInstruction::Symbol {
+                name: "LOWACC01".to_string(),
+                rotation: None,
+            });
+        }
+        return out;
+    }
+
+    // Area shoreline constructions carry a cross-hatch fill ahead of the edge
+    // styling (s52cnsy.cpp SLCONS03: "not found in PLIB 3.4, but seems to
+    // appear in later PLIB implementations by commercial ECDIS providers").
+    if feature.feature_type == FeatureType::Area {
+        out.push(RenderInstruction::AreaPattern {
+            pattern: "CROSSX01".to_string(),
+        });
+    }
+
+    out.push(match slcons03(feature, settings) {
+        SlconsResult::LineStyle(style) => RenderInstruction::LineStyle {
             pattern: style.pattern(),
             width: style.width(),
             color: style.color_token().to_string(),
-        }],
-        SlconsResult::LineComplex(name) => vec![RenderInstruction::LineComplex {
+        },
+        SlconsResult::LineComplex(name) => RenderInstruction::LineComplex {
             name: name.to_string(),
-        }],
-    }
+        },
+    });
+
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::senc::{AttributeValue, FeatureType, ObjectClass};
-    use std::collections::HashMap;
 
     fn make_slcons(
         catslc: Option<i32>,
@@ -114,18 +143,18 @@ mod tests {
         condtn: Option<i32>,
         quapos: Option<i32>,
     ) -> Feature {
-        let mut attributes = HashMap::new();
+        let mut attributes = crate::senc::Attributes::new();
         if let Some(v) = catslc {
-            attributes.insert("CATSLC".to_string(), AttributeValue::Integer(v));
+            attributes.insert("CATSLC", AttributeValue::Integer(v));
         }
         if let Some(v) = watlev {
-            attributes.insert("WATLEV".to_string(), AttributeValue::Integer(v));
+            attributes.insert("WATLEV", AttributeValue::Integer(v));
         }
         if let Some(v) = condtn {
-            attributes.insert("CONDTN".to_string(), AttributeValue::Integer(v));
+            attributes.insert("CONDTN", AttributeValue::Integer(v));
         }
         if let Some(v) = quapos {
-            attributes.insert("QUAPOS".to_string(), AttributeValue::Integer(v));
+            attributes.insert("QUAPOS", AttributeValue::Integer(v));
         }
         Feature {
             type_code: 0,

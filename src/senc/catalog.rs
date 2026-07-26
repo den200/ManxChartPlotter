@@ -274,8 +274,8 @@ impl ChartCatalog {
     ///
     /// This performs a lightweight quilt selection pass instead of returning every
     /// intersecting chart bbox. More-detailed charts are selected first; lower-scale
-    /// charts are only retained if they still contribute uncovered sample points
-    /// within the tile.
+    /// charts are only retained if they still cover part of the tile that no
+    /// more-detailed chart does.
     pub fn charts_for_tile(&self, tile: &TileBounds) -> Vec<&ChartInfo> {
         self.charts_for_tile_scaled(tile, f64::INFINITY)
     }
@@ -295,7 +295,6 @@ impl ChartCatalog {
         tile: &TileBounds,
         tile_scale_denom: f64,
     ) -> Vec<&ChartInfo> {
-        const SAMPLE_GRID: usize = 5;
         // A chart overzoomed out by more than this factor relative to the tile
         // scale is dropped (its detail is wasted and bloats the tile). Kept
         // generous so zoomed-out tiles still retain a coarse chart for coverage
@@ -333,33 +332,25 @@ impl ChartCatalog {
         // `candidates` retains the catalog's coarsest-first order.
         let intersecting = candidates;
 
-        let mut sample_points = Vec::with_capacity(SAMPLE_GRID * SAMPLE_GRID);
-        let width = tile.max_x - tile.min_x;
-        let height = tile.max_y - tile.min_y;
-        for y in 0..SAMPLE_GRID {
-            for x in 0..SAMPLE_GRID {
-                let fx = (x as f64 + 0.5) / SAMPLE_GRID as f64;
-                let fy = (y as f64 + 0.5) / SAMPLE_GRID as f64;
-                sample_points.push((tile.min_x + width * fx, tile.min_y + height * fy));
-            }
-        }
-
-        let mut covered = vec![false; sample_points.len()];
+        // What of the tile is still unaccounted for. Chart extents and tiles are
+        // both rectangles, so this is exact — the previous 5x5 sample grid was
+        // not, and it cost a visible hole: a chart covering 91% of a tile left
+        // the remaining 30px strip between two sample columns, so every sample
+        // read as covered and the coarser chart underneath was dropped. Nothing
+        // then painted that strip and the background colour showed through as a
+        // pale bar across the land.
+        let mut uncovered = vec![*tile];
         let mut selected = Vec::new();
+        // Half a pixel of a 256-px tile: below this nothing can show through.
+        let eps = (tile.max_x - tile.min_x).abs() / 512.0;
 
         // Iterate most-detailed to least-detailed for quilt selection.
         for chart in intersecting.iter().rev() {
-            let mut contributes = false;
-            for (idx, (x, y)) in sample_points.iter().copied().enumerate() {
-                if !covered[idx] && chart.contains_point(x, y) {
-                    covered[idx] = true;
-                    contributes = true;
-                }
-            }
+            let contributes = subtract_rect(&mut uncovered, &chart.extent_mercator, eps);
             if contributes || selected.is_empty() {
                 selected.push(*chart);
             }
-            if covered.iter().all(|c| *c) {
+            if uncovered.is_empty() {
                 break;
             }
         }
@@ -373,6 +364,7 @@ impl ChartCatalog {
     pub fn len(&self) -> usize {
         self.charts.len()
     }
+
 
     /// Check if catalog is empty
     pub fn is_empty(&self) -> bool {
@@ -404,6 +396,48 @@ impl Default for ChartCatalog {
     }
 }
 
+/// Remove `cut` from a set of disjoint rectangles, returning whether anything
+/// was removed.
+///
+/// Each overlapped rectangle is replaced by the up-to-four bands left around
+/// the cut. Chart extents and tiles are both axis-aligned rectangles, so this
+/// answers "does this chart cover ground the finer ones do not" exactly, which
+/// is what quilt selection needs — approximating it by sampling leaves holes
+/// exactly at chart boundaries, where the sliver is usually thinner than the
+/// sample spacing.
+///
+/// `eps` discards slivers below half a screen pixel, so floating-point noise in
+/// the Mercator conversion does not drag an extra chart into every tile.
+fn subtract_rect(region: &mut Vec<TileBounds>, cut: &TileBounds, eps: f64) -> bool {
+    let mut out = Vec::with_capacity(region.len());
+    let mut changed = false;
+    for r in region.iter() {
+        // No overlap: the rectangle survives whole.
+        if cut.max_x <= r.min_x || cut.min_x >= r.max_x || cut.max_y <= r.min_y || cut.min_y >= r.max_y
+        {
+            out.push(*r);
+            continue;
+        }
+        changed = true;
+        let (lx, hx) = (cut.min_x.max(r.min_x), cut.max_x.min(r.max_x));
+        if r.min_x < lx {
+            out.push(TileBounds::new(r.min_x, lx, r.min_y, r.max_y));
+        }
+        if hx < r.max_x {
+            out.push(TileBounds::new(hx, r.max_x, r.min_y, r.max_y));
+        }
+        if r.min_y < cut.min_y {
+            out.push(TileBounds::new(lx, hx, r.min_y, cut.min_y));
+        }
+        if cut.max_y < r.max_y {
+            out.push(TileBounds::new(lx, hx, cut.max_y, r.max_y));
+        }
+    }
+    out.retain(|r| r.max_x - r.min_x > eps && r.max_y - r.min_y > eps);
+    *region = out;
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +454,88 @@ mod tests {
 
         assert_eq!(id1, id2, "Same path should have same ID");
         assert_ne!(id1, id3, "Different paths should have different IDs");
+    }
+
+    fn chart_at(name: &str, scale: u32, extent: TileBounds) -> ChartInfo {
+        ChartInfo {
+            id: ChartInfo::id_from_path(Path::new(name)),
+            path: PathBuf::from(name),
+            name: name.to_string(),
+            native_scale: scale,
+            extent_wgs84: CellExtent {
+                min_lat: 55.0,
+                max_lat: 56.0,
+                min_lon: 10.0,
+                max_lon: 11.0,
+            },
+            extent_mercator: extent,
+            ref_lat: 55.5,
+            ref_lon: 10.5,
+        }
+    }
+
+    /// A detailed chart that covers most of a tile must not displace the
+    /// coarse one underneath it, or the strip it does not reach paints nothing.
+    ///
+    /// Regression: the harbour cell at Brøndby covers 91% of its tile. The old
+    /// 5x5 sample grid put its outermost column at 90%, so every sample read as
+    /// covered, the 1:22000 chart was dropped, and a 30px bar of background
+    /// colour ran up the map through solid land.
+    #[test]
+    fn coarse_chart_kept_where_detailed_one_falls_short() {
+        let tile = TileBounds::new(0.0, 1000.0, 0.0, 1000.0);
+        let mut catalog = ChartCatalog::new();
+        catalog.charts.push(chart_at(
+            "coarse",
+            22000,
+            TileBounds::new(-9000.0, 9000.0, -9000.0, 9000.0),
+        ));
+        catalog.charts.push(chart_at(
+            "detailed",
+            4000,
+            TileBounds::new(-100.0, 910.0, -100.0, 1100.0),
+        ));
+
+        let selected = catalog.charts_for_tile(&tile);
+        let names: Vec<&str> = selected.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["coarse", "detailed"], "background first");
+
+        // And when the detailed chart does cover the tile, the coarse one goes.
+        catalog.charts[1].extent_mercator = TileBounds::new(-100.0, 1100.0, -100.0, 1100.0);
+        let selected = catalog.charts_for_tile(&tile);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "detailed");
+    }
+
+    #[test]
+    fn subtract_rect_leaves_the_uncovered_band() {
+        let mut region = vec![TileBounds::new(0.0, 100.0, 0.0, 100.0)];
+        // A cut across the middle in y leaves a band above and below.
+        assert!(subtract_rect(
+            &mut region,
+            &TileBounds::new(-10.0, 110.0, 40.0, 60.0),
+            0.01
+        ));
+        assert_eq!(region.len(), 2);
+        assert!(region.iter().any(|r| r.max_y <= 40.0));
+        assert!(region.iter().any(|r| r.min_y >= 60.0));
+
+        // A cut that misses changes nothing and reports so.
+        let before = region.clone();
+        assert!(!subtract_rect(
+            &mut region,
+            &TileBounds::new(500.0, 600.0, 500.0, 600.0),
+            0.01
+        ));
+        assert_eq!(region.len(), before.len());
+
+        // Covering the rest empties it.
+        assert!(subtract_rect(
+            &mut region,
+            &TileBounds::new(-10.0, 110.0, -10.0, 110.0),
+            0.01
+        ));
+        assert!(region.is_empty());
     }
 
     #[test]

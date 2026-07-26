@@ -12,6 +12,7 @@
 //! - LIGHTS05/06: Light symbol selection based on color and range
 //! - SNDFRM02: Sounding formatting and safety depth coloring
 
+mod context;
 mod datcvr;
 mod depare;
 mod depcnt;
@@ -26,6 +27,7 @@ mod sndfrm;
 mod topmar;
 mod wrecks;
 
+pub use context::{CsContext, DepthAreaIndex};
 pub use datcvr::datcvr01_instructions;
 pub use depare::{depare02, depare02_color_token, depare02_instructions, DepthColorToken};
 pub use depcnt::{depcnt02, depcnt02_params, is_safety_contour, DepthContourStyle};
@@ -43,7 +45,7 @@ pub use sndfrm::{sndfrm02, sounding_color, sounding_color_rgb, SoundingRenderInf
 pub use topmar::topmar01_instructions;
 pub use wrecks::{wrecks02, wrecks02_instructions, wrecks02_symbol, Wrecks02Result, WrecksSymbol};
 
-use crate::s52::instruction::RenderInstruction;
+use crate::s52::instruction::{RenderInstruction, SymbolRotation};
 use crate::s52::MarinerSettings;
 use crate::senc::Feature;
 
@@ -60,6 +62,7 @@ pub fn execute_cs(
     procedure: &str,
     feature: &Feature,
     settings: &MarinerSettings,
+    ctx: &CsContext,
 ) -> Option<Vec<RenderInstruction>> {
     match procedure {
         "DATCVR01" => Some(datcvr01_instructions(feature)),
@@ -75,13 +78,26 @@ pub fn execute_cs(
         "SLCONS03" => Some(slcons03_instructions(feature, settings)),
         "QUAPOS01" => Some(quapos01_instructions(feature, settings)),
         "LIGHTS05" | "LIGHTS06" => {
-            let symbol_name = lights06_symbol(feature, settings);
+            // light_render_info carries the flare's 135-degree rotation and the
+            // ORIENT-derived rotation for directional lights; the instruction
+            // stream is where that belongs, so the renderer has one source.
+            // A light with a valid sector is drawn as a bounded arc, not a
+            // symbol: s52cnsy.cpp LIGHTS06 replaces the symbol command with
+            // CA(). navcore builds that arc in tiles/builder.rs from
+            // light_sector_info, so the instruction stream carries nothing —
+            // emitting the all-round symbol here would leave a ring the
+            // renderer then has to throw away.
+            if light_sector_info(feature).is_some() {
+                return Some(Vec::new());
+            }
+            let info = light_render_info(feature, settings);
             Some(vec![RenderInstruction::Symbol {
-                name: symbol_name.to_string(),
+                name: info.symbol_name.to_string(),
+                rotation: info.rotation_deg.map(SymbolRotation::Degrees),
             }])
         }
-        "OBSTRN04" => Some(obstrn04_instructions(feature, settings)),
-        "WRECKS02" => Some(wrecks02_instructions(feature, settings)),
+        "OBSTRN04" => Some(obstrn04_instructions(feature, settings, ctx)),
+        "WRECKS02" => Some(wrecks02_instructions(feature, settings, ctx)),
         "RESARE02" => Some(resare02_instructions(feature, settings)),
         "RESTRN01" => Some(restrn01_instructions(feature)),
         "QUALIN01" => Some(qualin01_instructions(feature)),
@@ -107,14 +123,27 @@ pub fn extract_cs_procedure(instruction: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contours these depth cases were written against. Pinned here so they
+    /// test the procedure rather than `MarinerSettings::default()`, which
+    /// tracks s52plib's own defaults and has changed under them once already.
+    fn test_contours() -> MarinerSettings {
+        MarinerSettings {
+            safety_depth: 10.0,
+            safety_contour: 10.0,
+            shallow_contour: 2.0,
+            deep_contour: 30.0,
+            ..Default::default()
+        }
+    }
+
     use crate::s52::instruction::LinePattern;
     use crate::senc::{AttributeValue, FeatureType, ObjectClass};
-    use std::collections::HashMap;
 
     fn make_depare(drval1: f64, drval2: f64) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("DRVAL1".to_string(), AttributeValue::Float(drval1));
-        attributes.insert("DRVAL2".to_string(), AttributeValue::Float(drval2));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("DRVAL1", AttributeValue::Float(drval1));
+        attributes.insert("DRVAL2", AttributeValue::Float(drval2));
         Feature {
             type_code: 0,
             object_class: ObjectClass::DepthArea,
@@ -130,10 +159,10 @@ mod tests {
     #[test]
     fn test_execute_depare02() {
         let feature = make_depare(0.0, 3.0);
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("DEPARE02", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("DEPARE02", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
-        if let RenderInstruction::AreaColor { color } = &instructions[0] {
+        if let RenderInstruction::AreaColor { color, .. } = &instructions[0] {
             assert_eq!(color, "DEPVS"); // Very shallow
         } else {
             panic!("Expected AreaColor instruction");
@@ -141,8 +170,8 @@ mod tests {
     }
 
     fn make_depcnt(valdco: f64) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("VALDCO".to_string(), AttributeValue::Float(valdco));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("VALDCO", AttributeValue::Float(valdco));
         Feature {
             type_code: 0,
             object_class: ObjectClass::DepthContour,
@@ -158,8 +187,8 @@ mod tests {
     #[test]
     fn test_execute_depcnt02() {
         let feature = make_depcnt(10.0); // Safety contour
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("DEPCNT02", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("DEPCNT02", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
         if let RenderInstruction::LineStyle {
             pattern,
@@ -176,9 +205,9 @@ mod tests {
     }
 
     fn make_depcnt_with_quapos(valdco: f64, quapos: i32) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("VALDCO".to_string(), AttributeValue::Float(valdco));
-        attributes.insert("QUAPOS".to_string(), AttributeValue::Integer(quapos));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("VALDCO", AttributeValue::Float(valdco));
+        attributes.insert("QUAPOS", AttributeValue::Integer(quapos));
         Feature {
             type_code: 0,
             object_class: ObjectClass::DepthContour,
@@ -195,8 +224,8 @@ mod tests {
     fn test_execute_depcnt02_low_accuracy() {
         // Safety contour with low accuracy (QUAPOS=4) should be dashed
         let feature = make_depcnt_with_quapos(10.0, 4);
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("DEPCNT02", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("DEPCNT02", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
         if let RenderInstruction::LineStyle {
             pattern,
@@ -215,8 +244,8 @@ mod tests {
     #[test]
     fn test_unknown_procedure() {
         let feature = make_depare(0.0, 10.0);
-        let settings = MarinerSettings::default();
-        assert!(execute_cs("UNKNOWN01", &feature, &settings).is_none());
+        let settings = test_contours();
+        assert!(execute_cs("UNKNOWN01", &feature, &settings, CsContext::EMPTY).is_none());
     }
 
     #[test]
@@ -230,9 +259,9 @@ mod tests {
     }
 
     fn make_slcons(catslc: Option<i32>) -> Feature {
-        let mut attributes = HashMap::new();
+        let mut attributes = crate::senc::Attributes::new();
         if let Some(v) = catslc {
-            attributes.insert("CATSLC".to_string(), AttributeValue::Integer(v));
+            attributes.insert("CATSLC", AttributeValue::Integer(v));
         }
         Feature {
             type_code: 0,
@@ -247,8 +276,8 @@ mod tests {
     }
 
     fn make_feature_with_quapos(quapos: i32) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("QUAPOS".to_string(), AttributeValue::Integer(quapos));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("QUAPOS", AttributeValue::Integer(quapos));
         Feature {
             type_code: 0,
             object_class: ObjectClass::Coastline,
@@ -266,8 +295,8 @@ mod tests {
         // Pier (CATSLC=4) is NOT a major structure per OpenCPN
         // Only wharf(6), mole(15), log ramp(16) are major structures
         let feature = make_slcons(Some(4)); // Pier
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("SLCONS03", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("SLCONS03", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
         if let RenderInstruction::LineStyle {
             pattern,
@@ -286,8 +315,8 @@ mod tests {
     #[test]
     fn test_execute_slcons03_breakwater() {
         let feature = make_slcons(Some(1)); // Breakwater
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("SLCONS03", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("SLCONS03", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
         if let RenderInstruction::LineStyle { width, .. } = &instructions[0] {
             assert_eq!(*width, 2); // Thinner for minor structure
@@ -299,8 +328,8 @@ mod tests {
     #[test]
     fn test_execute_quapos01_accurate() {
         let feature = make_feature_with_quapos(1); // Surveyed
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("QUAPOS01", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("QUAPOS01", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
         if let RenderInstruction::LineStyle { pattern, .. } = &instructions[0] {
             assert_eq!(*pattern, LinePattern::Solid);
@@ -312,8 +341,8 @@ mod tests {
     #[test]
     fn test_execute_quapos01_low_accuracy() {
         let feature = make_feature_with_quapos(4); // Approximate
-        let settings = MarinerSettings::default();
-        let instructions = execute_cs("QUAPOS01", &feature, &settings).unwrap();
+        let settings = test_contours();
+        let instructions = execute_cs("QUAPOS01", &feature, &settings, CsContext::EMPTY).unwrap();
         assert_eq!(instructions.len(), 1);
         if let RenderInstruction::LineComplex { name } = &instructions[0] {
             assert_eq!(name, "LOWACC21");

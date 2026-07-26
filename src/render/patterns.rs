@@ -19,9 +19,18 @@ pub fn get_pattern_lookup() -> &'static HashMap<String, u32> {
         let atlas_data: PatternAtlasJson =
             serde_json::from_str(atlas_json).expect("Failed to parse patterns atlas.json");
 
-        let mut lookup = HashMap::with_capacity(atlas_data.patterns.len());
-        for (idx, name) in atlas_data.patterns.keys().enumerate() {
-            lookup.insert(name.clone(), idx as u32);
+        // Sorted, not HashMap iteration order: the GPU metadata array in
+        // PatternRenderer::new() is built from a *separate* parse of the same
+        // JSON, and two HashMaps in one process have different hash seeds. With
+        // raw keys() order the two index assignments disagreed, so AP() drew
+        // whichever tile happened to land at that slot (DRGARE01 came out as a
+        // fish-farm pattern). Both sides sort, so both agree.
+        let mut names: Vec<&String> = atlas_data.patterns.keys().collect();
+        names.sort();
+
+        let mut lookup = HashMap::with_capacity(names.len());
+        for (idx, name) in names.iter().enumerate() {
+            lookup.insert((*name).clone(), idx as u32);
         }
 
         log::info!("Loaded {} patterns into atlas lookup", lookup.len());
@@ -196,7 +205,9 @@ impl PatternRenderer {
         let atlas_w = atlas_data.atlas_size[0] as f32;
         let atlas_h = atlas_data.atlas_size[1] as f32;
 
-        let pattern_names: Vec<_> = atlas_data.patterns.keys().collect();
+        // Must match get_pattern_lookup()'s ordering exactly — see the note there.
+        let mut pattern_names: Vec<_> = atlas_data.patterns.keys().collect();
+        pattern_names.sort();
         let pattern_count = pattern_names.len().min(MAX_PATTERN_TYPES);
 
         let mut metadata = vec![
@@ -218,18 +229,24 @@ impl PatternRenderer {
             let entry = &atlas_data.patterns[*name];
             let rect = entry.rect;
 
-            // Rendered tile size in pixels. Use the original HPGL cell size
-            // when present; the atlas rect is just the occupied bitmap bounds.
-            let tile_w_px = if entry.tile_size[0] > 0 {
-                entry.tile_size[0] as f32 * HPGL_SCALE
-            } else {
-                rect[2] as f32
-            };
-            let tile_h_px = if entry.tile_size[1] > 0 {
-                entry.tile_size[1] as f32 * HPGL_SCALE
-            } else {
-                rect[3] as f32
-            };
+            // Tile pitch, following s52plib's CreatePatternBufferSpec: the
+            // symbol's bounding box expanded to include its pivot, plus the
+            // pattern's declared minimum distance. Tiling at the symbol's own
+            // size instead — which is what this did — stamps the glyph edge to
+            // edge: a fish-haven area came out as a solid mat of fish where the
+            // reference shows two symbols, because FSHHAV02 asks for 20 mm of
+            // clear space between them.
+            let box_min = [
+                entry.origin[0].min(entry.pivot[0]) as f32,
+                entry.origin[1].min(entry.pivot[1]) as f32,
+            ];
+            let box_max = [
+                (entry.origin[0] + entry.tile_size[0] as i32).max(entry.pivot[0]) as f32,
+                (entry.origin[1] + entry.tile_size[1] as i32).max(entry.pivot[1]) as f32,
+            ];
+            let min_dist = entry.min_dist as f32;
+            let tile_w_px = ((box_max[0] - box_min[0]) + min_dist).max(1.0) * HPGL_SCALE;
+            let tile_h_px = ((box_max[1] - box_min[1]) + min_dist).max(1.0) * HPGL_SCALE;
 
             // Stagger factor: 0.5 for staggered (brick), 0.0 for linear (grid)
             let stagger = if entry.fill_type == "S" { 0.5 } else { 0.0 };
@@ -247,8 +264,12 @@ impl PatternRenderer {
                 offset_info: [
                     (entry.origin[0] - entry.pivot[0]) as f32 * HPGL_SCALE,
                     (entry.origin[1] - entry.pivot[1]) as f32 * HPGL_SCALE,
-                    0.0,
-                    0.0,
+                    // The glyph's own size in pixels. It occupies this much of
+                    // the tile and the rest is clear; where inside the tile it
+                    // sits only shifts the whole grid, so it is placed at the
+                    // origin.
+                    rect[2] as f32,
+                    rect[3] as f32,
                 ],
             };
         }
@@ -394,7 +415,11 @@ impl PatternRenderer {
                     stencil,
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                count: super::msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
                 multiview: None,
                 cache: None,
             })

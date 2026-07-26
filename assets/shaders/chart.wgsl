@@ -17,6 +17,7 @@ struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) color_index: u32,
     @location(2) disp_prio: u32,
+    @location(3) shade: f32,
 }
 
 struct VertexOutput {
@@ -28,8 +29,14 @@ struct VertexOutput {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = uniforms.view_proj * vec4<f32>(in.position, 0.0, 1.0);
-    out.clip_position.z = 1.0 - (f32(in.disp_prio) / 10.0);
-    out.color = palette[in.color_index];
+    // Priority *is* the depth. Scaling by w survives the perspective
+    // divide the tilted camera introduces, and is a no-op untilted (w = 1).
+    out.clip_position.z = (1.0 - f32(in.disp_prio) / 10.0) * out.clip_position.w;
+    // Depth relief: the band just inside a depth area's edge is darkened,
+    // fading to nothing inward, which reads as the step between depth bands.
+    // Zero for every ordinary fill vertex, so this costs nothing when off.
+    let c = palette[in.color_index];
+    out.color = vec4<f32>(c.rgb * (1.0 - in.shade), c.a);
     return out;
 }
 

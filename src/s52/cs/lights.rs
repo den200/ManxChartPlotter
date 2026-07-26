@@ -204,19 +204,89 @@ fn is_valid_sector(sectr1: Option<f64>, sectr2: Option<f64>) -> bool {
         (Some(a), Some(b)) => (a, b),
         _ => return false,
     };
+    // Any non-zero sweep is a sector. LIGHTS06 sets no minimum, and narrow
+    // leading sectors are real: a 0.5-degree sector marks a channel centreline.
     let sweep = if s2 <= s1 { s2 - s1 + 360.0 } else { s2 - s1 };
-    sweep >= 1.0 && sweep != 360.0
+    sweep > 0.0 && sweep != 360.0
 }
 
 /// Sector geometry parameters for LIGHTS05/06.
+/// Circle/arc radius in millimetres, per s52cnsy.cpp `_selSYcol`.
+///
+/// OpenCPN scales the ring by the light's nominal range and then nudges it per
+/// colour so co-located lights of different colours draw concentric rings
+/// instead of one on top of another. The comment there calls it "another
+/// non-standard extension", copied from SeeMyDenc — but it is what the
+/// reference renders, and the size difference is obvious on screen.
+fn all_round_radius_mm(valnmr: f64, colors: &[u8]) -> f64 {
+    let base = if valnmr <= 0.0 {
+        3.0
+    } else if valnmr < 7.0 {
+        3.0
+    } else if valnmr < 15.0 {
+        10.0
+    } else if valnmr < 30.0 {
+        15.0
+    } else {
+        20.0
+    };
+    let bump = match colors.len() {
+        1 => match colors[0] {
+            3 => 1.0,          // red
+            4 => 0.0,          // green
+            1 | 6 | 9 => 2.0,  // white / yellow / amber
+            12 => 3.0,         // magenta
+            _ => 5.0,
+        },
+        2 => {
+            let has = |c: u8| colors.contains(&c);
+            if has(1) && has(3) {
+                1.0
+            } else if has(1) && has(4) {
+                0.0
+            } else {
+                5.0
+            }
+        }
+        _ => 5.0,
+    };
+    base + bump
+}
+
 pub fn light_sector_info(feature: &Feature) -> Option<LightSectorInfo> {
-    let sectr1 = feature.attribute_float("SECTR1")?;
-    let sectr2 = feature.attribute_float("SECTR2")?;
-    if !is_valid_sector(Some(sectr1), Some(sectr2)) {
-        return None;
+    let valnmr = feature.attribute_float("VALNMR").unwrap_or(9.0);
+    let mut colors = parse_color_list(feature.attribute_str("COLOUR"));
+    if colors.is_empty() {
+        colors.push(12); // default magenta
     }
 
-    let valnmr = feature.attribute_float("VALNMR").unwrap_or(9.0);
+    let sectr1_attr = feature.attribute_float("SECTR1");
+    let sectr2_attr = feature.attribute_float("SECTR2");
+
+    // An all-round light has no sector but is still drawn as a ring, not as a
+    // fixed-size symbol (s52cnsy.cpp `_selSYcol` with bsectr=1 emits
+    // CA(OUTLW,4,<colour>,2,0,360,<radius>,0)).
+    if !is_valid_sector(sectr1_attr, sectr2_attr) {
+        // A directional or special-category light is symbolised, never ringed:
+        // LIGHTS06 tests CATLIT before it ever reaches the all-round branch.
+        let catlit = parse_catlit(feature.attribute_str("CATLIT"));
+        let special = catlit.iter().any(|c| matches!(c, 1 | 8 | 9 | 11 | 16));
+        if special || sectr1_attr.is_some() || sectr2_attr.is_some() || valnmr < 10.0 {
+            return None; // flare, directional, or a sector the arc code cannot use
+        }
+        let litvis = parse_litvis(feature.attribute_str("LITVIS"));
+        return Some(LightSectorInfo {
+            sectr1: 0.0,
+            sectr2: 360.0,
+            arc_radius_mm: all_round_radius_mm(valnmr, &colors),
+            sector_radius_mm: 0.0, // no sector legs on a full circle
+            arc_color_token: select_sector_color_token(&colors),
+            faint: litvis.iter().any(|v| matches!(v, 3 | 7 | 8)),
+        });
+    }
+
+    let sectr1 = sectr1_attr?;
+    let sectr2 = sectr2_attr?;
 
     // Arc radius in mm (OpenCPN)
     let arc_radius_mm = if valnmr > 0.0 {
@@ -235,11 +305,6 @@ pub fn light_sector_info(feature: &Feature) -> Option<LightSectorInfo> {
     // in our current label/line pipeline for dense bridge light clusters.
     // Keep the same arc radius logic, but shorten the leg extent slightly.
     let sector_radius_mm = (arc_radius_mm + 4.0_f64).min(22.0_f64);
-
-    let mut colors = parse_color_list(feature.attribute_str("COLOUR"));
-    if colors.is_empty() {
-        colors.push(12); // default magenta
-    }
 
     let litvis = parse_litvis(feature.attribute_str("LITVIS"));
     let faint = litvis.iter().any(|v| matches!(v, 3 | 7 | 8));
@@ -268,6 +333,12 @@ pub struct LightRenderInfo {
 
 pub fn light_render_info(feature: &Feature, settings: &MarinerSettings) -> LightRenderInfo {
     let catlit = parse_catlit(feature.attribute_str("CATLIT"));
+    // CATLIT 1 (directional function) or 16 (directional, leading). There is
+    // nothing to match against upstream here: LIGHTS06 declares `orientstr` and
+    // leaves the assignment commented out, so *every* directional light comes
+    // out of OpenCPN as SY(QUESMRK1) whether or not it has an ORIENT. navcore
+    // draws the oriented flare instead, which is what the S-52 procedure
+    // describes; the conformance differ records the difference.
     let is_directional = catlit.contains(&1) || catlit.contains(&16);
     let orient = feature.attribute_float("ORIENT");
 
@@ -285,7 +356,8 @@ pub fn light_render_info(feature: &Feature, settings: &MarinerSettings) -> Light
             return LightRenderInfo {
                 symbol_name: lights06_symbol(feature, settings),
                 rotation_deg: Some(rotation),
-                orient_text: Some(format!("{:03.0} deg", orient_deg)), // Text shows original ORIENT
+                // Chart convention, now that the label font carries U+00B0.
+                orient_text: Some(format!("{:03.0}\u{00b0}", orient_deg)),
             };
         }
         return LightRenderInfo {
@@ -295,9 +367,21 @@ pub fn light_render_info(feature: &Feature, settings: &MarinerSettings) -> Light
         };
     }
 
+    // A non-directional light drawn as a *flare* (nominal range < 10 NM, no
+    // sector) is rotated 135° — s52cnsy.cpp LIGHTS06 appends ",135)" to the
+    // symbol whenever b_isflare. Without it every small light's flare points
+    // in the symbol's unrotated direction instead of down-left toward the
+    // structure it belongs to. All-round symbols take no rotation.
+    let is_flare = matches!(
+        lights06(feature, settings),
+        LightSymbol::RedFlare
+            | LightSymbol::GreenFlare
+            | LightSymbol::YellowFlare
+            | LightSymbol::DefaultFlare
+    );
     LightRenderInfo {
         symbol_name: lights06_symbol(feature, settings),
-        rotation_deg: None,
+        rotation_deg: if is_flare { Some(135.0) } else { None },
         orient_text: None,
     }
 }
@@ -500,19 +584,17 @@ pub fn litdsn01(feature: &Feature) -> Option<String> {
 mod tests {
     use super::*;
     use crate::senc::{AttributeValue, FeatureType, ObjectClass};
-    use std::collections::HashMap;
 
     fn make_light(colour: Option<&str>, valnmr: Option<f64>, catlit: Option<&str>) -> Feature {
-        let mut attributes = HashMap::new();
+        let mut attributes = crate::senc::Attributes::new();
         if let Some(c) = colour {
-            attributes.insert("COLOUR".to_string(), AttributeValue::String(c.to_string()));
+            attributes.insert("COLOUR", AttributeValue::String(c.to_string()));
         }
         if let Some(v) = valnmr {
-            attributes.insert("VALNMR".to_string(), AttributeValue::Float(v));
+            attributes.insert("VALNMR", AttributeValue::Float(v));
         }
         if let Some(cat) = catlit {
-            attributes.insert(
-                "CATLIT".to_string(),
+            attributes.insert("CATLIT",
                 AttributeValue::String(cat.to_string()),
             );
         }
@@ -529,9 +611,9 @@ mod tests {
     }
 
     fn make_sector_light(sectr1: f64, sectr2: f64) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("SECTR1".to_string(), AttributeValue::Float(sectr1));
-        attributes.insert("SECTR2".to_string(), AttributeValue::Float(sectr2));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("SECTR1", AttributeValue::Float(sectr1));
+        attributes.insert("SECTR2", AttributeValue::Float(sectr2));
         Feature {
             type_code: 0,
             object_class: ObjectClass::Light,
@@ -569,22 +651,23 @@ mod tests {
     }
 
     #[test]
-    fn test_sector_sweep_too_small_uses_all_round() {
+    fn test_narrow_sector_is_still_a_sector() {
+        // A 0.2-degree sector is a real leading sector marking a channel
+        // centreline. LIGHTS06 sets no minimum sweep, and navcore's old
+        // 1-degree floor turned these into all-round rings.
         let mut feature = make_sector_light(10.0, 10.2);
-        feature.attributes.insert(
-            "COLOUR".to_string(),
+        feature.attributes.insert("COLOUR",
             AttributeValue::String("3".to_string()),
         );
-        let settings = MarinerSettings::default();
-        assert_eq!(lights06(&feature, &settings), LightSymbol::RedAllRound);
-        assert!(light_sector_info(&feature).is_none());
+        let info = light_sector_info(&feature).expect("narrow sector is a sector");
+        assert_eq!(info.sectr1, 10.0);
+        assert_eq!(info.sectr2, 10.2);
     }
 
     #[test]
     fn test_sector_sweep_full_circle_uses_all_round() {
         let mut feature = make_sector_light(10.0, 370.0);
-        feature.attributes.insert(
-            "COLOUR".to_string(),
+        feature.attributes.insert("COLOUR",
             AttributeValue::String("4".to_string()),
         );
         let settings = MarinerSettings::default();
@@ -604,24 +687,24 @@ mod tests {
         height: Option<f64>,
         valnmr: Option<f64>,
     ) -> Feature {
-        let mut attributes = HashMap::new();
+        let mut attributes = crate::senc::Attributes::new();
         if let Some(v) = litchr {
-            attributes.insert("LITCHR".to_string(), AttributeValue::Integer(v));
+            attributes.insert("LITCHR", AttributeValue::Integer(v));
         }
         if let Some(v) = siggrp {
-            attributes.insert("SIGGRP".to_string(), AttributeValue::String(v.to_string()));
+            attributes.insert("SIGGRP", AttributeValue::String(v.to_string()));
         }
         if let Some(v) = colour {
-            attributes.insert("COLOUR".to_string(), AttributeValue::String(v.to_string()));
+            attributes.insert("COLOUR", AttributeValue::String(v.to_string()));
         }
         if let Some(v) = sigper {
-            attributes.insert("SIGPER".to_string(), AttributeValue::Float(v));
+            attributes.insert("SIGPER", AttributeValue::Float(v));
         }
         if let Some(v) = height {
-            attributes.insert("HEIGHT".to_string(), AttributeValue::Float(v));
+            attributes.insert("HEIGHT", AttributeValue::Float(v));
         }
         if let Some(v) = valnmr {
-            attributes.insert("VALNMR".to_string(), AttributeValue::Float(v));
+            attributes.insert("VALNMR", AttributeValue::Float(v));
         }
         Feature {
             type_code: 0,
@@ -692,10 +775,10 @@ mod tests {
         );
         feature
             .attributes
-            .insert("SECTR1".to_string(), AttributeValue::Float(90.0));
+            .insert("SECTR1", AttributeValue::Float(90.0));
         feature
             .attributes
-            .insert("SECTR2".to_string(), AttributeValue::Float(180.0));
+            .insert("SECTR2", AttributeValue::Float(180.0));
 
         let desc = litdsn01(&feature).unwrap();
         assert_eq!(desc, "Fl 10s 20m"); // No G, no 15Nm

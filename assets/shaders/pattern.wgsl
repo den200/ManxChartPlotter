@@ -47,7 +47,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     // Transform world position to clip space
     let world_pos = vec4<f32>(in.position, 0.0, 1.0);
     out.clip_position = camera.view_proj * world_pos;
-    out.clip_position.z = 1.0 - (f32(in.disp_prio) / 10.0);
+    out.clip_position.z = (1.0 - f32(in.disp_prio) / 10.0) * out.clip_position.w;
 
     // Pass through data to fragment shader
     out.world_pos = in.position;
@@ -84,14 +84,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         stagger_offset = stagger;  // Usually 0.5
     }
 
-    // Calculate texture coordinates with wrap
+    // Position within the tile, in pixels.
     let u_local = fract((frag_x - offset_x) / tile_w + stagger_offset);
     let v_local = fract((frag_y + offset_y) / tile_h);
+    let in_tile = vec2<f32>(u_local * tile_w, v_local * tile_h);
 
-    // Map local UV [0,1] to atlas UV rect
+    // The glyph occupies only its own size; the rest of the tile is the S-52
+    // minimum distance between symbols and must stay clear.
+    let sym = pat_info.offset_info.zw;
+    if (in_tile.x >= sym.x || in_tile.y >= sym.y) {
+        discard;
+    }
+    let rel = in_tile / sym;
+
+    // Map position within the glyph to the atlas UV rect
     let uv_min = pat_info.uv_rect.xy;
     let uv_max = pat_info.uv_rect.zw;
-    let uv = mix(uv_min, uv_max, vec2<f32>(u_local, 1.0 - v_local));
+    let uv = mix(uv_min, uv_max, vec2<f32>(rel.x, 1.0 - rel.y));
 
     // Sample pattern texture
     let color = textureSample(t_atlas, s_atlas, uv);

@@ -121,18 +121,58 @@ pub fn is_safety_contour(feature: &Feature, settings: &MarinerSettings) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contours these depth cases were written against. Pinned here so they
+    /// test the procedure rather than `MarinerSettings::default()`, which
+    /// tracks s52plib's own defaults and has changed under them once already.
+    fn test_contours() -> MarinerSettings {
+        MarinerSettings {
+            safety_depth: 10.0,
+            safety_contour: 10.0,
+            shallow_contour: 2.0,
+            deep_contour: 30.0,
+            ..Default::default()
+        }
+    }
+
     use crate::senc::{AttributeValue, FeatureType, ObjectClass};
-    use std::collections::HashMap;
 
     fn make_depcnt(valdco: f64) -> Feature {
         make_depcnt_with_quapos(valdco, None)
     }
 
+    /// DEPCNT02 promotes the selected safety contour to DISPLAYBASE and clears
+    /// its SCAMIN — "The contour selected is highlighted as the safety contour
+    /// and put in DISPLAYBASE", and s52plib sets `Scamin = 1e8+1` to match. It
+    /// is the one line on the chart that must survive every filter, and it
+    /// moves with the mariner's setting, so the promotion has to be evaluated
+    /// per view rather than baked into the lookup table.
+    #[test]
+    fn safety_contour_is_promoted_and_follows_the_setting() {
+        let mut settings = test_contours();
+        settings.safety_contour = 5.0;
+        assert!(is_safety_contour(&make_depcnt(5.0), &settings));
+        assert!(!is_safety_contour(&make_depcnt(2.0), &settings));
+        assert!(!is_safety_contour(&make_depcnt(10.0), &settings));
+
+        // Change the mariner's setting and a different contour is promoted.
+        settings.safety_contour = 2.0;
+        assert!(is_safety_contour(&make_depcnt(2.0), &settings));
+        assert!(!is_safety_contour(&make_depcnt(5.0), &settings));
+
+        // Low positional accuracy changes the style, not the promotion: a
+        // dashed safety contour is still the safety contour.
+        assert!(is_safety_contour(
+            &make_depcnt_with_quapos(2.0, Some(4)),
+            &settings
+        ));
+    }
+
     fn make_depcnt_with_quapos(valdco: f64, quapos: Option<i32>) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("VALDCO".to_string(), AttributeValue::Float(valdco));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("VALDCO", AttributeValue::Float(valdco));
         if let Some(q) = quapos {
-            attributes.insert("QUAPOS".to_string(), AttributeValue::Integer(q));
+            attributes.insert("QUAPOS", AttributeValue::Integer(q));
         }
         Feature {
             type_code: 0,
@@ -150,7 +190,7 @@ mod tests {
     fn test_safety_contour() {
         // VALDCO = 10m = safety_contour (default)
         let feature = make_depcnt(10.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::SafetyContour);
         assert_eq!(style.width_multiplier(), 2.0);
@@ -161,7 +201,7 @@ mod tests {
     fn test_shallow_contour() {
         // VALDCO = 5m < 10m safety
         let feature = make_depcnt(5.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::ShallowContour);
         assert_eq!(style.width_multiplier(), 1.0);
@@ -171,7 +211,7 @@ mod tests {
     fn test_deep_contour() {
         // VALDCO = 20m > 10m safety
         let feature = make_depcnt(20.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::DeepContour);
         assert_eq!(style.width_multiplier(), 1.0);
@@ -181,7 +221,7 @@ mod tests {
     fn test_custom_safety_contour() {
         // With safety_contour = 5m
         let feature = make_depcnt(5.0);
-        let mut settings = MarinerSettings::default();
+        let mut settings = test_contours();
         settings.safety_contour = 5.0;
         assert!(is_safety_contour(&feature, &settings));
     }
@@ -190,7 +230,7 @@ mod tests {
     fn test_safety_tolerance() {
         // VALDCO = 10.05 should still match safety_contour = 10.0
         let feature = make_depcnt(10.05);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert!(is_safety_contour(&feature, &settings));
     }
 
@@ -200,7 +240,7 @@ mod tests {
     fn test_safety_contour_low_accuracy() {
         // Safety contour with QUAPOS=4 (approximate) should be dashed
         let feature = make_depcnt_with_quapos(10.0, Some(4));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::SafetyContourLowAccuracy);
         assert_eq!(style.pattern(), LinePattern::Dashed);
@@ -212,7 +252,7 @@ mod tests {
     fn test_shallow_contour_low_accuracy() {
         // Shallow contour with QUAPOS=5 should be dashed
         let feature = make_depcnt_with_quapos(5.0, Some(5));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::ShallowContourLowAccuracy);
         assert_eq!(style.pattern(), LinePattern::Dashed);
@@ -223,7 +263,7 @@ mod tests {
     fn test_deep_contour_low_accuracy() {
         // Deep contour with QUAPOS=4 should be dashed
         let feature = make_depcnt_with_quapos(20.0, Some(4));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::DeepContourLowAccuracy);
         assert_eq!(style.pattern(), LinePattern::Dashed);
@@ -234,7 +274,7 @@ mod tests {
         // QUAPOS=1 (surveyed) is accurate - solid line
         // Per spec Appendix M.2: only quapos > 1 && quapos < 10 is uncertain
         let feature = make_depcnt_with_quapos(10.0, Some(1));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::SafetyContour);
         assert_eq!(style.pattern(), LinePattern::Solid);
@@ -244,7 +284,7 @@ mod tests {
     fn test_quapos_2_is_low_accuracy() {
         // QUAPOS=2 is low accuracy (per spec: quapos > 1 && quapos < 10)
         let feature = make_depcnt_with_quapos(10.0, Some(2));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::SafetyContourLowAccuracy);
         assert_eq!(style.pattern(), LinePattern::Dashed);
@@ -254,7 +294,7 @@ mod tests {
     fn test_quapos_3_is_low_accuracy() {
         // QUAPOS=3 is low accuracy (per spec: quapos > 1 && quapos < 10)
         let feature = make_depcnt_with_quapos(10.0, Some(3));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let style = depcnt02(&feature, &settings);
         assert_eq!(style, DepthContourStyle::SafetyContourLowAccuracy);
         assert_eq!(style.pattern(), LinePattern::Dashed);
@@ -264,14 +304,14 @@ mod tests {
     fn test_is_safety_contour_with_low_accuracy() {
         // is_safety_contour should return true even for low-accuracy safety contours
         let feature = make_depcnt_with_quapos(10.0, Some(4));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert!(is_safety_contour(&feature, &settings));
     }
 
     #[test]
     fn test_depcnt02_params_returns_tuple() {
         let feature = make_depcnt_with_quapos(10.0, Some(4));
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let (pattern, width, color) = depcnt02_params(&feature, &settings);
         assert_eq!(pattern, LinePattern::Dashed);
         assert_eq!(width, 2);

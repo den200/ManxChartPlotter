@@ -137,6 +137,12 @@ struct SymbolEntry {
     rect: Option<[u32; 4]>,
     // v1 format: cell-based
     cell: Option<[u32; 2]>,
+    /// The size the symbol is *drawn* at, in nominal (3.125 px/mm) pixels.
+    ///
+    /// Separate from `rect` because a vector symbol is rasterised finer than it
+    /// is drawn — the atlas holds it oversampled so magnifying it on a dense
+    /// display has real detail to work with. For raster symbols the two are the
+    /// same, and for the v1 cell format this is the size within the cell.
     size: Option<[u32; 2]>,
     // Both formats
     pivot: [f32; 2],
@@ -308,7 +314,15 @@ impl SymbolRenderer {
                     (x + w) / atlas_w, // uv_max_x
                     (y + h) / atlas_h, // uv_max_y
                 ],
-                pivot_size: [entry.pivot[0], entry.pivot[1], w, h],
+                // Display size, which is the atlas rect only when the symbol
+                // was copied from the raster sheet rather than rendered from
+                // its vector definition.
+                pivot_size: match (entry.rect, entry.size) {
+                    (Some(_), Some(size)) => {
+                        [entry.pivot[0], entry.pivot[1], size[0] as f32, size[1] as f32]
+                    }
+                    _ => [entry.pivot[0], entry.pivot[1], w, h],
+                },
             };
         }
 
@@ -443,7 +457,11 @@ impl SymbolRenderer {
                     conservative: false,
                 },
                 depth_stencil,
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                count: super::msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
                 multiview: None,
                 cache: None,
             })

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use crate::senc::{Feature, s57_code_to_acronym};
 
-use super::cs::execute_cs;
+use super::cs::{execute_cs, CsContext};
 use super::instruction::RenderInstruction;
 use super::lookup::{DisplayCategory, DisplayPriority, GeometryType, LookupEntry, LookupTables, TableName};
 use super::parser::parse_chartsymbols;
@@ -47,6 +47,12 @@ fn settings_hash(settings: &MarinerSettings) -> u64 {
     settings.simplified_points.hash(&mut hasher);
     settings.show_important_text_only.hash(&mut hasher);
     settings.show_chart_boundaries.hash(&mut hasher);
+    // These three gate resolve_feature directly. Leaving them out of the key
+    // means a toggle at runtime is answered from the cache with the old verdict.
+    settings.show_meta_objects.hash(&mut hasher);
+    settings.show_quality_of_data.hash(&mut hasher);
+    settings.use_super_scamin.hash(&mut hasher);
+    settings.depth_relief.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -90,7 +96,37 @@ pub struct ResolvedFeature {
 }
 
 impl S52Engine {
-    fn bypass_display_category_filter(type_code: u16) -> bool {
+    /// Whether DEPCNT02 promotes this feature to DISPLAYBASE.
+    ///
+    /// The procedure's own commentary: "The contour selected is highlighted as
+    /// the safety contour and put in DISPLAYBASE." s52plib implements both
+    /// halves — `m_DisplayCat = DISPLAYBASE` and `Scamin = 1e8+1` — because the
+    /// safety contour is the one line on the chart that must never be dropped.
+    /// navcore did neither, so with a 2 m safety contour three segments of it
+    /// were SCAMIN-filtered out of a 1:11600 view.
+    pub fn is_promoted_safety_contour(&self, feature: &crate::senc::Feature) -> bool {
+        // DEPCNT (43). DEPARE's own boundary reaches the same test through
+        // DEPCNT02's "continuation A", but navcore draws that as an area
+        // boundary, which is not SCAMIN-filtered separately.
+        feature.type_code == 43 && super::cs::is_safety_contour(feature, &self.settings)
+    }
+
+    fn bypass_display_category_filter(&self, type_code: u16) -> bool {
+        // M_QUAL (308) has display category OTHER, so the standard display
+        // hides it. OpenCPN's "Quality of data" switch forces it visible
+        // independently of the category; mirror that rather than reclassifying.
+        if type_code == 308 && self.settings.show_quality_of_data {
+            return true;
+        }
+        // SOUNDG (129) is display category OTHER, but OpenCPN gates soundings on
+        // their own switch (`m_bShowSoundg`), not on the category.
+        if type_code == 129 && self.settings.show_soundings {
+            return true;
+        }
+        Self::bypass_display_category_filter_static(type_code)
+    }
+
+    fn bypass_display_category_filter_static(type_code: u16) -> bool {
         // M_CSCL (compilation scale, code 301) is metadata used by SCAMIN and
         // cross-chart cell selection. It carries no visible portrayal, so
         // letting it pass the category filter is harmless and keeps the
@@ -153,8 +189,24 @@ impl S52Engine {
         feature: &Feature,
         geom_type: GeometryType,
     ) -> Option<ResolvedFeature> {
+        self.resolve_feature_ctx(feature, geom_type, CsContext::EMPTY)
+    }
+
+    /// [`resolve_feature`] with the feature's surroundings supplied.
+    ///
+    /// Only UDWHAZ03 (via OBSTRN04/WRECKS02) reads the context today, but it
+    /// participates in both cache keys: the same rock in shallow water and in
+    /// deep water resolves differently and must not share a cache entry.
+    ///
+    /// [`resolve_feature`]: S52Engine::resolve_feature
+    pub fn resolve_feature_ctx(
+        &self,
+        feature: &Feature,
+        geom_type: GeometryType,
+        ctx: &CsContext,
+    ) -> Option<ResolvedFeature> {
         let acronym = s57_code_to_acronym(feature.type_code);
-        let attr_hash = feature_attr_hash(feature);
+        let attr_hash = feature_attr_hash(feature) ^ ctx.hash_value();
         let resolve_key = ResolveCacheKey {
             object_class: feature.type_code,
             geom_type,
@@ -178,9 +230,29 @@ impl S52Engine {
             acronym, geom_type, table, entry.instruction
         );
 
-        // Display category check
+        // Meta-object filter, mirroring s52plib.cpp ObjectRenderCheckCat.
+        //
+        // Under "All" (the OTHER category selected) the filter applies only to
+        // meta objects that are *themselves* category OTHER — an M_NSYS is
+        // category STANDARD, so OpenCPN keeps drawing its navigational-system
+        // boundary. Under any narrower category every `M_*` class is dropped.
+        // Treating them all alike hid 419 M_NSYS features the reference shows.
+        if !self.settings.show_meta_objects && acronym.starts_with("M_") {
+            let meta_filtered = if self.settings.show_other {
+                entry.display_category == DisplayCategory::Other
+            } else {
+                true
+            };
+            if meta_filtered && !(self.settings.show_quality_of_data && acronym == "M_QUAL") {
+                return None;
+            }
+        }
+
+        // Display category check. DEPCNT02 promotes the selected safety
+        // contour to DISPLAYBASE, so it survives any display category.
         if !self.settings.should_show(entry.display_category)
-            && !Self::bypass_display_category_filter(feature.type_code)
+            && !self.bypass_display_category_filter(feature.type_code)
+            && !self.is_promoted_safety_contour(feature)
         {
             return None;
         }
@@ -211,7 +283,7 @@ impl S52Engine {
                     }
 
                     // Cache miss: execute CS and store result
-                    if let Some(cs_results) = execute_cs(procedure, feature, &self.settings) {
+                    if let Some(cs_results) = execute_cs(procedure, feature, &self.settings, ctx) {
                         self.cs_cache.lock().unwrap().insert(cache_key, cs_results.clone());
                         expanded.extend(cs_results);
                     }
@@ -230,6 +302,70 @@ impl S52Engine {
             .unwrap()
             .insert(resolve_key, resolved.clone());
         resolved
+    }
+
+    /// Resolve a feature for the conformance harness (`navcore --dump-ir`).
+    ///
+    /// Same pipeline as [`resolve_feature`] but with nothing filtered out: the
+    /// chosen lookup entry is returned even when the display category would
+    /// hide it, and CS procedures are expanded regardless. That matches what
+    /// tools/s52oracle reports from OpenCPN's engine, so a diff of the two
+    /// streams isolates symbology-resolution differences from visibility rules.
+    pub fn resolve_ir(
+        &self,
+        feature: &Feature,
+        geom_type: GeometryType,
+        ctx: &CsContext,
+    ) -> (Option<&LookupEntry>, Vec<RenderInstruction>) {
+        let acronym = s57_code_to_acronym(feature.type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
+        let Some(entry) = self.tables.lookup_best_fast(acronym, geom_type, table, feature) else {
+            return (None, Vec::new());
+        };
+
+        let mut expanded = Vec::new();
+        for instr in RenderInstruction::parse_all(&entry.instruction) {
+            match &instr {
+                RenderInstruction::ConditionalSymbology { procedure } => {
+                    if let Some(results) = execute_cs(procedure, feature, &self.settings, ctx) {
+                        expanded.extend(results);
+                    }
+                }
+                _ => expanded.push(instr),
+            }
+        }
+        (Some(entry), expanded)
+    }
+
+    /// The display category of the lookup row that actually applies to this
+    /// feature.
+    ///
+    /// [`get_display_category`] answers for the object *class*, taking the
+    /// first row it finds; where rows differ by attribute — an OBSTRN that is
+    /// DISPLAYBASE only when WATLEV says it is awash — that is a different row
+    /// from the one portrayal uses. The SCAMIN bypass has to agree with
+    /// portrayal, or a safety-critical object gets filtered by a SCAMIN that
+    /// S-52 says must not apply to it.
+    ///
+    /// [`get_display_category`]: S52Engine::get_display_category
+    pub fn display_category_for(
+        &self,
+        feature: &Feature,
+        geom_type: GeometryType,
+    ) -> Option<DisplayCategory> {
+        let acronym = s57_code_to_acronym(feature.type_code);
+        let table = TableName::preferred_ext(
+            geom_type,
+            self.settings.symbolized_boundaries,
+            self.settings.simplified_points,
+        );
+        self.tables
+            .lookup_best_fast(acronym, geom_type, table, feature)
+            .map(|e| e.display_category)
     }
 
     /// Get display priority for a feature from its best matching lookup entry.
@@ -289,7 +425,7 @@ impl S52Engine {
 
         // 3. Display category check
         if !self.settings.should_show(entry.display_category)
-            && !Self::bypass_display_category_filter(feature.type_code)
+            && !self.bypass_display_category_filter(feature.type_code)
         {
             return None;
         }
@@ -314,7 +450,7 @@ impl S52Engine {
         if let Some(entries) = self.tables.lookup(acronym, geom_type, table) {
             if let Some(entry) = entries.first() {
                 return self.settings.should_show(entry.display_category)
-                    || Self::bypass_display_category_filter(type_code);
+                    || self.bypass_display_category_filter(type_code);
             }
         }
 
@@ -356,16 +492,18 @@ impl S52Engine {
     pub fn get_area_color_index(&self, feature: &Feature) -> Option<u16> {
         let instructions = self.get_instructions(feature, GeometryType::Area)?;
         for instr in &instructions {
-            if let super::instruction::RenderInstruction::AreaColor { color } = instr {
+            if let super::instruction::RenderInstruction::AreaColor { color, .. } = instr {
                 return self.get_color_index(color);
             }
         }
         // If no direct AC found, try CS procedures that may produce AC results
         for instr in &instructions {
             if let super::instruction::RenderInstruction::ConditionalSymbology { procedure } = instr {
-                if let Some(cs_instructions) = super::cs::execute_cs(procedure, feature, &self.settings) {
+                if let Some(cs_instructions) =
+                    super::cs::execute_cs(procedure, feature, &self.settings, CsContext::EMPTY)
+                {
                     for cs_instr in &cs_instructions {
-                        if let super::instruction::RenderInstruction::AreaColor { color } = cs_instr {
+                        if let super::instruction::RenderInstruction::AreaColor { color, .. } = cs_instr {
                             return self.get_color_index(color);
                         }
                     }
@@ -398,16 +536,18 @@ impl S52Engine {
     pub fn get_area_color(&self, feature: &Feature) -> Option<[f32; 4]> {
         let instructions = self.get_instructions(feature, GeometryType::Area)?;
         for instr in &instructions {
-            if let super::instruction::RenderInstruction::AreaColor { color } = instr {
+            if let super::instruction::RenderInstruction::AreaColor { color, .. } = instr {
                 return self.get_color(color);
             }
         }
         // If no direct AC found, try CS procedures that may produce AC results
         for instr in &instructions {
             if let super::instruction::RenderInstruction::ConditionalSymbology { procedure } = instr {
-                if let Some(cs_instructions) = super::cs::execute_cs(procedure, feature, &self.settings) {
+                if let Some(cs_instructions) =
+                    super::cs::execute_cs(procedure, feature, &self.settings, CsContext::EMPTY)
+                {
                     for cs_instr in &cs_instructions {
-                        if let super::instruction::RenderInstruction::AreaColor { color } = cs_instr {
+                        if let super::instruction::RenderInstruction::AreaColor { color, .. } = cs_instr {
                             return self.get_color(color);
                         }
                     }
@@ -472,15 +612,17 @@ mod tests {
         let cat = engine.get_display_category(116, GeometryType::Line);
         assert_eq!(cat, Some(DisplayCategory::Other));
 
-        // Default settings (STANDARD mode, show_other=false) hide Other-category
-        // features like roads. Enabling show_other opts back in.
-        assert!(!engine.should_render_class(116, GeometryType::Line));
-        let mut engine_all = engine;
-        let mut settings = engine_all.settings.clone();
+        // Default settings show the OTHER category ("ENC display: All"), so
+        // roads render; selecting STANDARD hides them again.
+        assert!(engine.should_render_class(116, GeometryType::Line));
+        let mut engine_std = engine;
+        let mut settings = engine_std.settings.clone();
+        settings.show_other = false;
+        engine_std.set_settings(settings.clone());
+        assert!(!engine_std.should_render_class(116, GeometryType::Line));
         settings.show_other = true;
-        engine_all.set_settings(settings);
-        assert!(engine_all.should_render_class(116, GeometryType::Line));
-        let engine = engine_all;
+        engine_std.set_settings(settings);
+        let engine = engine_std;
 
         // Coastlines (code 30) should always render (Displaybase)
         let cat = engine.get_display_category(30, GeometryType::Line);

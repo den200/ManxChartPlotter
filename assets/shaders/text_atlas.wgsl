@@ -62,7 +62,7 @@ fn vs_main(
     let ndc_offset = pixel_offset / camera.view_size * 2.0;
     clip_pos.x += ndc_offset.x * clip_pos.w;
     clip_pos.y += ndc_offset.y * clip_pos.w;
-    clip_pos.z = 0.0; // Draw labels on top of everything
+    clip_pos.z = 0.0; // Draw labels on top of everything (0 * w is still 0)
 
     out.clip_position = clip_pos;
     out.uv = mix(instance.uv_min, instance.uv_max, uv_corner);
@@ -74,14 +74,19 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_atlas, s_atlas, in.uv).r;
-    // Sharpen the bilinearly-filtered bitmap edges back toward binary ink so
-    // strokes stay visually thick across a wide range of scales. Preserves
-    // antialiased edges but restores the bold black core the user expects.
-    let sharpened = smoothstep(0.30, 0.60, sample);
-    if (sharpened < 0.02) {
+    // Signed distance to the outline, 0.5 at the edge (see
+    // tools/make_font_atlas.py). Recovering the edge with a smoothstep one
+    // screen pixel wide is what keeps a single baked field crisp from a 10px
+    // sounding to a 40px place name: fwidth measures how fast the field moves
+    // per pixel, which is exactly the antialiasing width the size calls for.
+    let d = textureSample(t_atlas, s_atlas, in.uv).r;
+    let w = max(fwidth(d), 0.0001);
+    // Bias the threshold slightly inside the outline. Chart text sits on
+    // saturated area fills, and a hairline-thin stem disappears against them.
+    let alpha = smoothstep(0.5 - w, 0.5 + w, d + 0.04);
+    if (alpha < 0.01) {
         discard;
     }
     let color = palette[in.color_index];
-    return vec4<f32>(color.rgb, color.a * in.color.a * sharpened);
+    return vec4<f32>(color.rgb, color.a * in.color.a * alpha);
 }

@@ -61,17 +61,13 @@ pub struct TileGpuBuffers {
     pub pattern_vertex_count: u32,
     /// Pattern vertex offsets per priority level
     pub pattern_priority_offsets: [u32; 11],
-    /// Coverage stencil buffer — triangulated M_COVR polygons from foreground charts
-    pub coverage_buffer: Option<wgpu::Buffer>,
-    /// Number of coverage vertices (triangle list)
-    pub coverage_vertex_count: u32,
-    /// Background area buffer (stencil-tested, pass when stencil==0)
+    /// Background area buffer (drawn before the foreground)
     pub bg_area_buffer: Option<wgpu::Buffer>,
     /// Number of background area vertices
     pub bg_area_vertex_count: u32,
     /// Background area vertex offsets per priority level
     pub bg_area_priority_offsets: [u32; 11],
-    /// Background pattern buffer (stencil-tested)
+    /// Background pattern buffer (drawn before the foreground)
     pub bg_pattern_buffer: Option<wgpu::Buffer>,
     /// Number of background pattern vertices
     pub bg_pattern_vertex_count: u32,
@@ -280,19 +276,7 @@ impl TileGpuCache {
             (None, 0)
         };
 
-        // Create GPU buffer for coverage stencil triangles
-        let (coverage_buffer, coverage_vertex_count) = if !packet.coverage_vertices.is_empty() {
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: None,
-                contents: bytemuck::cast_slice(&packet.coverage_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            (Some(buffer), packet.coverage_vertices.len() as u32)
-        } else {
-            (None, 0)
-        };
-
-        // Create GPU buffers for background area vertices (stencil-tested)
+        // Create GPU buffers for background area vertices (drawn before the foreground)
         let (bg_area_buffer, bg_area_vertex_count) = if !packet.bg_area_vertices.is_empty() {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
@@ -304,7 +288,7 @@ impl TileGpuCache {
             (None, 0)
         };
 
-        // Create GPU buffers for background pattern vertices (stencil-tested)
+        // Create GPU buffers for background pattern vertices (drawn before the foreground)
         let (bg_pattern_buffer, bg_pattern_vertex_count) = if !packet.bg_pattern_vertices.is_empty() {
             let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: None,
@@ -331,8 +315,6 @@ impl TileGpuCache {
             pattern_buffer,
             pattern_vertex_count,
             pattern_priority_offsets: packet.pattern_priority_offsets,
-            coverage_buffer,
-            coverage_vertex_count,
             bg_area_buffer,
             bg_area_vertex_count,
             bg_area_priority_offsets: packet.bg_area_priority_offsets,

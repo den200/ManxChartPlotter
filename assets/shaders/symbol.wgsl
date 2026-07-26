@@ -96,7 +96,7 @@ fn vs_main(
     let ndc_offset = rotated_offset / camera.view_size * 2.0;
     clip_pos.x += ndc_offset.x * clip_pos.w;
     clip_pos.y += ndc_offset.y * clip_pos.w;
-    clip_pos.z = 1.0 - (f32(instance.disp_prio) / 10.0);
+    clip_pos.z = (1.0 - f32(instance.disp_prio) / 10.0) * clip_pos.w;
 
     out.clip_position = clip_pos;
     out.tex_coord = uv;

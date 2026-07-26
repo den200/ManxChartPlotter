@@ -4,14 +4,90 @@
 //! arrays ready for GPU rendering.
 
 use super::camera::Camera;
-use super::label::{glyph_uv_rect, LabelGlyphInstance};
+use super::label::LabelGlyphInstance;
 use super::text::SoundingInstance;
 
-/// Glyph dimensions in pixels (matching label.rs font atlas)
-const _GLYPH_W: f32 = 5.0;
-const _GLYPH_H: f32 = 7.0;
+/// Nominal glyph cell, in pixels at `scale = 1.0`.
+///
+/// The cell is no longer the glyph — the font is proportional — but it stays
+/// the unit `scale` is expressed in, and the unit S-52's `xoffs`/`yoffs` count
+/// in, so every caller and the tuned `s52_text_scale` keep working unchanged.
 const CELL_W: f32 = 8.0;
 const CELL_H: f32 = 8.0;
+
+/// Cap height, as a fraction of the cell, that the proportional font is sized
+/// to. The 5x7 bitmap it replaces inked 8 of its 8 cell rows, so matching that
+/// cap height keeps every label the size the reference captures were tuned to.
+const CAP_PER_CELL: f32 = 1.0;
+
+/// Where the baseline sits inside the cell, measured down from the cell centre
+/// in cell heights. The old bitmap sat cap-top at the cell top with its
+/// descenders inside the cell, which puts the baseline a little above the
+/// bottom edge.
+const BASELINE_DROP: f32 = 0.38;
+
+/// Pixels per em for a given `scale`, derived from the font's own cap height so
+/// a different typeface stays the same visual size.
+fn em_px(scale: f32) -> f32 {
+    CELL_H * scale * CAP_PER_CELL / super::font::atlas().cap_height
+}
+
+/// Width of `text` in pixels at `scale`.
+///
+/// `space` is the S-52 spacing code. Both of the values the tables actually use
+/// lay the text out with the font's own advances; see [`SPACE_STANDARD`].
+pub fn text_width_px(text: &str, scale: f32, bold: bool, space: u8) -> f32 {
+    let _ = space;
+    super::font::atlas().advance_of(text, bold) * em_px(scale)
+}
+
+/// S-52 TX/TE character spacing: 1 = fit, 2 = standard, 3 = wrapped.
+///
+/// Neither 2 nor 3 changes the *pitch* — 3 means the label may break across
+/// lines, and 1 means it is stretched to fit between two positions. qutenav
+/// names them `{Fit = 1, Standard = 2, Wrapped = 3}` and implements 2 and 3
+/// identically, warning on 1. navcore does the same; wrapping is a layout
+/// feature nothing in the tables needs yet, and s52plib ignores the field
+/// entirely.
+pub const SPACE_STANDARD: u8 = 2;
+
+/// Push one glyph, converting the font's em-space quad into the centred pixel
+/// quad the vertex shader expects.
+///
+/// `pen_x` is the pen position and `baseline_y` the baseline, both in the
+/// label's local pixel space (y up). Returns the advance.
+#[allow(clippy::too_many_arguments)]
+fn push_glyph(
+    out: &mut Vec<LabelGlyphInstance>,
+    c: char,
+    bold: bool,
+    position: [f32; 2],
+    pen_x: f32,
+    baseline_y: f32,
+    em: f32,
+    color: [f32; 4],
+    color_index: u32,
+) -> f32 {
+    let Some(g) = super::font::atlas().glyph(c, bold) else {
+        return 0.0;
+    };
+    let (x0, y0) = (pen_x + g.plane[0] * em, baseline_y + g.plane[1] * em);
+    let (x1, y1) = (pen_x + g.plane[2] * em, baseline_y + g.plane[3] * em);
+    let advance = g.advance * em;
+    if x1 > x0 && y1 > y0 {
+        out.push(LabelGlyphInstance {
+            position,
+            offset_px: [(x0 + x1) * 0.5, (y0 + y1) * 0.5],
+            size_px: [x1 - x0, y1 - y0],
+            uv_min: [g.uv[0], g.uv[1]],
+            uv_max: [g.uv[2], g.uv[3]],
+            rotation: 0.0,
+            color,
+            color_index,
+        });
+    }
+    advance
+}
 
 /// Text justification (S-52 convention)
 #[derive(Clone, Copy, Debug, Default)]
@@ -76,6 +152,17 @@ pub struct TextParams {
     /// S-52 text display group / viewing group (dis field from TX/TE).
     /// Lower = more important. Used by ShowImportantTextOnly filter (hides >= 20).
     pub dis: u8,
+    /// Draw in the bold weight. S-52's TX/TE carries a font weight in CHARS[1]
+    /// ('6' = bold); OpenCPN honours it, which is why place names are heavy and
+    /// light descriptions are not.
+    pub bold: bool,
+    /// S-52 character spacing: 1 = fit, 2 = standard, 3 = proportional.
+    ///
+    /// Standard spacing means a fixed pitch — seabed qualities and the TE'd
+    /// names are specified that way, place names are not. s52plib parses this
+    /// field and never uses it, so every label there gets the platform font's
+    /// own spacing regardless of what the lookup asked for.
+    pub space: u8,
 }
 
 impl Default for TextParams {
@@ -92,6 +179,8 @@ impl Default for TextParams {
             yoffs: 0,
             disp_prio: 0,
             dis: 10,
+            bold: false,
+            space: 3,
         }
     }
 }
@@ -112,7 +201,7 @@ pub fn layout_text(params: &TextParams) -> Vec<LabelGlyphInstance> {
     }
 
     let char_count = params.text.chars().count();
-    let total_width = char_count as f32 * CELL_W * params.scale;
+    let total_width = text_width_px(&params.text, params.scale, params.bold, params.space);
     let char_height = CELL_H * params.scale;
     let avg_char_width = CELL_W * params.scale;
 
@@ -133,30 +222,25 @@ pub fn layout_text(params: &TextParams) -> Vec<LabelGlyphInstance> {
         VJust::Bottom => {}
     }
 
-    let base_offset_x = xadjust;
-    let base_offset_y = yadjust;
-
-    let glyph_size = [CELL_W * params.scale, CELL_H * params.scale];
+    // The old fixed cell was centred on (xadjust, yadjust); the pen starts at
+    // that cell's left edge and the baseline sits inside it.
+    let mut pen_x = xadjust - avg_char_width * 0.5;
+    let baseline_y = yadjust - char_height * BASELINE_DROP;
+    let em = em_px(params.scale);
 
     let mut instances = Vec::with_capacity(char_count);
-    let mut x_advance = 0.0;
-
     for c in params.text.chars() {
-        // Get UV coordinates for this glyph
-        let uvs = glyph_uv_rect(c).unwrap_or_else(|| glyph_uv_rect(' ').unwrap());
-
-        instances.push(LabelGlyphInstance {
-            position: params.position,
-            offset_px: [base_offset_x + x_advance, base_offset_y],
-            size_px: glyph_size,
-            uv_min: [uvs[0], uvs[1]],
-            uv_max: [uvs[2], uvs[3]],
-            rotation: 0.0,
-            color: params.color,
-            color_index: params.color_index,
-        });
-
-        x_advance += CELL_W * params.scale;
+        pen_x += push_glyph(
+            &mut instances,
+            c,
+            params.bold,
+            params.position,
+            pen_x,
+            baseline_y,
+            em,
+            params.color,
+            params.color_index,
+        );
     }
 
     instances
@@ -181,6 +265,8 @@ pub fn layout_light_text(position: [f32; 2], text: &str, color: [f32; 4]) -> Vec
         xoffs: 2, // 2 char widths right of symbol
         yoffs: 0,
         disp_prio: 0,
+        bold: false,
+        space: SPACE_STANDARD,
     })
 }
 
@@ -218,11 +304,11 @@ fn layout_sounding_glyphs(s: &SoundingInstance) -> Vec<LabelGlyphInstance> {
     let scale = s.scale;
     let cell = CELL_W * scale;
     let cell_h = CELL_H * scale;
-    let full_size = [cell, cell_h];
+    let em = em_px(scale);
 
     // Baseline matches layout_text() for HJust::Left / VJust::Bottom so the
     // sounding sits exactly where it always has.
-    let base_y = -(cell_h * 10.0 / 8.0);
+    let base_y = -(cell_h * 10.0 / 8.0) - cell_h * BASELINE_DROP;
 
     // Main (full-size) part: optional swept/drying markers + whole digits.
     let mut main = String::new();
@@ -235,43 +321,102 @@ fn layout_sounding_glyphs(s: &SoundingInstance) -> Vec<LabelGlyphInstance> {
     main.push_str(&whole_part.to_string());
 
     let mut glyphs = Vec::new();
-    let mut x = 0.0_f32;
-    let push_glyph = |glyphs: &mut Vec<LabelGlyphInstance>, c: char, ox: f32, oy: f32, size: [f32; 2]| {
-        let uv = glyph_uv_rect(c).unwrap_or_else(|| glyph_uv_rect(' ').unwrap());
-        glyphs.push(LabelGlyphInstance {
-            position: s.position,
-            offset_px: [ox, oy],
-            size_px: size,
-            uv_min: [uv[0], uv[1]],
-            uv_max: [uv[2], uv[3]],
-            rotation: 0.0,
-            color,
-            color_index,
-        });
-    };
-
+    let mut x = -cell * 0.5;
     for c in main.chars() {
-        push_glyph(&mut glyphs, c, x, base_y, full_size);
-        x += cell;
+        x += push_glyph(
+            &mut glyphs, c, false, s.position, x, base_y, em, color, color_index,
+        );
     }
 
     // Fractional digit as a subscript: smaller, dropped below the baseline,
     // tucked slightly under the trailing whole digit, and with no '.'.
     if has_decimal {
-        let sub_size = [cell * SUBSCRIPT_SCALE, cell_h * SUBSCRIPT_SCALE];
         let sub_x = x - cell * 0.12;
         let sub_y = base_y - cell_h * SUBSCRIPT_DROP;
         let c = char::from(b'0' + decimal_digit.min(9));
-        push_glyph(&mut glyphs, c, sub_x, sub_y, sub_size);
-        x = sub_x + sub_size[0];
+        x = sub_x
+            + push_glyph(
+                &mut glyphs,
+                c,
+                false,
+                s.position,
+                sub_x,
+                sub_y,
+                em * SUBSCRIPT_SCALE,
+                color,
+                color_index,
+            );
     }
 
     // Uncertainty marker stays full size after the value.
     if show_uncertainty {
-        push_glyph(&mut glyphs, '?', x, base_y, full_size);
+        push_glyph(
+            &mut glyphs, '?', false, s.position, x, base_y, em, color, color_index,
+        );
     }
 
     glyphs
+}
+
+/// How much of the symbol atlas's native size a sounding digit is drawn at.
+///
+/// The atlas cells are 6x10px including an antialiasing halo, so the ink is
+/// about three quarters of that, and the symbol pipeline then applies its own
+/// magnification. Calibrated against the reference: a sounding digit is ~22px
+/// of ink on a 2x display. The same factor scales the pivots, which is what
+/// keeps the digits of one sounding grouped.
+const SOUNDING_SYMBOL_SCALE: f32 = 1.16;
+
+/// Whether to portray soundings with the S-52 digit symbols.
+///
+/// Off by default, and the reason is the symbol atlas, not the procedure.
+/// navcore's atlas is OpenCPN's `rastersymbols-day.png` copied verbatim: a
+/// sheet of glyphs drawn for 1:1 display at 96 dpi, in which a sounding digit
+/// is 6x10px with an antialiasing halo baked in. The renderer magnifies it 2.5x
+/// to reach chart size, which turns that halo into a pale fringe and blends the
+/// black core away — measured against the reference over one sounding field,
+/// 100 near-black pixels against 636. The SDF text path is sharp at any size
+/// and lands within a pixel of the reference, so it stays the default.
+///
+/// Rasterising the symbols from their vector definitions at display resolution
+/// fixes this for *every* symbol on the chart, not just soundings; the digit
+/// symbols in particular are `<definition>R</definition>` — raster-only — so
+/// they would need upscaling rather than re-rendering. Until then this is
+/// available with `NAVCORE_SOUNDING_SYMBOLS=1` for comparison.
+pub fn sounding_symbols_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("NAVCORE_SOUNDING_SYMBOLS").is_ok_and(|v| v != "0"))
+}
+
+/// Turn decluttered soundings into the S-52 digit symbols that portray them.
+///
+/// Each symbol carries the pivot that places it, so all of them are emitted at
+/// the sounding's own position and the presentation library does the layout —
+/// which is the point of the design: the digits stay legible and correctly
+/// grouped without the renderer knowing anything about digit metrics.
+pub fn layout_sounding_symbols(
+    soundings: &[SoundingInstance],
+) -> Vec<super::symbols::SymbolInstance> {
+    let mut out = Vec::with_capacity(soundings.len() * 2);
+    for s in soundings {
+        let info = crate::s52::cs::SoundingRenderInfo::from_flags(s.flags);
+        for name in info.symbols() {
+            let Some(symbol_id) = super::symbols::symbol_id_from_s52_name(&name) else {
+                log::debug!("sounding symbol {} not in the atlas", name);
+                continue;
+            };
+            out.push(super::symbols::SymbolInstance {
+                position: s.position,
+                symbol_id,
+                rotation: 0.0,
+                // Soundings sit above the depth shades and below the point
+                // symbols proper; priority 6 is where S-52 puts them.
+                disp_prio: 6,
+                scale: s.scale * SOUNDING_SYMBOL_SCALE / 1.8,
+            });
+        }
+    }
+    out
 }
 
 pub fn layout_sounding_labels(soundings: &[SoundingInstance]) -> Vec<LabelGlyphInstance> {
@@ -402,8 +547,7 @@ pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>, camera: &Camera) {
 /// Uses text length * average character width instead of computing per-glyph
 /// metrics. Returns (width, height) in pixels.
 fn estimate_label_bounds(params: &TextParams, camera: &Camera) -> LabelRect {
-    let char_count = params.text.chars().count() as f32;
-    let total_width = char_count * CELL_W * params.scale;
+    let total_width = text_width_px(&params.text, params.scale, params.bold, params.space);
     let char_height = CELL_H * params.scale;
     let avg_char_width = CELL_W * params.scale;
 
@@ -545,7 +689,9 @@ pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>, c
         .map(|s| {
             let digit_count = ((s.flags >> 5) & 0x7) as f32;
             let has_decimal = (s.flags & 0x10) != 0;
-            let width = (digit_count + if has_decimal { 1.5 } else { 0.0 }) * CELL_W * s.scale;
+            // Digits are tabular, so one digit's advance sizes them all.
+            let digit_w = text_width_px("0", s.scale, false, SPACE_STANDARD);
+            let width = (digit_count + if has_decimal { SUBSCRIPT_SCALE } else { 0.0 }) * digit_w;
             let height = CELL_H * s.scale;
             let anchor = camera.world_to_screen(s.position[0], s.position[1]);
             LabelRect {
@@ -594,102 +740,105 @@ mod tests {
         assert!(glyphs.is_empty());
     }
 
+    /// The font is proportional, so the assertions here are about geometry
+    /// that must hold for any typeface — glyph count, anchoring, justification
+    /// and scaling — not about a fixed cell size.
     #[test]
     fn test_layout_single_char() {
         let params = TextParams {
             position: [100.0, 200.0],
             text: "A".to_string(),
-            color: [1.0, 0.0, 0.0, 1.0],
-            color_index: 0,
-            scale: 1.0,
-            hjust: HJust::Left,
-            vjust: VJust::Bottom,
-            xoffs: 0,
-            yoffs: 0,
-            disp_prio: 0,
-            dis: 10,
+            ..Default::default()
         };
         let glyphs = layout_text(&params);
         assert_eq!(glyphs.len(), 1);
         assert_eq!(glyphs[0].position, [100.0, 200.0]);
-        assert_eq!(glyphs[0].offset_px, [0.0, -10.0]);
-        assert_eq!(glyphs[0].size_px, [8.0, 8.0]);
+        assert!(glyphs[0].size_px[0] > 0.0 && glyphs[0].size_px[1] > 0.0);
+        // Cap height at scale 1.0 is one cell; the quad adds the SDF padding.
+        assert!(glyphs[0].size_px[1] > CELL_H && glyphs[0].size_px[1] < CELL_H * 3.0);
     }
 
     #[test]
     fn test_layout_center_justified() {
+        let text = "AB";
         let params = TextParams {
-            position: [0.0, 0.0],
-            text: "AB".to_string(),
-            color: [0.0, 0.0, 0.0, 1.0],
-            color_index: 0,
-            scale: 1.0,
+            text: text.to_string(),
             hjust: HJust::Center,
-            vjust: VJust::Bottom,
-            xoffs: 0,
-            yoffs: 0,
-            disp_prio: 0,
-            dis: 10,
+            ..Default::default()
         };
         let glyphs = layout_text(&params);
         assert_eq!(glyphs.len(), 2);
-        // Total width = 2 * 8 = 16, center offset = -8
-        assert_eq!(glyphs[0].offset_px[0], -8.0);
-        assert_eq!(glyphs[1].offset_px[0], 0.0); // -8 + 8
-        assert_eq!(glyphs[0].offset_px[1], -10.0);
+        let width = text_width_px(text, params.scale, false, params.space);
+        // Centred text straddles the anchor: the pen starts half a width left.
+        let left = glyphs[0].offset_px[0] - glyphs[0].size_px[0] / 2.0;
+        let right = glyphs[1].offset_px[0] + glyphs[1].size_px[0] / 2.0;
+        assert!((left + right).abs() < width, "not centred: {left}..{right}");
+        assert!(glyphs[0].offset_px[0] < glyphs[1].offset_px[0], "A before B");
     }
 
     #[test]
     fn test_layout_with_xoffs() {
-        let params = TextParams {
-            position: [0.0, 0.0],
+        let base = layout_text(&TextParams {
             text: "X".to_string(),
-            color: [0.0, 0.0, 0.0, 1.0],
-            color_index: 0,
-            scale: 1.0,
-            hjust: HJust::Left,
-            vjust: VJust::Bottom,
-            xoffs: 2, // 2 char widths right
-            yoffs: 0,
-            disp_prio: 0,
-            dis: 10,
-        };
-        let glyphs = layout_text(&params);
-        assert_eq!(glyphs[0].offset_px[0], 16.0); // 2 * 8 = 16
-        assert_eq!(glyphs[0].offset_px[1], -10.0);
+            ..Default::default()
+        });
+        let shifted = layout_text(&TextParams {
+            text: "X".to_string(),
+            xoffs: 2, // 2 character widths right
+            ..Default::default()
+        });
+        // xoffs counts nominal cells, whatever the glyph's own width is.
+        assert_eq!(shifted[0].offset_px[0] - base[0].offset_px[0], 2.0 * CELL_W);
+        assert_eq!(shifted[0].offset_px[1], base[0].offset_px[1]);
     }
 
     #[test]
     fn test_layout_light_text() {
         let glyphs = layout_light_text([1000.0, 2000.0], "Fl(3)G", [0.0, 0.0, 0.0, 1.0]);
         assert_eq!(glyphs.len(), 6);
-        // First glyph offset: xoffs=2 → 16px
-        assert_eq!(glyphs[0].offset_px[0], 16.0);
-        // VJust center with char_height=8 → offset = -6 (baseline adjusted)
-        assert_eq!(glyphs[0].offset_px[1], -6.0);
+        assert!(glyphs.iter().all(|g| g.position == [1000.0, 2000.0]));
+        // Left-justified with xoffs=2: the first glyph sits right of the anchor.
+        assert!(glyphs[0].offset_px[0] > CELL_W);
     }
 
     #[test]
     fn test_layout_scaled() {
-        let params = TextParams {
-            position: [0.0, 0.0],
-            text: "AB".to_string(),
-            color: [0.0, 0.0, 0.0, 1.0],
-            color_index: 0,
-            scale: 2.0,
-            hjust: HJust::Left,
-            vjust: VJust::Bottom,
-            xoffs: 0,
-            yoffs: 0,
-            disp_prio: 0,
-            dis: 10,
+        let mk = |scale| {
+            layout_text(&TextParams {
+                text: "AB".to_string(),
+                scale,
+                ..Default::default()
+            })
         };
-        let glyphs = layout_text(&params);
-        assert_eq!(glyphs.len(), 2);
-        // Scaled size
-        assert_eq!(glyphs[0].size_px, [16.0, 16.0]); // 8 * 2
-        // Scaled advance
-        assert_eq!(glyphs[1].offset_px[0], 16.0); // 8 * 2
+        let one = mk(1.0);
+        let two = mk(2.0);
+        assert_eq!(one.len(), 2);
+        assert_eq!(two.len(), 2);
+        // Doubling the scale doubles both the glyph size and the advance.
+        for i in 0..2 {
+            assert!((two[i].size_px[0] - one[i].size_px[0] * 2.0).abs() < 0.01);
+            assert!((two[i].size_px[1] - one[i].size_px[1] * 2.0).abs() < 0.01);
+        }
+        let adv_one = one[1].offset_px[0] - one[0].offset_px[0];
+        let adv_two = two[1].offset_px[0] - two[0].offset_px[0];
+        assert!((adv_two - adv_one * 2.0).abs() < 0.01);
+    }
+
+    /// Danish, German and French chart names must survive to the glyph list —
+    /// the old 5x7 table had nothing above U+007F and folded them to ASCII.
+    #[test]
+    fn test_latin1_names_have_glyphs() {
+        for name in ["Vallensbæk", "Brøndby Lystbådehavn", "Køge", "Läsö"] {
+            let glyphs = layout_text(&TextParams {
+                text: name.to_string(),
+                ..Default::default()
+            });
+            assert_eq!(
+                glyphs.len(),
+                name.chars().filter(|c| !c.is_whitespace()).count(),
+                "{name} lost glyphs"
+            );
+        }
     }
 
     #[test]

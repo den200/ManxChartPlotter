@@ -533,7 +533,9 @@ mod tests {
         assert_eq!(symbol.name, "LOWACC21");
         assert_eq!(symbol.width, 130);
         assert_eq!(symbol.height, 79);
-        assert_eq!(symbol.color_ref, "ACSTLN");
+        // The XML writes the token with its leading pen letter (ACSTLN); the
+        // parser strips it so the token resolves in the colour table.
+        assert_eq!(symbol.color_ref, "CSTLN");
         println!("LOWACC21: {:?}", symbol);
     }
 
@@ -639,6 +641,6 @@ mod tests {
 
         let symbol = symbol.unwrap();
         assert_eq!(symbol.width, 600);  // 6.00mm
-        assert_eq!(symbol.color_ref, "ACHGRD");
+        assert_eq!(symbol.color_ref, "CHGRD");
     }
 }

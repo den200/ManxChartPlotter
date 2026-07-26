@@ -107,15 +107,23 @@ pub fn depare02_instructions(
     let color_token = depare02_color_token(feature, settings);
     instructions.push(RenderInstruction::AreaColor {
         color: color_token.to_string(),
+        transparency: None,
     });
 
-    // 2. Special logic for DRGARE (Dredged Area)
-    //
-    // OpenCPN can emit AP(DRGARE01), but our current pattern fill path renders the
-    // hatch much heavier than the reference and dominates harbor basins. Keep the
-    // dredged boundary styling and defer the fill pattern until AP parity improves.
+    // 2. Special logic for DRGARE (Dredged Area), per s52cnsy.cpp DEPARE01:
+    //    a DRGARE with no DRVAL1 falls back to DEPMD, then always gets the
+    //    dredged-area pattern and a dashed grey boundary.
     if feature.object_class == ObjectClass::DredgedArea {
-        // Add dashed boundary line
+        if feature.drval1().is_none() {
+            instructions.clear();
+            instructions.push(RenderInstruction::AreaColor {
+                color: "DEPMD".to_string(),
+                transparency: None,
+            });
+        }
+        instructions.push(RenderInstruction::AreaPattern {
+            pattern: "DRGARE01".to_string(),
+        });
         instructions.push(RenderInstruction::LineStyle {
             pattern: LinePattern::Dashed,
             width: 1,
@@ -129,13 +137,26 @@ pub fn depare02_instructions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The contours these depth cases were written against. Pinned here so they
+    /// test the procedure rather than `MarinerSettings::default()`, which
+    /// tracks s52plib's own defaults and has changed under them once already.
+    fn test_contours() -> MarinerSettings {
+        MarinerSettings {
+            safety_depth: 10.0,
+            safety_contour: 10.0,
+            shallow_contour: 2.0,
+            deep_contour: 30.0,
+            ..Default::default()
+        }
+    }
+
     use crate::senc::{AttributeValue, FeatureType, ObjectClass};
-    use std::collections::HashMap;
 
     fn make_depare(drval1: f64, drval2: f64) -> Feature {
-        let mut attributes = HashMap::new();
-        attributes.insert("DRVAL1".to_string(), AttributeValue::Float(drval1));
-        attributes.insert("DRVAL2".to_string(), AttributeValue::Float(drval2));
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("DRVAL1", AttributeValue::Float(drval1));
+        attributes.insert("DRVAL2", AttributeValue::Float(drval2));
         Feature {
             type_code: 0,
             object_class: ObjectClass::DepthArea,
@@ -157,21 +178,21 @@ mod tests {
     #[test]
     fn test_drying_area() {
         let feature = make_depare(-2.0, 0.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(depare02(&feature, &settings), DepthColorToken::Drying);
     }
 
     #[test]
     fn test_very_shallow() {
         let feature = make_depare(0.0, 1.5);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(depare02(&feature, &settings), DepthColorToken::VeryShallow);
     }
 
     #[test]
     fn test_medium_shallow() {
         let feature = make_depare(2.5, 4.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(
             depare02(&feature, &settings),
             DepthColorToken::MediumShallow
@@ -181,21 +202,21 @@ mod tests {
     #[test]
     fn test_medium_deep() {
         let feature = make_depare(12.0, 20.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(depare02(&feature, &settings), DepthColorToken::MediumDeep);
     }
 
     #[test]
     fn test_deep_water() {
         let feature = make_depare(35.0, 50.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(depare02(&feature, &settings), DepthColorToken::DeepWater);
     }
 
     #[test]
     fn test_crosses_shallow_contour() {
         let feature = make_depare(1.0, 3.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(depare02(&feature, &settings), DepthColorToken::VeryShallow);
     }
 
@@ -204,7 +225,7 @@ mod tests {
         // Malformed chart where drval2<drval1; helper normalises drval2 = drval1+0.01,
         // so behaviour is driven by drval1 alone.
         let feature = make_depare(5.0, 3.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         assert_eq!(
             depare02(&feature, &settings),
             DepthColorToken::MediumShallow
@@ -214,7 +235,7 @@ mod tests {
     #[test]
     fn test_custom_safety_contour() {
         let feature = make_depare(6.0, 15.0);
-        let mut settings = MarinerSettings::default();
+        let mut settings = test_contours();
         settings.safety_contour = 5.0;
         assert_eq!(depare02(&feature, &settings), DepthColorToken::MediumDeep);
     }
@@ -222,7 +243,7 @@ mod tests {
     #[test]
     fn test_two_shades_safe() {
         let feature = make_depare(12.0, 20.0);
-        let mut settings = MarinerSettings::default();
+        let mut settings = test_contours();
         settings.depth_shade_mode = DepthShadeMode::TwoShades;
         settings.safety_contour = 10.0;
         assert_eq!(depare02(&feature, &settings), DepthColorToken::DeepWater);
@@ -231,7 +252,7 @@ mod tests {
     #[test]
     fn test_two_shades_unsafe() {
         let feature = make_depare(5.0, 15.0);
-        let mut settings = MarinerSettings::default();
+        let mut settings = test_contours();
         settings.depth_shade_mode = DepthShadeMode::TwoShades;
         settings.safety_contour = 10.0;
         assert_eq!(depare02(&feature, &settings), DepthColorToken::VeryShallow);
@@ -240,13 +261,14 @@ mod tests {
     #[test]
     fn test_drgare_instructions() {
         let feature = make_drgare(5.0, 10.0);
-        let settings = MarinerSettings::default();
+        let settings = test_contours();
         let instrs = depare02_instructions(&feature, &settings);
 
-        // Should have AC and LS
-        assert_eq!(instrs.len(), 2);
+        // AC(depth shade) + AP(DRGARE01) + LS(DASH,1,CHGRF), per s52cnsy.cpp
+        assert_eq!(instrs.len(), 3);
         assert!(matches!(instrs[0], RenderInstruction::AreaColor { .. }));
-        if let RenderInstruction::LineStyle { pattern, .. } = &instrs[1] {
+        assert!(matches!(instrs[1], RenderInstruction::AreaPattern { .. }));
+        if let RenderInstruction::LineStyle { pattern, .. } = &instrs[2] {
             assert_eq!(*pattern, LinePattern::Dashed);
         } else {
             panic!("Expected LineStyle");

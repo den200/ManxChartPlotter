@@ -31,62 +31,61 @@ impl DisplayCategory {
 /// S-52 display priority - controls draw order.
 /// Higher priority features are drawn on top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// The ten S-52 priority levels, in spec order. The numbering is fixed by the
+/// standard (and by OpenCPN's `DisPrio` enum): "No data" is the *bottom* level,
+/// below Group 1 — not a mid-stack default.
 pub enum DisplayPriority {
-    /// Group 1 areas (background)
+    /// No-data fill areas (unsurveyed water) — painted below everything
+    NoData,
+    /// Group 1 areas (background: land, depth areas, unsurveyed)
     Group1,
-    /// Area 1 (land, etc.)
+    /// Area 1 — superimposed areas
     Area1,
-    /// Area 2 (depth areas, etc.)
+    /// Area 2 — superimposed areas, also water features
     Area2,
-    /// Point symbols
-    Point,
-    /// Lines
-    Line,
-    /// Area pattern (hatching)
-    AreaPattern,
-    /// Area symbols (point symbols in area)
+    /// Point symbols, also land features
+    PointSymbol,
+    /// Line symbols, also restricted areas
+    LineSymbol,
+    /// Area symbols, also traffic areas
     AreaSymbol,
     /// Routing (traffic lanes, etc.)
     Routing,
     /// Hazards (wrecks, obstructions)
     Hazards,
-    /// Mariners (user-added)
+    /// Mariners (VRM, EBL, own ship)
     Mariners,
 }
 
 impl DisplayPriority {
-    /// Parse from XML string like "Area 2" or "Point Symbol"
+    /// Parse from the `<disp-prio>` text in chartsymbols.xml.
     ///
-    /// Handles variations from chartsymbols.xml disp-prio values:
-    /// - "Point" / "Point Symbol"
-    /// - "Line" / "Lines" / "Line Symbol"
-    /// - "Area Symbol" / "Area Pattern"
-    /// - "No data" (maps to Line as default)
+    /// The ten strings below are exactly the ones the file uses; anything else
+    /// falls back to `NoData`, matching `chartsymbols.cpp`'s final `else`.
     pub fn from_str(s: &str) -> Option<Self> {
         match s.trim() {
             "Group 1" => Some(Self::Group1),
             "Area 1" => Some(Self::Area1),
             "Area 2" => Some(Self::Area2),
-            "Point" | "Point Symbol" => Some(Self::Point),
-            "Line" | "Lines" | "Line Symbol" | "No data" => Some(Self::Line),
-            "Area Pattern" => Some(Self::AreaPattern),
+            "Point Symbol" => Some(Self::PointSymbol),
+            "Line Symbol" => Some(Self::LineSymbol),
             "Area Symbol" => Some(Self::AreaSymbol),
             "Routing" => Some(Self::Routing),
             "Hazards" => Some(Self::Hazards),
             "Mariners" | "Mariners Standard" | "Mariners Other" => Some(Self::Mariners),
-            _ => None,
+            _ => Some(Self::NoData),
         }
     }
 
     /// Get numeric priority for sorting (higher = on top)
     pub fn as_u8(&self) -> u8 {
         match self {
-            Self::Group1 => 0,
-            Self::Area1 => 1,
-            Self::Area2 => 2,
-            Self::Point => 3,
-            Self::Line => 4,
-            Self::AreaPattern => 5,
+            Self::NoData => 0,
+            Self::Group1 => 1,
+            Self::Area1 => 2,
+            Self::Area2 => 3,
+            Self::PointSymbol => 4,
+            Self::LineSymbol => 5,
             Self::AreaSymbol => 6,
             Self::Routing => 7,
             Self::Hazards => 8,
@@ -196,6 +195,9 @@ pub struct LookupEntry {
     pub instruction: String,
     /// Comment from original file
     pub comment: Option<String>,
+    /// The `id` attribute of the `<lookup>` element — OpenCPN's `nSequence`,
+    /// the third sort key of its LUP array (see [`LookupTables::finalize_lookups`]).
+    pub seq: u32,
 }
 
 impl LookupEntry {
@@ -205,7 +207,25 @@ impl LookupEntry {
     ///
     /// Attribute code format: 6-char S-57 name + value digits.
     /// E.g., "CATSLC1" means CATSLC attribute must equal 1.
-    pub fn matches_attributes(&self, attributes: &HashMap<&str, Vec<i32>>) -> bool {
+    /// Does this entry's attribute filter match the feature?
+    ///
+    /// Mirrors the value comparison in `FindBestLUP` (s52plib.cpp), which
+    /// switches on the *stored type* of the feature's attribute:
+    ///
+    /// | stored as | compared how |
+    /// |---|---|
+    /// | integer / enum | numeric equality |
+    /// | float          | numeric equality |
+    /// | string, incl. S-57 'L' lists | **whole-string** equality |
+    ///
+    /// The list case is the one that matters: a feature with `CATREA="4,5"`
+    /// does *not* satisfy a `CATREA4` filter, because OpenCPN compares
+    /// `strcmp("4,5", "4")`. Treating the value as a set of integers and
+    /// testing membership — which navcore used to do — picks a more specific
+    /// lookup row than OpenCPN ever would.
+    pub fn matches_attributes(&self, feature: &crate::senc::Feature) -> bool {
+        use crate::senc::AttributeValue;
+
         if self.attribute_codes.is_empty() {
             return true;
         }
@@ -222,44 +242,42 @@ impl LookupEntry {
             }
 
             let attr_name = &code[..6];
-            let value_str = &code[6..];
+            let value_str = code[6..].trim();
+            let stored = feature.attributes.get(attr_name);
 
-            // If no value specified, just check attribute exists
+            // Blank value: any value of this attribute matches (S-52 8.3.3.4).
             if value_str.is_empty() {
-                if !attributes.contains_key(attr_name) {
+                if stored.is_none() {
                     return false;
                 }
                 continue;
             }
 
-            // "?" is S-52 negative filter: attribute must NOT be present.
+            // "?" is the S-52 negative filter: the attribute must be absent.
             // E.g. the DEPARE LUP "DRVAL1? DRVAL2?" matches only unsurveyed
-            // depth areas that carry no depth attributes. Without this branch
-            // the filter silently fell through (parse::<i32>() fails → continue)
-            // and every DEPARE was misclassified as NODTA+PRTSUR01, deleting
-            // water fills across the chart.
+            // depth areas that carry no depth attributes. (OpenCPN never
+            // matches a '?' row at all — it forgets to count the match — but
+            // the spec reading below is what keeps navcore's water fills.)
             if value_str == "?" {
-                if attributes.contains_key(attr_name) {
+                if stored.is_some() {
                     return false;
                 }
                 continue;
             }
 
-            // Parse expected value. Unknown filter syntax is treated as a
-            // non-match rather than silently accepted, so any new LUP syntax
-            // we don't yet understand fails loud instead of quiet.
-            let Ok(expected_value) = value_str.parse::<i32>() else {
-                return false;
-            };
-
-            // Check if attribute exists and matches any of its values
-            match attributes.get(attr_name) {
-                Some(values) => {
-                    if !values.iter().any(|v| *v == expected_value) {
-                        return false;
-                    }
+            let matched = match stored {
+                Some(AttributeValue::Integer(v)) => {
+                    value_str.parse::<i32>().map(|e| e == *v).unwrap_or(false)
                 }
-                None => return false,
+                Some(AttributeValue::Float(v)) => value_str
+                    .parse::<f64>()
+                    .map(|e| (e - *v).abs() < 1e-6)
+                    .unwrap_or(false),
+                Some(AttributeValue::String(s)) => s == value_str,
+                None => false,
+            };
+            if !matched {
+                return false;
             }
         }
 
@@ -408,60 +426,45 @@ impl LookupTables {
             .map(|v| v.as_slice())
     }
 
-    /// Find the best matching entry for a feature using OpenCPN-style scoring.
+    /// Find the lookup row OpenCPN would pick for this feature.
     ///
-    /// Among all entries whose attribute filters the feature satisfies, prefer the
-    /// one with the most attribute codes (most specific). Ties keep insertion
-    /// order. Falls back to the no-attr default, then to the first entry.
+    /// `FindBestLUP` (s52plib.cpp) walks the object's rows **in array order**
+    /// and takes the *first* whose attribute filter matches completely — "the
+    /// first 100% match is selected". Specificity does not win on its own; it
+    /// wins because [`finalize_lookups`] has already sorted the rows
+    /// most-attributes-first, exactly as OpenCPN's `CompareLUPObjects` does.
+    /// With no full match, the first row carrying no attributes at all is the
+    /// default.
     ///
-    /// Mirrors `FindBestLUP` in `s52plib.cpp:306`: an entry with filters
-    /// `CATLAM1 COLOUR3` is preferred over one with just `CATLAM1` when both
-    /// match, because the first is more specific.
+    /// [`finalize_lookups`]: LookupTables::finalize_lookups
     pub fn lookup_best(
         &self,
         object_class: &str,
         geom_type: GeometryType,
         table_name: TableName,
-        attributes: &HashMap<&str, Vec<i32>>,
+        feature: &crate::senc::Feature,
     ) -> Option<&LookupEntry> {
         let entries = self.lookup(object_class, geom_type, table_name)?;
 
-        let mut best: Option<(&LookupEntry, usize)> = None;
-        let mut generic_fallback: Option<&LookupEntry> = None;
-
         for entry in entries {
             if entry.attribute_codes.is_empty() {
-                if generic_fallback.is_none() {
-                    generic_fallback = Some(entry);
-                }
                 continue;
             }
-            if entry.matches_attributes(attributes) {
-                let specificity = entry.attribute_codes.len();
-                match best {
-                    Some((_, best_spec)) if specificity <= best_spec => {}
-                    _ => best = Some((entry, specificity)),
-                }
+            if entry.matches_attributes(feature) {
+                return Some(entry);
             }
         }
 
-        if let Some((entry, _)) = best {
-            return Some(entry);
-        }
-        if let Some(entry) = generic_fallback {
-            return Some(entry);
-        }
-        entries.first()
+        entries
+            .iter()
+            .find(|e| e.attribute_codes.is_empty())
+            .or_else(|| entries.first())
     }
 
-    /// Fast lookup that avoids building attributes_as_map() when not needed.
+    /// Fast path around [`lookup_best`] for classes whose rows carry no
+    /// attribute filters at all — the common case.
     ///
-    /// Most object classes have only generic LUP entries (empty attribute_codes).
-    /// For those, we can skip the expensive HashMap allocation entirely and
-    /// return the first entry directly.
-    ///
-    /// Only falls back to `lookup_best()` (which needs the attr map) when there
-    /// are attribute-filtered entries that actually require matching.
+    /// [`lookup_best`]: LookupTables::lookup_best
     pub fn lookup_best_fast<'a>(
         &'a self,
         object_class: &str,
@@ -471,17 +474,39 @@ impl LookupTables {
     ) -> Option<&'a LookupEntry> {
         let entries = self.lookup(object_class, geom_type, table_name)?;
 
-        // Check if ANY entry has attribute filters
-        let has_filtered = entries.iter().any(|e| !e.attribute_codes.is_empty());
-
-        if !has_filtered {
-            // All entries are generic — return first without allocating attrs map
+        if entries.iter().all(|e| e.attribute_codes.is_empty()) {
             return entries.first();
         }
 
-        // Some entries need attribute matching — build map and do full lookup
-        let attrs = feature.attributes_as_map();
-        self.lookup_best(object_class, geom_type, table_name, &attrs)
+        self.lookup_best(object_class, geom_type, table_name, feature)
+    }
+
+    /// Order every object's rows the way OpenCPN's sorted LUP array is ordered,
+    /// so that "first full match wins" picks the same row.
+    ///
+    /// `CompareLUPObjects` sorts by object name, then by **attribute count
+    /// descending**, then by `nSequence` (the `<lookup id>` from the XML).
+    /// Where two rows tie on all three — chartsymbols.xml has ACHARE rows that
+    /// share `id="2"` — OpenCPN's sorted-array insert leaves the later-parsed
+    /// row first, so file order is reversed for exact ties.
+    pub fn finalize_lookups(&mut self) {
+        for entries in self.entries.values_mut() {
+            let order: Vec<usize> = (0..entries.len()).collect();
+            let mut idx = order;
+            idx.sort_by(|&a, &b| {
+                let (ea, eb) = (&entries[a], &entries[b]);
+                eb.attribute_codes
+                    .len()
+                    .cmp(&ea.attribute_codes.len())
+                    .then(ea.seq.cmp(&eb.seq))
+                    .then(b.cmp(&a))
+            });
+            let mut sorted: Vec<LookupEntry> = Vec::with_capacity(entries.len());
+            for i in idx {
+                sorted.push(entries[i].clone());
+            }
+            *entries = sorted;
+        }
     }
 
     /// Get color RGB values by name

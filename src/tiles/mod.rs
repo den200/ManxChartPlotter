@@ -5,6 +5,7 @@
 
 pub mod clip;
 pub mod builder;
+pub mod scene;
 pub mod cache;
 pub mod worker;
 
@@ -316,6 +317,76 @@ pub fn visible_tiles(bounds: &TileBounds, z: u8, margin_factor: f32) -> Vec<Tile
         }
     }
     tiles
+}
+
+/// Visible tiles for a tilted view, refined by distance.
+///
+/// A plan view wants one zoom level: every pixel is the same number of metres,
+/// so every tile should be built at the same chart scale. Tilted, that stops
+/// being true — the top of the screen can be three or four screen-heights away,
+/// where a tile covers a fraction of the pixels it covers in the foreground.
+/// Building those at the foreground's scale is what would make the tilted view
+/// cost several times the plan view for detail no one can see.
+///
+/// So instead of one level this walks the quadtree from `z_min` and stops
+/// subdividing a tile once its own zoom matches the zoom the perspective wants
+/// where it sits — `mpp_at` gives the metres per pixel on the ground at a
+/// point, and `zoom_from_camera` turns that back into a level.
+///
+/// `contains` decides whether a tile is in view at all; it is given the tile's
+/// bounds and must account for the trapezium (and for anything behind the eye,
+/// which projects back onto the screen mirrored if it is not excluded here).
+pub fn visible_tiles_lod(
+    bounds: &TileBounds,
+    z_min: u8,
+    z_max: u8,
+    mpp_at: &dyn Fn(f64, f64) -> f32,
+    contains: &dyn Fn(&TileBounds) -> bool,
+) -> Vec<TileId> {
+    let mut out = Vec::new();
+    let mut stack: Vec<TileId> = visible_tiles(bounds, z_min, 1.0);
+    // A runaway refinement would be a hang, not a glitch: 4^(z_max - z_min)
+    // tiles is millions if the stop rule is ever wrong about a tile.
+    const MAX_TILES: usize = 4096;
+    while let Some(t) = stack.pop() {
+        if out.len() + stack.len() >= MAX_TILES {
+            out.push(t);
+            continue;
+        }
+        let b = t.bounds();
+        if !contains(&b) {
+            continue;
+        }
+        if t.z >= z_max {
+            out.push(t);
+            continue;
+        }
+        // The near corner decides: a tile is too coarse as soon as any part of
+        // it is close enough to deserve more detail.
+        let want = [
+            (b.min_x, b.min_y),
+            (b.max_x, b.min_y),
+            (b.min_x, b.max_y),
+            (b.max_x, b.max_y),
+            ((b.min_x + b.max_x) * 0.5, (b.min_y + b.max_y) * 0.5),
+        ]
+        .iter()
+        .map(|&(x, y)| zoom_from_camera(mpp_at(x, y)))
+        .max()
+        .unwrap_or(t.z);
+        if want <= t.z {
+            out.push(t);
+            continue;
+        }
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+            stack.push(TileId {
+                z: t.z + 1,
+                x: t.x * 2 + dx,
+                y: t.y * 2 + dy,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]

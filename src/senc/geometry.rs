@@ -429,6 +429,24 @@ impl AreaGeometry {
         }
     }
 
+    /// Like [`for_each_vertex_direct`](Self::for_each_vertex_direct) but hands
+    /// back whole triangles, so a caller can measure one before emitting it.
+    pub fn for_each_triangle_direct<F>(&self, ref_mx: f32, ref_my: f32, mut callback: F)
+    where
+        F: FnMut([[f32; 2]; 3]),
+    {
+        let mut tri = [[0.0f32; 2]; 3];
+        let mut n = 0usize;
+        self.for_each_vertex_direct(ref_mx, ref_my, |v| {
+            tri[n] = v;
+            n += 1;
+            if n == 3 {
+                callback(tri);
+                n = 0;
+            }
+        });
+    }
+
     /// Iterate triangles as global Mercator coordinates via callback.
     ///
     /// Zero-allocation: uses callback pattern instead of intermediate Vecs.
@@ -490,6 +508,20 @@ impl AreaGeometry {
     /// Returns polylines as Vec<[f32; 2]>; the caller can close/transform as needed.
     pub fn resolve_rings(&self, edge_table: &EdgeTable) -> Vec<Vec<[f32; 2]>> {
         self.resolve_rings_impl(edge_table, None)
+    }
+
+    /// Like [`resolve_rings`](Self::resolve_rings) but returns only *closed*
+    /// rings, stitching the open fragments back together first.
+    ///
+    /// `resolve_rings` starts a new path wherever the stored edge order breaks
+    /// the node chain, which for a multi-part boundary is most of them. Callers
+    /// that stroke a boundary do not care — an open path draws fine. Callers
+    /// that need a polygon do: a fragment forced shut is a polygon no chart
+    /// declares, and one used as a quilt mask punches a hole in the chart
+    /// underneath. The fragments are all there, just out of order, so join them
+    /// end to end and keep what closes.
+    pub fn resolve_closed_rings(&self, edge_table: &EdgeTable) -> Vec<Vec<[f32; 2]>> {
+        stitch_closed_rings(self.resolve_rings_impl(edge_table, None))
     }
 
     /// Like [`resolve_rings`](Self::resolve_rings) but omits any edge whose index
@@ -1040,8 +1072,101 @@ impl EdgeTable {
     }
 }
 
+
+/// Endpoints within this many metres are the same node.
+///
+/// SENC coordinates are metres from the cell's reference point held as f32, so
+/// a shared node can differ in the last bits; half a metre is far below chart
+/// resolution and far above that error.
+const RING_JOIN_EPS: f32 = 0.5;
+
+fn same_point(a: [f32; 2], b: [f32; 2]) -> bool {
+    (a[0] - b[0]).abs() <= RING_JOIN_EPS && (a[1] - b[1]).abs() <= RING_JOIN_EPS
+}
+
+/// Join open polyline fragments end to end and keep the ones that close.
+///
+/// Greedy: take a fragment, keep appending whichever remaining fragment starts
+/// or ends at its tail until it closes or nothing fits. Fragments that never
+/// close are dropped — for a coverage polygon, a boundary with a gap in it is
+/// not a claim about where the data is.
+fn stitch_closed_rings(fragments: Vec<Vec<[f32; 2]>>) -> Vec<Vec<[f32; 2]>> {
+    let mut closed = Vec::new();
+    let mut open: Vec<Vec<[f32; 2]>> = Vec::new();
+    for f in fragments {
+        if f.len() < 2 {
+            continue;
+        }
+        if f.len() >= 4 && same_point(f[0], *f.last().unwrap()) {
+            closed.push(f);
+        } else {
+            open.push(f);
+        }
+    }
+
+    while let Some(mut cur) = open.pop() {
+        loop {
+            let tail = *cur.last().unwrap();
+            if same_point(cur[0], tail) {
+                break;
+            }
+            let hit = open.iter().position(|f| same_point(tail, f[0])).map(|i| (i, false)).or_else(
+                || {
+                    open.iter()
+                        .position(|f| same_point(tail, *f.last().unwrap()))
+                        .map(|i| (i, true))
+                },
+            );
+            let Some((i, reversed)) = hit else { break };
+            let mut next = open.remove(i);
+            if reversed {
+                next.reverse();
+            }
+            cur.extend(next.into_iter().skip(1));
+        }
+        if cur.len() >= 4 && same_point(cur[0], *cur.last().unwrap()) {
+            // Snap the seam so downstream point-in-polygon tests see an exactly
+            // closed ring rather than one off by the join tolerance.
+            let first = cur[0];
+            *cur.last_mut().unwrap() = first;
+            closed.push(cur);
+        }
+    }
+    closed
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn stitch_joins_fragments_into_a_ring() {
+        // A square delivered as three out-of-order pieces, one of them backwards.
+        let frags = vec![
+            vec![[0.0, 0.0], [10.0, 0.0]],
+            vec![[10.0, 10.0], [10.0, 0.0]], // reversed
+            vec![[10.0, 10.0], [0.0, 10.0], [0.0, 0.0]],
+        ];
+        let rings = stitch_closed_rings(frags);
+        assert_eq!(rings.len(), 1);
+        let r = &rings[0];
+        assert_eq!(r.first(), r.last());
+        assert_eq!(r.len(), 5);
+    }
+
+    #[test]
+    fn stitch_drops_a_boundary_with_a_gap() {
+        let frags = vec![
+            vec![[0.0, 0.0], [10.0, 0.0]],
+            vec![[10.0, 10.0], [0.0, 10.0]], // no edge joins the two
+        ];
+        assert!(stitch_closed_rings(frags).is_empty());
+    }
+
+    #[test]
+    fn stitch_keeps_an_already_closed_ring_untouched() {
+        let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]];
+        assert_eq!(stitch_closed_rings(vec![ring.clone()]), vec![ring]);
+    }
     use super::*;
 
     #[test]

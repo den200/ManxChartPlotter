@@ -69,6 +69,105 @@ impl SoundingRenderInfo {
         flags
     }
 
+    /// Rebuild a [`SoundingRenderInfo`] from its packed flags.
+    ///
+    /// The renderer decides which soundings survive decluttering after the
+    /// builder has already packed them for the GPU, so the symbol composition
+    /// has to be able to work from the flags alone.
+    pub fn from_flags(flags: u32) -> Self {
+        Self {
+            whole_part: (flags >> 12) & 0x1_FFFF,
+            decimal_digit: ((flags & (1 << 4)) != 0).then(|| ((flags >> 8) & 0xF) as u8),
+            digit_count: ((flags >> 5) & 0x7) as u8,
+            is_shallow: flags & 1 != 0,
+            is_drying: flags & (1 << 1) != 0,
+            show_uncertainty: flags & (1 << 2) != 0,
+            is_swept: flags & (1 << 3) != 0,
+        }
+    }
+
+    /// The `SY()` symbols S-52 composes this sounding from.
+    ///
+    /// Soundings are not text. The presentation library ships a set of digit
+    /// symbols whose *pivots* encode the placement — position 2 sits at +12px,
+    /// position 1 at +5, position 0 at -2, and the fraction digit is dropped
+    /// below the baseline — and SNDFRM02 picks one symbol per digit position.
+    /// That is what makes a sounding readable at any orientation and what makes
+    /// "9₂" render as the chart convention rather than as "9.2".
+    ///
+    /// The branch structure is s52cnsy.cpp's, which is the procedure's: the
+    /// choice of *positions* depends on the magnitude, so 25.0 draws as
+    /// positions 1 and 0 while 25.5 draws as 2, 1 and the fraction.
+    pub fn symbols(&self) -> Vec<String> {
+        // "SOUNDS" is the shallow (danger) set, "SOUNDG" the safe one.
+        let p = if self.is_shallow { "SOUNDS" } else { "SOUNDG" };
+        let mut out = Vec::with_capacity(4);
+        if self.is_swept {
+            out.push(format!("{p}B1"));
+        }
+        if self.show_uncertainty {
+            out.push(format!("{p}C2"));
+        }
+
+        let whole = self.whole_part;
+        let fraction = self.decimal_digit.filter(|d| *d > 0);
+        let drying = self.is_drying;
+
+        // Continuation A: a single leading digit, optional fraction.
+        if whole < 10 {
+            out.push(format!("{p}1{whole}"));
+            if let Some(f) = fraction {
+                out.push(format!("{p}5{f}"));
+            }
+            if drying {
+                out.push(format!("{p}A1"));
+            }
+            return out;
+        }
+
+        // Two digits with a fraction keep the fraction's position free by
+        // shifting the whole part left one place.
+        if whole < 31 {
+            if let Some(f) = fraction {
+                out.push(format!("{p}2{}", whole / 10));
+                out.push(format!("{p}1{}", whole % 10));
+                out.push(format!("{p}5{f}"));
+                if drying {
+                    out.push(format!("{p}A1"));
+                }
+                return out;
+            }
+        }
+
+        // Continuation B and beyond: whole digits only.
+        let digits: Vec<u32> = {
+            let mut d = Vec::new();
+            let mut n = whole;
+            while n > 0 {
+                d.push(n % 10);
+                n /= 10;
+            }
+            d.reverse();
+            d
+        };
+        // Position codes per digit count, from s52cnsy.cpp. A drying two-digit
+        // value shifts left to leave room for the A1 bar.
+        let positions: &[u8] = match (digits.len(), drying) {
+            (2, true) => &[2, 1],
+            (2, false) => &[1, 0],
+            (3, _) => &[2, 1, 0],
+            (4, _) => &[2, 1, 0, 4],
+            _ => &[3, 2, 1, 0, 4],
+        };
+        for (digit, pos) in digits.iter().zip(positions.iter()) {
+            out.push(format!("{p}{pos}{digit}"));
+        }
+        if drying {
+            out.push(format!("{p}A1"));
+        }
+        out
+    }
+
     /// Get the S-52 color token for this sounding
     pub fn color_token(&self) -> &'static str {
         if self.is_shallow {
@@ -326,14 +425,13 @@ mod tests {
     use super::*;
     use crate::s52::DepthUnit;
     use crate::senc::{FeatureType, ObjectClass};
-    use std::collections::HashMap;
 
     fn make_sounding() -> Feature {
         Feature {
             type_code: 129, // SOUNDG
             object_class: ObjectClass::Sounding,
             feature_type: FeatureType::Point,
-            attributes: HashMap::new(),
+            attributes: crate::senc::Attributes::new(),
             area_geometry: None,
             point_geometry: None,
             line_geometry: None,
@@ -343,7 +441,7 @@ mod tests {
 
     fn make_sounding_with_attr(name: &str, value: AttributeValue) -> Feature {
         let mut feature = make_sounding();
-        feature.attributes.insert(name.to_string(), value);
+        feature.attributes.insert(name, value);
         feature
     }
 
@@ -535,5 +633,85 @@ mod tests {
         assert_eq!(info.whole_part, 18);
         assert_eq!(info.decimal_digit, None);
         assert_eq!(info.digit_count, 2);
+    }
+}
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::*;
+
+    fn info(whole: u32, decimal: Option<u8>, shallow: bool) -> SoundingRenderInfo {
+        SoundingRenderInfo {
+            whole_part: whole,
+            decimal_digit: decimal,
+            digit_count: if whole >= 10 { 2 } else { 1 },
+            is_shallow: shallow,
+            is_drying: false,
+            show_uncertainty: false,
+            is_swept: false,
+        }
+    }
+
+    /// The digit *positions* depend on the magnitude — that is the whole point
+    /// of the symbol set, and getting it wrong stacks digits on top of each
+    /// other rather than merely misplacing them.
+    #[test]
+    fn sndfrm02_composes_the_standard_symbol_positions() {
+        // One digit, with and without a fraction.
+        assert_eq!(info(2, Some(5), true).symbols(), ["SOUNDS12", "SOUNDS55"]);
+        assert_eq!(info(9, None, false).symbols(), ["SOUNDG19"]);
+        // Two digits with a fraction shift left to free the fraction slot.
+        assert_eq!(
+            info(25, Some(5), false).symbols(),
+            ["SOUNDG22", "SOUNDG15", "SOUNDG55"]
+        );
+        // The same value without a fraction uses positions 1 and 0 instead.
+        assert_eq!(info(25, None, false).symbols(), ["SOUNDG12", "SOUNDG05"]);
+        // Three and four digits.
+        assert_eq!(
+            info(125, None, false).symbols(),
+            ["SOUNDG21", "SOUNDG12", "SOUNDG05"]
+        );
+        assert_eq!(
+            info(1250, None, false).symbols(),
+            ["SOUNDG21", "SOUNDG12", "SOUNDG05", "SOUNDG40"]
+        );
+    }
+
+    #[test]
+    fn sndfrm02_marks_swept_uncertain_and_drying() {
+        let mut i = info(3, None, true);
+        i.is_swept = true;
+        i.show_uncertainty = true;
+        i.is_drying = true;
+        assert_eq!(
+            i.symbols(),
+            ["SOUNDSB1", "SOUNDSC2", "SOUNDS13", "SOUNDSA1"]
+        );
+    }
+
+    /// The shallow set is chosen against the mariner's safety *depth*, which is
+    /// what makes a sounding print black rather than grey.
+    #[test]
+    fn safety_depth_selects_the_shallow_symbol_set() {
+        let feature = crate::senc::Feature {
+            type_code: 129,
+            object_class: crate::senc::ObjectClass::Other,
+            feature_type: crate::senc::FeatureType::Point,
+            attributes: crate::senc::Attributes::new(),
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        };
+        let mut settings = MarinerSettings::default();
+        settings.safety_depth = 3.0;
+        let shallow = sndfrm02(2.5, &feature, &settings);
+        assert!(shallow.is_shallow, "2.5m is shallower than a 3m safety depth");
+        assert!(shallow.symbols()[0].starts_with("SOUNDS"));
+
+        let deep = sndfrm02(7.5, &feature, &settings);
+        assert!(!deep.is_shallow);
+        assert!(deep.symbols()[0].starts_with("SOUNDG"));
     }
 }

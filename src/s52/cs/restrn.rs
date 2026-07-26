@@ -86,9 +86,19 @@ fn restriction_symbol(feature: &Feature) -> &'static str {
 }
 
 /// Generate render instructions for RESTRN01 conditional symbology.
+///
+/// RESTRN01 is only a signpost for RESCSP01: with no RESTRN attribute there is
+/// nothing to symbolise and the procedure returns nothing (s52cnsy.cpp
+/// RESTRN01 returns NULL when GetStringAttrWXS(obj, "RESTRN") is NULL). Falling
+/// through to the RSRDEF51 default instead put a spurious magenta restriction
+/// symbol on every unrestricted OSPARE/DMPGRD/MIPARE/MARCUL/TSSLPT area.
 pub fn restrn01_instructions(feature: &Feature) -> Vec<RenderInstruction> {
+    if feature.attribute_str("RESTRN").is_none() && feature.attribute_int("RESTRN").is_none() {
+        return Vec::new();
+    }
     let sym_name = restriction_symbol(feature);
     vec![RenderInstruction::Symbol {
         name: sym_name.to_string(),
+        rotation: None,
     }]
 }

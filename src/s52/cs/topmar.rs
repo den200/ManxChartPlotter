@@ -52,6 +52,7 @@ pub fn topmar01_instructions(
 
     vec![RenderInstruction::Symbol {
         name: name.to_string(),
+        rotation: None,
     }]
 }
 

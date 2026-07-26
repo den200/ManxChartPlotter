@@ -87,7 +87,7 @@ pub(crate) fn get_lc_pattern_table() -> Option<&'static LcPatternTable> {
 /// If `is_point_symbol` is true, applies soft SCAMIN (gradual fade up to 2x scamin).
 /// `chart_native_scale` enables SUPER_SCAMIN: features without a SCAMIN attribute
 /// are hidden when view_scale exceeds chart_scale * 2 (matching OpenCPN behavior).
-fn should_render_at_scale_ex(
+pub fn should_render_at_scale_ex(
     feature: &Feature,
     view_scale: f64,
     bypass_scamin: bool,
@@ -126,16 +126,39 @@ fn should_render_at_scale_ex(
         }
     }
 
-    // SUPER_SCAMIN: features without SCAMIN attribute use chart_scale * 2.
-    // Prevents features from overview/small-scale charts showing at detailed zoom levels.
+    // SUPER_SCAMIN: a feature whose cell declares no SCAMIN gets a synthetic one
+    // derived from the cell's compilation scale, so overview-chart clutter does
+    // not survive into detailed zooms.
+    //
+    // s52plib.cpp gates this on an exemption list and uses a factor of 4. The
+    // exemptions are the classes that describe the water and the land itself —
+    // applying the rule to them empties the chart of exactly the features a
+    // mariner needs most. navcore applied it to everything at factor 2, which
+    // is what erased the dredged basins inside Brondby Havn: the harbour cell is
+    // 1:4000, its DRGAREs carry no SCAMIN, and 2 x 4000 is a closer zoom than
+    // the harbour is normally viewed at.
     if let Some(chart_scale) = chart_native_scale {
-        let super_scamin = chart_scale as f64 * 2.0;
-        if view_scale > super_scamin {
-            return 0.0;
+        if !super_scamin_exempt(feature) {
+            let super_scamin = chart_scale as f64 * 4.0;
+            if view_scale > super_scamin {
+                return 0.0;
+            }
         }
     }
 
     1.0
+}
+
+/// Classes exempt from SUPER_SCAMIN, per the name test in s52plib.cpp.
+///
+/// LNDARE is exempt only when it is drawn as a filled area; a LNDARE whose
+/// portrayal is not an area colour is treated like any other object.
+fn super_scamin_exempt(feature: &Feature) -> bool {
+    let name = crate::senc::s57_code_to_acronym(feature.type_code);
+    matches!(
+        name,
+        "LNDARE" | "DEPARE" | "SWPARE" | "RECTRK" | "TSEZNE" | "DRGARE" | "COALNE"
+    ) || name.starts_with("TSS")
 }
 
 /// Error type for tile building
@@ -165,6 +188,16 @@ pub struct AreaVertex {
     pub position: [f32; 2],
     pub color_index: u32,
     pub disp_prio: u32,
+    /// How much to darken this vertex's palette colour, 0..1.
+    ///
+    /// Zero for every ordinary fill vertex. The depth-relief option emits an
+    /// extra band of triangles just inside each depth area's boundary, shaded
+    /// at the edge and fading to nothing inward, which reads as a terraced
+    /// seabed. It rides in the same vertex stream as the fills because the area
+    /// pipeline is opaque and depth-tested: a band drawn after its own fill
+    /// simply overwrites it, so overlapping bands at concave corners cannot
+    /// compound into a dark blotch the way alpha blending would.
+    pub shade: f32,
 }
 
 /// A batch of line vertices for a single style
@@ -200,12 +233,8 @@ pub struct TilePacket {
     pub pattern_priority_offsets: [u32; 11],
     /// Estimated byte size for cache budgeting
     pub byte_size: usize,
-    /// Coverage mask triangles — triangulated M_COVR polygons from more-detailed charts.
-    /// Used by GPU stencil pass to mask background chart geometry.
-    /// Each vertex is [x, y] in Spherical Mercator.
-    pub coverage_vertices: Vec<[f32; 2]>,
-    /// Background area vertices (from charts covered by a more-detailed chart).
-    /// Drawn with stencil test (pass when stencil==0) to suppress behind foreground.
+    /// Background area vertices — from every chart in the tile coarser than
+    /// its finest. Drawn before the foreground so the finer chart wins.
     pub bg_area_vertices: Vec<AreaVertex>,
     /// Background area vertex offsets per priority level
     pub bg_area_priority_offsets: [u32; 11],
@@ -229,7 +258,6 @@ impl TilePacket {
             pattern_vertices: Vec::new(),
             pattern_priority_offsets: [0; 11],
             byte_size: 0,
-            coverage_vertices: Vec::new(),
             bg_area_vertices: Vec::new(),
             bg_area_priority_offsets: [0; 11],
             bg_pattern_vertices: Vec::new(),
@@ -253,7 +281,6 @@ impl TilePacket {
             self.label_candidates.len() * std::mem::size_of::<crate::render::TextParams>();
         let pattern_bytes =
             self.pattern_vertices.len() * std::mem::size_of::<crate::render::PatternVertex>();
-        let coverage_bytes = self.coverage_vertices.len() * std::mem::size_of::<[f32; 2]>();
         let bg_area_bytes = self.bg_area_vertices.len() * std::mem::size_of::<AreaVertex>();
         let bg_pattern_bytes =
             self.bg_pattern_vertices.len() * std::mem::size_of::<crate::render::PatternVertex>();
@@ -263,7 +290,6 @@ impl TilePacket {
             + text_bytes
             + label_bytes
             + pattern_bytes
-            + coverage_bytes
             + bg_area_bytes
             + bg_pattern_bytes;
     }
@@ -291,7 +317,11 @@ impl TilePacket {
 /// Builds tile packets from chart data with spatial prefiltering and clipping.
 pub struct TileBuilder<'a> {
     catalog: &'a ChartCatalog,
-    chart_cache: &'a Mutex<HashMap<u64, Arc<ChartData>>>,
+    chart_cache: &'a ChartCache,
+    /// M_COVR tessellation per chart. Global Mercator, so it is the same for
+    /// every tile; shared with the other builders because one is constructed
+    /// per tile, and recomputing this per tile cost more than the tile did.
+    coverage_cache: &'a CoverageCache,
     keys: &'a KeyStore,
     decryptor: &'a Mutex<CachedDecryptor>,
     /// S-52 presentation engine for display filtering
@@ -308,6 +338,9 @@ pub struct TileBuilder<'a> {
     view_center_x: f32,
     /// Camera center in global Mercator meters
     view_center_y: f32,
+    /// Provenance log for `navcore --dump-scene`. `None` in normal rendering,
+    /// so the instrumentation costs nothing.
+    pub scene_log: Option<std::sync::Mutex<super::scene::SceneLog>>,
 }
 
 fn instruction_summary(instructions: &[RenderInstruction]) -> String {
@@ -317,9 +350,9 @@ fn instruction_summary(instructions: &[RenderInstruction]) -> String {
             RenderInstruction::LineStyle { pattern, width, color } => {
                 format!("LS({pattern:?},{width},{color})")
             }
-            RenderInstruction::AreaColor { color } => format!("AC({color})"),
+            RenderInstruction::AreaColor { color, .. } => format!("AC({color})"),
             RenderInstruction::AreaPattern { pattern } => format!("AP({pattern})"),
-            RenderInstruction::Symbol { name } => format!("SY({name})"),
+            RenderInstruction::Symbol { name, .. } => format!("SY({name})"),
             RenderInstruction::Text { attribute, .. } => format!("TX({attribute})"),
             RenderInstruction::LineComplex { name } => format!("LC({name})"),
             RenderInstruction::ConditionalSymbology { procedure } => format!("CS({procedure})"),
@@ -337,7 +370,82 @@ struct LoadedChartContext<'a> {
     info: &'a ChartInfo,
     ref_mx: f64,
     ref_my: f64,
-    coverage_polygons: Vec<Vec<[f64; 2]>>,
+    coverage_triangles: Arc<Vec<[[f64; 2]; 3]>>,
+}
+
+/// Coverage tessellations keyed by chart id, shared across tile builders.
+pub type CoverageCache = Mutex<HashMap<u64, Arc<Vec<[[f64; 2]; 3]>>>>;
+
+/// Parsed charts, one slot per chart id.
+///
+/// Two locks, deliberately. The outer one guards the map and is held only long
+/// enough to find the slot; the inner one guards *that chart's* load. So two
+/// tiles wanting the same chart queue behind each other, while tiles wanting
+/// different charts still parse in parallel.
+///
+/// A single `HashMap<u64, Arc<ChartData>>` cannot do this: checking it, then
+/// dropping the lock to parse, then inserting, is check-then-act, and eight
+/// rayon threads starting a screenful of tiles together all miss and all parse.
+/// One 3802-feature cell was being parsed six times per view — and because the
+/// decryptor is behind a single global mutex, those redundant reads serialised
+/// and blocked tiles that needed other charts.
+pub type ChartCache = Mutex<HashMap<u64, Arc<Mutex<Option<Arc<ChartData>>>>>>;
+
+impl TileBuilder<'_> {
+    /// Smallest triangle worth sending to the GPU, in square metres at this
+    /// tile's own scale.
+    ///
+    /// The SENC's tessellation is compiled at the cell's scale, so a chart
+    /// drawn well outside that scale carries a great many triangles smaller
+    /// than a pixel. Over Zealand at 1:700000 a third of every triangle in the
+    /// view fell under one pixel and together they painted 0.8% of it — a third
+    /// of the vertex budget for nothing anyone can see. Dropping them is the
+    /// zoom LOD: at the scale a cell was made for the test never fires, and the
+    /// further out you zoom the more it removes.
+    ///
+    /// Half a pixel, not a whole one: the gap a dropped sliver leaves shows the
+    /// colour beneath, and at half a pixel with 4x multisampling that is a few
+    /// per cent of one pixel's colour.
+    fn min_triangle_area_m2(&self) -> f32 {
+        const MIN_TRIANGLE_PX: f32 = 0.5;
+        let mpp = self.view_meters_per_pixel;
+        MIN_TRIANGLE_PX * mpp * mpp
+    }
+
+    fn below_min_triangle_area(&self, tri: &[[f32; 2]; 3]) -> bool {
+        let a = ((tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+            - (tri[2][0] - tri[0][0]) * (tri[1][1] - tri[0][1]))
+            .abs()
+            * 0.5;
+        a < self.min_triangle_area_m2()
+    }
+
+    fn below_min_triangle_area_f64(&self, tri: &[[f64; 2]; 3]) -> bool {
+        let a = ((tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+            - (tri[2][0] - tri[0][0]) * (tri[1][1] - tri[0][1]))
+            .abs()
+            * 0.5;
+        a < self.min_triangle_area_m2() as f64
+    }
+
+    /// The chart's coverage tessellation, computed once per chart.
+    fn coverage_for(
+        &self,
+        chart_id: u64,
+        chart: &ChartData,
+        ref_mx: f64,
+        ref_my: f64,
+    ) -> Arc<Vec<[[f64; 2]; 3]>> {
+        if let Some(hit) = self.coverage_cache.lock().unwrap().get(&chart_id) {
+            return Arc::clone(hit);
+        }
+        let tris = Arc::new(extract_coverage_triangles(chart, ref_mx, ref_my));
+        self.coverage_cache
+            .lock()
+            .unwrap()
+            .insert(chart_id, Arc::clone(&tris));
+        tris
+    }
 }
 
 fn chart_debug_name(info: &ChartInfo) -> String {
@@ -368,11 +476,13 @@ impl<'a> TileBuilder<'a> {
         catalog: &'a ChartCatalog,
         keys: &'a KeyStore,
         decryptor: &'a Mutex<CachedDecryptor>,
-        chart_cache: &'a Mutex<HashMap<u64, Arc<ChartData>>>,
+        chart_cache: &'a ChartCache,
+        coverage_cache: &'a CoverageCache,
     ) -> Self {
         Self {
             catalog,
             chart_cache,
+            coverage_cache,
             keys,
             decryptor,
             s52_engine: None,
@@ -382,6 +492,7 @@ impl<'a> TileBuilder<'a> {
             view_height_px: 0.0,
             view_center_x: 0.0,
             view_center_y: 0.0,
+            scene_log: None,
         }
     }
 
@@ -390,11 +501,13 @@ impl<'a> TileBuilder<'a> {
         catalog: &'a ChartCatalog,
         keys: &'a KeyStore,
         decryptor: &'a Mutex<CachedDecryptor>,
-        chart_cache: &'a Mutex<HashMap<u64, Arc<ChartData>>>,
+        chart_cache: &'a ChartCache,
+        coverage_cache: &'a CoverageCache,
     ) -> Self {
         Self {
             catalog,
             chart_cache,
+            coverage_cache,
             keys,
             decryptor,
             s52_engine: None,
@@ -404,10 +517,67 @@ impl<'a> TileBuilder<'a> {
             view_height_px: 0.0,
             view_center_x: 0.0,
             view_center_y: 0.0,
+            scene_log: None,
         }
     }
 
     /// Set the S-52 presentation engine for display category filtering
+    /// The cell scale SUPER_SCAMIN should use, or `None` when the rule is off.
+    fn super_scamin_scale(&self, info: &ChartInfo) -> Option<u32> {
+        self.s52_engine
+            .filter(|e| e.settings.use_super_scamin)
+            .map(|_| info.native_scale)
+    }
+
+    /// Note a feature the builder decided not to draw (`--dump-scene` only).
+    fn log_skip(
+        &self,
+        info: &ChartInfo,
+        feature_index: usize,
+        feature: &crate::senc::Feature,
+        reason: &'static str,
+    ) {
+        if let Some(log) = &self.scene_log {
+            // Same extent the draw path uses, including the degenerate-bbox
+            // reconstruction — a skip that cannot be located on screen is only
+            // half an answer.
+            let extent = feature.area_geometry.as_ref().map(|geom| {
+                if let Some(b) = (bbox_is_degenerate(geom.extent))
+                    .then(|| area_bounds_global(geom, info.ref_lat, info.ref_lon))
+                    .flatten()
+                {
+                    [b.min_x, b.min_y, b.max_x, b.max_y]
+                } else {
+                    let (min_x, min_y) =
+                        crate::tiles::latlon_to_mercator(geom.extent.min_y, geom.extent.min_x);
+                    let (max_x, max_y) =
+                        crate::tiles::latlon_to_mercator(geom.extent.max_y, geom.extent.max_x);
+                    [min_x, min_y, max_x, max_y]
+                }
+            });
+            log.lock().unwrap().record_skip(
+                &info.path.file_stem().unwrap_or_default().to_string_lossy(),
+                feature_index,
+                crate::senc::s57_code_to_acronym(feature.type_code),
+                reason,
+                extent,
+            );
+        }
+    }
+
+    /// Collect scene provenance while building (`navcore --dump-scene`).
+    pub fn with_scene_log(mut self) -> Self {
+        self.scene_log = Some(std::sync::Mutex::new(super::scene::SceneLog::new()));
+        self
+    }
+
+    /// Take the collected provenance, leaving the builder without a log.
+    pub fn take_scene_log(&mut self) -> Option<super::scene::SceneLog> {
+        self.scene_log
+            .take()
+            .map(|m| m.into_inner().unwrap_or_default())
+    }
+
     pub fn with_s52_engine(mut self, engine: &'a S52Engine) -> Self {
         self.s52_engine = Some(engine);
         self
@@ -467,10 +637,22 @@ impl<'a> TileBuilder<'a> {
     fn view_scale_denominator(&self) -> f64 {
         // Scale denominator N in 1:N.
         // 1 px corresponds to (1/ppmm) mm = (0.001/ppmm) meters on screen.
-        // So N = meters_per_pixel / (0.001/ppmm) = meters_per_pixel * ppmm * 1000.
+        // So N = ground_metres_per_pixel / (0.001/ppmm).
+        //
+        // The camera works in *Mercator* metres, which are stretched by
+        // 1/cos(latitude) — a factor of 1.77 at Danish latitudes. Feeding that
+        // straight in made every SCAMIN test think the view was 1.8x more
+        // zoomed out than it is, so detail vanished far too early: at Brøndby
+        // the harbour buildings (SCAMIN 11999) were dropped from a 1:8400 view
+        // that OpenCPN draws them in. A chart scale is a ground scale.
         let mpp = self.view_meters_per_pixel.max(1e-6) as f64;
         let ppmm = self.view_ppmm.max(1e-6) as f64;
-        mpp * ppmm * 1000.0
+        let (lat, _) = crate::tiles::mercator_to_latlon(
+            self.view_center_x as f64,
+            self.view_center_y as f64,
+        );
+        let ground_mpp = mpp * lat.to_radians().cos().max(0.01);
+        ground_mpp * ppmm * 1000.0
     }
 
     /// Build a tile packet (CPU work only, no GPU upload).
@@ -497,18 +679,16 @@ impl<'a> TileBuilder<'a> {
         let mut loaded_charts: Vec<LoadedChartContext<'_>> = Vec::new();
 
         for info in charts.into_iter().take(Self::MAX_CHARTS_PER_TILE) {
-            self.ensure_chart_loaded(info)?;
-            let chart = self.chart_cache.lock().unwrap().get(&info.id).cloned();
+            let chart = Some(self.load_chart(info)?);
             if let Some(chart) = chart {
                 let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
-                let coverage_polygons =
-                    extract_coverage_polygons(&chart, info, ref_mx, ref_my);
+                let coverage_triangles = self.coverage_for(info.id, &chart, ref_mx, ref_my);
                 loaded_charts.push(LoadedChartContext {
                     chart,
                     info,
                     ref_mx,
                     ref_my,
-                    coverage_polygons,
+                    coverage_triangles,
                 });
             }
         }
@@ -522,6 +702,23 @@ impl<'a> TileBuilder<'a> {
         )
         .ok();
 
+        if let Some(log) = &self.scene_log {
+            let mut log = log.lock().unwrap();
+            for ctx in &loaded_charts {
+                log.record_coverage(
+                    &ctx.info.path.file_stem().unwrap_or_default().to_string_lossy(),
+                    ctx.info.native_scale,
+                    [
+                        ctx.info.extent_mercator.min_x,
+                        ctx.info.extent_mercator.min_y,
+                        ctx.info.extent_mercator.max_x,
+                        ctx.info.extent_mercator.max_y,
+                    ],
+                    ctx.coverage_triangles.iter().map(|t| t.to_vec()).collect(),
+                );
+            }
+        }
+
         for (chart_index, ctx) in loaded_charts.iter().enumerate() {
             let detailed_coverages = collect_more_detailed_coverages(&loaded_charts, chart_index);
             writeln!(
@@ -529,7 +726,7 @@ impl<'a> TileBuilder<'a> {
                 "- chart {} (1:{}): {} coverage polygons, {} more-detailed masks",
                 chart_debug_name(ctx.info),
                 ctx.info.native_scale,
-                ctx.coverage_polygons.len(),
+                ctx.coverage_triangles.len(),
                 detailed_coverages.len()
             )
             .ok();
@@ -548,7 +745,7 @@ impl<'a> TileBuilder<'a> {
                 );
                 let resolved = engine.and_then(|e| e.resolve_feature(feature, GeometryType::Area));
                 let is_masked = !feature.is_coverage()
-                    && point_in_any_polygon([cx, cy], &detailed_coverages)
+                    && point_in_any_triangle([cx, cy], &detailed_coverages)
                     && relation_all_vertices_covered(
                         geom,
                         ctx.info.ref_lat,
@@ -603,7 +800,7 @@ impl<'a> TileBuilder<'a> {
                     (bbox.min_x + bbox.max_x) / 2.0,
                 );
                 let resolved = engine.and_then(|e| e.resolve_feature(feature, GeometryType::Line));
-                if point_in_any_polygon([cx, cy], &detailed_coverages) && resolved.is_some() {
+                if point_in_any_triangle([cx, cy], &detailed_coverages) && resolved.is_some() {
                     *masked_counts
                         .entry(format!("LINE {}", s57_code_to_acronym(feature.type_code)))
                         .or_insert(0) += 1;
@@ -666,7 +863,7 @@ impl<'a> TileBuilder<'a> {
                 let Some(point) = &feature.point_geometry else { continue };
                 let (mx, my) = crate::tiles::latlon_to_mercator(point.x, point.y);
                 let resolved = engine.and_then(|e| e.resolve_feature(feature, GeometryType::Point));
-                if point_in_any_polygon([mx, my], &detailed_coverages) && resolved.is_some() {
+                if point_in_any_triangle([mx, my], &detailed_coverages) && resolved.is_some() {
                     *masked_counts
                         .entry(format!("POINT {}", s57_code_to_acronym(feature.type_code)))
                         .or_insert(0) += 1;
@@ -694,7 +891,7 @@ impl<'a> TileBuilder<'a> {
                 let Some(mp) = &feature.multipoint_geometry else { continue };
                 for point in &mp.points {
                     let merc = [ctx.ref_mx + point[0] as f64, ctx.ref_my + point[1] as f64];
-                    if point_in_any_polygon(merc, &detailed_coverages) {
+                    if point_in_any_triangle(merc, &detailed_coverages) {
                         *masked_counts.entry("SOUNDG".to_string()).or_insert(0) += 1;
                     }
                 }
@@ -791,31 +988,59 @@ impl<'a> TileBuilder<'a> {
         let mut line_stats_total = LineBuildStats::default();
 
         let mut loaded_charts: Vec<LoadedChartContext<'_>> = Vec::new();
+        let load_start = profile.then(Instant::now);
 
         // Process charts in scale order (small scale first = background)
         // Skip charts that fail to load - some may have parsing issues
         for info in charts.into_iter().take(Self::MAX_CHARTS_PER_TILE) {
-            if let Err(e) = self.ensure_chart_loaded(info) {
-                // Log but continue - don't fail entire tile for one bad chart
-                eprintln!("Warning: Skipping chart {}: {}", info.name, e);
-                continue;
-            }
-
-            // Clone Arc to release lock quickly — chart data is shared, not copied
-            let chart = self.chart_cache.lock().unwrap().get(&info.id).cloned();
+            let chart = match self.load_chart(info) {
+                Ok(chart) => Some(chart),
+                Err(e) => {
+                    // Log but continue - don't fail entire tile for one bad chart
+                    eprintln!("Warning: Skipping chart {}: {}", info.name, e);
+                    continue;
+                }
+            };
             if let Some(chart) = chart {
                 let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
-                let coverage_polygons =
-                    extract_coverage_polygons(&chart, info, ref_mx, ref_my);
+                let coverage_triangles = self.coverage_for(info.id, &chart, ref_mx, ref_my);
                 loaded_charts.push(LoadedChartContext {
                     chart,
                     info,
                     ref_mx,
                     ref_my,
-                    coverage_polygons,
+                    coverage_triangles,
                 });
             }
         }
+
+        if let Some(log) = &self.scene_log {
+            let mut log = log.lock().unwrap();
+            for ctx in &loaded_charts {
+                log.record_coverage(
+                    &ctx.info.path.file_stem().unwrap_or_default().to_string_lossy(),
+                    ctx.info.native_scale,
+                    [
+                        ctx.info.extent_mercator.min_x,
+                        ctx.info.extent_mercator.min_y,
+                        ctx.info.extent_mercator.max_x,
+                        ctx.info.extent_mercator.max_y,
+                    ],
+                    ctx.coverage_triangles.iter().map(|t| t.to_vec()).collect(),
+                );
+            }
+        }
+
+        let load_ms = load_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let feat_start = profile.then(Instant::now);
+
+        // The finest scale present in this tile. Everything coarser is drawn
+        // first so the finest cell wins by overdraw; nothing is masked away.
+        let finest_scale = loaded_charts
+            .iter()
+            .map(|c| c.info.native_scale)
+            .min()
+            .unwrap_or(0);
 
         for (chart_index, ctx) in loaded_charts.iter().enumerate() {
             let detailed_coverages = collect_more_detailed_coverages(&loaded_charts, chart_index);
@@ -826,8 +1051,8 @@ impl<'a> TileBuilder<'a> {
                 continue;
             }
 
-            // A chart is "background" when a more-detailed chart overlaps it
-            let is_background = !detailed_coverages.is_empty();
+            // A chart is "background" when a finer-scale chart shares the tile.
+            let is_background = ctx.info.native_scale > finest_scale;
 
             // Process area features with spatial prefilter
             let area_stats = self.build_areas(
@@ -841,6 +1066,7 @@ impl<'a> TileBuilder<'a> {
                     &mut all_area_ranges,
                     &mut lc_patterns,
                     &detailed_coverages,
+                    &ctx.coverage_triangles,
                     is_background,
                 );
                 if log::log_enabled!(log::Level::Debug) {
@@ -938,6 +1164,9 @@ impl<'a> TileBuilder<'a> {
                     );
                 }
         }
+
+        let feat_ms = feat_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let fin_start = profile.then(Instant::now);
 
         // Finalize merged line batches (across all charts)
         if include_lines {
@@ -1067,7 +1296,7 @@ impl<'a> TileBuilder<'a> {
 
         // Sort ALL area vertices globally by priority and split into fg/bg buffers.
         // This ensures correct S-52 draw order across multi-chart tiles.
-        // Background geometry is drawn with stencil test; foreground without.
+        // Background geometry is drawn first; foreground over it.
         if !all_area_ranges.is_empty() {
             all_area_ranges.sort_by_key(|r| r.0);
 
@@ -1130,6 +1359,28 @@ impl<'a> TileBuilder<'a> {
                 bg_prio += 1;
             }
 
+            // The scene log records vertices as the feature loop emits them;
+            // this records the buffer *after* the priority reorder, which is
+            // what actually reaches the GPU. If a bbox here does not cover the
+            // ground the features did, the reorder mis-sliced.
+            if let Some(log) = &self.scene_log {
+                let mut bboxes = Vec::new();
+                for p in 0..10usize {
+                    let (s0, e0) = (fg_area_offsets[p] as usize, fg_area_offsets[p + 1] as usize);
+                    if e0 > s0 {
+                        let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
+                        for v in &packet.area_vertices[s0..e0] {
+                            b[0] = b[0].min(v.position[0] as f64);
+                            b[1] = b[1].min(v.position[1] as f64);
+                            b[2] = b[2].max(v.position[0] as f64);
+                            b[3] = b[3].max(v.position[1] as f64);
+                        }
+                        bboxes.push((p as u8, (e0 - s0) as u32, b));
+                    }
+                }
+                log.lock().unwrap().record_packet(bboxes);
+            }
+
             packet.area_priority_offsets = fg_area_offsets;
             packet.pattern_priority_offsets = fg_pattern_offsets;
             packet.bg_area_priority_offsets = bg_area_offsets;
@@ -1167,26 +1418,16 @@ impl<'a> TileBuilder<'a> {
         packet.label_candidates = label_candidates;
         // Text layout and decluttering deferred to global pass
 
-        // Triangulate coverage polygons from more-detailed charts for GPU stencil masking.
-        // All charts except the first (least-detailed) contribute their coverage polygons.
-        if loaded_charts.len() > 1 {
-            for ctx in &loaded_charts[1..] {
-                for polygon in &ctx.coverage_polygons {
-                    // Fan triangulation from first vertex — works for convex/near-convex coverage polygons
-                    if polygon.len() >= 3 {
-                        let v0 = [polygon[0][0] as f32, polygon[0][1] as f32];
-                        for i in 1..polygon.len() - 1 {
-                            let v1 = [polygon[i][0] as f32, polygon[i][1] as f32];
-                            let v2 = [polygon[i + 1][0] as f32, polygon[i + 1][1] as f32];
-                            packet.coverage_vertices.push(v0);
-                            packet.coverage_vertices.push(v1);
-                            packet.coverage_vertices.push(v2);
-                        }
-                    }
-                }
-            }
+        let fin_ms = fin_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if profile {
+            log::info!(
+                "profile.tile_phases: tile={:?} load={}us features={}us finalize={}us verts={} lines={} syms={}",
+                tile_id, load_ms, feat_ms, fin_ms,
+                packet.area_vertices.len() + packet.bg_area_vertices.len(),
+                packet.total_line_vertices(),
+                packet.symbol_instances.len(),
+            );
         }
-
         packet.compute_byte_size();
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
@@ -1215,12 +1456,18 @@ impl<'a> TileBuilder<'a> {
     }
 
     /// Ensure chart is loaded in cache
-    fn ensure_chart_loaded(&self, info: &ChartInfo) -> Result<(), BuildError> {
-        {
-            let cache = self.chart_cache.lock().unwrap();
-            if cache.contains_key(&info.id) {
-                return Ok(());
-            }
+    /// The parsed chart, loading it if this is the first request.
+    ///
+    /// Concurrent callers for the same chart wait for the first one rather than
+    /// each parsing their own copy — see [`ChartCache`].
+    pub(crate) fn load_chart(&self, info: &ChartInfo) -> Result<Arc<ChartData>, BuildError> {
+        let slot = {
+            let mut cache = self.chart_cache.lock().unwrap();
+            Arc::clone(cache.entry(info.id).or_default())
+        };
+        let mut slot = slot.lock().unwrap();
+        if let Some(chart) = slot.as_ref() {
+            return Ok(Arc::clone(chart));
         }
 
         // Get chart name for key lookup
@@ -1244,13 +1491,9 @@ impl<'a> TileBuilder<'a> {
             .decrypt_chart(&info.path, &install_key)
             .map_err(BuildError::Decrypt)?;
 
-        let chart = ChartData::parse(senc_bytes).map_err(BuildError::Parse)?;
-
-        self.chart_cache
-            .lock()
-            .unwrap()
-            .insert(info.id, Arc::new(chart));
-        Ok(())
+        let chart = Arc::new(ChartData::parse(senc_bytes).map_err(BuildError::Parse)?);
+        *slot = Some(Arc::clone(&chart));
+        Ok(chart)
     }
 
     /// Build area triangles with spatial prefilter and clipping
@@ -1275,9 +1518,16 @@ impl<'a> TileBuilder<'a> {
             Vec<Vec<[f32; 2]>>,
             bool, // is_background
         )>,
-        detailed_coverages: &[Vec<[f64; 2]>],
+        detailed_coverages: &[[[f64; 2]; 3]],
+        // The chart's own M_COVR rings. Reported by `--dump-scene` so a chart
+        // painting outside its declared coverage is visible; not used to gate
+        // drawing, because doing that correctly needs geometry clipped to the
+        // ring, and both cheaper tests (feature centroid, extent overlap)
+        // measured *worse* against the reference than drawing everything.
+        coverage_triangles: &[[[f64; 2]; 3]],
         is_background: bool,
     ) -> AreaBuildStats {
+        let _ = coverage_triangles;
         let mut stats = AreaBuildStats::default();
         let mut logged_first_bbox = false;
         let before_verts = packet.area_vertices.len();
@@ -1289,24 +1539,57 @@ impl<'a> TileBuilder<'a> {
         // PrioritizeLineFeature shared-edge rule. Edge indices are per-chart.
         let coast_edges = collect_coast_edges(chart);
 
-        for feature in chart.areas() {
+        for (feature_index, feature) in chart
+            .features
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.feature_type == crate::senc::FeatureType::Area)
+        {
             stats.total_features += 1;
+
+            // Cheapest test first. Every other test in this loop — the display
+            // category, the display priority, SCAMIN, the full S-52 resolve —
+            // costs table lookups and hashing, and a tile covers a small
+            // fraction of a chart, so the overwhelming majority of features are
+            // not in it. Doing the bbox test last meant a 100-feature tile paid
+            // S-52 resolution on every feature of every chart overlapping it:
+            // 30 ms per tile to emit a few hundred vertices.
+            //
+            // A degenerate bbox (some cells store one) is not trustworthy here,
+            // so those fall through to the slower path below that measures the
+            // real bounds from the geometry.
+            if let Some(ref geom) = feature.area_geometry {
+                if !bbox_is_degenerate(geom.extent)
+                    && geom.extent.tile_relation(bounds) == BBoxTileRelation::Outside
+                {
+                    self.log_skip(info, feature_index, feature, "outside-tile");
+                    continue;
+                }
+            }
 
             // SCAMIN/SCAMAX filtering: bypass SCAMIN for DISPLAYBASE features
             // (coastline, depth areas, safety contours must always be visible)
+            // "SCAMIN must not apply to GROUP1 objects, Meta Objects or
+            // DisplayCategoryBase objects" — s52plib.cpp, guarding against ENCs
+            // that encode a spurious SCAMIN on a depth area or coastline.
             let bypass_scamin = self
                 .s52_engine
-                .and_then(|e| e.get_display_category(feature.type_code, GeometryType::Area))
-                .map(|cat| cat == DisplayCategory::Displaybase)
+                .map(|e| {
+                    e.display_category_for(feature, GeometryType::Area)
+                        == Some(DisplayCategory::Displaybase)
+                        || e.get_display_priority(feature, GeometryType::Area)
+                            == crate::s52::DisplayPriority::Group1.as_u8()
+                })
                 .unwrap_or(false);
             let scamin_scale = should_render_at_scale_ex(
                 feature,
                 self.view_scale_denominator(),
                 bypass_scamin,
                 false,
-                Some(info.native_scale),
+                self.super_scamin_scale(info),
             );
             if scamin_scale == 0.0 {
+                self.log_skip(info, feature_index, feature, "scamin");
                 continue;
             }
 
@@ -1317,13 +1600,16 @@ impl<'a> TileBuilder<'a> {
             };
             let resolved = match engine.resolve_feature(feature, GeometryType::Area) {
                 Some(r) => r,
-                None => continue, // Filtered by display category
+                None => {
+                    self.log_skip(info, feature_index, feature, "no-lup-or-display-category");
+                    continue;
+                }
             };
 
             let has_nodata_fill = resolved.instructions.iter().any(|instr| {
                 matches!(
                     instr,
-                    RenderInstruction::AreaColor { color } if color == "NODTA"
+                    RenderInstruction::AreaColor { color, .. } if color == "NODTA"
                 )
             });
             let has_prtsur01 = resolved.instructions.iter().any(|instr| {
@@ -1334,6 +1620,7 @@ impl<'a> TileBuilder<'a> {
             });
             if let Some(ref geom) = feature.area_geometry {
                 stats.with_geometry += 1;
+
 
                 let actual_bounds = if bbox_is_degenerate(geom.extent) {
                     area_bounds_global(geom, info.ref_lat, info.ref_lon)
@@ -1361,11 +1648,11 @@ impl<'a> TileBuilder<'a> {
                 // superseded.
                 if (has_nodata_fill || has_prtsur01)
                     && !detailed_coverages.is_empty()
-                    && point_in_any_polygon([cx, cy], &detailed_coverages)
+                    && point_in_any_triangle([cx, cy], &detailed_coverages)
                 {
                     continue;
                 }
-                // CPU coverage masking removed — GPU stencil now handles this.
+                // Coverage does not mask: the quilt is resolved by draw order.
                 // Foreground areas at the same priority naturally overwrite background
                 // (they appear later in the vertex buffer, and depth test is LessEqual).
 
@@ -1405,6 +1692,7 @@ impl<'a> TileBuilder<'a> {
                     geom.extent.tile_relation(bounds)
                 };
                 if relation == BBoxTileRelation::Outside {
+                    self.log_skip(info, feature_index, feature, "outside-tile");
                     continue;
                 }
                 stats.bbox_pass += 1;
@@ -1443,27 +1731,40 @@ impl<'a> TileBuilder<'a> {
                     }
                 });
 
-                // Skip fill for unknown areas (no color index),
-                // but still process boundary lines and text labels below.
-                if let Some(color_index) = color_index_opt {
+                // An area with a pattern but no AC() — M_QUAL's survey-quality
+                // overlay is `AP(DQUALA11);LS(DASH,2,CHGRD)` — still has a fill
+                // to draw: the pattern. Requiring a colour dropped the pattern
+                // with it. `color_index` of None means "no solid fill", not
+                // "nothing to draw"; only areas with neither are skipped.
+                if let Some(color_index) = color_index_opt.or(pattern_id.map(|_| 0)) {
+                    let solid_fill = color_index_opt.is_some();
                     if relation == BBoxTileRelation::FullyInside {
                         // FAST PATH: feature bbox fully inside tile — emit vertices directly
                         // No clipping, no f64 conversion, no heap allocations
-                        // (Coverage masking now handled by GPU stencil, not CPU filtering)
+                        // (the quilt is resolved by draw order, not by masking)
                         stats.fast_path_features += 1;
-                        geom.for_each_vertex_direct(ref_mx as f32, ref_my as f32, |pos| {
-                            packet.area_vertices.push(AreaVertex {
-                                position: pos,
-                                color_index: color_index as u32,
-                                disp_prio: feature_priority as u32,
-                            });
-                            if let Some(pid) = pattern_id {
-                                packet.pattern_vertices.push(crate::render::PatternVertex {
-                                    position: pos,
-                                    pattern_id: pid,
-                                    offset: [0.0, 0.0],
-                                    disp_prio: feature_priority as u32,
-                                });
+                        geom.for_each_triangle_direct(ref_mx as f32, ref_my as f32, |tri| {
+                            if self.below_min_triangle_area(&tri) {
+                                stats.subpixel_triangles += 1;
+                                return;
+                            }
+                            for pos in tri {
+                                if solid_fill {
+                                    packet.area_vertices.push(AreaVertex {
+                                        position: pos,
+                                        color_index: color_index as u32,
+                                        disp_prio: feature_priority as u32,
+                                        shade: 0.0,
+                                    });
+                                }
+                                if let Some(pid) = pattern_id {
+                                    packet.pattern_vertices.push(crate::render::PatternVertex {
+                                        position: pos,
+                                        pattern_id: pid,
+                                        offset: [0.0, 0.0],
+                                        disp_prio: feature_priority as u32,
+                                    });
+                                }
                             }
                         });
                     } else {
@@ -1472,7 +1773,12 @@ impl<'a> TileBuilder<'a> {
                         geom.for_each_triangle_global(info.ref_lat, info.ref_lon, |tri| {
                             stats.triangles_seen += 1;
 
-                            // CPU triangle masking removed — GPU stencil handles coverage masking.
+                            if self.below_min_triangle_area_f64(&tri) {
+                                stats.subpixel_triangles += 1;
+                                return;
+                            }
+
+                            // No coverage masking: draw order resolves the quilt.
 
                             // Per-triangle outcode fast-accept/reject before full SH clipping
                             let oc0 = outcode(tri[0], bounds);
@@ -1490,11 +1796,14 @@ impl<'a> TileBuilder<'a> {
                                 stats.trivial_accept_triangles += 1;
                                 for &vertex in &tri {
                                     let local = self.global_to_vertex(vertex, bounds);
-                                    packet.area_vertices.push(AreaVertex {
-                                        position: local,
-                                        color_index: color_index as u32,
-                                        disp_prio: feature_priority as u32,
-                                    });
+                                    if solid_fill {
+                                        packet.area_vertices.push(AreaVertex {
+                                            position: local,
+                                            color_index: color_index as u32,
+                                            disp_prio: feature_priority as u32,
+                                            shade: 0.0,
+                                        });
+                                    }
                                     if let Some(pid) = pattern_id {
                                         packet.pattern_vertices.push(
                                             crate::render::PatternVertex {
@@ -1516,11 +1825,14 @@ impl<'a> TileBuilder<'a> {
                                 let triangulated = triangulate_fan(&clipped);
                                 for vertex in &triangulated {
                                     let local = self.global_to_vertex(*vertex, bounds);
-                                    packet.area_vertices.push(AreaVertex {
-                                        position: local,
-                                        color_index: color_index as u32,
-                                        disp_prio: feature_priority as u32,
-                                    });
+                                    if solid_fill {
+                                        packet.area_vertices.push(AreaVertex {
+                                            position: local,
+                                            color_index: color_index as u32,
+                                            disp_prio: feature_priority as u32,
+                                            shade: 0.0,
+                                        });
+                                    }
                                     if let Some(pid) = pattern_id {
                                         packet.pattern_vertices.push(
                                             crate::render::PatternVertex {
@@ -1536,7 +1848,45 @@ impl<'a> TileBuilder<'a> {
                         });
                     }
 
-                    if packet.area_vertices.len() == vert_start {
+                    // Depth relief: shade a groove along this depth area's own
+                    // boundary. Emitted after the fill so it overwrites it.
+                    //
+                    // Skipped for the same features whose boundary strokes are
+                    // suppressed below: an incompletely-surveyed area's rings
+                    // run right across the cell, including under the land, and
+                    // a groove there is a line no chart contains.
+                    if solid_fill
+                        && !has_nodata_fill
+                        && !has_prtsur01
+                        && self.depth_relief_enabled()
+                        && is_depth_area(feature)
+                    {
+                        self.add_depth_relief_band(
+                            chart,
+                            geom,
+                            &coast_edges,
+                            bounds,
+                            packet,
+                            ref_mx,
+                            ref_my,
+                            color_index as u32,
+                            feature_priority,
+                        );
+                    }
+
+                    let senc_end = packet.area_vertices.len();
+                    // Re-tessellate only when the SENC carries no tessellation
+                    // at all. "The stored triangles emitted nothing for this
+                    // tile" is the *normal* case for a feature whose bounding
+                    // box overlaps the tile but whose polygon does not, and
+                    // re-running earcut over the whole ring set then fills the
+                    // concavities and holes the real tessellation excludes: an
+                    // OBSTRN at Mosede painted 250x95px of harbour DEPVS that
+                    // the reference leaves as the surrounding DEPMS.
+                    if solid_fill
+                        && packet.area_vertices.len() == vert_start
+                        && geom.triangles.is_empty()
+                    {
                         self.add_area_ring_fill_fallback(
                             chart,
                             geom,
@@ -1550,6 +1900,57 @@ impl<'a> TileBuilder<'a> {
                             relation,
                         );
                     }
+
+                    if let Some(log) = &self.scene_log {
+                        let source = if senc_end > vert_start {
+                            if stats.triangles_clipped > 0 {
+                                super::scene::AreaSource::SencTrianglesClipped
+                            } else {
+                                super::scene::AreaSource::SencTriangles
+                            }
+                        } else {
+                            super::scene::AreaSource::RingFallback
+                        };
+                        let (min_x, min_y) = super::latlon_to_mercator(
+                            geom.extent.min_y,
+                            geom.extent.min_x,
+                        );
+                        let (max_x, max_y) = super::latlon_to_mercator(
+                            geom.extent.max_y,
+                            geom.extent.max_x,
+                        );
+                        // Vertices are already global Mercator (global_to_vertex
+                        // is the identity), pushed as a flat triangle list.
+                        let tris: Vec<[[f64; 2]; 3]> = packet.area_vertices
+                            [vert_start..packet.area_vertices.len()]
+                            .chunks_exact(3)
+                            .map(|t| {
+                                [
+                                    [t[0].position[0] as f64, t[0].position[1] as f64],
+                                    [t[1].position[0] as f64, t[1].position[1] as f64],
+                                    [t[2].position[0] as f64, t[2].position[1] as f64],
+                                ]
+                            })
+                            .collect();
+                        let mut log = log.lock().unwrap();
+                        log.begin_feature(
+                            &info.path.file_stem().unwrap_or_default().to_string_lossy(),
+                            feature_index,
+                            crate::senc::s57_code_to_acronym(feature.type_code),
+                            [min_x, min_y, max_x, max_y],
+                        );
+                        log.record_area(
+                            source,
+                            feature_priority,
+                            color_index as u32,
+                            info.native_scale,
+                            is_background,
+                            tris,
+                        );
+                        log.end_feature();
+                    }
+                } else if self.scene_log.is_some() {
+                    self.log_skip(info, feature_index, feature, "no-area-colour");
                 } // end color_index gate
 
                 if has_prtsur01 {
@@ -1679,7 +2080,14 @@ impl<'a> TileBuilder<'a> {
                             .iter()
                             .map(|p| [ref_mx + p[0] as f64, ref_my + p[1] as f64])
                             .collect();
-                        close_ring_if_needed(&mut global);
+                        // Close only a genuine ring. `resolve_rings` breaks a
+                        // boundary into open paths wherever an edge is dropped
+                        // (shared with the coast) or the node chain is
+                        // discontinuous, and joining those ends draws a segment
+                        // no chart contains — a restricted-area corridor
+                        // reaching the shore came out as a straight magenta
+                        // chord across several kilometres of land.
+                        close_open_ring_if_rounding_gap(&mut global);
                         let clipped = clip_polyline(&global, bounds);
                         for segment in clipped {
                             if segment.len() < 2 {
@@ -1689,6 +2097,24 @@ impl<'a> TileBuilder<'a> {
                                 .iter()
                                 .map(|p| self.global_to_vertex(*p, bounds))
                                 .collect();
+                            if let Some(log) = &self.scene_log {
+                                if let Some((_, style)) = line_styles.first() {
+                                    log.lock().unwrap().record_line(
+                                        &info
+                                            .path
+                                            .file_stem()
+                                            .unwrap_or_default()
+                                            .to_string_lossy(),
+                                        feature_index,
+                                        crate::senc::s57_code_to_acronym(feature.type_code),
+                                        super::scene::LineSource::AreaBoundary,
+                                        boundary_priority,
+                                        is_background,
+                                        style_label(style),
+                                        vec![segment.clone()],
+                                    );
+                                }
+                            }
                             for (pass_idx, style) in &line_styles {
                                 let key = LineBatchKey::new_with_priority(
                                     boundary_priority,
@@ -1750,6 +2176,7 @@ impl<'a> TileBuilder<'a> {
                         color: color_token,
                         weight,
                         bsize,
+                        space,
                         dis,
                         ..
                     } = instr
@@ -1776,7 +2203,9 @@ impl<'a> TileBuilder<'a> {
 	                                    text,
 	                                    color,
 	                                    color_index,
-	                                    scale: s52_text_scale(*bsize, *weight),
+	                                    scale: s52_text_scale(*bsize, *weight, self.view_ppmm),
+	                                    bold: *weight >= 6,
+	                                    space: *space,
                                     hjust: HJust::from(*hjust),
                                     vjust: VJust::from(*vjust),
                                     xoffs: *xoffs as i32,
@@ -1862,6 +2291,99 @@ impl<'a> TileBuilder<'a> {
             vertices,
             indices,
         });
+    }
+
+    fn depth_relief_enabled(&self) -> bool {
+        self.s52_engine
+            .map(|e| e.settings.depth_relief)
+            .unwrap_or(false)
+    }
+
+    /// Shade a soft groove along a depth area's boundary.
+    ///
+    /// The band straddles the edge — darkest on the line, fading to nothing at
+    /// `RELIEF_WIDTH_PX` either side — which reads as the step between one
+    /// depth band and the next. Depth areas are nested, each boundary being a
+    /// surveyed contour, so shading every one gives the terraced look without
+    /// inventing anything about the seabed between them.
+    ///
+    /// Straddling rather than shading only the inside is deliberate: it needs
+    /// no notion of which side is "in". `resolve_rings` returns open paths
+    /// wherever the node chain breaks or an edge is shared, and an inward-only
+    /// band silently skipped every one of those — which in practice was most of
+    /// the large depth areas, leaving the effect visible only in harbours.
+    #[allow(clippy::too_many_arguments)]
+    fn add_depth_relief_band(
+        &self,
+        chart: &ChartData,
+        geom: &crate::senc::AreaGeometry,
+        coast_edges: &HashSet<u32>,
+        bounds: &TileBounds,
+        packet: &mut TilePacket,
+        ref_mx: f64,
+        ref_my: f64,
+        color_index: u32,
+        priority: u8,
+    ) {
+        /// Half-width of the groove, in nominal pixels.
+        const RELIEF_HALF_WIDTH_PX: f64 = 5.0;
+        /// How dark the centre line is. Enough to read as a step, not enough to
+        /// be mistaken for a different depth shade.
+        const RELIEF_SHADE: f32 = 0.22;
+
+        let half = RELIEF_HALF_WIDTH_PX * self.view_meters_per_pixel as f64;
+        if half <= 0.0 {
+            return;
+        }
+
+        // Edges shared with the coast are dropped: the groove is meant to mark
+        // the step from one depth band to the next, and the shoreline already
+        // carries its own coastline stroke. It also keeps the band off the
+        // land, where a depth area's ring can run for kilometres beneath a
+        // neighbouring chart's LNDARE.
+        for ring in geom.resolve_rings_excluding(&chart.edge_table, coast_edges) {
+            let pts: Vec<[f64; 2]> = ring
+                .iter()
+                .map(|p| [ref_mx + p[0] as f64, ref_my + p[1] as f64])
+                .collect();
+            for w in pts.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let len = (dx * dx + dy * dy).sqrt();
+                if len < 1e-9 {
+                    continue;
+                }
+                let (nx, ny) = (-dy / len * half, dx / len * half);
+                let quad = [
+                    [a[0] + nx, a[1] + ny],
+                    [b[0] + nx, b[1] + ny],
+                    [b[0] - nx, b[1] - ny],
+                    [a[0] - nx, a[1] - ny],
+                ];
+                if quad.iter().all(|p| p[0] > bounds.max_x)
+                    || quad.iter().all(|p| p[0] < bounds.min_x)
+                    || quad.iter().all(|p| p[1] > bounds.max_y)
+                    || quad.iter().all(|p| p[1] < bounds.min_y)
+                {
+                    continue;
+                }
+                let v = |p: [f64; 2], shade: f32| AreaVertex {
+                    position: self.global_to_vertex(p, bounds),
+                    color_index,
+                    disp_prio: priority as u32,
+                    shade,
+                };
+                // Two triangles per side, meeting on the boundary itself.
+                for (outer0, outer1) in [(quad[0], quad[1]), (quad[3], quad[2])] {
+                    packet.area_vertices.push(v(a, RELIEF_SHADE));
+                    packet.area_vertices.push(v(b, RELIEF_SHADE));
+                    packet.area_vertices.push(v(outer1, 0.0));
+                    packet.area_vertices.push(v(a, RELIEF_SHADE));
+                    packet.area_vertices.push(v(outer1, 0.0));
+                    packet.area_vertices.push(v(outer0, 0.0));
+                }
+            }
+        }
     }
 
     fn add_area_ring_fill_fallback(
@@ -1971,37 +2493,61 @@ impl<'a> TileBuilder<'a> {
             Vec<Vec<[f32; 2]>>,
             bool, // is_background
         )>,
-        _detailed_coverages: &[Vec<[f64; 2]>],
+        _detailed_coverages: &[[[f64; 2]; 3]],
         is_background: bool,
         label_candidates: &mut Vec<TextParams>,
     ) -> LineBuildStats {
         let mut stats = LineBuildStats::default();
 
-        for feature in chart.lines() {
+        // Enumerated over all features, not over `chart.lines()`, so the index
+        // matches the `chart#index` ids `--dump-ir` emits and a finding in one
+        // tool can be looked up in the other.
+        for (feature_index, feature) in chart
+            .features
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.feature_type == crate::senc::FeatureType::Line)
+        {
             stats.total_features += 1;
+
+            // Cheapest test first — see the note in `build_areas`.
+            if let Some(ref geom) = feature.line_geometry {
+                if !bbox_is_degenerate(geom.extent)
+                    && geom.extent.tile_relation(bounds) == BBoxTileRelation::Outside
+                {
+                    continue;
+                }
+            }
 
             // SCAMIN/SCAMAX filtering: bypass SCAMIN for DISPLAYBASE features
             let bypass_scamin = self
                 .s52_engine
-                .and_then(|e| e.get_display_category(feature.type_code, GeometryType::Line))
-                .map(|cat| cat == DisplayCategory::Displaybase)
+                .map(|e| {
+                    e.get_display_category(feature.type_code, GeometryType::Line)
+                        == Some(DisplayCategory::Displaybase)
+                        // DEPCNT02 clears the safety contour's SCAMIN outright
+                        // (`Scamin = 1e8+1`). It is the one line that must be on
+                        // the chart at every zoom.
+                        || e.is_promoted_safety_contour(feature)
+                })
                 .unwrap_or(false);
             let scamin_scale = should_render_at_scale_ex(
                 feature,
                 self.view_scale_denominator(),
                 bypass_scamin,
                 false,
-                Some(info.native_scale),
+                self.super_scamin_scale(info),
             );
             if scamin_scale == 0.0 {
+
                 continue;
             }
 
             if let Some(ref geom) = feature.line_geometry {
                 stats.with_geometry += 1;
 
-                // CPU line centroid masking removed — GPU stencil now handles this
-                // at pixel granularity via bg/fg buffer split + stencil test.
+                // No coverage masking: the bg/fg split puts coarser charts
+                // under finer ones and draw order settles it.
 
                 let acronym = s57_code_to_acronym(feature.type_code);
 
@@ -2130,6 +2676,7 @@ impl<'a> TileBuilder<'a> {
                                 color: color_token,
                                 weight,
                                 bsize,
+                                space,
                                 dis,
                                 ..
                             } = instr
@@ -2160,7 +2707,9 @@ impl<'a> TileBuilder<'a> {
 	                                        text: text.clone(),
 	                                        color,
 	                                        color_index,
-	                                        scale: s52_text_scale(*bsize, *weight),
+	                                        scale: s52_text_scale(*bsize, *weight, self.view_ppmm),
+	                                        bold: *weight >= 6,
+	                                        space: *space,
                                         hjust: HJust::from(*hjust),
                                         vjust: VJust::from(*vjust),
                                         xoffs: *xoffs as i32,
@@ -2233,7 +2782,7 @@ impl<'a> TileBuilder<'a> {
                     let clipped_segments = clip_polyline(&polyline, bounds);
 
                     for segment in clipped_segments {
-                        // CPU polyline coverage masking removed — GPU stencil handles this.
+                        // No coverage masking: draw order resolves the quilt.
 
                         // Douglas-Peucker simplification: drop sub-pixel detail
                         let segment = super::clip::simplify_polyline(&segment, simplify_eps);
@@ -2241,6 +2790,21 @@ impl<'a> TileBuilder<'a> {
                             continue;
                         }
                         stats.segments_out += segment.len() - 1;
+
+                        if let Some(log) = &self.scene_log {
+                            if let Some((_, style, _)) = style_ops.first() {
+                                log.lock().unwrap().record_line(
+                                    &info.path.file_stem().unwrap_or_default().to_string_lossy(),
+                                    feature_index,
+                                    acronym,
+                                    super::scene::LineSource::LineFeature,
+                                    disp_prio,
+                                    is_background,
+                                    style_label(style),
+                                    vec![segment.clone()],
+                                );
+                            }
+                        }
 
                         let mut pts: Vec<[f32; 2]> = Vec::with_capacity(segment.len());
                         for p in segment {
@@ -2333,7 +2897,7 @@ impl<'a> TileBuilder<'a> {
         packet: &mut TilePacket,
         all_symbol_priorities: &mut Vec<(u8, usize)>,
         label_candidates: &mut Vec<TextParams>,
-        detailed_coverages: &[Vec<[f64; 2]>],
+        detailed_coverages: &[[[f64; 2]; 3]],
     ) -> SymbolBuildStats {
         use crate::senc::FeatureType;
 
@@ -2349,6 +2913,21 @@ impl<'a> TileBuilder<'a> {
             }
             stats.total_features += 1;
 
+            // Cheapest test first — see the note in `build_areas`. A point is
+            // its own bounding box, so this is exact; the margin is for symbols
+            // whose art extends beyond the pivot.
+            if let Some(pg) = &feature.point_geometry {
+                let (mx, my) = super::latlon_to_mercator(pg.x, pg.y);
+                let margin = (bounds.max_x - bounds.min_x) * 0.05;
+                if mx < bounds.min_x - margin
+                    || mx > bounds.max_x + margin
+                    || my < bounds.min_y - margin
+                    || my > bounds.max_y + margin
+                {
+                    continue;
+                }
+            }
+
             // SCAMIN/SCAMAX filtering: bypass SCAMIN for DISPLAYBASE features
             let bypass_scamin = self
                 .s52_engine
@@ -2360,9 +2939,10 @@ impl<'a> TileBuilder<'a> {
                 self.view_scale_denominator(),
                 bypass_scamin,
                 true,
-                Some(info.native_scale),
+                self.super_scamin_scale(info),
             );
             if scamin_scale == 0.0 {
+
                 continue;
             }
 
@@ -2385,11 +2965,17 @@ impl<'a> TileBuilder<'a> {
             // Emit every SY() instruction in the resolved (CS-expanded) list.
             // OpenCPN treats point portrayal as an ordered sequence of operations;
             // stopping at the first symbol drops supplementary marks from CS/LUPs.
+            // Each entry is (atlas id, rotation in degrees). The rotation comes
+            // from the instruction itself — SY(LIGHTS12,135) for a light flare,
+            // SY(TSSLPT51,ORIENT) for a traffic-lane arrow that must point
+            // along the lane.
             let mut symbol_ids: Vec<u32> = Vec::new();
+            let mut symbol_rotations: Vec<Option<f64>> = Vec::new();
             for instr in &resolved.instructions {
-                if let RenderInstruction::Symbol { name } = instr {
+                if let RenderInstruction::Symbol { name, rotation } = instr {
                     if let Some(id) = crate::render::symbols::symbol_id_from_s52_name(name) {
                         symbol_ids.push(id);
+                        symbol_rotations.push(rotation.as_ref().and_then(|r| r.degrees(feature)));
                     } else {
                         log::debug!(
                             "symbol '{}' not in atlas for class={:?}",
@@ -2401,21 +2987,35 @@ impl<'a> TileBuilder<'a> {
             }
 
             // LIGHTS special handling: rotation and sector info
-            let (symbol_rotation_deg, orient_text) = if feature.object_class == ObjectClass::Light {
-                let info = light_render_info(feature, &engine.settings);
-                // If resolve_feature didn't find a symbol, use lights CS symbol
-                if symbol_ids.is_empty() {
-                    if let Some(id) = crate::render::symbols::symbol_id_from_s52_name(info.symbol_name)
-                    {
-                        symbol_ids.push(id);
+            let (symbol_rotation_deg, orient_text, light_sector) =
+                if feature.object_class == ObjectClass::Light {
+                    let info = light_render_info(feature, &engine.settings);
+                    let sector = light_sector_info(feature);
+                    if sector.is_some() {
+                        // Valid sector light: draw ONLY the bounded sector arc (matches
+                        // OpenCPN s52cnsy.cpp:1280, which REPLACES the symbol command with
+                        // the CA() arc). Suppress the all-round LIGHTS91/92/93 circle that
+                        // would otherwise be drawn as a full ring on top of the arc.
+                        symbol_ids.clear();
+                        symbol_rotations.clear();
+                    } else if symbol_ids.is_empty() {
+                        // Non-sector light: fall back to the CS-selected flare/all-round symbol.
+                        if let Some(id) =
+                            crate::render::symbols::symbol_id_from_s52_name(info.symbol_name)
+                        {
+                            symbol_ids.push(id);
+                            symbol_rotations.push(info.rotation_deg);
+                        }
                     }
-                }
-                (info.rotation_deg, info.orient_text)
-            } else {
-                (None, None)
-            };
+                    (info.rotation_deg, info.orient_text, sector)
+                } else {
+                    (None, None, None)
+                };
 
-            if symbol_ids.is_empty() {
+            // Skip only when there is nothing to draw: no symbol AND no sector arc.
+            // (A valid sector light has an empty symbol list but must still reach the
+            // arc/label code below.)
+            if symbol_ids.is_empty() && light_sector.is_none() {
                 log::debug!("no atlas symbol for class={:?}", feature.object_class);
                 continue;
             }
@@ -2441,7 +3041,7 @@ impl<'a> TileBuilder<'a> {
             // OSENC stores: pg.x = latitude, pg.y = longitude (opposite of typical convention)
             let (mx, my) = super::latlon_to_mercator(point_geom.x, point_geom.y);
 
-            if point_in_any_polygon([mx, my], detailed_coverages) {
+            if point_in_any_triangle([mx, my], detailed_coverages) {
                 continue;
             }
 
@@ -2451,14 +3051,17 @@ impl<'a> TileBuilder<'a> {
             }
             stats.bbox_pass += 1;
 
-            let rotation = symbol_rotation_deg
-                .map(|deg| (deg as f32) * (std::f32::consts::PI / 180.0))
-                .unwrap_or(0.0);
-
             // Use priority from resolved feature (already computed by resolve_feature)
             let sym_priority = resolved.priority;
 
-            for symbol_id in symbol_ids {
+            for (sym_i, symbol_id) in symbol_ids.into_iter().enumerate() {
+                let rotation = symbol_rotations
+                    .get(sym_i)
+                    .copied()
+                    .flatten()
+                    .or(symbol_rotation_deg)
+                    .map(|deg| (deg as f32) * (std::f32::consts::PI / 180.0))
+                    .unwrap_or(0.0);
                 let sym_idx = packet.symbol_instances.len();
                 packet.symbol_instances.push(SymbolInstance {
                     position: [mx as f32, my as f32],
@@ -2477,9 +3080,13 @@ impl<'a> TileBuilder<'a> {
                     mx,
                     my
                 );
-                let sector = light_sector_info(feature);
-                if let Some(ref sector) = sector {
-                    self.add_light_sector_lines(packet, [mx as f32, my as f32], sector);
+                if let Some(ref sector) = light_sector {
+                    self.add_light_sector_lines(
+                        packet,
+                        [mx as f32, my as f32],
+                        sector,
+                        resolved.priority,
+                    );
                 }
 
                 // Generate light description text (only for first light at each position).
@@ -2488,7 +3095,7 @@ impl<'a> TileBuilder<'a> {
                 // drawn but the "Fl 3s 4m 3Nm" label silently disappears.
                 let pos = (mx, my);
                 let dedupe_radius_m = 15.0_f64;
-                let is_first_at_pos = if sector.is_some() {
+                let is_first_at_pos = if light_sector.is_some() {
                     true
                 } else {
                     match last_light_pos {
@@ -2524,7 +3131,9 @@ impl<'a> TileBuilder<'a> {
 	                                text: desc,
 	                                color,
 	                                color_index,
-	                                scale: s52_text_scale(11, 5),
+	                                scale: s52_text_scale(11, 5, self.view_ppmm),
+	                                bold: false,
+	                                space: crate::render::text_layout::SPACE_STANDARD,
                                 hjust: HJust::Left,
                                 vjust: VJust::Center,
                                 xoffs: 1,
@@ -2547,7 +3156,9 @@ impl<'a> TileBuilder<'a> {
 	                            text,
 	                            color,
 	                            color_index,
-	                            scale: s52_text_scale(10, 5),
+	                            scale: s52_text_scale(10, 5, self.view_ppmm),
+	                            bold: false,
+	                            space: crate::render::text_layout::SPACE_STANDARD,
                             hjust: HJust::Left,
                             vjust: VJust::Top,
                             xoffs: 2,
@@ -2575,11 +3186,34 @@ impl<'a> TileBuilder<'a> {
                         color: color_token,
                         weight,
                         bsize,
+                        space,
                         dis,
                         ..
                     } = instr
                     {
                         if self.should_skip_text(*dis) {
+                            continue;
+                        }
+                        // A depth on an obstruction or wreck is a *sounding*.
+                        // OBSTRN04 and WRECKS02 hand it to SNDFRM02, which
+                        // emits digit symbols; navcore draws soundings as text,
+                        // so route it through the same layout instead of the
+                        // label path. Otherwise it came out at label size and
+                        // with a decimal point — "9.2" at twice the height of
+                        // the "9₂" the reference draws in the same place.
+                        if attribute == "VALSOU" {
+                            if let Some(depth) = feature.attribute_float("VALSOU") {
+                                let info = crate::s52::cs::sndfrm02(depth, feature, &engine.settings);
+                                let color_index =
+                                    engine.get_color_index(info.color_token()).unwrap_or(0) as u32;
+                                packet.text_instances.push(SoundingInstance {
+                                    position: [mx as f32, my as f32],
+                                    depth: info.whole_part as f32,
+                                    flags: info.to_flags(),
+                                    scale: 1.8,
+                                    color_index,
+                                });
+                            }
                             continue;
                         }
                         let text_value =
@@ -2595,7 +3229,9 @@ impl<'a> TileBuilder<'a> {
 	                                text,
 	                                color,
 	                                color_index,
-	                                scale: s52_text_scale(*bsize, *weight),
+	                                scale: s52_text_scale(*bsize, *weight, self.view_ppmm),
+	                                bold: *weight >= 6,
+	                                space: *space,
                                 hjust: HJust::from(*hjust),
                                 vjust: VJust::from(*vjust),
                                 xoffs: *xoffs as i32,
@@ -2627,7 +3263,7 @@ impl<'a> TileBuilder<'a> {
         packet: &mut TilePacket,
         ref_mx: f64,
         ref_my: f64,
-        detailed_coverages: &[Vec<[f64; 2]>],
+        detailed_coverages: &[[[f64; 2]; 3]],
     ) -> usize {
         let default_settings = crate::s52::MarinerSettings::default();
         let settings = self
@@ -2689,7 +3325,7 @@ impl<'a> TileBuilder<'a> {
                 let y = ref_my + point[1] as f64;
                 let depth = point[2] as f64;
 
-                if point_in_any_polygon([x, y], detailed_coverages) {
+                if point_in_any_triangle([x, y], detailed_coverages) {
                     continue;
                 }
 
@@ -2739,6 +3375,7 @@ impl<'a> TileBuilder<'a> {
         packet: &mut TilePacket,
         center: [f32; 2],
         sector: &crate::s52::LightSectorInfo,
+        priority: u8,
     ) {
         let sectr1 = sector.sectr1;
         let sectr2 = if sector.sectr2 <= sectr1 {
@@ -2768,8 +3405,14 @@ impl<'a> TileBuilder<'a> {
             }
         };
 
-        let mm_to_meters =
-            |mm: f64| mm * (self.view_ppmm as f64) * (self.view_meters_per_pixel as f64);
+        // The CA() radius argument behaves as a *diameter* on screen: OpenCPN
+        // computes `rad = radius * canvas_pix_per_mm`, but the circle it draws
+        // for `CA(...,10.0,25.0)` measures 76 px across in the 1:2600 reference
+        // capture, where 10 mm at that canvas density would be 160 px. Halving
+        // reproduces the reference to within 5% across all four views.
+        let mm_to_meters = |mm: f64| {
+            mm * 0.5 * (self.view_ppmm as f64) * (self.view_meters_per_pixel as f64)
+        };
         let arc_radius_m = mm_to_meters(sector.arc_radius_mm);
         let sector_radius_m = mm_to_meters(sector.sector_radius_mm);
 
@@ -2788,7 +3431,11 @@ impl<'a> TileBuilder<'a> {
         let arc_key = LineStyleKey::new(LinePattern::Solid, arc_width, arc_color);
         let legs_key = LineStyleKey::new(LinePattern::Dashed, 2, "CHBLK");
 
-        let priority = 4u8; // SYMB_POINT
+        // The arc belongs to the LIGHTS object and draws at that object's LUP
+        // priority (Hazards, 8) — not a fixed level. A hardcoded 4 happened to
+        // sit above everything while navcore's priority ladder was shifted one
+        // step low; with the correct S-52 numbering it fell under the line
+        // symbology and the sector arcs vanished from the chart.
         let lookup_id = 0u32;
 
         // Outline arc
@@ -2813,8 +3460,12 @@ impl<'a> TileBuilder<'a> {
             });
         }
 
-        // Sector legs
-        let leg_lines = light_sector_leg_lines(center, sector_radius_m, s1, s2);
+        // Sector legs — a full circle (an all-round light) has none.
+        let leg_lines = if sector.sector_radius_mm <= 0.0 || sweep >= 360.0 {
+            Vec::new()
+        } else {
+            light_sector_leg_lines(center, sector_radius_m, s1, s2)
+        };
         if !leg_lines.is_empty() {
             let (vertices, indices) = build_line_vertices_multi_indexed(&leg_lines);
             if !vertices.is_empty() {
@@ -2861,7 +3512,7 @@ impl<'a> TileBuilder<'a> {
 
         // General case: extract from first AC instruction (already CS-expanded)
         for instr in instructions {
-            if let RenderInstruction::AreaColor { color } = instr {
+            if let RenderInstruction::AreaColor { color, .. } = instr {
                 return engine.get_color_index(color);
             }
         }
@@ -2912,38 +3563,44 @@ fn get_text_for_attribute(
     }
 }
 
+/// The S-52 line style as written, for the scene log: `DASH,2,CHMGD`.
+fn style_label(style: &LineStyleKey) -> String {
+    format!(
+        "{:?},{},{}",
+        style.pattern, style.width, style.color_token
+    )
+    .to_uppercase()
+}
+
+/// Whether a feature is one of the depth areas the relief effect shades.
+///
+/// DEPARE (42) and DRGARE (46) are the two that carry a depth range and get a
+/// depth shade; UNSARE and the rest are flat by definition.
+fn is_depth_area(feature: &crate::senc::Feature) -> bool {
+    matches!(feature.type_code, 42 | 46)
+}
+
+/// Replace characters the label font has no glyph for.
+///
+/// The atlas covers ASCII and Latin-1, so Danish, German and French chart names
+/// now render as written — this used to fold "Brøndby" to "Brondby" because the
+/// 5x7 bitmap table stopped at U+007F. What remains is the tail beyond Latin-1:
+/// fold it to the nearest plain letter rather than drop it, so a name stays
+/// readable instead of losing characters.
 fn sanitize_bitmap_text(input: &str) -> String {
+    let font = crate::render::font::atlas();
     input
         .chars()
-        .map(|c| match c {
-            'Æ' | 'Ǽ' => 'A',
-            'æ' | 'ǽ' => 'a',
-            'Ø' => 'O',
-            'ø' => 'o',
-            'Å' => 'A',
-            'å' => 'a',
-            'Ä' => 'A',
-            'ä' => 'a',
-            'Ö' => 'O',
-            'ö' => 'o',
-            'Ü' => 'U',
-            'ü' => 'u',
-            'É' | 'È' | 'Ê' | 'Ë' => 'E',
-            'é' | 'è' | 'ê' | 'ë' => 'e',
-            'Á' | 'À' | 'Â' => 'A',
-            'á' | 'à' | 'â' => 'a',
-            'Ó' | 'Ò' | 'Ô' => 'O',
-            'ó' | 'ò' | 'ô' => 'o',
-            'Í' | 'Ì' | 'Î' => 'I',
-            'í' | 'ì' | 'î' => 'i',
-            'Ú' | 'Ù' | 'Û' => 'U',
-            'ú' | 'ù' | 'û' => 'u',
-            'Ñ' => 'N',
-            'ñ' => 'n',
-            'Ç' => 'C',
-            'ç' => 'c',
-            _ if c.is_ascii() => c,
-            _ => ' ',
+        .map(|c| {
+            if font.has_glyph(c) {
+                return c;
+            }
+            match c {
+                'Ǽ' => 'Æ',
+                'ǽ' => 'æ',
+                _ if c.is_whitespace() => ' ',
+                _ => '?',
+            }
         })
         .collect()
 }
@@ -2984,44 +3641,49 @@ fn close_ring_if_needed(points: &mut Vec<[f64; 2]>) {
     }
 }
 
-fn point_in_polygon(point: [f64; 2], polygon: &[[f64; 2]]) -> bool {
-    if polygon.len() < 3 {
-        return false;
+/// Close a stroked boundary path only if its ends are a rounding error apart.
+///
+/// A complete ring already returns to its first node, so the only thing left to
+/// bridge is f32 noise from the SENC's chart-local coordinates. A path whose
+/// ends are genuinely apart is an *open* path — the boundary was cut where an
+/// edge is shared with a higher-priority feature, or the node chain broke — and
+/// joining it draws a straight line across whatever lies between.
+fn close_open_ring_if_rounding_gap(points: &mut Vec<[f64; 2]>) {
+    if points.len() < 2 {
+        return;
     }
-
-    let mut inside = false;
-    let mut j = polygon.len() - 1;
-    for i in 0..polygon.len() {
-        let xi = polygon[i][0];
-        let yi = polygon[i][1];
-        let xj = polygon[j][0];
-        let yj = polygon[j][1];
-
-        let intersects = ((yi > point[1]) != (yj > point[1]))
-            && (point[0] < (xj - xi) * (point[1] - yi) / ((yj - yi) + 1e-12) + xi);
-        if intersects {
-            inside = !inside;
-        }
-        j = i;
+    let first = points[0];
+    let last = *points.last().unwrap();
+    let gap = ((first[0] - last[0]).powi(2) + (first[1] - last[1]).powi(2)).sqrt();
+    // Mercator metres. Sub-pixel at every zoom the renderer supports, and far
+    // below the shortest real edge in an ENC.
+    const ROUNDING_GAP_M: f64 = 1.0;
+    if gap > 1e-3 && gap < ROUNDING_GAP_M {
+        points.push(first);
     }
-
-    inside
 }
 
-fn point_in_any_polygon(point: [f64; 2], polygons: &[Vec<[f64; 2]>]) -> bool {
-    polygons.iter().any(|polygon| point_in_polygon(point, polygon))
+/// Is the point inside any of the coverage triangles?
+fn point_in_any_triangle(p: [f64; 2], tris: &[[[f64; 2]; 3]]) -> bool {
+    let side = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    tris.iter().any(|t| {
+        let (d0, d1, d2) = (side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0]));
+        let neg = d0 < 0.0 || d1 < 0.0 || d2 < 0.0;
+        let pos = d0 > 0.0 || d1 > 0.0 || d2 > 0.0;
+        !(neg && pos)
+    })
 }
 
 // triangle_centroid and triangle_masked_by_coverage removed —
-// GPU stencil masking replaces CPU per-triangle coverage checks.
+// Per-triangle coverage checks were removed with the coverage mask itself.
 
 fn relation_all_vertices_covered(
     geom: &crate::senc::AreaGeometry,
     ref_lat: f64,
     ref_lon: f64,
-    polygons: &[Vec<[f64; 2]>],
+    coverage: &[[[f64; 2]; 3]],
 ) -> bool {
-    if polygons.is_empty() {
+    if coverage.is_empty() {
         return false;
     }
 
@@ -3030,7 +3692,7 @@ fn relation_all_vertices_covered(
     geom.for_each_triangle_global(ref_lat, ref_lon, |tri| {
         for vertex in tri {
             any_vertex = true;
-            if !point_in_any_polygon(vertex, polygons) {
+            if !point_in_any_triangle(vertex, coverage) {
                 all_covered = false;
                 break;
             }
@@ -3041,9 +3703,9 @@ fn relation_all_vertices_covered(
 
 fn mask_polyline_by_coverage(
     polyline: &[[f64; 2]],
-    polygons: &[Vec<[f64; 2]>],
+    coverage: &[[[f64; 2]; 3]],
 ) -> Vec<Vec<[f64; 2]>> {
-    if polygons.is_empty() || polyline.len() < 2 {
+    if coverage.is_empty() || polyline.len() < 2 {
         return vec![polyline.to_vec()];
     }
 
@@ -3063,11 +3725,11 @@ fn mask_polyline_by_coverage(
             a[1] + (b[1] - a[1]) * 0.75,
         ];
 
-        if point_in_any_polygon(a, polygons)
-            || point_in_any_polygon(b, polygons)
-            || point_in_any_polygon(midpoint, polygons)
-            || point_in_any_polygon(quarter_a, polygons)
-            || point_in_any_polygon(quarter_b, polygons)
+        if point_in_any_triangle(a, coverage)
+            || point_in_any_triangle(b, coverage)
+            || point_in_any_triangle(midpoint, coverage)
+            || point_in_any_triangle(quarter_a, coverage)
+            || point_in_any_triangle(quarter_b, coverage)
         {
             if current.len() >= 2 {
                 kept.push(std::mem::take(&mut current));
@@ -3092,8 +3754,8 @@ fn mask_polyline_by_coverage(
     kept
 }
 
-fn tile_region_fully_covered(bounds: TileBounds, polygons: &[Vec<[f64; 2]>]) -> bool {
-    if polygons.is_empty() {
+fn tile_region_fully_covered(bounds: TileBounds, coverage: &[[[f64; 2]; 3]]) -> bool {
+    if coverage.is_empty() {
         return false;
     }
 
@@ -3107,61 +3769,59 @@ fn tile_region_fully_covered(bounds: TileBounds, polygons: &[Vec<[f64; 2]>]) -> 
 
     test_points
         .into_iter()
-        .all(|point| point_in_any_polygon(point, polygons))
+        .all(|point| point_in_any_triangle(point, coverage))
 }
 
 fn collect_more_detailed_coverages(
     loaded_charts: &[LoadedChartContext<'_>],
     chart_index: usize,
-) -> Vec<Vec<[f64; 2]>> {
+) -> Vec<[[f64; 2]; 3]> {
     loaded_charts[chart_index + 1..]
         .iter()
-        .flat_map(|ctx| ctx.coverage_polygons.iter().cloned())
+        .flat_map(|ctx| ctx.coverage_triangles.iter().copied())
         .collect()
 }
 
-fn extract_coverage_polygons(
+/// The chart's declared coverage, as triangles in global Mercator metres.
+///
+/// Taken from the M_COVR feature's own tessellation, not from its edge rings.
+/// The rings are not reliably reconstructable: one 1:22000 cell lists 172 edge
+/// references for its coverage and `resolve_rings` can recover only two
+/// two-point fragments from them, because most of those edges are not in the
+/// cell's edge table at all. Closing those fragments invented polygons that
+/// masked the chart underneath — the pale rectangles over land — and the
+/// obvious retreat, using the chart's extent rectangle, is worse: an extent is
+/// a bounding box, and masking by it asserts data across every bay the cell
+/// does not chart.
+///
+/// Empty means "this chart makes no claim about where it has data", and the
+/// quilt must then not mask anything on its behalf. Drawing a coarse chart
+/// under a detailed one costs a few overdrawn triangles; masking it out where
+/// the detailed chart has nothing costs a hole.
+fn extract_coverage_triangles(
     chart: &ChartData,
-    info: &ChartInfo,
     ref_mx: f64,
     ref_my: f64,
-) -> Vec<Vec<[f64; 2]>> {
-    let mut polygons = Vec::new();
-
-    // Collect actual M_COVR polygons (CATCOV=1 means "coverage available")
+) -> Vec<[[f64; 2]; 3]> {
+    let mut tris = Vec::new();
     for feature in chart.areas() {
         if !feature.is_coverage() || feature.attribute_int("CATCOV") != Some(1) {
             continue;
         }
-
         let Some(geom) = &feature.area_geometry else {
             continue;
         };
-
-        for ring in geom.resolve_rings(&chart.edge_table) {
-            let mut polygon: Vec<[f64; 2]> = ring
-                .iter()
-                .map(|p| [ref_mx + p[0] as f64, ref_my + p[1] as f64])
-                .collect();
-            close_ring_if_needed(&mut polygon);
-            if polygon.len() >= 4 {
-                polygons.push(polygon);
+        for prim in &geom.triangles {
+            for chunk in prim.to_triangles().chunks_exact(3) {
+                tris.push([
+                    [ref_mx + chunk[0][0] as f64, ref_my + chunk[0][1] as f64],
+                    [ref_mx + chunk[1][0] as f64, ref_my + chunk[1][1] as f64],
+                    [ref_mx + chunk[2][0] as f64, ref_my + chunk[2][1] as f64],
+                ]);
             }
         }
     }
-
-    // Only fall back to extent rectangle if no M_COVR features found
-    if polygons.is_empty() {
-        polygons.push(vec![
-            [info.extent_mercator.min_x, info.extent_mercator.min_y],
-            [info.extent_mercator.max_x, info.extent_mercator.min_y],
-            [info.extent_mercator.max_x, info.extent_mercator.max_y],
-            [info.extent_mercator.min_x, info.extent_mercator.max_y],
-            [info.extent_mercator.min_x, info.extent_mercator.min_y],
-        ]);
-    }
-
-    polygons
+    tris
 }
 
 /// Compute the arc-length midpoint of a polyline. Returns None for empty or
@@ -3284,17 +3944,20 @@ fn horizontal_polygon_intervals(
 
 /// Convert a CHARS body-size (points) and weight to a bitmap-font scale.
 ///
-/// Until the TTF-atlas font lands (Gap 1), the 8x8 procedural bitmap cell is
-/// scaled linearly by bsize. Weight 6+ ("bold") nudges the scale up slightly so
-/// OBJNAM labels rendered bold in openCPN stay visually dominant here too.
-fn s52_text_scale(bsize: u8, weight: u8) -> f32 {
-    let base = (bsize as f32 / 8.0).clamp(0.9, 4.0);
-    if weight >= 6 { base * 1.15 } else { base }
-}
-
-#[allow(dead_code)]
-fn s52_text_scale_simple(bsize: u8) -> f32 {
-    s52_text_scale(bsize, 5)
+/// OpenCPN maps the S-52 `bsize` to a font POINT size — `fontSize = (bsize/20)*4 + default`,
+/// floored near 10pt (s52plib.cpp:2465-2488) — then rasterizes it at the display DPI. The
+/// previous formula (`bsize/8`) ignored DPI entirely, so labels came out ~2x too small on a
+/// 1x display and ~3-4x too small on Retina. `view_ppmm` carries the HiDPI factor (4.0 px/mm
+/// at 96 DPI x1, 8.0 at x2), so we size the 8px glyph cell directly from the point size at
+/// that DPI. Weight 6+ ("bold") nudges the scale up slightly, matching OpenCPN's bold OBJNAMs.
+fn s52_text_scale(bsize: u8, weight: u8, view_ppmm: f32) -> f32 {
+    let points = ((bsize as f32 / 20.0) * 4.0 + 12.0).max(10.0);
+    // 0.0352 tunes the 8px cap-height cell to OpenCPN's rendered label size
+    // (bsize=11 -> ~14px logical cap on x1, ~28px physical on x2).
+    // Weight is no longer faked with size: the atlas carries a real bold face,
+    // selected via TextParams::bold.
+    let _ = weight;
+    points * view_ppmm * 0.0352
 }
 
 /// Format a numeric value using S-52 TE format string (subset of printf-style).
@@ -3445,6 +4108,7 @@ fn push_area_and_pattern_vertex(
         position,
         color_index,
         disp_prio: priority as u32,
+        shade: 0.0,
     });
     if let Some(pattern_id) = pattern_id {
         packet.pattern_vertices.push(crate::render::PatternVertex {
@@ -3464,6 +4128,7 @@ struct AreaBuildStats {
     fast_path_features: usize,
     slow_path_features: usize,
     triangles_seen: usize,
+    subpixel_triangles: usize,
     triangles_clipped: usize,
     trivial_accept_triangles: usize,
     trivial_reject_triangles: usize,
@@ -3561,7 +4226,6 @@ fn legacy_line_style(feature: &Feature, s52_engine: Option<&S52Engine>) -> Optio
 mod tests {
     use super::*;
     use crate::senc::{AttributeValue, Feature, FeatureType};
-    use std::collections::HashMap;
 
     #[test]
     fn area_vertex_layout_matches_shader() {
@@ -3569,7 +4233,8 @@ mod tests {
         // @location(0) position: vec2<f32>
         // @location(1) color_index: u32
         // @location(2) disp_prio: u32
-        assert_eq!(std::mem::size_of::<AreaVertex>(), 16);
+        // @location(3) shade: f32
+        assert_eq!(std::mem::size_of::<AreaVertex>(), 20);
         assert_eq!(std::mem::align_of::<AreaVertex>(), 4);
     }
 
@@ -3580,6 +4245,7 @@ mod tests {
             position: [0.0, 0.0],
             color_index: 0,
             disp_prio: 0,
+            shade: 0.0,
         });
         packet.compute_byte_size();
         assert_eq!(packet.byte_size, std::mem::size_of::<AreaVertex>());
@@ -3611,8 +4277,8 @@ mod tests {
         );
         let symbol = symbol.unwrap();
         assert_eq!(
-            symbol.color_ref, "ACSTLN",
-            "LOWACC21 should use ACSTLN color"
+            symbol.color_ref, "CSTLN",
+            "LOWACC21 uses ACSTLN in the XML; the parser strips the pen letter"
         );
     }
 
@@ -3664,13 +4330,11 @@ mod tests {
 
     #[test]
     fn text_prefers_national_object_name() {
-        let mut attributes = HashMap::new();
-        attributes.insert(
-            "OBJNAM".to_string(),
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("OBJNAM",
             AttributeValue::String("Brondby".to_string()),
         );
-        attributes.insert(
-            "NOBJNM".to_string(),
+        attributes.insert("NOBJNM",
             AttributeValue::String("Brøndby".to_string()),
         );
 
@@ -3685,9 +4349,11 @@ mod tests {
             multipoint_geometry: None,
         };
 
+        // The national name wins, and it now survives verbatim: the label font
+        // carries Latin-1, so "Brøndby" no longer has to be folded to "Brondby".
         assert_eq!(
             get_text_for_attribute(&feature, "OBJNAM", None),
-            Some("Brondby".to_string())
+            Some("Brøndby".to_string())
         );
     }
 
@@ -3700,17 +4366,15 @@ mod tests {
     }
 
     #[test]
-    fn point_in_polygon_detects_coverage_hits() {
-        let polygon = vec![
-            [0.0, 0.0],
-            [10.0, 0.0],
-            [10.0, 10.0],
-            [0.0, 10.0],
-            [0.0, 0.0],
+    fn point_in_triangle_detects_coverage_hits() {
+        let tris = [
+            [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]],
+            [[0.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
         ];
-
-        assert!(point_in_polygon([5.0, 5.0], &polygon));
-        assert!(!point_in_polygon([15.0, 5.0], &polygon));
+        assert!(point_in_any_triangle([5.0, 5.0], &tris));
+        assert!(point_in_any_triangle([1.0, 9.0], &tris));
+        assert!(!point_in_any_triangle([15.0, 5.0], &tris));
+        assert!(!point_in_any_triangle([-1.0, 5.0], &tris));
     }
 
     #[test]

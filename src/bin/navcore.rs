@@ -16,8 +16,9 @@ use std::sync::{Arc, Mutex};
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalPosition,
-    event::{ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, NamedKey},
     window::{Window, WindowId},
 };
 
@@ -100,6 +101,19 @@ fn main() {
         return;
     }
 
+    // Dump what the renderer decided to draw, with provenance
+    if args.len() >= 6 && args[1] == "--dump-scene" {
+        dump_scene_mode(&args[2], &args[3], &args[4], &args[5]);
+        return;
+    }
+
+    // Dump the S-52 instruction stream for conformance testing against OpenCPN
+    if args.len() >= 4 && args[1] == "--dump-ir" {
+        let limit = args.get(4).and_then(|s| s.parse::<usize>().ok());
+        dump_ir_mode(&args[2], &args[3], limit);
+        return;
+    }
+
     // Determine chart source from args
     let source = match args.get(1) {
         Some(p) => {
@@ -118,6 +132,469 @@ fn main() {
 
     let mut app = App::new(source);
     event_loop.run_app(&mut app).expect("Event loop failed");
+}
+
+/// Dump every area primitive the renderer emits for a viewport, with the
+/// provenance needed to trace a pixel back to a feature and a code path.
+///
+///   navcore --dump-scene <charts> <lat,lon,mpp> <WxH> <out.ndjson>
+///
+/// Coordinates in the output are screen pixels for that viewport, so a pixel
+/// noticed in a capture can be looked up directly (tools/scenecheck.py).
+fn dump_scene_mode(chart_path: &str, view: &str, size: &str, out_path: &str) {
+    use std::io::Write;
+
+    let parts: Vec<f64> = view.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    let [lat, lon, mpp] = parts[..] else {
+        eprintln!("--dump-scene: view must be 'lat,lon,mpp'");
+        return;
+    };
+    let Some((w, h)) = size.split_once('x') else {
+        eprintln!("--dump-scene: size must be 'WxH'");
+        return;
+    };
+    let (view_w, view_h): (f64, f64) = match (w.trim().parse(), h.trim().parse()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            eprintln!("--dump-scene: size must be 'WxH'");
+            return;
+        }
+    };
+
+    let dir = PathBuf::from(chart_path);
+    let mut keys = KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(&dir) {
+        eprintln!("Warning: could not load keys: {}", e);
+    }
+    let base = match ChartDecryptor::new("license") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to create decryptor: {}", e);
+            return;
+        }
+    };
+    let mut decryptor = CachedDecryptor::new(base);
+    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build catalog: {}", e);
+            return;
+        }
+    };
+    let mut engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Failed to load chartsymbols.xml: {}", e);
+            return;
+        }
+    };
+    engine.set_settings(navcore2::s52::MarinerSettings::from_env());
+
+    let (cx, cy) = navcore2::tiles::latlon_to_mercator(lat, lon);
+    let z = zoom_from_camera(mpp as f32);
+    let half_w = view_w * mpp / 2.0;
+    let half_h = view_h * mpp / 2.0;
+    let view_bounds = TileBounds::new(cx - half_w, cx + half_w, cy - half_h, cy + half_h);
+    let tiles = visible_tiles(&view_bounds, z, 1.0);
+
+    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let decryptor = Mutex::new(decryptor);
+
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(out_path).expect("create scene file"),
+    );
+    // Header: everything needed to map the records back to a capture.
+    writeln!(
+        out,
+        "{}",
+        serde_json::json!({
+            "record": "viewport", "lat": lat, "lon": lon, "mpp": mpp,
+            "width_px": view_w, "height_px": view_h, "zoom": z,
+            "center_mercator": [cx, cy], "tiles": tiles.len(),
+        })
+    )
+    .ok();
+
+    // Global Mercator -> screen pixels, y down.
+    let to_px = |p: [f64; 2]| [(p[0] - cx) / mpp + view_w / 2.0, view_h / 2.0 - (p[1] - cy) / mpp];
+
+    let mut n_areas = 0usize;
+    let mut n_fallback = 0usize;
+    let mut n_skipped = 0usize;
+    let mut n_lines = 0usize;
+    for tile_id in tiles {
+        let mut builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache)
+            .with_s52_engine(&engine)
+            .with_view_params(mpp as f32, 8.0, view_w as f32, view_h as f32, cx as f32, cy as f32)
+            .with_scene_log();
+        if builder.build_cpu(tile_id).is_err() {
+            continue;
+        }
+        let Some(log) = builder.take_scene_log() else {
+            continue;
+        };
+        // json! cannot take a block, so the corner transform lives here.
+        fn cov_extent_px(
+            cov: &navcore2::tiles::scene::SceneCoverage,
+            to_px: &impl Fn([f64; 2]) -> [f64; 2],
+        ) -> [f64; 4] {
+            let a = to_px([cov.extent[0], cov.extent[3]]);
+            let b = to_px([cov.extent[2], cov.extent[1]]);
+            [a[0], a[1], b[0], b[1]]
+        }
+        for (prio, count, b) in &log.packet {
+            let a = to_px([b[0], b[3]]);
+            let c = to_px([b[2], b[1]]);
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "record": "packet",
+                    "tile": [tile_id.z, tile_id.x, tile_id.y],
+                    "priority": prio, "vertices": count,
+                    "bbox_px": [a[0], a[1], c[0], c[1]],
+                })
+            )
+            .ok();
+        }
+        for cov in &log.coverage {
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "record": "coverage",
+                    "tile": [tile_id.z, tile_id.x, tile_id.y],
+                    "chart": cov.chart,
+                    "chart_scale": cov.chart_scale,
+                    "extent_px": cov_extent_px(cov, &to_px),
+                    "polygons_px": cov.polygons.iter()
+                        .map(|p| p.iter().map(|&v| to_px(v)).collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                })
+            )
+            .ok();
+        }
+        for skip in &log.skipped {
+            n_skipped += 1;
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "record": "skip",
+                    "tile": [tile_id.z, tile_id.x, tile_id.y],
+                    "chart": skip.chart,
+                    "feature": skip.feature,
+                    "class": skip.class,
+                    "reason": skip.reason,
+                    "extent_px": skip.extent.map(|ext| {
+                        let a = to_px([ext[0], ext[3]]);
+                        let b = to_px([ext[2], ext[1]]);
+                        [a[0], a[1], b[0], b[1]]
+                    }),
+                })
+            )
+            .ok();
+        }
+        for line in &log.lines {
+            n_lines += 1;
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "record": "line",
+                    "tile": [tile_id.z, tile_id.x, tile_id.y],
+                    "chart": line.chart,
+                    "feature": line.feature,
+                    "class": line.class,
+                    "source": line.source,
+                    "priority": line.priority,
+                    "is_background": line.is_background,
+                    "style": line.style,
+                    "polylines_px": line.polylines.iter()
+                        .map(|p| p.iter().map(|&v| to_px(v)).collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                })
+            )
+            .ok();
+        }
+        for area in log.areas {
+            n_areas += 1;
+            if area.source == navcore2::tiles::scene::AreaSource::RingFallback {
+                n_fallback += 1;
+            }
+            let tris_px: Vec<[[f64; 2]; 3]> = area
+                .tris
+                .iter()
+                .map(|t| [to_px(t[0]), to_px(t[1]), to_px(t[2])])
+                .collect();
+            let ext = area.extent;
+            let e0 = to_px([ext[0], ext[3]]); // NW corner -> top-left in pixels
+            let e1 = to_px([ext[2], ext[1]]);
+            writeln!(
+                out,
+                "{}",
+                serde_json::json!({
+                    "record": "area",
+                    "tile": [tile_id.z, tile_id.x, tile_id.y],
+                    "chart": area.chart,
+                    "feature": area.feature,
+                    "class": area.class,
+                    "source": area.source,
+                    "priority": area.priority,
+                    "color_index": area.color_index,
+                    "chart_scale": area.chart_scale,
+                    "is_background": area.is_background,
+                    "extent_px": [e0[0], e0[1], e1[0], e1[1]],
+                    "tris_px": tris_px,
+                })
+            )
+            .ok();
+        }
+    }
+
+    eprintln!(
+        "navcore --dump-scene: {} area primitives ({} via ring fallback), {} stroked, {} skipped -> {}",
+        n_areas, n_fallback, n_lines, n_skipped, out_path
+    );
+}
+
+/// Dump the S-52 symbology resolution for every feature in a chart or chart
+/// directory, as NDJSON, for conformance testing against OpenCPN.
+///
+/// Writes two files:
+///   <prefix>.features.ndjson — feature class/primitive/attributes, the input
+///                              for tools/s52oracle
+///   <prefix>.navcore.ndjson  — navcore's own LUP choice and expanded rules
+///
+/// Records are joined on `id`, so a line-by-line diff of navcore's stream
+/// against the oracle's isolates every symbology divergence, independent of
+/// rendering.
+fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
+    use std::io::Write;
+    use navcore2::s52::{DepthAreaIndex, GeometryType, S52Engine};
+    use navcore2::senc::{AttributeValue, FeatureType};
+
+    let path = PathBuf::from(chart_path);
+    let chart_dir = if path.is_dir() {
+        path.clone()
+    } else {
+        path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
+    };
+
+    let mut keys = KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(&chart_dir) {
+        eprintln!("Warning: could not load keys: {}", e);
+    }
+
+    let base_decryptor = match ChartDecryptor::new("license") {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("Failed to create decryptor: {}", e);
+            return;
+        }
+    };
+    let mut decryptor = CachedDecryptor::new(base_decryptor);
+
+    let engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
+        Ok(mut e) => {
+            // Same mariner settings the renderer would use, so a conformance
+            // run describes the picture actually being captured.
+            e.set_settings(navcore2::s52::MarinerSettings::from_env());
+            e
+        }
+        Err(e) => {
+            eprintln!("Failed to load chartsymbols.xml: {}", e);
+            return;
+        }
+    };
+
+    // NAVCORE_VIEW_SCALE=<denominator> turns on the visibility verdict.
+    let view_scale: Option<f64> = std::env::var("NAVCORE_VIEW_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
+    let mut chart_files: Vec<PathBuf> = if path.is_dir() {
+        std::fs::read_dir(&path)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension()
+                    .map(|x| x.eq_ignore_ascii_case("oesu"))
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        vec![path.clone()]
+    };
+    chart_files.sort();
+    if let Some(n) = limit {
+        chart_files.truncate(n);
+    }
+
+    let mut feat_out = std::io::BufWriter::new(
+        std::fs::File::create(format!("{}.features.ndjson", out_prefix)).expect("create features file"),
+    );
+    let mut ir_out = std::io::BufWriter::new(
+        std::fs::File::create(format!("{}.navcore.ndjson", out_prefix)).expect("create ir file"),
+    );
+
+    let mut total = 0usize;
+    let mut no_lup = 0usize;
+
+    for chart_file in chart_files.iter() {
+        let name = chart_file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let Some(key) = keys.lookup(name).map(|k| k.to_string()) else {
+            eprintln!("skip {} (no key)", name);
+            continue;
+        };
+        let bytes = match decryptor.decrypt_chart(chart_file.to_str().unwrap(), &key) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("skip {} (decrypt: {})", name, e);
+                continue;
+            }
+        };
+        let chart = match ChartData::parse(bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("skip {} (parse: {})", name, e);
+                continue;
+            }
+        };
+
+        // Same neighbourhood information OpenCPN's GetAssociatedObjects would
+        // supply, so UDWHAZ03 can decide isolated dangers.
+        let depth_index =
+            DepthAreaIndex::build(&chart.features, chart.header.ref_lat, chart.header.ref_lon);
+
+        for (fi, feature) in chart.features.iter().enumerate() {
+            // Stable across chart ordering, filtering and single-chart runs, so
+            // a divergence found in a full-set run can be reproduced from one
+            // chart and kept as a regression fixture.
+            let id = format!("{}#{}", name, fi);
+            let acronym = s57_code_to_acronym(feature.type_code);
+            let ctx = depth_index.context_for(feature);
+            let (prim, geom) = match feature.feature_type {
+                FeatureType::Point | FeatureType::Multipoint => ("P", GeometryType::Point),
+                FeatureType::Line => ("L", GeometryType::Line),
+                FeatureType::Area => ("A", GeometryType::Area),
+            };
+
+            // Feature record: attributes carry their S-57 storage type so the
+            // oracle rebuilds the same typed S57Obj that OpenCPN would.
+            let mut attrs = serde_json::Map::new();
+            for (k, v) in &feature.attributes {
+                let pair = match v {
+                    AttributeValue::Integer(i) => {
+                        serde_json::json!(["I", i])
+                    }
+                    AttributeValue::Float(f) => serde_json::json!(["F", f]),
+                    AttributeValue::String(s) => serde_json::json!(["S", s]),
+                };
+                attrs.insert(k.to_string(), pair);
+            }
+            // The surrounding depth areas, so tools/s52oracle can run OpenCPN's
+            // UDWHAZ03 over the same neighbourhood instead of its no-chart
+            // fallback. Emitted only where a CS procedure consults it.
+            // Visibility: would this feature be drawn at all? Emitted only when
+            // NAVCORE_VIEW_SCALE is set, so the harness can diff the decision
+            // against OpenCPN's ObjectRenderCheckCat. This is a third decision
+            // layer, separate from "which symbology" and "which geometry": a
+            // feature can resolve perfectly and still never reach the screen.
+            let visibility = view_scale.map(|vs| {
+                let cat = engine.display_category_for(feature, geom);
+                // DEPCNT02 promotes the selected safety contour to DISPLAYBASE
+                // and clears its SCAMIN; the renderer does the same, so the
+                // harness has to model it or it reports a divergence that is
+                // really the promotion.
+                let bypass = cat == Some(navcore2::s52::DisplayCategory::Displaybase)
+                    || engine.is_promoted_safety_contour(feature);
+                let scale_ok = navcore2::tiles::builder::should_render_at_scale_ex(
+                    feature,
+                    vs,
+                    bypass,
+                    false,
+                    engine
+                        .settings
+                        .use_super_scamin
+                        .then_some(chart.header.native_scale),
+                ) > 0.0;
+                let category_ok = engine.resolve_feature(feature, geom).is_some();
+                (scale_ok && category_ok, scale_ok, category_ok)
+            });
+
+            let vis_json = visibility.map(|(v, s, c)| {
+                serde_json::json!({"visible": v, "scale_ok": s, "category_ok": c})
+            });
+            let frec = if ctx.is_empty() {
+                serde_json::json!({
+                    "id": id, "obj": acronym, "prim": prim, "attrs": attrs,
+                    "chart_scale": chart.header.native_scale,
+                    "view_scale": view_scale,
+                })
+            } else {
+                serde_json::json!({
+                    "id": id, "obj": acronym, "prim": prim, "attrs": attrs,
+                    "chart_scale": chart.header.native_scale,
+                    "view_scale": view_scale,
+                    "assoc": {
+                        "area_drval1": ctx.area_drval1,
+                        "line_drval2": ctx.line_drval2,
+                    },
+                })
+            };
+            writeln!(feat_out, "{}", frec).ok();
+
+            // navcore's resolution of the same feature
+            let (entry, expanded) = engine.resolve_ir(feature, geom, &ctx);
+            let irec = match entry {
+                Some(e) => {
+                    let rules: Vec<String> = e
+                        .instruction
+                        .split(';')
+                        .map(|s| s.trim_matches(|c: char| c == '\u{1f}' || c.is_whitespace()))
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+                    let exp: Vec<String> = expanded.iter().map(|i| i.to_s52()).collect();
+                    serde_json::json!({
+                        "id": id, "obj": acronym, "prim": prim,
+                        "lup": {
+                            "tnam": format!("{:?}", e.table_name),
+                            "dpri": e.display_priority.as_u8(),
+                            "disc": format!("{:?}", e.display_category),
+                            "inst": e.instruction,
+                        },
+                        "rules": rules,
+                        "expanded": exp,
+                        "visibility": vis_json,
+                    })
+                }
+                None => {
+                    no_lup += 1;
+                    serde_json::json!({
+                        "id": id, "obj": acronym, "prim": prim,
+                        "lup": serde_json::Value::Null,
+                        "rules": Vec::<String>::new(),
+                        "expanded": Vec::<String>::new(),
+                    })
+                }
+            };
+            writeln!(ir_out, "{}", irec).ok();
+            total += 1;
+        }
+        eprintln!("dumped {} ({} features)", name, chart.features.len());
+    }
+
+    eprintln!(
+        "navcore --dump-ir: {} features from {} charts, {} without a LUP",
+        total,
+        chart_files.len(),
+        no_lup
+    );
 }
 
 /// Print chart info and exit
@@ -332,7 +809,8 @@ fn tile_debug_mode(dir_path: &str) {
         tiles.len()
     );
 
-    let chart_cache: Mutex<HashMap<u64, Arc<ChartData>>> = Mutex::new(HashMap::new());
+    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     // Load S-52 engine for display category filtering
@@ -347,7 +825,7 @@ fn tile_debug_mode(dir_path: &str) {
         }
     };
 
-    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache);
+    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
     let builder = if let Some(ref engine) = s52_engine {
         builder.with_s52_engine(engine)
     } else {
@@ -438,7 +916,8 @@ fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
     let (mx, my) = navcore2::tiles::latlon_to_mercator(center_lat, center_lon);
     let tile_id = TileId::from_mercator(mx, my, z);
 
-    let chart_cache: Mutex<HashMap<u64, Arc<ChartData>>> = Mutex::new(HashMap::new());
+    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     let s52_engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
@@ -449,7 +928,7 @@ fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
         }
     };
 
-    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache);
+    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
     let builder = if let Some(ref engine) = s52_engine {
         builder.with_s52_engine(engine)
     } else {
@@ -499,7 +978,8 @@ fn inspect_latlon_mode(dir_path: &str, lat: f64, lon: f64, z: u8) {
     let (mx, my) = navcore2::tiles::latlon_to_mercator(lat, lon);
     let tile_id = TileId::from_mercator(mx, my, z);
 
-    let chart_cache: Mutex<HashMap<u64, Arc<ChartData>>> = Mutex::new(HashMap::new());
+    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     let s52_engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
@@ -510,7 +990,7 @@ fn inspect_latlon_mode(dir_path: &str, lat: f64, lon: f64, z: u8) {
         }
     };
 
-    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache);
+    let builder = TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
     let builder = if let Some(ref engine) = s52_engine {
         builder.with_s52_engine(engine)
     } else {
@@ -665,7 +1145,7 @@ fn scan_charts_mode(dir_path: &str) {
             // Attributes
             let attrs = class_attrs.entry(class_name.clone()).or_default();
             for (attr_name, _) in &feature.attributes {
-                attrs.insert(attr_name.clone());
+                attrs.insert(attr_name.to_string());
             }
 
             // Geometry type
@@ -747,6 +1227,10 @@ struct App {
     // Touch state for pinch-zoom
     touches: HashMap<u64, PhysicalPosition<f64>>,
     pinch_start_distance: Option<f32>,
+    // Headless capture (NAVCORE_SHOT=path): render until tiles settle, save PNG, exit.
+    shot_path: Option<String>,
+    shot_requested: bool,
+    frame_count: u32,
 }
 
 impl App {
@@ -760,6 +1244,9 @@ impl App {
             mouse_pressed: false,
             touches: HashMap::new(),
             pinch_start_distance: None,
+            shot_path: std::env::var("NAVCORE_SHOT").ok().filter(|s| !s.is_empty()),
+            shot_requested: false,
+            frame_count: 0,
         }
     }
 
@@ -892,6 +1379,47 @@ impl App {
 
 impl ApplicationHandler for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Headless capture mode: drive frames until tiles settle, capture, then exit.
+        if let Some(path) = self.shot_path.clone() {
+            if let Some(state) = &mut self.state {
+                if self.shot_requested {
+                    if state.capture_pending() {
+                        state.window().request_redraw();
+                        event_loop.set_control_flow(ControlFlow::WaitUntil(
+                            std::time::Instant::now() + std::time::Duration::from_millis(16),
+                        ));
+                    } else {
+                        event_loop.exit();
+                    }
+                } else {
+                    // Warm-up frames + drained tile queue => view has settled.
+                    // Also refuse to capture until the surface actually has the
+                    // size NAVCORE_SIZE asked for: the window can come up at the
+                    // default size and be resized a frame later, and a capture
+                    // taken in between is geometrically wrong.
+                    let size_ready = match std::env::var("NAVCORE_SIZE").ok().and_then(|s| {
+                        let (w, h) = s.split_once('x')?;
+                        Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+                    }) {
+                        Some((w, h)) => {
+                            let got = state.window().inner_size();
+                            got.width == w && got.height.abs_diff(h) <= 2
+                        }
+                        None => true,
+                    };
+                    if self.frame_count >= 120 && size_ready && state.pending_tiles_empty() {
+                        state.request_capture(path);
+                        self.shot_requested = true;
+                    }
+                    state.window().request_redraw();
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + std::time::Duration::from_millis(16),
+                    ));
+                }
+            }
+            return;
+        }
+
         if let Some(ref state) = self.state {
             if state.needs_redraw() {
                 // Immediate redraw for user interaction
@@ -917,14 +1445,19 @@ impl ApplicationHandler for App {
                 ChartSource::Directory(_) => "NavCore - Multi-Chart Viewer",
             };
 
+            // NAVCORE_SIZE="WxH" requests an exact physical (pixel) surface size so
+            // captures can be compared pixel-for-pixel with a reference screenshot.
+            let attrs = Window::default_attributes().with_title(title);
+            let attrs = match std::env::var("NAVCORE_SIZE").ok().and_then(|s| {
+                let (w, h) = s.split_once('x')?;
+                Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
+            }) {
+                Some((w, h)) => attrs.with_inner_size(winit::dpi::PhysicalSize::new(w, h)),
+                None => attrs.with_inner_size(winit::dpi::LogicalSize::new(1024, 768)),
+            };
+
             let window = Arc::new(
-                event_loop
-                    .create_window(
-                        Window::default_attributes()
-                            .with_title(title)
-                            .with_inner_size(winit::dpi::LogicalSize::new(1024, 768)),
-                    )
-                    .expect("Failed to create window"),
+                event_loop.create_window(attrs).expect("Failed to create window"),
             );
 
             let state = pollster::block_on(RenderState::new(window));
@@ -957,6 +1490,35 @@ impl ApplicationHandler for App {
                     Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
                     Err(wgpu::SurfaceError::OutOfMemory) => event_loop.exit(),
                     Err(e) => eprintln!("Render error: {:?}", e),
+                }
+                self.frame_count = self.frame_count.saturating_add(1);
+            }
+
+            // Up/Down pitch the camera; 0 returns to the plan view. Tilt is a
+            // display mode, so it is a transient key, not a saved setting.
+            WindowEvent::KeyboardInput {
+                event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
+                ..
+            } => {
+                const STEP: f32 = 5.0_f32 * std::f32::consts::PI / 180.0;
+                let tilt = &mut state.camera.tilt;
+                let changed = match logical_key.as_ref() {
+                    Key::Named(NamedKey::ArrowUp) => {
+                        *tilt = (*tilt + STEP).min(navcore2::render::MAX_TILT);
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        *tilt = (*tilt - STEP).max(0.0);
+                        true
+                    }
+                    Key::Character("0") => {
+                        *tilt = 0.0;
+                        true
+                    }
+                    _ => false,
+                };
+                if changed {
+                    state.mark_dirty();
                 }
             }
 

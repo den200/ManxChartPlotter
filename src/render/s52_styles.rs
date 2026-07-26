@@ -84,24 +84,78 @@ pub const SNDG2: Color = [0.027, 0.027, 0.027, 1.0];
 /// Pixels per millimeter at 96 DPI (96 / 25.4)
 const PPMM: f32 = 4.0;
 
-// DASH pattern: 3mm period, 0.66 on fraction
-const DASH_PERIOD: f32 = 3.0 * PPMM; // 12 px
-const DASH_ON: f32 = DASH_PERIOD * 0.66; // ~8 px
-const DASH_OFF: f32 = DASH_PERIOD * 0.34; // ~4 px
+// ------------------------------------------------------------
+// S-52 line geometry.
+//
+// An LS() width is expressed in units of one *nominal ECDIS pixel*: 0.32 mm, a
+// nominal display density of 3.125 px/mm. qutenav, an independent S-52
+// implementation, encodes both numbers explicitly (`LineWidthMM(w) = w * 0.32`,
+// `nominal_dpmm = 3.125`) and its 18-bit line stipple sampled at 5 bits/mm
+// gives a 3.6 mm dash period (12 bits on, 6 off) and a 1.2 mm dot period
+// (2 on, 4 off).
+//
+// Rendering the width as a literal 0.32 mm on a 200-dpi display is the naive
+// reading and it is wrong in practice: pontoons and bridge outlines come out as
+// slabs, because the unit means "one pixel on a chart display", not "keep this
+// physical thickness whatever the density". qutenav resolves it by compressing
+// the width as density rises — 0.7x at 6.2 px/mm falling to 0.3x at 15.9 — and
+// navcore follows that.
+//
+// OpenCPN does something different again: `RenderLS` uses w/6 mm (its comment
+// calls the 6 "semi-standard LCD display densities") evaluated against a
+// `canvas_pix_per_mm` that stays at the logical 96-dpi figure on a Retina
+// canvas. The result is about 0.4x this, and — the actual defect — it changes
+// with the display's scale factor, so the same chart is drawn differently on
+// two monitors. Dash and dot lengths stay at their physical millimetre values,
+// which is where the standard and OpenCPN really do diverge.
+// ------------------------------------------------------------
 
-// DOT pattern: 1mm period, 0.5 on fraction
-const DOT_PERIOD: f32 = 1.0 * PPMM; // 4 px
-const DOT_ON: f32 = DOT_PERIOD * 0.5; // 2 px
-const DOT_OFF: f32 = DOT_PERIOD * 0.5; // 2 px
+/// S-52 pen width unit: one nominal ECDIS pixel, 0.32 mm.
+const LINE_WIDTH_UNIT_MM: f32 = 0.32;
+/// Minimum drawn width. A line thinner than a pixel would disappear.
+const MIN_LINE_WIDTH_PX: f32 = 1.0;
 
-/// Convert S-52 width units to pixels.
-/// OpenCPN uses width values directly as pixel widths (not 0.3mm per unit from spec K.3).
-/// This matches OpenCPN's RenderLS behavior: `glLineWidth(wxMax(m_GLMinCartographicLineWidth, w))`
+/// How much of the nominal width to keep at a given display density.
+///
+/// qutenav's curve: 0.7 at 6.2 px/mm, 0.3 at 15.9, linear between, clamped
+/// outside. A chart display much denser than the 3.125 px/mm the presentation
+/// library was drawn for wants its lines to stay hairlines, not to grow. Dash
+// and dot *lengths* are not compressed: a gap is only legible at its real size.
+fn line_density_compression(ppmm: f32) -> f32 {
+    let t = ((ppmm - 6.2) / 9.7).clamp(0.0, 1.0);
+    0.7 * (1.0 - t) + 0.3 * t
+}
+
+/// DASH: 3.6 mm of ink, 1.8 mm of gap — a 5.4 mm period.
+///
+/// s52plib cites these figures and then discards them: "reduced from s52 specs
+/// (5.4), 3.6mm dash, 1.8mm space / float width = GetPPMM() * 3; //looks
+/// better". navcore keeps the spec.
+const DASH_ON_MM: f32 = 3.6;
+const DASH_OFF_MM: f32 = 1.8;
+/// DOTT: 0.4 mm of ink, 0.8 mm of gap — a 1.2 mm period.
+///
+/// No comparable citation in s52plib, which uses a 1 mm period at even duty.
+/// These are qutenav's, whose 18-bit stipple at 5 bits/mm reads 2 bits on, 4
+/// off.
+const DOT_ON_MM: f32 = 0.4;
+const DOT_OFF_MM: f32 = 0.8;
+
+// Precomputed constants for the static LineStyle table below, at the 96-dpi base.
+const DASH_ON: f32 = DASH_ON_MM * PPMM;
+const DASH_OFF: f32 = DASH_OFF_MM * PPMM;
+const DOT_ON: f32 = DOT_ON_MM * PPMM;
+const DOT_OFF: f32 = DOT_OFF_MM * PPMM;
+
+/// Convert an S-52 LS() width to pixels at the 96-dpi base.
 const fn width(w: u8) -> f32 {
-    if w == 0 {
-        1.0
+    let w = if w == 0 { 1 } else { w };
+    // 0.7 is line_density_compression() at the 96-dpi base (below its knee).
+    let px = w as f32 * LINE_WIDTH_UNIT_MM * PPMM * 0.7;
+    if px < MIN_LINE_WIDTH_PX {
+        MIN_LINE_WIDTH_PX
     } else {
-        w as f32
+        px
     }
 }
 
@@ -331,32 +385,22 @@ pub const SAFETY_CONTOUR_STYLE: LineStyle = DEPCNT_SAFETY;
 
 use crate::tiles::LineStyleId;
 
-/// Convert S-52 width units to pixels with custom ppmm.
-/// Matches OpenCPN's line width handling:
-/// - For normal displays (ppmm <= 7): use w directly as pixel width
-/// - For HiDPI displays (ppmm > 7): scale assuming w was designed for 6 ppmm
+/// Convert an S-52 LS() width to pixels: `w` units of 0.32 mm at this display
+/// density. See the note on [`LINE_WIDTH_UNIT_MM`] for why this does not follow
+/// OpenCPN.
 fn width_scaled(w: u8, ppmm: f32) -> f32 {
     let w_f = if w == 0 { 1.0 } else { w as f32 };
-    if ppmm > 7.0 {
-        // HiDPI: treat w as "pixels at 6 ppmm" and scale to actual ppmm
-        // This matches OpenCPN: target_w_mm = w / 6.0; lineWidth = target_w_mm * ppmm
-        (w_f / 6.0) * ppmm
-    } else {
-        // Normal displays: use w directly as pixel width
-        w_f
-    }
+    (w_f * LINE_WIDTH_UNIT_MM * ppmm * line_density_compression(ppmm)).max(MIN_LINE_WIDTH_PX)
 }
 
-/// Compute dash pattern for given ppmm
+/// DASH geometry in pixels at this display density.
 fn dash_pattern(ppmm: f32) -> (f32, f32) {
-    let period = 3.0 * ppmm; // 3mm period
-    (period * 0.66, period * 0.34)
+    (DASH_ON_MM * ppmm, DASH_OFF_MM * ppmm)
 }
 
-/// Compute dot pattern for given ppmm
+/// DOTT geometry in pixels at this display density.
 fn dot_pattern(ppmm: f32) -> (f32, f32) {
-    let period = 1.0 * ppmm; // 1mm period
-    (period * 0.5, period * 0.5)
+    (DOT_ON_MM * ppmm, DOT_OFF_MM * ppmm)
 }
 
 /// Get the LineStyle for a given LineStyleId, scaled by ppmm for HiDPI

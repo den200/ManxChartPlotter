@@ -33,13 +33,16 @@ pub struct Vertex {
     pub position: [f32; 2],
     pub color_index: u32,
     pub disp_prio: u32,
+    /// Darkening applied to the palette colour, 0..1 — see `AreaVertex::shade`.
+    pub shade: f32,
 }
 
 impl Vertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 4] = wgpu::vertex_attr_array![
         0 => Float32x2,
         1 => Uint32,
         2 => Uint32,
+        3 => Float32,
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {
@@ -207,6 +210,57 @@ pub struct LineBatch {
     pub vertex_count: u32,
 }
 
+/// The nearest ancestor of `tile` that is already built, if any.
+///
+/// Walks up the pyramid at most four levels: beyond a 16x magnification a
+/// coarser tile tells you nothing useful and it is better to show the clear
+/// colour than a smear. Drawn through a scissor rectangle covering the missing
+/// tile, this is what stops a zoom change from blanking the map — the old level
+/// stands in, coarser, until the new one arrives.
+fn nearest_resident_ancestor(tile: TileId, resident: impl Fn(TileId) -> bool) -> Option<TileId> {
+    let mut ancestor = tile;
+    for _ in 0..4 {
+        if ancestor.z == 0 {
+            return None;
+        }
+        ancestor = TileId {
+            z: ancestor.z - 1,
+            x: ancestor.x / 2,
+            y: ancestor.y / 2,
+        };
+        if resident(ancestor) {
+            return Some(ancestor);
+        }
+    }
+    None
+}
+
+/// The multisampled colour target the main pass draws into.
+fn create_msaa_view(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("MSAA Colour Target"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: super::msaa_samples(),
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+
 /// Complete render state for chart visualization
 pub struct RenderState {
     pub window: Arc<Window>,
@@ -232,6 +286,8 @@ pub struct RenderState {
 
     // Depth buffer for layer priority
     pub depth_texture: wgpu::Texture,
+    /// Multisampled colour target; resolved into the surface each frame.
+    msaa_view: wgpu::TextureView,
     pub depth_view: wgpu::TextureView,
 
     // Geometry
@@ -258,7 +314,6 @@ pub struct RenderState {
     pub label_camera_bind_group: Option<wgpu::BindGroup>,
 
     // Stencil-write pipeline for coverage masking (background chart suppression)
-    pub stencil_pipeline: wgpu::RenderPipeline,
 
     // Background area pipeline (stencil test: pass when stencil==0)
     pub bg_pipeline: wgpu::RenderPipeline,
@@ -280,6 +335,9 @@ pub struct RenderState {
     pub global_text_count: u32,
     pub global_label_buffer: Option<wgpu::Buffer>,
     pub global_label_count: u32,
+    /// Sounding digit symbols, built from the globally decluttered soundings.
+    global_sounding_buffer: Option<wgpu::Buffer>,
+    global_sounding_count: u32,
 
     // Tile-based rendering (for multi-chart mode)
     /// Chart catalog (metadata only) - None for single chart mode
@@ -308,6 +366,15 @@ pub struct RenderState {
     current_z: u8,
     /// Fallback tiles from previous z-level (drawn while new tiles load after z-change)
     previous_visible_tiles: Vec<TileId>,
+    /// What to draw for each visible tile, in order.
+    ///
+    /// Usually the tile itself. Where a tile is not yet built, the nearest
+    /// ancestor that *is* — drawn through a scissor rectangle covering exactly
+    /// the missing tile's area, so a coarser tile fills the hole without
+    /// spilling over its neighbours. Without this the map goes to the clear
+    /// colour on every zoom change and stays there until the whole level is
+    /// built, which is seconds.
+    tile_draw_list: Vec<(TileCacheKey, Option<[u32; 4]>)>,
     /// Style hash for previous z-level fallback tiles
     previous_style_hash: u64,
     /// S-52 presentation engine for display category filtering
@@ -322,6 +389,21 @@ pub struct RenderState {
     cached_visible_line_styles_key: u64,
     /// Key for the last uploaded line-uniform contents
     last_line_uniforms_key: u64,
+    /// If set, the draw pass records what it issued (NAVCORE_DUMP_DRAW).
+    pub draw_log: Option<std::cell::RefCell<Vec<serde_json::Value>>>,
+    /// If set, render() copies the next frame to this PNG path (NAVCORE_SHOT headless capture)
+    pending_capture: Option<String>,
+}
+
+/// Per-frame report of which visible tiles are resident, pending or known to
+/// have no chart data. `NAVCORE_TILE_DEBUG=1`.
+fn tile_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NAVCORE_TILE_DEBUG")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 fn profile_enabled() -> bool {
@@ -356,7 +438,14 @@ impl RenderState {
             .await
             .expect("Failed to find adapter");
 
-        println!("DEBUG: Using GPU: {}", adapter.get_info().name);
+        let adapter_info = adapter.get_info();
+        super::set_msaa_samples(super::choose_msaa_samples(&adapter_info));
+        println!(
+            "DEBUG: Using GPU: {} ({:?}), MSAA {}x",
+            adapter_info.name,
+            adapter_info.device_type,
+            super::msaa_samples()
+        );
 
         let (device, queue) = adapter
             .request_device(
@@ -389,7 +478,8 @@ impl RenderState {
         println!("DEBUG: Available formats: {:?}", surface_caps.formats);
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC lets NAVCORE_SHOT read the rendered frame back for headless captures.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width,
             height: size.height,
@@ -477,13 +567,14 @@ impl RenderState {
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: super::msaa_samples(),
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth24PlusStencil8,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa_view = create_msaa_view(&device, config.format, size.width, size.height);
 
         // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -528,7 +619,7 @@ impl RenderState {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: super::msaa_samples(),
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -619,104 +710,42 @@ impl RenderState {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                // Lines carry no usable depth: the per-style uniform writes
+                // disp_prio 0, so line.wgsl puts every line at z = 1.0 (far
+                // plane). Depth-testing them therefore erased any line drawn
+                // over an area of priority >= 1 — invisible until navcore's
+                // priority ladder was one step low and Group 1 also landed on
+                // z = 1.0. Draw order is already sequenced per priority on the
+                // CPU (areas, then lines, then symbols), so the line passes need
+                // no depth test of their own.
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: super::msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });
 
-        // Stencil-write pipeline: renders coverage triangles to set stencil=1,
-        // masking background chart geometry from rendering underneath foreground charts.
-        let stencil_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Stencil Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/shaders/stencil.wgsl").into()),
-        });
-
-        let stencil_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Stencil Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &stencil_shader,
-                entry_point: "vs_main",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        offset: 0,
-                        shader_location: 0,
-                        format: wgpu::VertexFormat::Float32x2,
-                    }],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &stencil_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::empty(), // Don't write color
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: wgpu::StencilState {
-                    front: wgpu::StencilFaceState {
-                        compare: wgpu::CompareFunction::Always,
-                        fail_op: wgpu::StencilOperation::Keep,
-                        depth_fail_op: wgpu::StencilOperation::Keep,
-                        pass_op: wgpu::StencilOperation::Replace,
-                    },
-                    back: wgpu::StencilFaceState {
-                        compare: wgpu::CompareFunction::Always,
-                        fail_op: wgpu::StencilOperation::Keep,
-                        depth_fail_op: wgpu::StencilOperation::Keep,
-                        pass_op: wgpu::StencilOperation::Replace,
-                    },
-                    read_mask: 0xFF,
-                    write_mask: 0xFF,
-                },
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        // Background area pipeline: identical to main pipeline but with stencil test
-        // (pass when stencil==0 → only draws where no foreground coverage)
-        let bg_stencil_state = wgpu::StencilState {
-            front: wgpu::StencilFaceState {
-                compare: wgpu::CompareFunction::Equal,
-                fail_op: wgpu::StencilOperation::Keep,
-                depth_fail_op: wgpu::StencilOperation::Keep,
-                pass_op: wgpu::StencilOperation::Keep,
-            },
-            back: wgpu::StencilFaceState {
-                compare: wgpu::CompareFunction::Equal,
-                fail_op: wgpu::StencilOperation::Keep,
-                depth_fail_op: wgpu::StencilOperation::Keep,
-                pass_op: wgpu::StencilOperation::Keep,
-            },
-            read_mask: 0xFF,
-            write_mask: 0x00, // don't modify stencil
-        };
+        // Background chart pipelines. Identical to the foreground ones — the
+        // separation is draw *order*, nothing else: a tile's coarser charts are
+        // drawn before its finer ones so the finer ones win by overdraw.
+        //
+        // These used to carry a stencil test that suppressed background
+        // geometry wherever a finer chart declared coverage. It cannot be made
+        // right with one stencil buffer per tile: the mask a chart needs is
+        // "every chart finer than me", which differs per chart, and one tile-wide
+        // union masked a mid-scale chart with its own coverage. Worse, coverage
+        // is a claim about where a cell has *data*, not about where it *paints*,
+        // so even a per-chart mask removes the chart underneath in every gap the
+        // finer cell leaves. That was the pale rectangles across Zealand.
+        // Painter's order alone quilts correctly and cannot punch a hole.
+        let bg_stencil_state = wgpu::StencilState::default();
 
         let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("BG Chart Pipeline"),
@@ -754,7 +783,7 @@ impl RenderState {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState {
-                count: 1,
+                count: super::msaa_samples(),
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
@@ -793,12 +822,24 @@ impl RenderState {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                // Lines carry no usable depth: the per-style uniform writes
+                // disp_prio 0, so line.wgsl puts every line at z = 1.0 (far
+                // plane). Depth-testing them therefore erased any line drawn
+                // over an area of priority >= 1 — invisible until navcore's
+                // priority ladder was one step low and Group 1 also landed on
+                // z = 1.0. Draw order is already sequenced per priority on the
+                // CPU (areas, then lines, then symbols), so the line passes need
+                // no depth test of their own.
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
                 stencil: bg_stencil_state,
                 bias: wgpu::DepthBiasState::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState {
+                count: super::msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
             multiview: None,
             cache: None,
         });
@@ -883,6 +924,11 @@ impl RenderState {
         };
 
         Self {
+            // NAVCORE_DUMP_DRAW=<path> records what the draw pass issued.
+            draw_log: std::env::var("NAVCORE_DUMP_DRAW")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .map(|_| std::cell::RefCell::new(Vec::new())),
             window,
             surface,
             device,
@@ -897,6 +943,7 @@ impl RenderState {
             palette_buffer,
             uniform_bind_group_layout,
             depth_texture,
+            msaa_view,
             depth_view,
             vertex_buffer: None,
             vertex_count: 0,
@@ -913,7 +960,8 @@ impl RenderState {
             global_text_count: 0,
             global_label_buffer: None,
             global_label_count: 0,
-            stencil_pipeline,
+            global_sounding_buffer: None,
+            global_sounding_count: 0,
             bg_pipeline,
             line_pipeline,
             bg_line_pipeline,
@@ -936,6 +984,7 @@ impl RenderState {
             visible_tiles_cache: Vec::new(),
             current_z: 0,
             previous_visible_tiles: Vec::new(),
+            tile_draw_list: Vec::new(),
             previous_style_hash: 0,
             s52_engine: None,
             needs_redraw: true,
@@ -943,6 +992,7 @@ impl RenderState {
             cached_visible_line_styles: Vec::new(),
             cached_visible_line_styles_key: 0,
             last_line_uniforms_key: 0,
+            pending_capture: None,
         }
     }
 
@@ -1015,6 +1065,7 @@ impl RenderState {
                         position: pos,
                         color_index,
                         disp_prio: 0,
+                        shade: 0.0,
                     });
                 }
             }
@@ -1231,9 +1282,9 @@ impl RenderState {
 
         // Simple triangle in NDC space
         let vertices = vec![
-            Vertex { position: [0.0, 0.5], color_index: 0, disp_prio: 0 },   // Top
-            Vertex { position: [-0.5, -0.5], color_index: 0, disp_prio: 0 }, // Bottom-left
-            Vertex { position: [0.5, -0.5], color_index: 0, disp_prio: 0 },  // Bottom-right
+            Vertex { position: [0.0, 0.5], color_index: 0, disp_prio: 0, shade: 0.0 },   // Top
+            Vertex { position: [-0.5, -0.5], color_index: 0, disp_prio: 0, shade: 0.0 }, // Bottom-left
+            Vertex { position: [0.5, -0.5], color_index: 0, disp_prio: 0, shade: 0.0 },  // Bottom-right
         ];
 
         // Create vertex buffer
@@ -1382,6 +1433,20 @@ impl RenderState {
             }
         }
 
+        // NAVCORE_TILT=<degrees> pitches the camera back. Off by default: a
+        // chart is a plan, and every S-52 measurement — bearing, distance,
+        // symbol size in millimetres — is stated on that plan.
+        if let Ok(t) = std::env::var("NAVCORE_TILT") {
+            match t.trim().parse::<f32>() {
+                Ok(deg) => {
+                    self.camera.tilt =
+                        deg.to_radians().clamp(0.0, crate::render::camera::MAX_TILT);
+                    println!("NAVCORE_TILT: {:.1}°", self.camera.tilt.to_degrees());
+                }
+                Err(_) => eprintln!("NAVCORE_TILT must be a number of degrees; ignoring '{}'", t),
+            }
+        }
+
         println!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
             catalog.charts.len(), center_x, center_y, zoom);
 
@@ -1395,15 +1460,22 @@ impl RenderState {
 
         // Load S-52 presentation engine for display category filtering
         // Load once for main thread (palette ops), once for worker (tile building)
+        // Mariner settings come from the environment so a capture and the
+        // conformance dumps of the same view resolve features identically.
+        // Both engines must get them: the worker's engine is the one that
+        // actually decides what goes into a tile.
+        let env_settings = crate::s52::MarinerSettings::from_env();
         let mut worker_engine: Option<S52Engine> = None;
         match S52Engine::load("assets/s52/chartsymbols.xml") {
-            Ok(engine) => {
+            Ok(mut engine) => {
+                engine.set_settings(env_settings.clone());
                 println!("{}", engine.summary());
                 // Upload active palette to GPU
                 self.upload_palette(&engine.tables);
                 self.s52_engine = Some(engine);
                 // Load a second engine for the worker thread
-                if let Ok(engine2) = S52Engine::load("assets/s52/chartsymbols.xml") {
+                if let Ok(mut engine2) = S52Engine::load("assets/s52/chartsymbols.xml") {
+                    engine2.set_settings(env_settings);
                     worker_engine = Some(engine2);
                 }
             }
@@ -1448,13 +1520,16 @@ impl RenderState {
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
-                sample_count: 1,
+                sample_count: super::msaa_samples(),
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Depth24PlusStencil8,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
             self.depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.msaa_view = create_msaa_view(
+                &self.device, self.config.format, self.config.width, self.config.height,
+            );
 
             self.camera.resize(new_size.width as f32, new_size.height as f32);
             self.needs_redraw = true;
@@ -1498,6 +1573,19 @@ impl RenderState {
         self.camera.position.y.to_bits().hash(&mut hasher);
         self.camera.zoom.to_bits().hash(&mut hasher);
         hasher.finish()
+    }
+
+
+    /// The pixels-per-mm figure S-52 line styling is evaluated at.
+    ///
+    /// The *physical* density, because S-52 specifies line widths and dash
+    /// periods in millimetres on the display — that is the whole point of
+    /// giving them in millimetres. OpenCPN evaluates them against a
+    /// `canvas_pix_per_mm` that stays at the logical 96-dpi figure on a Retina
+    /// canvas, which halves every stroke and dash; matching that would make
+    /// navcore's output depend on the display density the same way.
+    fn line_style_ppmm(&self) -> f32 {
+        self.effective_ppmm.max(1.0)
     }
 
     fn collect_visible_line_styles(&self) -> Vec<LineStyleKey> {
@@ -1582,7 +1670,7 @@ impl RenderState {
                 let tables = self.s52_engine.as_ref().map(|e| &e.tables);
                 for (slot, style_key) in self.cached_visible_line_styles.iter().enumerate() {
                     let offset = (slot as u32) * align;
-                    let style = style_for_key(style_key, self.effective_ppmm, tables);
+                    let style = style_for_key(style_key, self.line_style_ppmm(), tables);
                     let line_uniforms = LineUniforms {
                         view_proj,
                         viewport_size,
@@ -1651,11 +1739,16 @@ impl RenderState {
         });
 
         {
+            let multisampled = super::msaa_samples() > 1;
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    // Draw multisampled, resolve into the surface. StoreOp is
+                    // Discard because only the resolved image is ever read.
+                    // With multisampling off there is nothing to resolve and the
+                    // surface is the target.
+                    view: if multisampled { &self.msaa_view } else { &view },
+                    resolve_target: multisampled.then_some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: OCEAN_BACKGROUND[0] as f64,
@@ -1663,7 +1756,11 @@ impl RenderState {
                             b: OCEAN_BACKGROUND[2] as f64,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Store,
+                        store: if multisampled {
+                            wgpu::StoreOp::Discard
+                        } else {
+                            wgpu::StoreOp::Store
+                        },
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1753,6 +1850,12 @@ impl RenderState {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Headless capture: copy the just-rendered surface texture before it is presented.
+        if let Some(path) = self.pending_capture.take() {
+            self.save_capture(&output.texture, &path);
+        }
+
         output.present();
 
         self.needs_redraw = false;
@@ -1792,16 +1895,68 @@ impl RenderState {
         }
     }
 
-    /// Build missing tiles (capped per frame to avoid stalls)
-    /// Must be called BEFORE render pass to avoid GPU stalls
-    /// Higher values fill viewport faster but may cause frame stutters on slow hardware
-    #[cfg(target_os = "macos")]
-    const MAX_TILES_PER_FRAME: usize = 16;
+    /// How many missing tiles may be handed to the worker in one frame.
+    ///
+    /// The cap existed because a request was a commitment: the worker built the
+    /// whole batch before reporting anything, so over-requesting meant the next
+    /// view waited behind a screenful of tiles it no longer needed. Requests are
+    /// now cancellable per tile and results stream back as they finish, so the
+    /// budget can be the whole screen — the work that matters starts sooner and
+    /// the work that stops mattering is dropped.
+    /// Kept modest because each candidate costs a chart-coverage query against
+    /// the whole catalogue on the main thread before it is requested; raising
+    /// this to a screenful made the frame itself the bottleneck.
+    const MAX_TILES_PER_FRAME: usize = 32;
 
-    #[cfg(not(target_os = "macos"))]
-    const MAX_TILES_PER_FRAME: usize = 8;
+    /// Confine the following draws to a tile's area, or release the scissor.
+    fn apply_scissor<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        scissor: Option<[u32; 4]>,
+    ) {
+        match scissor {
+            Some([x, y, w, h]) => render_pass.set_scissor_rect(x, y, w, h),
+            None => render_pass.set_scissor_rect(0, 0, self.size.width, self.size.height),
+        }
+    }
+
+    /// The scissor rectangle covering a tile's area on screen, in physical
+    /// pixels, or None if it is entirely off-screen.
+    fn tile_scissor(&self, tile_id: &TileId) -> Option<[u32; 4]> {
+        let b = tile_id.bounds();
+        // Tilted, a tile is a trapezium on screen, so take the box around all
+        // four projected corners rather than two opposite ones.
+        let mut x0 = f32::MAX;
+        let mut y0 = f32::MAX;
+        let mut x1 = f32::MIN;
+        let mut y1 = f32::MIN;
+        for (wx, wy) in [
+            (b.min_x, b.min_y),
+            (b.max_x, b.min_y),
+            (b.max_x, b.max_y),
+            (b.min_x, b.max_y),
+        ] {
+            let p = self.camera.world_to_screen(wx as f32, wy as f32);
+            if !p.x.is_finite() || !p.y.is_finite() {
+                return None;
+            }
+            x0 = x0.min(p.x);
+            y0 = y0.min(p.y);
+            x1 = x1.max(p.x);
+            y1 = y1.max(p.y);
+        }
+        let x0 = x0.floor().max(0.0);
+        let y0 = y0.floor().max(0.0);
+        let x1 = x1.ceil().min(self.size.width as f32);
+        let y1 = y1.ceil().min(self.size.height as f32);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        Some([x0 as u32, y0 as u32, (x1 - x0) as u32, (y1 - y0) as u32])
+    }
 
     fn build_visible_tiles(&mut self) {
+        let t_upload = profile_enabled().then(Instant::now);
         // 1. Upload deferred tiles from last frame first
         let mut uploads_this_frame = 0usize;
         const MAX_UPLOADS_PER_FRAME: usize = 64;
@@ -1851,6 +2006,9 @@ impl RenderState {
             }
         }
 
+        let ms_upload = t_upload.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_select = profile_enabled().then(Instant::now);
+
         // 2. Compute zoom level with hysteresis (prevents z-flip on small zoom changes)
         let raw_z = zoom_from_camera_raw(self.camera.zoom);
         let z = if self.current_z == 0 {
@@ -1877,7 +2035,36 @@ impl RenderState {
         }
 
         let view_bounds = self.camera.visible_bounds_tile();
-        self.visible_tiles_cache = visible_tiles(&view_bounds, z, 1.2);
+        self.visible_tiles_cache = if self.camera.tilt > 0.0 {
+            // Tilted, one level over the whole footprint would either starve
+            // the foreground or build the far half at a detail no pixel can
+            // show. Refine by distance instead: `z` stays the level the centre
+            // of the screen deserves, and the walk coarsens outward from it.
+            let cam = self.camera.clone();
+            let footprint = cam.ground_footprint();
+            let eye = cam.eye();
+            crate::tiles::visible_tiles_lod(
+                &view_bounds,
+                z.saturating_sub(4).max(6),
+                z,
+                &|x, y| cam.ground_mpp_at(x, y),
+                &|b| {
+                    // Behind the eye is not "far away", it is off the chart:
+                    // it would project back onto the screen mirrored. The
+                    // view direction is (0, sin t, -cos t) from an eye at
+                    // height d cos t, so a ground point is in front when
+                    // (y - eye.y) sin t + d cos^2 t > 0.
+                    let (st, ct) = (cam.tilt.sin(), cam.tilt.cos());
+                    let d = cam.eye_distance();
+                    if (b.max_y as f32 - eye.y) * st + d * ct * ct <= 0.0 {
+                        return false;
+                    }
+                    tile_meets_footprint(b, &footprint)
+                },
+            )
+        } else {
+            visible_tiles(&view_bounds, z, 1.2)
+        };
 
         // Diagnostic logging (first 5 frames only)
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1907,6 +2094,36 @@ impl RenderState {
             let b_dist = (b_cx - cam_x).powi(2) + (b_cy - cam_y).powi(2);
             a_dist.partial_cmp(&b_dist).unwrap_or(std::cmp::Ordering::Equal)
         });
+
+        let ms_select = t_select.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_draw = profile_enabled().then(Instant::now);
+
+        // Build the draw list: the tile itself when it is resident, otherwise
+        // the nearest resident ancestor clipped to this tile's screen rect.
+        self.tile_draw_list.clear();
+        let mut with_scissor = Vec::new();
+        for tile_id in &self.visible_tiles_cache {
+            let key = TileCacheKey::new(*tile_id, self.style_hash);
+            if self.tile_cache.contains(&key) {
+                self.tile_draw_list.push((key, None));
+                continue;
+            }
+            if let Some(ancestor) =
+                nearest_resident_ancestor(*tile_id, |t| {
+                    self.tile_cache.contains(&TileCacheKey::new(t, self.style_hash))
+                })
+            {
+                if let Some(rect) = self.tile_scissor(tile_id) {
+                    with_scissor.push((TileCacheKey::new(ancestor, self.style_hash), Some(rect)));
+                }
+            }
+        }
+        // Unclipped first: the scissor is render-pass state, so grouping the
+        // draws that do not need it avoids setting and resetting it per tile.
+        self.tile_draw_list.extend(with_scissor);
+
+        let ms_draw = t_draw.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        let t_missing = profile_enabled().then(Instant::now);
 
         // 3. Find missing tiles not in cache AND not already requested from worker
         let mut missing = Vec::new();
@@ -1938,6 +2155,14 @@ impl RenderState {
             }
         }
 
+        let ms_missing = t_missing.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+        if profile_enabled() && (ms_upload + ms_select + ms_draw + ms_missing) > 2000 {
+            log::info!(
+                "profile.bvt_breakdown: upload={}us select={}us drawlist={}us missing={}us candidates={}",
+                ms_upload, ms_select, ms_draw, ms_missing, self.visible_tiles_cache.len()
+            );
+        }
+
         // 4. Send missing tiles to background worker
         if !missing.is_empty() {
             if let Some(ref worker) = self.tile_worker {
@@ -1949,11 +2174,42 @@ impl RenderState {
                     center_x: self.camera.position.x,
                     center_y: self.camera.position.y,
                 };
+                // A new request supersedes the last, and the worker abandons
+                // whatever of it has not started. Those tiles never report
+                // back, so anything still marked pending from the previous
+                // generation has to be released or it would never be requested
+                // again — a permanent hole in the map.
+                self.pending_tiles.clear();
                 for tid in &missing {
                     self.pending_tiles.insert(*tid);
                 }
                 worker.request_tiles(missing, view_params);
             }
+        }
+
+        if tile_debug_enabled() {
+            let (mut res, mut pend, mut empty, mut other) = (0, 0, 0, 0);
+            let mut empties = Vec::new();
+            for t in &self.visible_tiles_cache {
+                let k = TileCacheKey::new(*t, self.style_hash);
+                if self.tile_cache.contains(&k) {
+                    res += 1;
+                } else if self.pending_tiles.contains(t) {
+                    pend += 1;
+                } else if self.tile_cache.is_known_empty(&k) {
+                    empty += 1;
+                    empties.push(format!("z{}/{}/{}", t.z, t.x, t.y));
+                } else {
+                    other += 1;
+                }
+            }
+            eprintln!(
+                "TILES visible={} resident={} pending={} empty={} unknown={} drawn={} empties=[{}]",
+                self.visible_tiles_cache.len(),
+                res, pend, empty, other,
+                self.tile_draw_list.len(),
+                empties.join(",")
+            );
         }
 
         // 5. Evict tiles over budget
@@ -1963,7 +2219,7 @@ impl RenderState {
     /// Draw tiles using cached visible_tiles from build_visible_tiles()
     fn build_global_text_buffers(&mut self) {
         use crate::render::{
-            text_layout::{declutter_and_layout_labels_ex, declutter_soundings, layout_sounding_labels},
+            text_layout::{declutter_and_layout_labels_ex, declutter_soundings},
         };
         use wgpu::util::DeviceExt;
 
@@ -1979,7 +2235,21 @@ impl RenderState {
         }
 
         declutter_soundings(&mut all_soundings, &self.camera);
-        let sounding_glyphs = layout_sounding_labels(&all_soundings);
+        // S-52 portrays soundings with the presentation library's digit
+        // symbols. navcore can, and does under NAVCORE_SOUNDING_SYMBOLS=1, but
+        // the raster atlas is too coarse to magnify — see
+        // `text_layout::sounding_symbols_enabled`.
+        let use_symbols = crate::render::text_layout::sounding_symbols_enabled();
+        let sounding_symbols = if use_symbols {
+            crate::render::text_layout::layout_sounding_symbols(&all_soundings)
+        } else {
+            Vec::new()
+        };
+        let sounding_glyphs = if use_symbols {
+            Vec::new()
+        } else {
+            crate::render::text_layout::layout_sounding_labels(&all_soundings)
+        };
         // Scale-aware ShowImportantTextOnly: suppress dis >= 20 labels (place
         // names, light descriptions) only at overview zooms. Once zoomed into
         // harbour/approach detail (z >= 14) show them, matching OpenCPN. Mirrors
@@ -1997,6 +2267,17 @@ impl RenderState {
         self.global_text_buffer = None;
         self.global_text_count = 0;
 
+        self.global_sounding_buffer = None;
+        self.global_sounding_count = sounding_symbols.len() as u32;
+        if self.global_sounding_count > 0 {
+            self.global_sounding_buffer =
+                Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Global Sounding Symbol Buffer"),
+                    contents: bytemuck::cast_slice(&sounding_symbols),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                }));
+        }
+
         self.global_label_buffer = None;
         self.global_label_count = decluttered_labels.len() as u32;
         if self.global_label_count > 0 {
@@ -2008,44 +2289,35 @@ impl RenderState {
         }
     }
 
+    /// Record what the draw pass actually issued for a tile.
+    ///
+    /// The scene dump (`navcore --dump-scene`) proves what the *builder*
+    /// decided; this proves what the *renderer* did with it. Between them sits
+    /// upload, cache residency and per-priority slicing — where geometry that
+    /// exists in a tile packet can still never reach the screen.
+    fn log_draw(&self, rec: serde_json::Value) {
+        if let Some(log) = &self.draw_log {
+            log.borrow_mut().push(rec);
+        }
+    }
+
     fn draw_tiles<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, line_style_offsets: &HashMap<LineStyleKey, u32>) {
         use std::sync::atomic::{AtomicU32, Ordering};
         static DRAW_FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
         let draw_frame = DRAW_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
         let debug_mode = debug_render_mode();
 
-        // === Stencil-write pass: coverage masking ===
-        // Render foreground chart coverage polygons to stencil (value=1).
-        // Background chart geometry will be suppressed where stencil==1.
-        {
-            render_pass.set_pipeline(&self.stencil_pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_stencil_reference(1);
-            for tile_id in &self.visible_tiles_cache {
-                let key = TileCacheKey::new(*tile_id, self.style_hash);
-                if let Some(buffers) = self.tile_cache.get(&key) {
-                    if let Some(ref cov_buf) = buffers.coverage_buffer {
-                        if buffers.coverage_vertex_count > 0 {
-                            render_pass.set_vertex_buffer(0, cov_buf.slice(..));
-                            render_pass.draw(0..buffers.coverage_vertex_count, 0..1);
-                        }
-                    }
-                }
-            }
-        }
-
         // === Priority-ordered drawing ===
         // S-52 requires interleaved draw order: for each priority level (0-9),
         // draw areas → patterns → lines → symbols, then text on top.
 
         // Pre-collect and sort all line batches by priority
-        let mut legacy_draws: Vec<(&LineBatchGpu, LineStyleKey)> = Vec::new();
-        for tile_id in &self.visible_tiles_cache {
-            let key = TileCacheKey::new(*tile_id, self.style_hash);
-            if let Some(buffers) = self.tile_cache.get(&key) {
+        let mut legacy_draws: Vec<(&LineBatchGpu, LineStyleKey, Option<[u32; 4]>)> = Vec::new();
+        for (key, scissor) in &self.tile_draw_list {
+            if let Some(buffers) = self.tile_cache.get(key) {
                 for batch in &buffers.line_batches {
                     if batch.index_count > 0 {
-                        legacy_draws.push((batch, batch.key.style.clone()));
+                        legacy_draws.push((batch, batch.key.style.clone(), *scissor));
                     }
                 }
             }
@@ -2066,22 +2338,57 @@ impl RenderState {
         {
             let mut start = 0;
             for prio in 0..10u8 {
-                let end = legacy_draws.partition_point(|(b, _)| b.key.disp_prio <= prio);
+                let end = legacy_draws.partition_point(|(b, _, _)| b.key.disp_prio <= prio);
                 legacy_prio_ranges[prio as usize] = (start, end);
                 start = end;
             }
         }
 
+        if self.draw_log.is_some() {
+            for tile_id in &self.visible_tiles_cache {
+                let key = TileCacheKey::new(*tile_id, self.style_hash);
+                match self.tile_cache.get(&key) {
+                    Some(b) => self.log_draw(serde_json::json!({
+                        "record": "tile",
+                        "tile": [tile_id.z, tile_id.x, tile_id.y],
+                        "resident": true,
+                        "area_vertex_offsets": b.area_priority_offsets,
+                        "bg_area_vertex_offsets": b.bg_area_priority_offsets,
+                        "line_batches": b.line_batches.len(),
+                    })),
+                    None => self.log_draw(serde_json::json!({
+                        "record": "tile",
+                        "tile": [tile_id.z, tile_id.x, tile_id.y],
+                        "resident": false,
+                        "note": "visible but not in the GPU tile cache — nothing of it is drawn",
+                    })),
+                }
+            }
+        }
+
+        // NAVCORE_MAX_PRIO=<n> stops the draw loop after priority n. Bisecting
+        // the priority stack is the fastest way to find which layer is painting
+        // over another: the scene dump says what *should* be there, this says
+        // which pass removed it.
+        let max_prio: u8 = std::env::var("NAVCORE_MAX_PRIO")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9);
+
         for priority in 0..10u8 {
+            if priority > max_prio {
+                break;
+            }
             let p = priority as usize;
 
             // --- Background areas at this priority (stencil test: pass when stencil==0) ---
             render_pass.set_pipeline(&self.bg_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_stencil_reference(0);
-            for tile_id in &self.visible_tiles_cache {
-                let key = TileCacheKey::new(*tile_id, self.style_hash);
-                if let Some(buffers) = self.tile_cache.get(&key) {
+            for (key, scissor) in &self.tile_draw_list {
+                let _ = &key.tile_id;
+                if let Some(buffers) = self.tile_cache.get(key) {
+                    self.apply_scissor(render_pass, *scissor);
                     if let Some(ref bg_buf) = buffers.bg_area_buffer {
                         let start = buffers.bg_area_priority_offsets[p];
                         let end = buffers.bg_area_priority_offsets[p + 1];
@@ -2097,15 +2404,22 @@ impl RenderState {
             // --- Foreground areas at this priority (no stencil test) ---
             render_pass.set_pipeline(&self.pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            for tile_id in &self.visible_tiles_cache {
-                let key = TileCacheKey::new(*tile_id, self.style_hash);
-                if let Some(buffers) = self.tile_cache.get(&key) {
+            for (key, scissor) in &self.tile_draw_list {
+                let _ = &key.tile_id;
+                if let Some(buffers) = self.tile_cache.get(key) {
+                    self.apply_scissor(render_pass, *scissor);
                     let start = buffers.area_priority_offsets[p];
                     let end = buffers.area_priority_offsets[p + 1];
                     if end > start {
                         render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
                         render_pass.draw(start..end, 0..1);
                         drew_tiles += 1;
+                        self.log_draw(serde_json::json!({
+                            "record": "draw", "kind": "area-fg",
+                            "tile": [key.tile_id.z, key.tile_id.x, key.tile_id.y],
+                            "fallback": scissor.is_some(),
+                            "priority": priority, "vertices": end - start,
+                        }));
                     }
                 }
             }
@@ -2116,9 +2430,10 @@ impl RenderState {
             {
                 let mut bg_pattern_state_set = false;
                 let mut fg_pattern_state_set = false;
-                for tile_id in &self.visible_tiles_cache {
-                    let key = TileCacheKey::new(*tile_id, self.style_hash);
-                    if let Some(buffers) = self.tile_cache.get(&key) {
+                for (key, scissor) in &self.tile_draw_list {
+                    let _ = &key.tile_id;
+                    if let Some(buffers) = self.tile_cache.get(key) {
+                        self.apply_scissor(render_pass, *scissor);
                         // Draw bg patterns
                         if let Some(ref bg_pat_buf) = buffers.bg_pattern_buffer {
                             let start = buffers.bg_pattern_priority_offsets[p];
@@ -2166,7 +2481,7 @@ impl RenderState {
 
             // Find the split point: bg batches (is_background=true) sort first
             let bg_end = legacy_draws[l_start..l_end]
-                .partition_point(|(b, _)| b.key.is_background)
+                .partition_point(|(b, _, _)| b.key.is_background)
                 + l_start;
 
             // Background lines (stencil test: pass when stencil==0)
@@ -2174,12 +2489,13 @@ impl RenderState {
                 render_pass.set_pipeline(&self.bg_line_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 render_pass.set_stencil_reference(0);
-                for (batch, style_key) in &legacy_draws[l_start..bg_end] {
+                for (batch, style_key, scissor) in &legacy_draws[l_start..bg_end] {
                     if last_style.as_ref() != Some(style_key) {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
                     let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
                     render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                     render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -2194,12 +2510,13 @@ impl RenderState {
             if l_end > bg_end {
                 render_pass.set_pipeline(&self.line_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                for (batch, style_key) in &legacy_draws[bg_end..l_end] {
+                for (batch, style_key, scissor) in &legacy_draws[bg_end..l_end] {
                     if last_style.as_ref() != Some(style_key) {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
                     let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
                     render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
                     render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -2219,9 +2536,9 @@ impl RenderState {
                     symbol_draw_calls = 1;
                 } else if debug_mode != 3 {
                     let mut symbol_state_set = false;
-                    for tile_id in &self.visible_tiles_cache {
-                        let key = TileCacheKey::new(*tile_id, self.style_hash);
-                        if let Some(buffers) = self.tile_cache.get(&key) {
+                    for (key, scissor) in &self.tile_draw_list {
+                        if let Some(buffers) = self.tile_cache.get(key) {
+                            self.apply_scissor(render_pass, *scissor);
                             if let Some(ref symbol_buffer) = buffers.symbol_buffer {
                                 let start = buffers.symbol_priority_offsets[p];
                                 let end = buffers.symbol_priority_offsets[p + 1];
@@ -2291,6 +2608,26 @@ impl RenderState {
             }
         }
 
+        // The global passes below are not per-tile; release any scissor the
+        // hole-filling draws left set.
+        self.apply_scissor(render_pass, None);
+
+        // 4b) Soundings, as S-52 digit symbols
+        if let (Some(ref symbol_renderer), Some(ref symbol_bind_group), Some(ref buf)) = (
+            &self.symbol_renderer,
+            &self.symbol_camera_bind_group,
+            &self.global_sounding_buffer,
+        ) {
+            if self.global_sounding_count > 0 {
+                symbol_renderer.render_with_buffer(
+                    render_pass,
+                    symbol_bind_group,
+                    buf,
+                    self.global_sounding_count,
+                );
+            }
+        }
+
         // 5) Labels (non-numeric text)
         if let (Some(ref label_renderer), Some(ref label_bind_group)) =
             (&self.label_renderer, &self.label_camera_bind_group)
@@ -2332,6 +2669,113 @@ impl RenderState {
     pub fn mark_dirty(&mut self) {
         self.needs_redraw = true;
     }
+
+    /// Request that the next rendered frame be saved to `path` as a PNG (headless capture).
+    pub fn request_capture(&mut self, path: String) {
+        self.pending_capture = Some(path);
+        self.needs_redraw = true;
+    }
+
+    /// True while a capture has been requested but not yet written.
+    pub fn capture_pending(&self) -> bool {
+        self.pending_capture.is_some()
+    }
+
+    /// Copy a rendered surface texture to CPU and write it as a PNG. Used by NAVCORE_SHOT.
+    fn save_capture(&self, texture: &wgpu::Texture, path: &str) {
+        let width = self.config.width;
+        let height = self.config.height;
+        let bpp = 4u32;
+        let unpadded = width * bpp;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded = ((unpadded + align - 1) / align) * align;
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture-readback"),
+            size: (padded * height) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("capture") });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        if rx.recv().map(|r| r.is_err()).unwrap_or(true) {
+            eprintln!("NAVCORE_SHOT: failed to map readback buffer");
+            return;
+        }
+
+        let data = slice.get_mapped_range();
+        let is_bgra = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        );
+        let mut pixels = Vec::with_capacity((unpadded * height) as usize);
+        for row in 0..height {
+            let start = (row * padded) as usize;
+            let line = &data[start..start + unpadded as usize];
+            for px in line.chunks_exact(4) {
+                if is_bgra {
+                    pixels.extend_from_slice(&[px[2], px[1], px[0], px[3]]);
+                } else {
+                    pixels.extend_from_slice(&[px[0], px[1], px[2], px[3]]);
+                }
+            }
+        }
+        drop(data);
+        buffer.unmap();
+
+        match image::RgbaImage::from_raw(width, height, pixels) {
+            Some(img) => match img.save(path) {
+                Ok(()) => {
+                    eprintln!("NAVCORE_SHOT: wrote {} ({}x{})", path, width, height);
+                    if let (Ok(dump), Some(log)) =
+                        (std::env::var("NAVCORE_DUMP_DRAW"), &self.draw_log)
+                    {
+                        let lines: Vec<String> = log
+                            .borrow()
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect();
+                        if std::fs::write(&dump, lines.join("\n") + "\n").is_ok() {
+                            eprintln!(
+                                "NAVCORE_DUMP_DRAW: wrote {} draw records to {}",
+                                lines.len(),
+                                dump
+                            );
+                        }
+                    }
+                }
+                Err(e) => eprintln!("NAVCORE_SHOT: save failed: {}", e),
+            },
+            None => eprintln!("NAVCORE_SHOT: bad capture buffer dimensions"),
+        }
+    }
 }
 
 /// S-57 type codes for area features (used by legacy load_chart path)
@@ -2348,5 +2792,108 @@ impl Drop for RenderState {
         if let Some(worker) = self.tile_worker.take() {
             worker.shutdown();
         }
+    }
+}
+
+
+/// Does this tile's box overlap the camera's ground footprint?
+///
+/// The footprint is a convex quad — a rectangle untilted, a trapezium tilted —
+/// so the separating-axis test over both shapes' edge normals is exact, and
+/// cheap enough to run per candidate tile during the quadtree walk. Testing the
+/// footprint's *bounding box* instead would pull in the two large wedges either
+/// side of the trapezium, which at a 45 degree tilt is most of the tiles.
+fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::Vec2; 4]) -> bool {
+    let rect = [
+        glam::Vec2::new(b.min_x as f32, b.min_y as f32),
+        glam::Vec2::new(b.max_x as f32, b.min_y as f32),
+        glam::Vec2::new(b.max_x as f32, b.max_y as f32),
+        glam::Vec2::new(b.min_x as f32, b.max_y as f32),
+    ];
+    let axes = |p: &[glam::Vec2; 4]| {
+        let mut out = [glam::Vec2::ZERO; 4];
+        for i in 0..4 {
+            let e = p[(i + 1) % 4] - p[i];
+            out[i] = glam::Vec2::new(-e.y, e.x);
+        }
+        out
+    };
+    for axis in axes(&rect).into_iter().chain(axes(quad)) {
+        if axis.length_squared() < 1e-12 {
+            continue;
+        }
+        let proj = |p: &[glam::Vec2; 4]| {
+            let mut lo = f32::MAX;
+            let mut hi = f32::MIN;
+            for v in p {
+                let d = axis.dot(*v);
+                lo = lo.min(d);
+                hi = hi.max(d);
+            }
+            (lo, hi)
+        };
+        let (a0, a1) = proj(&rect);
+        let (b0, b1) = proj(quad);
+        if a1 < b0 || b1 < a0 {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod footprint_tests {
+    use super::*;
+    use crate::tiles::TileBounds;
+
+    fn quad(pts: [(f32, f32); 4]) -> [glam::Vec2; 4] {
+        pts.map(|(x, y)| glam::Vec2::new(x, y))
+    }
+
+    #[test]
+    fn overlapping_and_disjoint_boxes() {
+        let f = quad([(0.0, 0.0), (100.0, 0.0), (100.0, 100.0), (0.0, 100.0)]);
+        assert!(tile_meets_footprint(&TileBounds::new(50.0, 150.0, 50.0, 150.0), &f));
+        assert!(tile_meets_footprint(&TileBounds::new(-50.0, 500.0, -50.0, 500.0), &f));
+        assert!(!tile_meets_footprint(&TileBounds::new(200.0, 300.0, 0.0, 100.0), &f));
+    }
+
+    #[test]
+    fn corner_outside_a_trapezium_is_rejected() {
+        // The tilted footprint: narrow near edge, wide far edge. A tile off to
+        // the side of the near edge is inside the bounding box but outside the
+        // trapezium, and is exactly what the axis test has to exclude.
+        let f = quad([(40.0, 0.0), (60.0, 0.0), (200.0, 200.0), (-100.0, 200.0)]);
+        assert!(!tile_meets_footprint(&TileBounds::new(-90.0, -70.0, 0.0, 20.0), &f));
+        assert!(tile_meets_footprint(&TileBounds::new(-90.0, -70.0, 180.0, 200.0), &f));
+    }
+}
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    /// A zoom change must not blank the map: until the new level is built, each
+    /// missing tile is covered by the nearest coarser one that exists.
+    #[test]
+    fn nearest_ancestor_walks_up_the_pyramid() {
+        let tile = TileId { z: 15, x: 17514, y: 10264 };
+        let parent = TileId { z: 14, x: 8757, y: 5132 };
+        let grandparent = TileId { z: 13, x: 4378, y: 2566 };
+
+        assert_eq!(nearest_resident_ancestor(tile, |t| t == parent), Some(parent));
+        // The parent is missing too, so it keeps climbing.
+        assert_eq!(
+            nearest_resident_ancestor(tile, |t| t == grandparent),
+            Some(grandparent)
+        );
+        // Nothing cached anywhere above it.
+        assert_eq!(nearest_resident_ancestor(tile, |_| false), None);
+        // Four levels is the limit; a 5x-removed ancestor is too coarse to use.
+        let far = TileId { z: 10, x: 547, y: 320 };
+        assert_eq!(nearest_resident_ancestor(tile, |t| t == far), None);
+        // It never offers the tile itself — the caller has already established
+        // that one is missing.
+        assert_eq!(nearest_resident_ancestor(tile, |t| t == tile), None);
     }
 }

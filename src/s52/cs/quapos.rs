@@ -51,12 +51,11 @@ pub fn quapos01_instructions(
 mod tests {
     use super::*;
     use crate::senc::{AttributeValue, FeatureType};
-    use std::collections::HashMap;
 
     fn make_feature(object_class: ObjectClass, attrs: Vec<(&str, AttributeValue)>) -> Feature {
-        let mut attributes = HashMap::new();
+        let mut attributes = crate::senc::Attributes::new();
         for (k, v) in attrs {
-            attributes.insert(k.to_string(), v);
+            attributes.insert(k, v);
         }
         Feature {
             type_code: 0,

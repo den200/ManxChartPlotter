@@ -23,6 +23,7 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
     // State for current lookup entry
     let mut in_lookup = false;
     let mut current_name = String::new();
+    let mut current_seq: u32 = 0;
     let mut current_table_name: Option<TableName> = None;
     let mut current_type: Option<GeometryType> = None;
     let mut current_prio: Option<DisplayPriority> = None;
@@ -63,10 +64,20 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
                         current_instruction.clear();
                         current_comment = None;
 
-                        // Extract name attribute
+                        // Extract name and id ("nSequence" in OpenCPN terms)
+                        current_seq = 0;
                         for attr in e.attributes().flatten() {
-                            if attr.key.as_ref() == b"name" {
-                                current_name = String::from_utf8_lossy(&attr.value).to_string();
+                            match attr.key.as_ref() {
+                                b"name" => {
+                                    current_name =
+                                        String::from_utf8_lossy(&attr.value).to_string()
+                                }
+                                b"id" => {
+                                    current_seq = String::from_utf8_lossy(&attr.value)
+                                        .parse()
+                                        .unwrap_or(0)
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -159,10 +170,24 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
                     }
                     "lookup" => {
                         // Save the entry if we have required fields
-                        if let (Some(table_name), Some(geom_type), Some(prio), Some(cat)) =
-                            (current_table_name, current_type, current_prio, current_cat)
+                        // <display-cat /> and <disp-prio /> appear empty in a few
+                        // rows (M_NPUB, M_VDAT, M_SDAT, SMCFAC): no text event
+                        // fires, so the field stays None. chartsymbols.cpp
+                        // defaults both — OTHER and "no data" — rather than
+                        // dropping the row, which is what left those classes
+                        // with no lookup at all.
+                        let prio = current_prio.unwrap_or(DisplayPriority::NoData);
+                        let cat = current_cat.unwrap_or(DisplayCategory::Other);
+                        if let (Some(table_name), Some(geom_type)) =
+                            (current_table_name, current_type)
                         {
-                            if !current_name.is_empty() && !current_instruction.is_empty() {
+                            // An empty <instruction> is a real lookup result —
+                            // it means "render nothing" (e.g. TOPMAR in the
+                            // Simplified table, whose topmarks are baked into
+                            // the buoy symbol). Dropping those rows also breaks
+                            // the S-52 fallback "first LUP with no attributes",
+                            // which then lands on an arbitrary attributed row.
+                            if !current_name.is_empty() {
                                 tables.add_entry(LookupEntry {
                                     object_class: current_name.clone(),
                                     table_name,
@@ -172,6 +197,7 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
                                     attribute_codes: current_attribs.clone(),
                                     instruction: current_instruction.clone(),
                                     comment: current_comment.clone(),
+                                    seq: current_seq,
                                 });
                             }
                         }
@@ -190,6 +216,7 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
     }
 
     tables.finalize_palettes();
+    tables.finalize_lookups();
 
     Ok(tables)
 }

@@ -110,6 +110,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.position = vec4<f32>(final_pos, 0.0, 1.0);
     out.position.z = 1.0 - (u.disp_prio / 10.0);
     out.arc_len = in.arc_len;
+    // This stage does its own perspective divide so the stroke keeps a constant
+    // pixel width, which means it cannot rely on clip-space culling: a vertex
+    // behind the tilted camera divides by a negative w and lands back on screen
+    // mirrored. Push it out of the depth range instead so the GPU drops it.
+    if clip_curr.w <= 0.0 {
+        out.position.z = 2.0;
+    }
     return out;
 }
 

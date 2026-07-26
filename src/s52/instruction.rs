@@ -58,6 +58,33 @@ impl LinePattern {
     }
 }
 
+/// How an `SY()` instruction is rotated.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SymbolRotation {
+    /// A literal bearing in degrees, e.g. `SY(LIGHTS12,135)`.
+    Degrees(f64),
+    /// Take the bearing from one of the feature's attributes, e.g.
+    /// `SY(TSSLPT51,ORIENT)`.
+    FromAttribute(String),
+}
+
+impl SymbolRotation {
+    pub fn parse(arg: &str) -> Self {
+        match arg.parse::<f64>() {
+            Ok(d) => Self::Degrees(d),
+            Err(_) => Self::FromAttribute(arg.to_string()),
+        }
+    }
+
+    /// Resolve to degrees for a given feature.
+    pub fn degrees(&self, feature: &crate::senc::Feature) -> Option<f64> {
+        match self {
+            Self::Degrees(d) => Some(*d),
+            Self::FromAttribute(name) => feature.attribute_float(name),
+        }
+    }
+}
+
 /// Parsed S-52 render instruction
 #[derive(Debug, Clone)]
 pub enum RenderInstruction {
@@ -68,14 +95,28 @@ pub enum RenderInstruction {
         color: String, // Color token like "CSTLN"
     },
 
-    /// AC(color) - Area color fill
-    AreaColor { color: String },
+    /// AC(color[,transparency]) - Area color fill.
+    ///
+    /// The optional second argument is an S-52 transparency level (the tables
+    /// only ever use 3, "75% opaque"), used for overlay areas such as traffic
+    /// zones so the depth shade below stays readable.
+    AreaColor {
+        color: String,
+        transparency: Option<u8>,
+    },
 
     /// AP(pattern) - Area pattern fill (hatching)
     AreaPattern { pattern: String },
 
-    /// SY(symbol) - Point symbol
-    Symbol { name: String },
+    /// SY(symbol[,rotation]) - Point symbol.
+    ///
+    /// The optional second argument is not decoration: LIGHTS06 emits
+    /// `SY(LIGHTS12,135)` for every light flare, and the lookup tables use
+    /// `SY(TSSLPT51,ORIENT)` to turn traffic-lane arrows along the lane.
+    Symbol {
+        name: String,
+        rotation: Option<SymbolRotation>,
+    },
 
     /// TX/TE - Text label
     Text {
@@ -94,6 +135,11 @@ pub enum RenderInstruction {
         width: u8,
         /// Body size in points (CHARS[3..]). Typical 8-20.
         bsize: u8,
+        /// Character spacing (TX arg 4 / TE arg 5): 1 = fit, 2 = standard,
+        /// 3 = wrapped. s52plib parses this into `text->space` and never reads
+        /// it again; navcore at least round-trips it, so the conformance differ
+        /// can compare the field instead of scoring it as unmodelled.
+        space: u8,
         /// Text display group (last TX/TE argument). 21-29, lower = more important.
         /// Filtered by ShowImportantTextOnly (hide dis >= 20).
         dis: u8,
@@ -130,7 +176,18 @@ impl RenderInstruction {
         }
 
         let instr_type = &s[..open];
-        let args_str = &s[open + 1..close];
+        let mut args_str = &s[open + 1..close];
+
+        // chartsymbols.xml has a handful of rows with a stray extra ')' — e.g.
+        // LNDARE's "TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26))". rfind() then puts
+        // that paren inside the last argument, the numeric parse fails and the
+        // field silently falls back to its default (text group 21 instead of
+        // 26). Drop unbalanced trailing parens instead.
+        while args_str.ends_with(')')
+            && args_str.matches(')').count() > args_str.matches('(').count()
+        {
+            args_str = &args_str[..args_str.len() - 1];
+        }
 
         // Split args, handling quoted strings
         let args = parse_args(args_str);
@@ -144,6 +201,7 @@ impl RenderInstruction {
 
             "AC" if !args.is_empty() => Some(Self::AreaColor {
                 color: args[0].trim().to_string(),
+                transparency: args.get(1).and_then(|a| a.trim().parse::<u8>().ok()),
             }),
 
             "AP" if !args.is_empty() => Some(Self::AreaPattern {
@@ -152,6 +210,7 @@ impl RenderInstruction {
 
             "SY" if !args.is_empty() => Some(Self::Symbol {
                 name: args[0].trim().to_string(),
+                rotation: args.get(1).map(|a| SymbolRotation::parse(a.trim())),
             }),
 
             "LC" if !args.is_empty() => Some(Self::LineComplex {
@@ -177,6 +236,7 @@ impl RenderInstruction {
                     weight,
                     width,
                     bsize,
+                    space: args[3].trim().parse().unwrap_or(2),
                     dis: args[8].trim().parse().unwrap_or(21),
                 })
             }
@@ -196,6 +256,7 @@ impl RenderInstruction {
                     weight,
                     width,
                     bsize,
+                    space: args[4].trim().parse().unwrap_or(2),
                     dis: args[9].trim().parse().unwrap_or(21),
                 })
             }
@@ -214,11 +275,73 @@ impl RenderInstruction {
         matches!(self, Self::AreaColor { .. })
     }
 
+    /// Render back to canonical S-52 instruction text, e.g. "LS(SOLD,1,CSTLN)".
+    ///
+    /// Used by the `--dump-ir` conformance harness so navcore's resolved
+    /// instruction stream can be diffed token-for-token against OpenCPN's
+    /// (tools/s52oracle). Fields navcore does not model are simply absent from
+    /// the output — that asymmetry is the point: the diff reports it.
+    pub fn to_s52(&self) -> String {
+        match self {
+            Self::LineStyle { pattern, width, color } => {
+                let p = match pattern {
+                    LinePattern::Solid => "SOLD",
+                    LinePattern::Dashed => "DASH",
+                    LinePattern::Dotted => "DOTT",
+                    LinePattern::DashDot => "DASD",
+                };
+                format!("LS({},{},{})", p, width, color)
+            }
+            Self::AreaColor { color, transparency } => match transparency {
+                Some(t) => format!("AC({},{})", color, t),
+                None => format!("AC({})", color),
+            },
+            Self::AreaPattern { pattern } => format!("AP({})", pattern),
+            Self::Symbol { name, rotation } => match rotation {
+                Some(SymbolRotation::Degrees(d)) => format!("SY({},{})", name, d),
+                Some(SymbolRotation::FromAttribute(a)) => format!("SY({},{})", name, a),
+                None => format!("SY({})", name),
+            },
+            Self::LineComplex { name } => format!("LC({})", name),
+            Self::ConditionalSymbology { procedure } => format!("CS({})", procedure),
+            Self::Text {
+                attribute,
+                format,
+                hjust,
+                vjust,
+                xoffs,
+                yoffs,
+                color,
+                style,
+                weight,
+                width,
+                bsize,
+                space,
+                dis,
+            } => {
+                let chars = format!("'{}{}{}{:02}'", style, weight, width, bsize);
+                match format {
+                    // TE quotes its attribute name, TX does not — s52plib emits
+                    // "TE('%s','OBJNAM',...)" against "TX(NATSUR,...)". Matching
+                    // it keeps the conformance differ comparing like with like.
+                    Some(f) => format!(
+                        "TE('{}','{}',{},{},{},{},{},{},{},{})",
+                        f, attribute, hjust, vjust, space, chars, xoffs, yoffs, color, dis
+                    ),
+                    None => format!(
+                        "TX({},{},{},{},{},{},{},{},{})",
+                        attribute, hjust, vjust, space, chars, xoffs, yoffs, color, dis
+                    ),
+                }
+            }
+        }
+    }
+
     /// Get the color token if this instruction specifies a color
     pub fn color_token(&self) -> Option<&str> {
         match self {
             Self::LineStyle { color, .. } => Some(color),
-            Self::AreaColor { color } => Some(color),
+            Self::AreaColor { color, .. } => Some(color),
             Self::Text { color, .. } => Some(color),
             _ => None,
         }
@@ -352,7 +475,7 @@ mod tests {
     #[test]
     fn test_parse_ac() {
         let instr = RenderInstruction::parse_single("AC(LANDA)").unwrap();
-        if let RenderInstruction::AreaColor { color } = instr {
+        if let RenderInstruction::AreaColor { color, .. } = instr {
             assert_eq!(color, "LANDA");
         } else {
             panic!("Expected AreaColor");
@@ -362,7 +485,7 @@ mod tests {
     #[test]
     fn test_parse_sy() {
         let instr = RenderInstruction::parse_single("SY(ACHARE02)").unwrap();
-        if let RenderInstruction::Symbol { name } = instr {
+        if let RenderInstruction::Symbol { name, .. } = instr {
             assert_eq!(name, "ACHARE02");
         } else {
             panic!("Expected Symbol");
