@@ -57,8 +57,17 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
         .constrain(true)
         .collapsible(false)
         .show(ctx, |ui| {
+            // Numbered to match o-charts' own instructions — sign in, identify
+            // this system, install the chart — so a user who has read their
+            // page recognises where they are.
             if !shop.signed_in {
-                ui.label("Sign in with your o-charts account.");
+                ui.label(RichText::new("1. Sign in to o-charts").strong());
+                ui.label(
+                    RichText::new("The same account you bought the charts with.")
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
                 ui.add_space(6.0);
                 egui::Grid::new("shop-login")
                     .num_columns(2)
@@ -132,9 +141,18 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                 // chart: a slot is an assignment to a named computer, not to
                 // an account.
                 if shop.system_name.is_none() {
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("2. Identify this system").strong());
+                    ui.label(
+                        RichText::new(
+                            "A chart licence is assigned to a named computer, usually five \
+                             of them. Name this one to claim a slot.",
+                        )
+                        .small()
+                        .weak(),
+                    );
                     ui.horizontal(|ui| {
-                        ui.label("Name this machine:");
+                        ui.label("Name:");
                         ui.add(
                             egui::TextEdit::singleline(&mut shop.new_system_name)
                                 .hint_text("e.g. saloon-mac")
@@ -161,6 +179,8 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                         );
                     }
                 }
+                ui.add_space(6.0);
+                ui.label(RichText::new("3. Install your charts").strong());
                 ui.separator();
                 chart_table(ui, shop, actions);
             }

@@ -1498,6 +1498,9 @@ impl App {
 
         // Pass to render state - Arc::clone for keys, move decryptor
         if let Some(ref mut state) = self.state {
+            // A downloaded set is unpacked beside the ones already here, so
+            // the catalogue picks it up the same way.
+            state.set_chart_root(dir.clone());
             state.load_catalog(catalog, Arc::clone(&self.keys), decryptor);
         }
     }

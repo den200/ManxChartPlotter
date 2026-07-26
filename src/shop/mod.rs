@@ -24,6 +24,7 @@
 //! 5. `assign` — claim one of the chart's slots for this machine
 //! 6. `request_download` — a signed link to the package and to its keys
 
+pub mod install;
 pub mod protocol;
 pub mod service;
 pub mod types;

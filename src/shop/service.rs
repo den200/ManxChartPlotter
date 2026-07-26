@@ -28,11 +28,13 @@ pub enum Request {
         system_name: String,
         fingerprint: Fingerprint,
     },
-    /// Claim a slot and ask the shop for a download link.
+    /// Claim a slot, fetch the package and unpack it.
     Download {
         chart_id: String,
         /// What is on disk already, if anything.
         installed: Option<super::types::Edition>,
+        /// Where chart sets live.
+        root: std::path::PathBuf,
     },
 }
 
@@ -52,6 +54,10 @@ pub enum Event {
     SignedOut,
     /// The shop's answer to a download request, for one chart.
     Grant { chart_id: String, summary: String },
+    /// Bytes fetched so far, and the expected total when known.
+    Progress { chart_id: String, done: u64, total: u64 },
+    /// A chart set is on disk and ready to draw.
+    Installed { chart_id: String, summary: String },
     Failed(String),
 }
 
@@ -172,7 +178,8 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>) {
             Request::Download {
                 chart_id,
                 installed,
-            } => download(&client, session.as_ref(), &chart_id, installed, &events),
+                root,
+            } => download(&client, session.as_ref(), &chart_id, installed, &root, &events),
             Request::Refresh => list(&client, session.as_ref(), &events),
             Request::SignOut => {
                 session = None;
@@ -192,6 +199,7 @@ fn download(
     session: Option<&Session>,
     chart_id: &str,
     installed: Option<super::types::Edition>,
+    root: &std::path::Path,
     events: &Sender<Event>,
 ) {
     let Some(session) = session else {
@@ -279,12 +287,71 @@ fn download(
                 chart_id: chart_id.to_string(),
                 summary,
             });
+            fetch_and_install(client, &grant, chart_id, root, events);
         }
         Err(e) => {
             let _ = events.send(Event::Grant {
                 chart_id: chart_id.to_string(),
                 summary: format!("refused: {e}"),
             });
+        }
+    }
+}
+
+/// Fetch each granted package and unpack it.
+///
+/// Both the package and its keys carry a digest from the shop and both are
+/// checked. A truncated chart set that still unpacks is the worst outcome
+/// available: a chart with holes in it and nothing to say so.
+fn fetch_and_install(
+    client: &ShopClient,
+    grant: &super::types::DownloadGrant,
+    chart_id: &str,
+    root: &std::path::Path,
+    events: &Sender<Event>,
+) {
+    for file in &grant.files {
+        let _ = events.send(Event::Status("Downloading the chart set…".into()));
+        let zip = match client.download(&file.url, &file.sha256, |done, total| {
+            let _ = events.send(Event::Progress {
+                chart_id: chart_id.to_string(),
+                done,
+                total,
+            });
+        }) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = events.send(Event::Failed(e.to_string()));
+                return;
+            }
+        };
+
+        let _ = events.send(Event::Status("Downloading the chart keys…".into()));
+        let keys = match client.download(&file.keys_url, &file.keys_sha256, |_, _| {}) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = events.send(Event::Failed(e.to_string()));
+                return;
+            }
+        };
+
+        let _ = events.send(Event::Status("Unpacking…".into()));
+        match super::install::install(&zip, &keys, root, |_, _| {}) {
+            Ok(done) => {
+                let _ = events.send(Event::Installed {
+                    chart_id: chart_id.to_string(),
+                    summary: format!(
+                        "{} — {} cells in {}",
+                        done.set_name,
+                        done.cells,
+                        done.path.display()
+                    ),
+                });
+            }
+            Err(e) => {
+                let _ = events.send(Event::Failed(e.to_string()));
+                return;
+            }
         }
     }
 }

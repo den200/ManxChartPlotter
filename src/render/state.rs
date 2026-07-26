@@ -316,6 +316,9 @@ pub struct RenderState {
     /// The chart shop, on its own thread. Created on first use, because most
     /// sessions never open it.
     shop: Option<crate::shop::service::ShopService>,
+    /// Where chart sets live — the directory navcore was pointed at, which is
+    /// also where a downloaded set is unpacked so it sits beside the others.
+    chart_root: Option<std::path::PathBuf>,
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
@@ -974,6 +977,7 @@ impl RenderState {
             label_renderer,
             ui: None,
             shop: None,
+            chart_root: None,
             pick_anchor: None,
             pick_objects: Vec::new(),
             pick_pending: None,
@@ -1412,6 +1416,11 @@ impl RenderState {
 
     /// Load chart catalog for tile-based multi-chart rendering.
     /// Takes ownership of decryptor (not Clone) and wraps catalog in Arc.
+    /// Remember where chart sets live, so a download lands beside them.
+    pub fn set_chart_root(&mut self, root: std::path::PathBuf) {
+        self.chart_root = Some(root);
+    }
+
     pub fn load_catalog(
         &mut self,
         catalog: ChartCatalog,
@@ -1968,9 +1977,11 @@ impl RenderState {
                         .ui
                         .as_ref()
                         .and_then(|u| u.shop.installed.get(&chart_id).copied());
+                    let root = self.chart_root.clone().unwrap_or_else(|| "charts".into());
                     self.shop_send(crate::shop::service::Request::Download {
                         chart_id,
                         installed,
+                        root,
                     });
                 }
             }
@@ -2943,6 +2954,26 @@ impl RenderState {
                     ui.shop.system_name = None;
                     ui.shop.busy = false;
                     ui.shop.status = String::new();
+                }
+                Event::Progress {
+                    chart_id,
+                    done,
+                    total,
+                } => {
+                    ui.shop.grants.insert(
+                        chart_id,
+                        if total > 0 {
+                            format!("{} of {} MB", done / 1_000_000, total / 1_000_000)
+                        } else {
+                            format!("{} MB", done / 1_000_000)
+                        },
+                    );
+                }
+                Event::Installed { chart_id, summary } => {
+                    ui.shop.grants.insert(chart_id, format!("installed: {summary}"));
+                    ui.shop.busy = false;
+                    ui.shop.status =
+                        "Installed. Restart navcore to draw the new charts.".into();
                 }
                 Event::Grant { chart_id, summary } => {
                     ui.shop.grants.insert(chart_id, summary);
