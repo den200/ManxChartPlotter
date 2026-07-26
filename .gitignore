@@ -3,6 +3,12 @@
 # Build output of the S-52 oracle. tools/s52oracle/src is tracked; its build is not.
 /tools/s52oracle/build/
 
+# The chart set: licensed cells and, next to them, a keylist holding one
+# install key per cell. Both are the user's purchase, neither belongs in a
+# repository — they were tracked until v0.4.0 and have been removed from the
+# history entirely.
+/charts/
+
 # Reference material kept locally rather than vendored: OpenCPN and the other
 # renderers we read for a second opinion, plus profiling captures.
 /doc/openCPN/
