@@ -311,8 +311,8 @@ pub struct RenderState {
 
     // Label rendering (text atlas)
     pub label_renderer: Option<LabelRenderer>,
-    /// Screen-space panels: today only the object-query bubble.
-    overlay_renderer: Option<crate::render::overlay::OverlayRenderer>,
+    /// egui. Optional only so a headless capture can run without it.
+    ui: Option<crate::render::ui::Ui>,
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
@@ -324,8 +324,7 @@ pub struct RenderState {
     /// which is what made the first click report an empty result and the second
     /// one reveal it.
     pick_pending: Option<u64>,
-    pick_glyph_buffer: Option<wgpu::Buffer>,
-    pick_glyph_count: u32,
+
     pub label_camera_bind_group: Option<wgpu::BindGroup>,
 
     // Stencil-write pipeline for coverage masking (background chart suppression)
@@ -938,13 +937,6 @@ impl RenderState {
             }
         };
 
-        let overlay_renderer = Some(crate::render::overlay::OverlayRenderer::new(
-            &device,
-            surface_format,
-            wgpu::TextureFormat::Depth24PlusStencil8,
-            super::msaa_samples(),
-        ));
-
         Self {
             // NAVCORE_DUMP_DRAW=<path> records what the draw pass issued.
             draw_log: std::env::var("NAVCORE_DUMP_DRAW")
@@ -977,12 +969,11 @@ impl RenderState {
             text_renderer,
             text_camera_bind_group,
             label_renderer,
-            overlay_renderer,
+            ui: None,
             pick_anchor: None,
             pick_objects: Vec::new(),
             pick_pending: None,
-            pick_glyph_buffer: None,
-            pick_glyph_count: 0,
+
             label_camera_bind_group,
             global_text_buffer: None,
             global_text_count: 0,
@@ -1389,6 +1380,9 @@ impl RenderState {
 
     /// Switch the active palette (Day/Dusk/Night) — zero tile rebuilds.
     pub fn switch_palette(&mut self, palette_name: &str) {
+        if let Some(ref mut ui) = self.ui {
+            ui.set_dark(matches!(palette_name, "DUSK" | "NIGHT"));
+        }
         if let Some(ref mut engine) = self.s52_engine {
             engine.tables.set_active_palette(palette_name);
             let palette_data = engine.tables.active_palette_f32();
@@ -1692,10 +1686,6 @@ impl RenderState {
                 log::info!("profile.build_visible_tiles: {} ms", start.elapsed().as_millis());
             }
 
-            // The bubble is positioned in screen space from a world anchor, so
-            // it has to follow the camera; rebuilt every frame it is showing.
-            self.refresh_pick_panel();
-
             let text_layout_key = self.current_text_layout_key();
             if self.needs_redraw && self.last_text_layout_key != text_layout_key {
                 let text_start = profile_enabled().then(Instant::now);
@@ -1910,6 +1900,37 @@ impl RenderState {
                         debug_render_mode()
                     );
                 }
+            }
+        }
+
+        // The UI, in its own pass over the resolved surface. After this point
+        // the chart is finished with the frame.
+        let ui_actions = if let Some(mut ui) = self.ui.take() {
+            let anchor = self.pick_anchor.map(|a| {
+                let s = self.camera.world_to_screen(a[0], a[1]);
+                let ppp = self.scale_factor.max(0.01);
+                [s.x / ppp, s.y / ppp]
+            });
+            let actions = ui.run(
+                &self.window.clone(),
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &view,
+                [self.config.width, self.config.height],
+                crate::render::ui::UiState {
+                    picked: self.pick_anchor.map(|_| self.pick_objects.as_slice()),
+                    pick_anchor: anchor,
+                },
+            );
+            self.ui = Some(ui);
+            actions
+        } else {
+            Vec::new()
+        };
+        for action in ui_actions {
+            match action {
+                crate::render::ui::UiAction::DismissPick => self.dismiss_pick(),
             }
         }
 
@@ -2725,25 +2746,32 @@ impl RenderState {
             }
         }
 
-        // 6) The object-query bubble, on the glass above everything: panel
-        // first, then its text.
-        if let Some(ref overlay) = self.overlay_renderer {
-            overlay.draw(render_pass);
+    }
+
+    /// Create the UI. Separate from `new` because it needs the window.
+    pub fn init_ui(&mut self) {
+        if self.ui.is_none() {
+            self.ui = Some(crate::render::ui::Ui::new(
+                &self.device,
+                &self.window,
+                self.config.format,
+            ));
         }
-        if let (Some(ref label_renderer), Some(ref label_bind_group), Some(ref buffer)) = (
-            &self.label_renderer,
-            &self.label_camera_bind_group,
-            &self.pick_glyph_buffer,
-        ) {
-            if self.pick_glyph_count > 0 {
-                label_renderer.render_with_buffer(
-                    render_pass,
-                    label_bind_group,
-                    buffer,
-                    self.pick_glyph_count,
-                );
-            }
+    }
+
+    /// Offer a window event to the UI first. `true` means it was consumed and
+    /// the chart must ignore it — otherwise dragging a panel pans the map.
+    pub fn ui_on_window_event(&mut self, event: &winit::event::WindowEvent) -> bool {
+        let window = self.window.clone();
+        match self.ui {
+            Some(ref mut ui) => ui.on_window_event(&window, event),
+            None => false,
         }
+    }
+
+    /// Is the pointer over a panel?
+    pub fn ui_wants_pointer(&self) -> bool {
+        self.ui.as_ref().is_some_and(|u| u.wants_pointer())
     }
 
     /// Ask what chart objects are under a screen position, for the info bubble.
@@ -2765,7 +2793,6 @@ impl RenderState {
         let radius_px = 2.0 * self.effective_ppmm.max(1.0);
         self.pick_anchor = None;
         self.pick_objects.clear();
-        self.pick_glyph_count = 0;
         if let Some(ref worker) = self.tile_worker {
             self.pick_pending = Some(worker.request_pick(
                 [x as f64, y as f64],
@@ -2788,8 +2815,6 @@ impl RenderState {
         if self.pick_anchor.is_some() {
             self.pick_anchor = None;
             self.pick_objects.clear();
-            self.pick_glyph_count = 0;
-            self.pick_glyph_buffer = None;
             self.needs_redraw = true;
         }
     }
@@ -2797,62 +2822,6 @@ impl RenderState {
     /// Is the info bubble showing?
     pub fn pick_active(&self) -> bool {
         self.pick_anchor.is_some() || self.pick_pending.is_some()
-    }
-
-    /// Rebuild the bubble's geometry for the current camera.
-    ///
-    /// Run every frame while a pick is showing: the panel is positioned in
-    /// screen space but anchored to a world point, so panning and zooming move
-    /// it. It is a handful of quads and a few hundred glyphs, so rebuilding is
-    /// cheaper than tracking what invalidates it.
-    fn refresh_pick_panel(&mut self) {
-        use wgpu::util::DeviceExt;
-
-        let Some(anchor) = self.pick_anchor else {
-            if let Some(ref mut overlay) = self.overlay_renderer {
-                overlay.upload(
-                    &self.device,
-                    &self.queue,
-                    [self.size.width as f32, self.size.height as f32],
-                    &[],
-                );
-            }
-            self.pick_glyph_count = 0;
-            return;
-        };
-
-        let screen = self.camera.world_to_screen(anchor[0], anchor[1]);
-        let color_index = self
-            .s52_engine
-            .as_ref()
-            .and_then(|e| e.get_color_index("CHBLK"))
-            .unwrap_or(0) as u32;
-        let panel = crate::render::pick_panel::build(
-            &self.pick_objects,
-            anchor,
-            [screen.x, screen.y],
-            [self.size.width as f32, self.size.height as f32],
-            color_index,
-            self.effective_ppmm,
-        );
-
-        if let Some(ref mut overlay) = self.overlay_renderer {
-            overlay.upload(
-                &self.device,
-                &self.queue,
-                [self.size.width as f32, self.size.height as f32],
-                &panel.overlay,
-            );
-        }
-        self.pick_glyph_count = panel.glyphs.len() as u32;
-        self.pick_glyph_buffer = (!panel.glyphs.is_empty()).then(|| {
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("Pick Panel Glyphs"),
-                    contents: bytemuck::cast_slice(&panel.glyphs),
-                    usage: wgpu::BufferUsages::VERTEX,
-                })
-        });
     }
 
     /// Get window reference for redraw requests

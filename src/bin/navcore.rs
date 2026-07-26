@@ -1532,7 +1532,8 @@ impl ApplicationHandler for App {
                 event_loop.create_window(attrs).expect("Failed to create window"),
             );
 
-            let state = pollster::block_on(RenderState::new(window));
+            let mut state = pollster::block_on(RenderState::new(window));
+            state.init_ui();
             self.state = Some(state);
 
             // Load charts after renderer is ready
@@ -1542,6 +1543,23 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = &mut self.state else { return };
+
+        // The UI sees every event first. When it takes one — a click on a
+        // panel, a drag of its title bar — the chart must not also act on it,
+        // or dragging the object bubble would pan the map underneath.
+        let consumed = state.ui_on_window_event(&event);
+        if consumed
+            && !matches!(
+                event,
+                WindowEvent::RedrawRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::CloseRequested
+                    | WindowEvent::ScaleFactorChanged { .. }
+            )
+        {
+            state.mark_dirty();
+            return;
+        }
 
         match event {
             WindowEvent::CloseRequested => {
