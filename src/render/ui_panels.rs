@@ -169,11 +169,32 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                         }
                     });
                     if !shop.systems.is_empty() {
+                        // A USB key is registered like a computer but behaves
+                        // unlike one — the licence follows the key between
+                        // machines — so it should not read as a machine you
+                        // have forgotten owning.
+                        let named = shop
+                            .systems
+                            .iter()
+                            .map(|s| {
+                                if crate::shop::types::is_dongle_name(s) {
+                                    format!("{s} (USB key)")
+                                } else {
+                                    s.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         ui.label(
-                            RichText::new(format!(
-                                "Already on this account: {}",
-                                shop.systems.join(", ")
-                            ))
+                            RichText::new(format!("Already on this account: {named}"))
+                                .small()
+                                .weak(),
+                        );
+                        ui.label(
+                            RichText::new(
+                                "Registering a machine costs nothing; a slot is spent only \
+                                 when a chart set is assigned to it.",
+                            )
                             .small()
                             .weak(),
                         );
@@ -232,33 +253,53 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                         RichText::new(target.label())
                     };
                     ui.label(state);
-                    let assigned = shop
-                        .system_name
-                        .as_deref()
-                        .and_then(|n| c.slot_for(n))
-                        .is_some();
-                    ui.label(
-                        RichText::new(if assigned {
-                            "assigned".to_string()
-                        } else {
-                            format!("free slots {}", c.max_slots)
-                        })
-                        .small()
-                        .weak(),
-                    );
+                    // What this machine's claim on the chart is. A slot is
+                    // spent per machine, so the count has to be the shop's
+                    // real one: saying five are free when three are invites
+                    // the user to hand out slots they do not have.
+                    let mine = shop.system_name.as_deref().and_then(|n| c.slot_for(n));
+                    let on_key = c.dongle_slot();
+                    let cell = match (mine.is_some(), on_key) {
+                        (true, _) => "assigned here".to_string(),
+                        (false, Some(s)) => format!("on USB key {}", s.assigned_system),
+                        (false, None) => {
+                            format!("{} of {} free", c.free_slots(), c.total_slots())
+                        }
+                    };
+                    let holders = c.holders();
+                    let cell = ui.label(RichText::new(cell).small().weak());
+                    if !holders.is_empty() {
+                        cell.on_hover_text(format!(
+                            "{} of {} slot(s) in use: {}",
+                            c.assigned_slots(),
+                            c.total_slots(),
+                            holders.join(", ")
+                        ));
+                    }
                     // Offered even for an expired subscription. Whether the
                     // last edition it covered may still be fetched is the
                     // shop's decision, and the only way to learn it is to ask.
-                    let can_ask = shop.system_name.is_some() && !shop.busy;
-                    if ui
+                    let can_ask =
+                        shop.system_name.is_some() && !shop.busy && !c.is_fully_assigned();
+                    let button = ui
                         .add_enabled(can_ask, egui::Button::new("Download"))
                         .on_disabled_hover_text(if shop.system_name.is_none() {
                             "register this machine first"
+                        } else if c.is_fully_assigned() {
+                            "every slot on this licence is assigned to another machine"
                         } else {
                             "busy"
-                        })
-                        .clicked()
-                    {
+                        });
+                    let button = if c.expired {
+                        button.on_hover_text(
+                            "This subscription has lapsed. o-charts decides whether the \
+                             last edition it covered may still be fetched — pressing this \
+                             asks, and shows the answer.",
+                        )
+                    } else {
+                        button
+                    };
+                    if button.clicked() {
                         actions.push(UiAction::ShopDownload {
                             chart_id: c.id.clone(),
                         });
