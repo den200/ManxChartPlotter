@@ -107,6 +107,18 @@ pub fn install(
     }
     let set_name = set_name.ok_or_else(|| InstallError::Shape("the package is empty".into()))?;
 
+    // The set name comes from the archive too, so it gets the same treatment as
+    // an entry path. It is not enough to vet the entries: every entry of a
+    // package whose top-level directory is `..` is refused below, and the name
+    // was then still used to build the keylist's path — writing one file a
+    // directory above the install root. The keylist is the last thing written
+    // and the easiest to overlook.
+    let set_dir = safe_join(root, &set_name)
+        .filter(|p| p.parent() == Some(root))
+        .ok_or_else(|| {
+            InstallError::Shape(format!("unusable chart set name {set_name:?}"))
+        })?;
+
     let total = archive.len();
     let mut cells = 0usize;
     for i in 0..total {
@@ -139,7 +151,6 @@ pub fn install(
 
     // The keylist. navcore finds it by scanning the set directory for any XML
     // that is not the ChartList, so the name only has to differ from that.
-    let set_dir = root.join(&set_name);
     std::fs::create_dir_all(&set_dir)?;
     std::fs::write(set_dir.join(format!("{set_name}.XML")), keys_xml)?;
 
@@ -227,6 +238,26 @@ mod tests {
         let done = install(&zip, b"<keyList/>", dir.path(), |_, _| {}).unwrap();
         assert_eq!(done.cells, 1);
         assert!(!dir.path().parent().unwrap().join("escaped").exists());
+    }
+
+    #[test]
+    fn a_package_whose_set_name_escapes_is_refused_outright() {
+        // The entries are refused by `safe_join`, but the *set name* derived
+        // from them was once used unchecked to place the keylist — one file,
+        // one directory above the install root.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("charts");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip = zip_with(&[("../pwned.oesu", b"x")]);
+        let err = install(&zip, b"<keyList/>", &root, |_, _| {}).unwrap_err();
+        assert!(matches!(err, InstallError::Shape(_)), "{err}");
+        // Nothing was written beside the install root.
+        let siblings: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(siblings, vec![std::ffi::OsString::from("charts")], "{siblings:?}");
     }
 
     #[test]
