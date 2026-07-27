@@ -269,7 +269,18 @@ fn generate_fpr_into(binary: &Path, destination: &Path) -> DecryptResult<PathBuf
     fs::create_dir_all(destination)?;
     let temp_dir = tempdir()?;
     let temp_path = temp_dir.path();
-    let target = temp_path.to_string_lossy().to_string();
+
+    // The trailing separator is load-bearing. `oexserverd -g` joins its target
+    // to the filename it invents by plain string concatenation, so a target of
+    // `/tmp/.tmpAbC` yields `/tmp/.tmpAbCoc03D_1785145257.fpr` — the directory's
+    // own name glued onto the front, and the file written *beside* the
+    // directory rather than inside it. The name then travels to the shop as
+    // `xfprName`. The reference client forces the separator for the same
+    // reason.
+    let mut target = temp_path.to_string_lossy().into_owned();
+    if !target.ends_with(std::path::MAIN_SEPARATOR) {
+        target.push(std::path::MAIN_SEPARATOR);
+    }
 
     let args = vec!["-g".to_string(), target];
     let output = run_oex_cli(binary, &args)?;

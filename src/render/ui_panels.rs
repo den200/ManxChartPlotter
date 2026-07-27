@@ -146,11 +146,48 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                     ui.label(
                         RichText::new(
                             "A chart licence is assigned to a named computer, usually five \
-                             of them. Name this one to claim a slot.",
+                             of them. Registering a name costs nothing — a slot is spent only \
+                             when a chart set is assigned to it.",
                         )
                         .small()
                         .weak(),
                     );
+                    // Reusing the name this machine already carries is almost
+                    // always what is wanted, and typing a fresh one is the
+                    // expensive mistake: o-charts will not move or cancel an
+                    // assignment once made, so a second name for one computer
+                    // spends a second slot permanently.
+                    if !shop.systems.is_empty() {
+                        ui.label(
+                            RichText::new("Already on this account — reuse one:")
+                                .small()
+                                .weak(),
+                        );
+                        let mut chosen = None;
+                        ui.horizontal_wrapped(|ui| {
+                            for name in &shop.systems {
+                                let key = crate::shop::types::is_dongle_name(name);
+                                let label = if key {
+                                    format!("{name} (USB key)")
+                                } else {
+                                    name.clone()
+                                };
+                                let hint = if key {
+                                    "A USB key: the licence follows the key between machines, \
+                                     and only works while it is plugged in."
+                                } else {
+                                    "Reuse this name if it is what this computer was \
+                                     registered as before."
+                                };
+                                if ui.button(label).on_hover_text(hint).clicked() {
+                                    chosen = Some(name.clone());
+                                }
+                            }
+                        });
+                        if let Some(name) = chosen {
+                            shop.new_system_name = name;
+                        }
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Name:");
                         ui.add(
@@ -168,35 +205,27 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                             });
                         }
                     });
-                    if !shop.systems.is_empty() {
-                        // A USB key is registered like a computer but behaves
-                        // unlike one — the licence follows the key between
-                        // machines — so it should not read as a machine you
-                        // have forgotten owning.
-                        let named = shop
-                            .systems
-                            .iter()
-                            .map(|s| {
-                                if crate::shop::types::is_dongle_name(s) {
-                                    format!("{s} (USB key)")
-                                } else {
-                                    s.clone()
-                                }
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        ui.label(
-                            RichText::new(format!("Already on this account: {named}"))
-                                .small()
-                                .weak(),
-                        );
+                    if shop
+                        .systems
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(shop.new_system_name.trim()))
+                    {
                         ui.label(
                             RichText::new(
-                                "Registering a machine costs nothing; a slot is spent only \
-                                 when a chart set is assigned to it.",
+                                "This name is already on the account, so registering it \
+                                 re-points it at this machine rather than spending a new slot.",
                             )
                             .small()
                             .weak(),
+                        );
+                    } else if !shop.new_system_name.trim().is_empty() {
+                        ui.label(
+                            RichText::new(
+                                "This is a new name. o-charts cannot move or cancel an \
+                                 assignment once a chart is requested for it.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_rgb(180, 120, 40)),
                         );
                     }
                 }
