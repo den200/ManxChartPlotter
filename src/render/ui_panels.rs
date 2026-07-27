@@ -334,6 +334,38 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                         });
                     }
                     ui.end_row();
+                    // The provenance of the licence, on its own row: what was
+                    // bought, when it lapsed, and which edition this machine's
+                    // slot actually holds. For an expired set that last figure
+                    // is the whole question — it is the edition the licence
+                    // paid for, and the only one worth asking the shop for.
+                    let held = mine
+                        .map(|(_, s)| s.last_requested.trim())
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| installed.map(|e| e.to_string()));
+                    let mut facts = Vec::new();
+                    if !c.purchased.is_empty() {
+                        facts.push(format!("bought {}", c.purchased));
+                    }
+                    if !c.expires.is_empty() {
+                        facts.push(format!(
+                            "{} {}",
+                            if c.expired { "expired" } else { "renews" },
+                            c.expires
+                        ));
+                    }
+                    if let Some(ref held) = held {
+                        facts.push(format!("your edition {held}"));
+                    }
+                    if !facts.is_empty() {
+                        ui.label("");
+                        ui.label("");
+                        ui.label(RichText::new(facts.join(" · ")).small().weak());
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                    }
                     if let Some(answer) = shop.grants.get(&c.id) {
                         ui.label("");
                         ui.label("");

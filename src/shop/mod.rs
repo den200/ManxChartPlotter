@@ -240,13 +240,18 @@ impl ShopClient {
     }
 
     /// Ask for a download. Returns the package and key links.
+    /// `requested_version` is sent verbatim rather than as an [`Edition`],
+    /// because the shop's own strings are the safest thing to echo back: the
+    /// chart's `edition` arrives as `2026/1-29` but a slot's `lastRequested`
+    /// arrives as `1-20`, and re-formatting either one risks asking for an
+    /// edition that does not exist.
     pub fn request_download(
         &self,
         session: &Session,
         slot_uuid: &str,
         system_name: &str,
         target: DownloadTarget,
-        requested: Edition,
+        requested_version: &str,
         installed: Option<Edition>,
     ) -> Result<DownloadGrant, Error> {
         let Some(requested_file) = target.requested_file() else {
@@ -262,7 +267,7 @@ impl ShopClient {
             ("assignedSystemName", system_name),
             ("slotUuid", slot_uuid),
             ("requestedFile", requested_file),
-            ("requestedVersion", &requested.to_string()),
+            ("requestedVersion", requested_version),
             ("currentVersion", &current),
             ("version", &protocol::client_version()),
         ]))?;

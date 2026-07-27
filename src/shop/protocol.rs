@@ -124,6 +124,10 @@ fn explain(code: &str) -> &'static str {
         "5" => "this client version is no longer accepted by the shop",
         "6" => "wrong email or password",
         "10" => "this system name has been disabled",
+        // Not in the reference client's table — it falls through to a generic
+        // "operation cancelled". Observed when asking for an edition published
+        // after the licence lapsed.
+        "14" => "the shop would not grant this edition",
         "20" => "that chart is already assigned to this machine",
         "3d" => "no username given",
         "3e" => "invalid username",
@@ -292,6 +296,39 @@ fn set_file(f: &mut FileGrant, name: &str, value: &str) {
     }
 }
 
+/// What to ask the shop for: which package, and which edition by name.
+///
+/// The edition is a string rather than an [`Edition`] because the shop's own
+/// wording is the safest thing to echo back — a chart's `edition` arrives as
+/// `2026/1-29` while a slot's `lastRequested` arrives as `1-20`, and
+/// re-formatting either risks naming an edition that does not exist.
+///
+/// The expired case is the interesting one. A lapsed subscription still paid
+/// for the editions published while it ran, so asking for the shop's *current*
+/// edition asks for something the licence never covered and is refused. Ask
+/// instead for the last edition this slot actually received, as a full base:
+/// an update package is only valid against the exact edition it was built from.
+pub fn choose_request(
+    expired: bool,
+    slot_last_requested: &str,
+    installed: Option<Edition>,
+    available: Edition,
+) -> (DownloadTarget, String) {
+    if expired {
+        let entitled = Some(slot_last_requested.trim())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+            .or_else(|| installed.map(|e| e.to_string()));
+        if let Some(version) = entitled {
+            return (DownloadTarget::Base, version);
+        }
+    }
+    (
+        choose_download(installed, available),
+        available.to_string(),
+    )
+}
+
 /// Which package to ask for, given what is installed and what the shop has.
 ///
 /// There is no "check for updates" call: `getlist` reports the shop's edition
@@ -319,6 +356,46 @@ pub fn choose_download(installed: Option<Edition>, available: Edition) -> Downlo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_expired_licence_asks_for_the_edition_it_paid_for() {
+        let shop_has = Edition::parse("2026/1-29");
+        let on_disk = Some(Edition::parse("2025/1-20"));
+
+        // Live subscription: the shop's current edition. A base, because the
+        // year moved — only a minor bump within one edition can be patched.
+        let (target, version) = choose_request(false, "1-20", on_disk, shop_has);
+        assert_eq!(target, DownloadTarget::Base);
+        assert_eq!(version, "2026/1-29");
+
+        // Same edition, later update: that one is a patch.
+        let (target, version) =
+            choose_request(false, "1-20", on_disk, Edition::parse("2025/1-24"));
+        assert_eq!(target, DownloadTarget::Update);
+        assert_eq!(version, "2025/1-24");
+
+        // Lapsed: ask for what the slot last received, as a whole base. Asking
+        // for 2026/1-29 is asking for an edition published after the licence
+        // ran out, and the shop answers 14.
+        let (target, version) = choose_request(true, "1-20", on_disk, shop_has);
+        assert_eq!(target, DownloadTarget::Base);
+        assert_eq!(version, "1-20");
+
+        // The shop's own string wins over ours, verbatim — including its
+        // year-less form, which we must not "helpfully" reformat.
+        let (_, version) = choose_request(true, "  2025/1-20 ", on_disk, shop_has);
+        assert_eq!(version, "2025/1-20");
+
+        // No record on the slot: fall back to what is installed here.
+        let (target, version) = choose_request(true, "", on_disk, shop_has);
+        assert_eq!(target, DownloadTarget::Base);
+        assert_eq!(version, "2025/1-20");
+
+        // Expired and nothing installed: there is no old edition to name, so
+        // ask normally and let the shop refuse in its own words.
+        let (_, version) = choose_request(true, "", None, shop_has);
+        assert_eq!(version, "2026/1-29");
+    }
 
     #[test]
     fn password_and_bytes_are_uppercase_hex() {

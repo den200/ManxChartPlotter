@@ -250,17 +250,27 @@ fn download(
         }
     };
 
-    let target = super::protocol::choose_download(installed, chart.edition);
-    let _ = events.send(Event::Status(format!(
-        "Asking for the {} package…",
-        target.requested_file().unwrap_or("nothing")
-    )));
+    let last_requested = chart
+        .slot_for(&system_name)
+        .map(|(_, s)| s.last_requested.as_str())
+        .unwrap_or_default();
+    let (target, requested_version) =
+        super::protocol::choose_request(chart.expired, last_requested, installed, chart.edition);
+    let asked = requested_version.clone();
+    let _ = events.send(Event::Status(if chart.expired {
+        format!("Asking for edition {asked}, the last one your licence covered…")
+    } else {
+        format!(
+            "Asking for the {} package…",
+            target.requested_file().unwrap_or("nothing")
+        )
+    }));
     match client.request_download(
         session,
         &slot_uuid,
         &system_name,
         target,
-        chart.edition,
+        &requested_version,
         installed,
     ) {
         Ok(grant) if grant.files.is_empty() => {
@@ -290,9 +300,12 @@ fn download(
             fetch_and_install(client, &grant, chart_id, root, events);
         }
         Err(e) => {
+            // Naming the edition we asked for matters: "refused" alone cannot
+            // distinguish "you may not have this chart" from "you may not have
+            // *this edition* of it", and those have different remedies.
             let _ = events.send(Event::Grant {
                 chart_id: chart_id.to_string(),
-                summary: format!("refused: {e}"),
+                summary: format!("asked for edition {asked}, refused: {e}"),
             });
         }
     }
