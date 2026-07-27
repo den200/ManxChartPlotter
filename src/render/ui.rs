@@ -135,9 +135,18 @@ impl Ui {
         style(&self.ctx, dark);
     }
 
-    /// Does the pointer currently sit over a panel?
-    pub fn wants_pointer(&self) -> bool {
-        self.ctx.wants_pointer_input()
+    /// Is the pointer over any part of the interface — a panel, a window, a
+    /// widget?
+    ///
+    /// This, not `wants_pointer_input`, is the gate for "should the chart get
+    /// this click". `wants_pointer_input` is false whenever a button is down,
+    /// so that a drag begun on the chart keeps working as it passes over a
+    /// panel — useful, and exactly wrong for deciding whether a *press* was
+    /// meant for the interface. It is why clicking the menu bar also dropped a
+    /// pin on the chart behind it: the bar's background is not a widget, egui
+    /// did not claim the click, and it fell through.
+    pub fn pointer_over_ui(&self) -> bool {
+        self.ctx.is_pointer_over_area()
     }
 
     /// Build a frame, draw it over `view`, and return what the user asked for.

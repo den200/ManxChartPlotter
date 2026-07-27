@@ -1416,6 +1416,11 @@ struct App {
     mouse_pressed: bool,
     /// Where the left button went down, so a click can be told from a drag.
     drag_start: Option<PhysicalPosition<f64>>,
+    /// The press that began this gesture landed on the interface, so the whole
+    /// gesture belongs to it — press, drag and release alike. Decided once, at
+    /// the press, because a drag that starts on a panel and wanders over the
+    /// chart is still the panel's drag.
+    gesture_on_ui: bool,
     /// The same, for a single finger.
     touch_start: Option<PhysicalPosition<f64>>,
     // Touch state for pinch-zoom
@@ -1437,6 +1442,7 @@ impl App {
             last_mouse_pos: PhysicalPosition::new(0.0, 0.0),
             mouse_pressed: false,
             drag_start: None,
+            gesture_on_ui: false,
             touch_start: None,
             touches: HashMap::new(),
             pinch_start_distance: None,
@@ -1750,7 +1756,13 @@ impl ApplicationHandler for App {
                 if button == MouseButton::Left {
                     let pressed = btn_state == ElementState::Pressed;
                     if pressed {
+                        self.gesture_on_ui = state.ui_pointer_over();
                         self.drag_start = Some(self.last_mouse_pos);
+                    } else if self.gesture_on_ui {
+                        self.gesture_on_ui = false;
+                        self.drag_start = None;
+                        self.mouse_pressed = false;
+                        return;
                     } else if let Some(start) = self.drag_start.take() {
                         // A click identifies what is under it; a drag pans. The
                         // two arrive as the same pair of events, so they are
@@ -1772,7 +1784,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                if self.mouse_pressed {
+                if self.mouse_pressed && !self.gesture_on_ui {
                     let dx = (position.x - self.last_mouse_pos.x) as f32;
                     let dy = (position.y - self.last_mouse_pos.y) as f32;
                     state.camera.pan(dx, dy);
@@ -1820,6 +1832,7 @@ impl ApplicationHandler for App {
                         // from a pan on release.
                         if self.touches.len() == 1 {
                             self.touch_start = Some(location);
+                            self.gesture_on_ui = state.ui_pointer_over();
                         } else {
                             self.touch_start = None;
                         }
@@ -1852,7 +1865,7 @@ impl ApplicationHandler for App {
                                 }
                             }
                             self.pinch_start_distance = Some(new_distance);
-                        } else if self.touches.len() == 1 {
+                        } else if self.touches.len() == 1 && !self.gesture_on_ui {
                             // Single-finger pan
                             if let Some(old_loc) = old_location {
                                 let dx = (location.x - old_loc.x) as f32;
@@ -1871,7 +1884,10 @@ impl ApplicationHandler for App {
                                 let moved = ((location.x - start.x).powi(2)
                                     + (location.y - start.y).powi(2))
                                 .sqrt();
-                                if moved <= 10.0 && self.touches.len() == 1 {
+                                if moved <= 10.0
+                                    && self.touches.len() == 1
+                                    && !self.gesture_on_ui
+                                {
                                     if state.pick_active() {
                                         state.dismiss_pick();
                                     } else {
@@ -1884,6 +1900,7 @@ impl ApplicationHandler for App {
                             }
                         }
                         self.touch_start = None;
+                        self.gesture_on_ui = false;
                         self.touches.remove(&id);
                         self.pinch_start_distance = None;
                     }

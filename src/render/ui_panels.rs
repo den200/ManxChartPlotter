@@ -313,15 +313,27 @@ fn object_query(
             ui.label("Nothing charted here.");
             return;
         }
-        ui.label(
-            RichText::new(format!(
-                "{} object{} here",
-                objects.len(),
-                if objects.len() == 1 { "" } else { "s" }
-            ))
-            .small()
-            .weak(),
-        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} object{} here",
+                    objects.len(),
+                    if objects.len() == 1 { "" } else { "s" }
+                ))
+                .small()
+                .weak(),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Copy all")
+                    .on_hover_text("Copy every object listed here")
+                    .clicked()
+                {
+                    let all: String = objects.iter().map(as_text).collect::<Vec<_>>().join("\n");
+                    ui.ctx().copy_text(all);
+                }
+            });
+        });
         ui.separator();
 
         // Scrolls, so nothing is truncated: a tap in a harbour can find forty
@@ -346,6 +358,19 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new(&o.title).strong());
         ui.label(RichText::new(format!("({})", o.acronym)).weak().small());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Selecting text with a fingertip on a wet screen is not a thing
+            // anyone does successfully. One button copies the whole object —
+            // class, chart, every attribute and any chart note — which is what
+            // you want when reporting a chart error or asking someone ashore.
+            if ui
+                .small_button("Copy")
+                .on_hover_text("Copy this object's details")
+                .clicked()
+            {
+                ui.ctx().copy_text(as_text(o));
+            }
+        });
     });
     ui.label(
         RichText::new(format!(
@@ -382,6 +407,26 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
             ui.label(RichText::new(note.trim()).small());
         });
     }
+}
+
+/// One object as plain text, for the clipboard.
+fn as_text(o: &PickedObject) -> String {
+    let mut out = format!("{} ({})\n", o.title, o.acronym);
+    out.push_str(&format!(
+        "{} · 1:{} · {}\n",
+        geometry_name(o.geometry),
+        o.chart_scale,
+        o.chart
+    ));
+    for (k, v) in &o.attributes {
+        out.push_str(&format!("  {k}  {v}\n"));
+    }
+    for note in &o.notes {
+        out.push('\n');
+        out.push_str(note.trim());
+        out.push('\n');
+    }
+    out
 }
 
 fn geometry_name(kind: FeatureType) -> &'static str {

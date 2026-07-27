@@ -2836,9 +2836,9 @@ impl RenderState {
         }
     }
 
-    /// Is the pointer over a panel?
-    pub fn ui_wants_pointer(&self) -> bool {
-        self.ui.as_ref().is_some_and(|u| u.wants_pointer())
+    /// Is the pointer over the interface rather than the chart?
+    pub fn ui_pointer_over(&self) -> bool {
+        self.ui.as_ref().is_some_and(|u| u.pointer_over_ui())
     }
 
     /// Ask what chart objects are under a screen position, for the info bubble.
