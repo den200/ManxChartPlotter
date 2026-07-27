@@ -316,6 +316,14 @@ pub struct RenderState {
     /// The chart shop, on its own thread. Created on first use, because most
     /// sessions never open it.
     shop: Option<crate::shop::service::ShopService>,
+    /// The Signal K stream, on its own thread. Also created on first use — a
+    /// chart table with no boat around it should not open a socket.
+    signalk: Option<crate::signalk::SignalKService>,
+    /// What the boat is doing, as last heard.
+    vessel: crate::signalk::Vessel,
+    /// The camera is tracking the boat, so the catalogue clamp must not drag
+    /// it back to the middle of the charts.
+    following: bool,
     /// Where chart sets live — the directory navcore was pointed at, which is
     /// also where a downloaded set is unpacked so it sits beside the others.
     chart_root: Option<std::path::PathBuf>,
@@ -977,6 +985,9 @@ impl RenderState {
             label_renderer,
             ui: None,
             shop: None,
+            signalk: None,
+            vessel: Default::default(),
+            following: false,
             chart_root: None,
             pick_anchor: None,
             pick_objects: Vec::new(),
@@ -1917,6 +1928,7 @@ impl RenderState {
         }
 
         self.poll_shop();
+        self.poll_signalk();
 
         // The UI, in its own pass over the resolved surface. After this point
         // the chart is finished with the frame.
@@ -1926,6 +1938,7 @@ impl RenderState {
                 let ppp = self.scale_factor.max(0.01);
                 [s.x / ppp, s.y / ppp]
             });
+            let own_ship = self.own_ship_view();
             let actions = ui.run(
                 &self.window.clone(),
                 &self.device,
@@ -1936,7 +1949,9 @@ impl RenderState {
                 crate::render::ui::UiState {
                     picked: self.pick_anchor.map(|_| self.pick_objects.as_slice()),
                     pick_anchor: anchor,
+                    own_ship,
                 },
+                &self.vessel,
             );
             self.ui = Some(ui);
             actions
@@ -1996,6 +2011,36 @@ impl RenderState {
                         ui.shop.pending = None;
                     }
                 }
+                crate::render::ui::UiAction::SignalKConnect { url } => {
+                    let stream = crate::signalk::service::normalise_url(&url);
+                    if stream.is_empty() {
+                        if let Some(ref mut ui) = self.ui {
+                            ui.instruments.status = "Enter the address of your Signal K server"
+                                .into();
+                        }
+                    } else {
+                        log::info!("signalk: connecting to {stream}");
+                        self.signalk
+                            .get_or_insert_with(crate::signalk::SignalKService::new)
+                            .connect(stream);
+                        self.save_settings();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::SignalKDisconnect => {
+                    if let Some(ref sk) = self.signalk {
+                        sk.disconnect();
+                    }
+                    // Drop the readings with the connection. Keeping them would
+                    // leave a bar of numbers that look live and are not.
+                    self.vessel.clear();
+                    if let Some(ref mut ui) = self.ui {
+                        ui.instruments.connected = false;
+                        ui.instruments.available.clear();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::SettingsChanged => self.save_settings(),
             }
         }
 
@@ -2031,17 +2076,41 @@ impl RenderState {
         let min_y = (extent.min_y as f32) + half_h;
         let max_y = (extent.max_y as f32) - half_h;
 
-        // If the extent is smaller than the viewport at the current zoom, just center.
+        // If the extent is smaller than the viewport at the current zoom there
+        // is no meaningful range to clamp into, and the view is centred on the
+        // charts instead.
+        //
+        // Except while following the boat. That case is not hypothetical: at
+        // the zoom navcore opens at, a single chart set fits on screen whole,
+        // so this branch ran every frame and snapped the camera back a moment
+        // after the boat moved it — follow appeared to do nothing at all.
+        // Following still stays inside the charts, it simply is not dragged to
+        // their middle.
+        let centre_x = ((extent.min_x + extent.max_x) / 2.0) as f32;
+        let centre_y = ((extent.min_y + extent.max_y) / 2.0) as f32;
+
         if min_x.is_finite() && max_x.is_finite() && min_x <= max_x {
             self.camera.position.x = self.camera.position.x.clamp(min_x, max_x);
+        } else if self.following {
+            self.camera.position.x = self
+                .camera
+                .position
+                .x
+                .clamp(extent.min_x as f32, extent.max_x as f32);
         } else {
-            self.camera.position.x = ((extent.min_x + extent.max_x) / 2.0) as f32;
+            self.camera.position.x = centre_x;
         }
 
         if min_y.is_finite() && max_y.is_finite() && min_y <= max_y {
             self.camera.position.y = self.camera.position.y.clamp(min_y, max_y);
+        } else if self.following {
+            self.camera.position.y = self
+                .camera
+                .position
+                .y
+                .clamp(extent.min_y as f32, extent.max_y as f32);
         } else {
-            self.camera.position.y = ((extent.min_y + extent.max_y) / 2.0) as f32;
+            self.camera.position.y = centre_y;
         }
     }
 
@@ -2834,6 +2903,28 @@ impl RenderState {
                     ui.shop.open = true;
                     ui.shop.email = std::env::var("NAVCORE_SHOP_EMAIL").unwrap_or_default();
                 }
+                // `NAVCORE_SIGNALK=<address>` overrides the saved server, for
+                // testing against a particular one without touching settings.
+                if let Ok(url) = std::env::var("NAVCORE_SIGNALK") {
+                    if !url.is_empty() {
+                        ui.instruments.url = url;
+                    }
+                }
+            }
+            // Open the stream to the server this plotter was last using. A
+            // chart plotter that has to be told to reconnect every time the
+            // boat's power cycles is not a chart plotter.
+            let url = self
+                .ui
+                .as_ref()
+                .map(|u| u.instruments.url.clone())
+                .unwrap_or_default();
+            let stream = crate::signalk::service::normalise_url(&url);
+            if !stream.is_empty() {
+                log::info!("signalk: reconnecting to {stream}");
+                self.signalk
+                    .get_or_insert_with(crate::signalk::SignalKService::new)
+                    .connect(stream);
             }
         }
     }
@@ -2914,6 +3005,131 @@ impl RenderState {
     /// Is the info bubble showing?
     pub fn pick_active(&self) -> bool {
         self.pick_anchor.is_some() || self.pick_pending.is_some()
+    }
+
+    /// Where the instrument layout is kept between runs.
+    ///
+    /// A dashboard someone arranged at the chart table must still be there
+    /// when they start the engine.
+    fn settings_path() -> Option<std::path::PathBuf> {
+        Some(dirs::config_dir()?.join("navcore").join("settings.json"))
+    }
+
+    fn save_settings(&self) {
+        let (Some(ui), Some(path)) = (self.ui.as_ref(), Self::settings_path()) else {
+            return;
+        };
+        let Ok(json) = serde_json::to_string_pretty(&ui.instruments) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&path, json) {
+            // Not fatal: the session works, it just will not be remembered.
+            log::warn!("could not save settings to {}: {e}", path.display());
+        }
+    }
+
+    pub(crate) fn load_settings() -> Option<crate::render::ui::InstrumentView> {
+        let path = Self::settings_path()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                // A settings file from an older build should cost the user
+                // their layout, not their session.
+                log::warn!("ignoring unreadable settings at {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Project the boat onto the screen for the overlay.
+    ///
+    /// The renderer does this rather than the UI because the camera lives
+    /// here, and because the UI should not learn about Mercator to draw a
+    /// triangle.
+    fn own_ship_view(&self) -> Option<crate::render::ui_ownship::OwnShip> {
+        let (lat, lon) = self.vessel.position()?;
+        let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
+        let screen = self.camera.world_to_screen(wx as f32, wy as f32);
+        let ppp = self.scale_factor.max(0.01);
+
+        // The fix, not the heading, decides staleness: a boat that has lost
+        // its GPS must not keep drawing itself somewhere plausible.
+        let stale = self
+            .vessel
+            .get("navigation.position")
+            .map(|r| r.is_stale())
+            .unwrap_or(true);
+
+        Some(crate::render::ui_ownship::OwnShip {
+            screen: [screen.x / ppp, screen.y / ppp],
+            heading: self.vessel.heading_true().map(|h| h as f32),
+            cog: self
+                .vessel
+                .number("navigation.courseOverGroundTrue")
+                .map(|c| c as f32),
+            sog: self
+                .vessel
+                .number("navigation.speedOverGround")
+                .map(|s| s as f32),
+            // Metres per *logical point*, so the course vector is a real
+            // distance whatever the display's pixel density.
+            mpp: self.camera.zoom * ppp,
+            stale,
+        })
+    }
+
+    /// Fold whatever the boat has said into the vessel state.
+    fn poll_signalk(&mut self) {
+        let Some(ref sk) = self.signalk else { return };
+        let events = sk.poll();
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                crate::signalk::service::Event::Status(s) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.instruments.connected = s.is_connected();
+                        ui.instruments.status = s.summary();
+                    }
+                }
+                crate::signalk::service::Event::Delta(d) => self.vessel.apply(&d),
+            }
+        }
+        let mut follow = false;
+        if let Some(ref mut ui) = self.ui {
+            // The picker offers what the boat actually sends, which is the
+            // only list worth showing: a menu of every path Signal K defines
+            // would be hundreds long and mostly absent.
+            if ui.instruments.available.len() != self.vessel.len() {
+                ui.instruments.available = self.vessel.paths().map(str::to_string).collect();
+            }
+            follow = ui.instruments.follow;
+        }
+
+        self.following = false;
+        // Keep the boat centred, if asked. Only while the fix is fresh: a
+        // chart that keeps recentring on a dead position is worse than one
+        // that stays put and lets the stale marker drift off.
+        if follow {
+            if let Some((lat, lon)) = self.vessel.position() {
+                let fresh = self
+                    .vessel
+                    .get("navigation.position")
+                    .is_some_and(|r| !r.is_stale());
+                if fresh {
+                    let (x, y) =
+                        crate::render::projection::Projection::to_mercator(lat, lon);
+                    self.camera.position = glam::Vec2::new(x as f32, y as f32);
+                    self.following = true;
+                }
+            }
+        }
+        self.needs_redraw = true;
     }
 
     fn shop_send(&mut self, request: crate::shop::service::Request) {

@@ -61,5 +61,16 @@ egui-winit = { version = "0.29", default-features = false, features = ["clipboar
 # async runtime: the shop is a handful of requests at the dock, not a hot path,
 # and a runtime would be the largest dependency in the tree for it.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+
+# Signal K. The plan (4.1) named tokio-tungstenite; this is the same protocol
+# without the runtime. One socket read in a loop does not need an executor, and
+# tokio would be the largest crate in the tree — on a Pi 4 that is binary size
+# and scheduler overhead bought for nothing. Same shape as the shop worker:
+# blocking I/O on its own thread, results drained by the UI each frame.
+#
+# `handshake` is a default feature and carries `tungstenite::connect` with it —
+# turning defaults off removes the function that opens a connection. The same
+# trap as egui-winit's clipboard; see the egui-integration-traps note.
+tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"

@@ -1627,7 +1627,14 @@ impl ApplicationHandler for App {
                         }
                         None => true,
                     };
-                    if self.frame_count >= 120 && size_ready && state.pending_tiles_empty() {
+                    // NAVCORE_SHOT_FRAMES lengthens the warm-up, for captures
+                    // that must wait on something slower than the tiles — a
+                    // Signal K connection, say.
+                    let warmup: u32 = std::env::var("NAVCORE_SHOT_FRAMES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(120);
+                    if self.frame_count >= warmup && size_ready && state.pending_tiles_empty() {
                         state.request_capture(path);
                         self.shot_requested = true;
                     }

@@ -14,24 +14,42 @@ pub fn build(
     ctx: &Context,
     state: &UiState<'_>,
     shop: &mut ShopView,
+    instruments: &mut crate::render::ui::InstrumentView,
+    vessel: &crate::signalk::Vessel,
     actions: &mut Vec<UiAction>,
 ) {
-    menu_bar(ctx, shop);
+    menu_bar(ctx, shop, instruments);
+    // The strip claims its edge before the chart is told how much room it has,
+    // so a window opened over it still lands inside the remaining area.
+    super::ui_instruments::bar(ctx, instruments, vessel);
+    if let Some(ref ship) = state.own_ship {
+        super::ui_ownship::draw(ctx, ship);
+    }
     if let Some(objects) = state.picked {
         object_query(ctx, objects, state.pick_anchor, actions);
     }
     if shop.open {
         chart_shop(ctx, shop, actions);
     }
+    if instruments.open {
+        super::ui_instruments::settings(ctx, instruments, vessel, actions);
+    }
 }
 
 /// A thin strip along the top. Deliberately thin: the chart is the instrument,
 /// and every row of pixels the interface takes is a row of sea it does not show.
-fn menu_bar(ctx: &Context, shop: &mut ShopView) {
+fn menu_bar(
+    ctx: &Context,
+    shop: &mut ShopView,
+    instruments: &mut crate::render::ui::InstrumentView,
+) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
         ui.horizontal(|ui| {
             if ui.button("Charts").clicked() {
                 shop.open = !shop.open;
+            }
+            if ui.button("Instruments").clicked() {
+                instruments.open = !instruments.open;
             }
             ui.separator();
             ui.label(

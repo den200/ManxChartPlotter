@@ -29,6 +29,7 @@ pub mod decrypt;
 pub mod pick;
 pub mod render;
 pub mod shop;
+pub mod signalk;
 pub mod s52;
 pub mod senc;
 pub mod tiles;

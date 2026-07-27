@@ -42,6 +42,68 @@ pub enum UiAction {
     ShopConfirmDownload { chart_id: String },
     /// Drop the pending confirmation.
     ShopCancelDownload,
+    /// Open the Signal K stream at this address.
+    SignalKConnect { url: String },
+    /// Close it and stop reconnecting.
+    SignalKDisconnect,
+    /// The instrument layout changed and should be written to disk.
+    SettingsChanged,
+}
+
+/// Where the instrument strip sits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum BarPosition {
+    Top,
+    /// The default. A chart plotter is looked at from above and in front, and
+    /// the helm's own hand covers the bottom of a bracket-mounted screen far
+    /// less often than it covers the top.
+    #[default]
+    Bottom,
+    Hidden,
+}
+
+/// The instrument strip and the connection behind it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct InstrumentView {
+    /// What the user typed, not the normalised stream URL — so the settings
+    /// window shows it back exactly as they wrote it.
+    pub url: String,
+    pub position: BarPosition,
+    /// The paths on the bar, in the order shown.
+    pub tiles: Vec<String>,
+    pub units: crate::signalk::UnitPrefs,
+    /// Follow the boat: recentre the chart as the position moves.
+    pub follow: bool,
+
+    // Everything below is live state, not preference.
+    #[serde(skip)]
+    pub open: bool,
+    #[serde(skip)]
+    pub status: String,
+    #[serde(skip)]
+    pub connected: bool,
+    /// Paths the server has actually sent, for the picker.
+    #[serde(skip)]
+    pub available: Vec<String>,
+}
+
+impl Default for InstrumentView {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            position: BarPosition::default(),
+            tiles: crate::signalk::catalog::DEFAULT_BAR
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            units: Default::default(),
+            follow: true,
+            open: false,
+            status: "Not connected".into(),
+            connected: false,
+            available: Vec::new(),
+        }
+    }
 }
 
 /// A download awaiting the user's word.
@@ -91,6 +153,8 @@ pub struct UiState<'a> {
     pub picked: Option<&'a [crate::pick::PickedObject]>,
     /// Where the picked position currently is on screen, in *logical* points.
     pub pick_anchor: Option<[f32; 2]>,
+    /// The boat, already projected — the renderer owns the camera, not the UI.
+    pub own_ship: Option<super::ui_ownship::OwnShip>,
 }
 
 pub struct Ui {
@@ -103,6 +167,8 @@ pub struct Ui {
     repaint_after: Option<std::time::Duration>,
     /// The chart shop panel's own state.
     pub shop: ShopView,
+    /// The instrument strip and its Signal K connection.
+    pub instruments: InstrumentView,
 }
 
 impl Ui {
@@ -130,6 +196,9 @@ impl Ui {
             renderer,
             actions: Vec::new(),
             repaint_after: None,
+            // Whatever was arranged last time, or the four readings a plotter
+            // is expected to answer without being asked.
+            instruments: crate::render::state::RenderState::load_settings().unwrap_or_default(),
             shop: ShopView::default(),
         }
     }
@@ -193,13 +262,15 @@ impl Ui {
         view: &wgpu::TextureView,
         size: [u32; 2],
         state: UiState<'_>,
+        vessel: &crate::signalk::Vessel,
     ) -> Vec<UiAction> {
         self.actions.clear();
         let input = self.state.take_egui_input(window);
         let actions = &mut self.actions;
         let shop = &mut self.shop;
+        let instruments = &mut self.instruments;
         let output = self.ctx.run(input, |ctx| {
-            super::ui_panels::build(ctx, &state, shop, actions);
+            super::ui_panels::build(ctx, &state, shop, instruments, vessel, actions);
         });
         self.state
             .handle_platform_output(window, output.platform_output);
