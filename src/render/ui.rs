@@ -117,15 +117,20 @@ impl Ui {
         matches!(self.repaint_after, Some(d) if d < std::time::Duration::from_millis(100))
     }
 
-    /// Offer an event to the UI. `true` means the UI consumed it and the chart
-    /// must not also act on it — otherwise a drag on a panel would pan the map
-    /// underneath.
+    /// Offer an event to the UI.
+    ///
+    /// Both halves of the answer matter. `consumed` is not enough on its own: a
+    /// *press* is essentially never consumed, because egui decides consumption
+    /// from `wants_pointer_input`, which is false the moment a button goes
+    /// down and only becomes true once a frame has run with that press. Use
+    /// [`pointer_over_ui`](Self::pointer_over_ui) to gate a press, and
+    /// `repaint` to keep the state that answer depends on current.
     pub fn on_window_event(
         &mut self,
         window: &winit::window::Window,
         event: &winit::event::WindowEvent,
-    ) -> bool {
-        self.state.on_window_event(window, event).consumed
+    ) -> egui_winit::EventResponse {
+        self.state.on_window_event(window, event)
     }
 
     /// Follow the chart's palette: a light interface over the Day chart, a dark

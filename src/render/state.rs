@@ -2827,11 +2827,24 @@ impl RenderState {
     }
 
     /// Offer a window event to the UI first. `true` means it was consumed and
-    /// the chart must ignore it — otherwise dragging a panel pans the map.
+    /// the chart must ignore it.
+    ///
+    /// Also honours egui's request for a repaint, which is not optional. egui
+    /// asks for one on every pointer move, and its idea of what the pointer is
+    /// over is whatever the last frame computed. Skip the repaints and that
+    /// answer goes stale: the cursor sits on a text field while egui still
+    /// believes it is over the chart, so the click falls through and drops a
+    /// pin. Hover highlights, tooltips and cursor shapes all die the same way.
     pub fn ui_on_window_event(&mut self, event: &winit::event::WindowEvent) -> bool {
         let window = self.window.clone();
         match self.ui {
-            Some(ref mut ui) => ui.on_window_event(&window, event),
+            Some(ref mut ui) => {
+                let response = ui.on_window_event(&window, event);
+                if response.repaint {
+                    self.needs_redraw = true;
+                }
+                response.consumed
+            }
             None => false,
         }
     }

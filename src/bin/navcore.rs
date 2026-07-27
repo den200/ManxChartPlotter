@@ -22,6 +22,13 @@ use winit::{
     window::{Window, WindowId},
 };
 
+/// How far the pointer may move between press and release and still count as a
+/// click rather than a drag, in physical pixels. A mouse is steady; a hand on a
+/// trackpad is not.
+const CLICK_SLOP: f64 = 4.0;
+/// The same for a finger, which never lifts from quite where it landed.
+const TOUCH_SLOP: f64 = 10.0;
+
 use navcore2::{CachedDecryptor, ChartDecryptor, KeyStore};
 use navcore2::render::RenderState;
 use navcore2::s52::S52Engine;
@@ -1421,6 +1428,13 @@ struct App {
     /// the press, because a drag that starts on a panel and wanders over the
     /// chart is still the panel's drag.
     gesture_on_ui: bool,
+    /// The pointer has moved far enough since the press for this to be a drag
+    /// rather than a click.
+    ///
+    /// Without it, every click panned the chart by the two or three pixels the
+    /// hand moves between pressing and releasing: the object bubble opened and
+    /// the chart slid out from under it at the same moment.
+    panning: bool,
     /// The same, for a single finger.
     touch_start: Option<PhysicalPosition<f64>>,
     // Touch state for pinch-zoom
@@ -1443,6 +1457,7 @@ impl App {
             mouse_pressed: false,
             drag_start: None,
             gesture_on_ui: false,
+            panning: false,
             touch_start: None,
             touches: HashMap::new(),
             pinch_start_distance: None,
@@ -1758,6 +1773,7 @@ impl ApplicationHandler for App {
                     if pressed {
                         self.gesture_on_ui = state.ui_pointer_over();
                         self.drag_start = Some(self.last_mouse_pos);
+                        self.panning = false;
                     } else if self.gesture_on_ui {
                         self.gesture_on_ui = false;
                         self.drag_start = None;
@@ -1770,7 +1786,7 @@ impl ApplicationHandler for App {
                         let moved = ((self.last_mouse_pos.x - start.x).powi(2)
                             + (self.last_mouse_pos.y - start.y).powi(2))
                         .sqrt();
-                        if moved <= 4.0 {
+                        if moved <= CLICK_SLOP {
                             let (x, y) = (self.last_mouse_pos.x as f32, self.last_mouse_pos.y as f32);
                             if state.pick_active() {
                                 state.dismiss_pick();
@@ -1785,10 +1801,23 @@ impl ApplicationHandler for App {
 
             WindowEvent::CursorMoved { position, .. } => {
                 if self.mouse_pressed && !self.gesture_on_ui {
-                    let dx = (position.x - self.last_mouse_pos.x) as f32;
-                    let dy = (position.y - self.last_mouse_pos.y) as f32;
-                    state.camera.pan(dx, dy);
-                    state.mark_dirty();
+                    // Only once the hand has clearly moved. Panning from the
+                    // first pixel means a click drags the chart a little, which
+                    // reads as the map slipping the moment you tap it.
+                    if !self.panning {
+                        if let Some(start) = self.drag_start {
+                            let moved = ((position.x - start.x).powi(2)
+                                + (position.y - start.y).powi(2))
+                            .sqrt();
+                            self.panning = moved > CLICK_SLOP;
+                        }
+                    }
+                    if self.panning {
+                        let dx = (position.x - self.last_mouse_pos.x) as f32;
+                        let dy = (position.y - self.last_mouse_pos.y) as f32;
+                        state.camera.pan(dx, dy);
+                        state.mark_dirty();
+                    }
                 }
                 self.last_mouse_pos = position;
             }
@@ -1833,6 +1862,7 @@ impl ApplicationHandler for App {
                         if self.touches.len() == 1 {
                             self.touch_start = Some(location);
                             self.gesture_on_ui = state.ui_pointer_over();
+                            self.panning = false;
                         } else {
                             self.touch_start = None;
                         }
@@ -1866,8 +1896,16 @@ impl ApplicationHandler for App {
                             }
                             self.pinch_start_distance = Some(new_distance);
                         } else if self.touches.len() == 1 && !self.gesture_on_ui {
-                            // Single-finger pan
-                            if let Some(old_loc) = old_location {
+                            // Single-finger pan, once it is clearly a drag.
+                            if !self.panning {
+                                if let Some(start) = self.touch_start {
+                                    let moved = ((location.x - start.x).powi(2)
+                                        + (location.y - start.y).powi(2))
+                                    .sqrt();
+                                    self.panning = moved > TOUCH_SLOP;
+                                }
+                            }
+                            if let (true, Some(old_loc)) = (self.panning, old_location) {
                                 let dx = (location.x - old_loc.x) as f32;
                                 let dy = (location.y - old_loc.y) as f32;
                                 state.camera.pan(dx, dy);
@@ -1884,7 +1922,7 @@ impl ApplicationHandler for App {
                                 let moved = ((location.x - start.x).powi(2)
                                     + (location.y - start.y).powi(2))
                                 .sqrt();
-                                if moved <= 10.0
+                                if moved <= TOUCH_SLOP
                                     && self.touches.len() == 1
                                     && !self.gesture_on_ui
                                 {
