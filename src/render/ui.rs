@@ -30,7 +30,33 @@ pub enum UiAction {
     /// Register this machine with the account under a name.
     ShopRegister { system_name: String },
     /// Claim a slot for a chart and ask the shop for a download.
-    ShopDownload { chart_id: String },
+    ///
+    /// `edition` names the edition to ask for; `None` means the shop's
+    /// current one, which is right for a live subscription and wrong for a
+    /// lapsed one.
+    ShopDownload {
+        chart_id: String,
+        edition: Option<String>,
+    },
+    /// Put a lapsed chart's download to the user before sending it.
+    ShopConfirmDownload { chart_id: String },
+    /// Drop the pending confirmation.
+    ShopCancelDownload,
+}
+
+/// A download awaiting the user's word.
+///
+/// A lapsed subscription cannot have the shop's current edition, so navcore
+/// asks for an older one — a decision worth showing rather than making
+/// silently, because it is the user's licence and the user's money.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDownload {
+    pub chart_id: String,
+    pub chart_name: String,
+    /// The edition to ask for, when one could be worked out.
+    pub edition: Option<String>,
+    /// Where that edition came from, in words.
+    pub because: String,
 }
 
 /// What the shop panel is showing.
@@ -55,6 +81,8 @@ pub struct ShopView {
     pub new_system_name: String,
     /// What the shop said about the last download request, per chart id.
     pub grants: std::collections::HashMap<String, String>,
+    /// A download the user has not yet confirmed.
+    pub pending: Option<PendingDownload>,
 }
 
 /// What the UI is allowed to see.

@@ -77,6 +77,10 @@ pub struct Chart {
     pub max_slots: u32,
     pub thumbnail: String,
     pub quantities: Vec<Quantity>,
+    /// Links to the current edition's `ChartList.xml` files. Their paths carry
+    /// the set's family name, which is the only thing tying a shop listing to
+    /// a directory on disk.
+    pub base_chart_lists: Vec<String>,
 }
 
 /// Is this the shop's name for a USB key?
@@ -100,6 +104,15 @@ impl Chart {
                 .find(|s| s.assigned_system == system_name)
                 .map(|s| (q, s))
         })
+    }
+
+    /// The set's family name — `oeuSENC-DK` — as used by both the shop's URLs
+    /// and the directory names it ships. `None` when the shop sent no links,
+    /// in which case there is nothing to key an installed set to.
+    pub fn set_stem(&self) -> Option<String> {
+        self.base_chart_lists
+            .iter()
+            .find_map(|url| super::installed::set_stem(url))
     }
 
     /// A slot held by a USB key, if the licence is on one.

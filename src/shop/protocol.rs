@@ -270,6 +270,8 @@ fn set_chart(c: &mut Chart, name: &str, value: &str) {
         "editionDate" => c.edition_date = value.into(),
         "maxSlots" => c.max_slots = value.parse().unwrap_or(0),
         "thumbLink" => c.thumbnail = value.into(),
+        // Repeated: one element per link, not a nested list.
+        "baseChartList" => c.base_chart_lists.push(value.into()),
         _ => {}
     }
 }

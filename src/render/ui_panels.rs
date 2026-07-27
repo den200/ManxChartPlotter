@@ -233,6 +233,9 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                 ui.label(RichText::new("3. Install your charts").strong());
                 ui.separator();
                 chart_table(ui, shop, actions);
+                if let Some(pending) = shop.pending.clone() {
+                    confirm_download(ui, &pending, actions);
+                }
             }
 
             if !shop.status.is_empty() {
@@ -242,6 +245,64 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
             }
         });
     shop.open = open;
+}
+
+/// Put a lapsed set's download to the user before sending it.
+///
+/// The shop will not grant the edition it currently publishes to a licence
+/// that expired before that edition existed. navcore can ask for an older one
+/// — the last this machine actually received — but which edition to claim is
+/// the user's business, so it is shown, named, and confirmed.
+fn confirm_download(
+    ui: &mut egui::Ui,
+    pending: &crate::render::ui::PendingDownload,
+    actions: &mut Vec<UiAction>,
+) {
+    ui.add_space(8.0);
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.label(
+            RichText::new(format!("{} — subscription lapsed", pending.chart_name)).strong(),
+        );
+        ui.label(RichText::new(&pending.because).small());
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            match &pending.edition {
+                Some(edition) => {
+                    if ui
+                        .button(format!("Ask for edition {edition}"))
+                        .clicked()
+                    {
+                        actions.push(UiAction::ShopDownload {
+                            chart_id: pending.chart_id.clone(),
+                            edition: Some(edition.clone()),
+                        });
+                    }
+                }
+                None => {
+                    // Nothing on disk and nothing on the slot: there is no
+                    // older edition to name. Asking for the current one will
+                    // almost certainly be refused, but the shop's answer is
+                    // more use than navcore's guess about it.
+                    if ui
+                        .button("Ask for the current edition anyway")
+                        .on_hover_text(
+                            "Expect a refusal — the licence expired before this edition \
+                             was published. The shop's exact answer is worth having.",
+                        )
+                        .clicked()
+                    {
+                        actions.push(UiAction::ShopDownload {
+                            chart_id: pending.chart_id.clone(),
+                            edition: None,
+                        });
+                    }
+                }
+            }
+            if ui.button("Cancel").clicked() {
+                actions.push(UiAction::ShopCancelDownload);
+            }
+        });
+    });
 }
 
 fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) {
@@ -329,8 +390,19 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                         button
                     };
                     if button.clicked() {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: c.id.clone(),
+                        // A lapsed set cannot have the shop's current edition,
+                        // so navcore must ask for a different one. That is a
+                        // decision about the user's licence, so it is put to
+                        // them rather than made silently.
+                        actions.push(if c.expired {
+                            UiAction::ShopConfirmDownload {
+                                chart_id: c.id.clone(),
+                            }
+                        } else {
+                            UiAction::ShopDownload {
+                                chart_id: c.id.clone(),
+                                edition: None,
+                            }
                         });
                     }
                     ui.end_row();

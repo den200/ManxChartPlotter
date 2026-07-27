@@ -1972,17 +1972,29 @@ impl RenderState {
                         }
                     }
                 }
-                crate::render::ui::UiAction::ShopDownload { chart_id } => {
+                crate::render::ui::UiAction::ShopDownload { chart_id, edition } => {
                     let installed = self
                         .ui
                         .as_ref()
                         .and_then(|u| u.shop.installed.get(&chart_id).copied());
                     let root = self.chart_root.clone().unwrap_or_else(|| "charts".into());
+                    if let Some(ref mut ui) = self.ui {
+                        ui.shop.pending = None;
+                    }
                     self.shop_send(crate::shop::service::Request::Download {
                         chart_id,
                         installed,
+                        edition,
                         root,
                     });
+                }
+                crate::render::ui::UiAction::ShopConfirmDownload { chart_id } => {
+                    self.prepare_lapsed_download(&chart_id);
+                }
+                crate::render::ui::UiAction::ShopCancelDownload => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.shop.pending = None;
+                    }
                 }
             }
         }
@@ -2916,6 +2928,66 @@ impl RenderState {
     }
 
     /// This machine's o-charts fingerprint, if it has a licence at all.
+    /// Work out which edition a lapsed licence may still ask for, and put it
+    /// to the user.
+    ///
+    /// Two sources, best first: the shop's own record of what this machine's
+    /// slot last received, then the edition installed here. Either is an
+    /// edition the licence demonstrably covered; the shop's current one is
+    /// not, which is why asking for it comes back refused.
+    fn prepare_lapsed_download(&mut self, chart_id: &str) {
+        let Some(ref mut ui) = self.ui else { return };
+        let Some(chart) = ui.shop.charts.iter().find(|c| c.id == chart_id) else {
+            return;
+        };
+
+        let from_slot = ui
+            .shop
+            .system_name
+            .as_deref()
+            .and_then(|name| chart.slot_for(name))
+            .map(|(_, s)| s.last_requested.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let from_disk = ui.shop.installed.get(chart_id).map(|e| e.to_string());
+
+        let (edition, because) = match (from_slot, from_disk) {
+            (Some(slot), _) => (
+                Some(slot.clone()),
+                format!(
+                    "The shop has {}, published after your licence expired — it will not \
+                     grant that. Edition {slot} is the last one the shop recorded for this \
+                     machine, and your licence covered it.",
+                    chart.edition
+                ),
+            ),
+            (None, Some(disk)) => (
+                Some(disk.clone()),
+                format!(
+                    "The shop has {}, published after your licence expired — it will not \
+                     grant that. Edition {disk} is what is installed here, so your licence \
+                     covered it.",
+                    chart.edition
+                ),
+            ),
+            (None, None) => (
+                None,
+                format!(
+                    "The shop has {}, published after your licence expired. navcore cannot \
+                     tell which edition you last held — nothing for this set is installed \
+                     here and the shop recorded no earlier request.",
+                    chart.edition
+                ),
+            ),
+        };
+
+        ui.shop.pending = Some(crate::render::ui::PendingDownload {
+            chart_id: chart_id.to_string(),
+            chart_name: chart.name.clone(),
+            edition,
+            because,
+        });
+    }
+
     fn machine_fingerprint() -> Option<crate::shop::Fingerprint> {
         crate::decrypt::ChartDecryptor::new("license")
             .ok()
@@ -2956,6 +3028,34 @@ impl RenderState {
                     ui.shop.password.clear();
                 }
                 Event::Charts { charts, systems } => {
+                    // Key each listed chart to what is on disk. Without this
+                    // the panel cannot say which edition is held, and a lapsed
+                    // subscription has nothing to ask the shop for except the
+                    // current edition — which is the one it will not grant.
+                    let root = self.chart_root.clone().unwrap_or_else(|| "charts".into());
+                    let on_disk = crate::shop::installed::scan(&root);
+                    let mut installed: std::collections::HashMap<_, _> = charts
+                        .iter()
+                        .filter_map(|c| {
+                            let stem = c.set_stem()?;
+                            let edition =
+                                crate::shop::installed::newest_for(&on_disk, &stem)?;
+                            Some((c.id.clone(), edition))
+                        })
+                        .collect();
+                    // The stem comes from the shop's ChartList links, and not
+                    // every reply carries them. One chart set owned and one
+                    // installed is unambiguous without any key at all — and
+                    // it is much the commonest case, one region per boat.
+                    if installed.is_empty() && charts.len() == 1 && on_disk.len() == 1 {
+                        installed.insert(charts[0].id.clone(), on_disk[0].edition);
+                    }
+                    log::info!(
+                        "chart shop: {} set(s) on disk, {} matched to the listing",
+                        on_disk.len(),
+                        installed.len()
+                    );
+                    ui.shop.installed = installed;
                     ui.shop.charts = charts;
                     ui.shop.systems = systems;
                     ui.shop.busy = false;
