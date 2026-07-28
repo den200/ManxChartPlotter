@@ -155,6 +155,11 @@ pub struct UiState<'a> {
     pub pick_anchor: Option<[f32; 2]>,
     /// The boat, already projected — the renderer owns the camera, not the UI.
     pub own_ship: Option<super::ui_ownship::OwnShip>,
+    /// The AIS traffic, likewise, with its closest approaches already worked
+    /// out on the ellipsoid.
+    pub ais: Vec<super::ui_ais::AisTarget>,
+    /// Metres per logical point, so a course vector is a real distance.
+    pub mpp: f32,
 }
 
 pub struct Ui {
@@ -262,7 +267,7 @@ impl Ui {
         view: &wgpu::TextureView,
         size: [u32; 2],
         state: UiState<'_>,
-        vessel: &crate::signalk::Vessel,
+        fleet: &crate::signalk::Fleet,
     ) -> Vec<UiAction> {
         self.actions.clear();
         let input = self.state.take_egui_input(window);
@@ -270,7 +275,7 @@ impl Ui {
         let shop = &mut self.shop;
         let instruments = &mut self.instruments;
         let output = self.ctx.run(input, |ctx| {
-            super::ui_panels::build(ctx, &state, shop, instruments, vessel, actions);
+            super::ui_panels::build(ctx, &state, shop, instruments, fleet, actions);
         });
         self.state
             .handle_platform_output(window, output.platform_output);

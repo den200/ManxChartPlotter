@@ -70,6 +70,15 @@ impl Vessel {
         self.readings.get(path).and_then(Reading::number)
     }
 
+    /// A reading that is a string — a vessel's name, a GNSS fix type, a
+    /// navigational state.
+    pub fn text(&self, path: &str) -> Option<&str> {
+        match self.readings.get(path).map(|r| &r.value) {
+            Some(Value::Text(t)) => Some(t.as_str()),
+            _ => None,
+        }
+    }
+
     /// Every path heard so far, in a stable order.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
         self.readings.keys().map(String::as_str)
@@ -108,6 +117,21 @@ impl Vessel {
 
     pub fn clear(&mut self) {
         self.readings.clear();
+    }
+
+    /// Take readings from another vessel, keeping whichever is newer.
+    ///
+    /// Used when readings were filed against the wrong vessel and have to be
+    /// moved without losing what has arrived since.
+    pub fn merge(&mut self, other: &Vessel) {
+        for (path, reading) in &other.readings {
+            match self.readings.get(path) {
+                Some(mine) if mine.at >= reading.at => {}
+                _ => {
+                    self.readings.insert(path.clone(), reading.clone());
+                }
+            }
+        }
     }
 }
 

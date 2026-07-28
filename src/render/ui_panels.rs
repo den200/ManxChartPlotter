@@ -15,13 +15,14 @@ pub fn build(
     state: &UiState<'_>,
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
-    vessel: &crate::signalk::Vessel,
+    fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
     menu_bar(ctx, shop, instruments);
     // The strip claims its edge before the chart is told how much room it has,
     // so a window opened over it still lands inside the remaining area.
-    super::ui_instruments::bar(ctx, instruments, vessel);
+    super::ui_instruments::bar(ctx, instruments, &fleet.own);
+    super::ui_ais::draw(ctx, &state.ais, state.mpp);
     if let Some(ref ship) = state.own_ship {
         super::ui_ownship::draw(ctx, ship);
     }
@@ -32,7 +33,7 @@ pub fn build(
         chart_shop(ctx, shop, actions);
     }
     if instruments.open {
-        super::ui_instruments::settings(ctx, instruments, vessel, actions);
+        super::ui_instruments::settings(ctx, instruments, &fleet.own, actions);
     }
 }
 

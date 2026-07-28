@@ -29,8 +29,11 @@ pub enum Request {
 pub enum Event {
     /// Where we are in the connection's life, in words fit for a status line.
     Status(Status),
-    /// A parsed delta, ready to fold into the vessel state.
+    /// A parsed delta, ready to fold into the fleet.
     Delta(delta::Delta),
+    /// The server's greeting named our own vessel. Must reach the fleet before
+    /// any delta can be routed: without it every AIS target looks like us.
+    SelfContext(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -269,9 +272,19 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, stop: Arc<AtomicBo
 fn simulate(course: super::sim::Course, events: &Sender<Event>, stop: &AtomicBool) {
     const TICK: Duration = Duration::from_millis(250);
     let mut sim = super::sim::Simulator::new(course);
+    // Traffic too, so the AIS layer can be seen without standing up a server.
+    // The own boat's deltas carry no context, which is how a server says "my
+    // vessel", so the fleet routes everything correctly without a greeting.
+    let mut traffic = super::sim::traffic_around(course);
     while !stop.load(Ordering::Relaxed) {
-        if events.send(Event::Delta(sim.step(TICK.as_secs_f64()))).is_err() {
+        let dt = TICK.as_secs_f64();
+        if events.send(Event::Delta(sim.step(dt))).is_err() {
             return; // UI gone
+        }
+        for target in traffic.iter_mut() {
+            if events.send(Event::Delta(target.step(dt))).is_err() {
+                return;
+            }
         }
         thread::sleep(TICK);
     }
@@ -294,11 +307,6 @@ fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), 
         return Err(describe(&e.to_string()));
     }
 
-    // Learned from the server's greeting, and needed before any delta can be
-    // trusted: a stream carrying AIS sends one delta per vessel, and they are
-    // structurally identical to our own.
-    let mut self_context: Option<String> = None;
-
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = socket.close(None);
@@ -308,15 +316,14 @@ fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), 
             Ok(Message::Text(text)) => {
                 if let Some(ctx) = delta::parse_hello(&text) {
                     log::debug!("signalk: own vessel is {ctx}");
-                    self_context = Some(ctx);
+                    if events.send(Event::SelfContext(ctx)).is_err() {
+                        return Ok(());
+                    }
                 }
                 if let Some(d) = delta::parse(&text) {
-                    // Another ship's position is not ours. Dropping it here
-                    // rather than in the UI keeps the vessel state meaning
-                    // exactly one boat.
-                    if !d.is_self(self_context.as_deref()) {
-                        continue;
-                    }
+                    // Every vessel is forwarded, ours and the AIS traffic
+                    // alike; the fleet routes them on context. Filtering here
+                    // would throw away the traffic the chart is meant to show.
                     if events.send(Event::Delta(d)).is_err() {
                         return Ok(()); // UI gone
                     }

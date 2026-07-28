@@ -74,3 +74,4 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
+geographiclib-rs = "0.2.7"

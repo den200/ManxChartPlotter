@@ -138,6 +138,102 @@ impl Simulator {
     pub fn position(&self) -> (f64, f64) {
         (self.lat, self.lon)
     }
+
+    pub fn heading(&self) -> f64 {
+        self.heading
+    }
+}
+
+/// One simulated AIS target.
+pub struct Traffic {
+    pub context: String,
+    pub name: &'static str,
+    /// What the vessel says it is doing, in Signal K's vocabulary.
+    pub state: &'static str,
+    /// AIS ship type code — 30 fishing, 60 passenger, 70 cargo, 80 tanker.
+    pub ship_type: u32,
+    sim: Simulator,
+    /// A moored or anchored vessel does not move, whatever its course says.
+    moving: bool,
+}
+
+impl Traffic {
+    pub fn step(&mut self, dt: f64) -> Delta {
+        let mut delta = if self.moving {
+            self.sim.step(dt)
+        } else {
+            // Still, but still reporting: an anchored ship broadcasts its
+            // position every few minutes and must appear on the chart.
+            let (lat, lon) = self.sim.position();
+            Delta {
+                context: None,
+                updates: vec![
+                    Update {
+                        path: "navigation.position".into(),
+                        value: Value::Position { lat, lon },
+                    },
+                    Update {
+                        path: "navigation.speedOverGround".into(),
+                        value: Value::Number(0.0),
+                    },
+                    Update {
+                        path: "navigation.headingTrue".into(),
+                        value: Value::Number(self.sim.heading()),
+                    },
+                ],
+            }
+        };
+
+        // A target's identity travels with it — the chart labels a ship, not a
+        // number, whenever the ship has told us its name.
+        delta.updates.push(Update {
+            path: "name".into(),
+            value: Value::Text(self.name.to_string()),
+        });
+        delta.updates.push(Update {
+            path: "navigation.state".into(),
+            value: Value::Text(self.state.to_string()),
+        });
+        delta.updates.push(Update {
+            path: "design.aisShipType".into(),
+            value: Value::Number(self.ship_type as f64),
+        });
+        delta.context = Some(self.context.clone());
+        delta
+    }
+}
+
+/// A plausible sea's worth of traffic around a point.
+///
+/// Chosen to exercise the display rather than to be realistic: a ship crossing
+/// ahead so there is a real closest approach, one overtaking slowly from
+/// astern, a fishing boat wandering, and one at anchor that must draw no
+/// course vector however stale its heading.
+pub fn traffic_around(centre: Course) -> Vec<Traffic> {
+    let spec: &[(&str, &'static str, &'static str, u32, f64, f64, f64, f64, bool)] = &[
+        // name, state, mmsi, type, dlat, dlon, heading, knots, moving
+        ("NORDLYS", "under way using engine", "219001234", 60, 0.045, -0.070, 95.0, 12.0, true),
+        ("KATTEGAT TRADER", "under way using engine", "244060807", 70, -0.055, 0.045, 340.0, 9.5, true),
+        ("HAVFISK", "under way using engine", "219778001", 30, 0.020, 0.065, 210.0, 4.0, true),
+        ("ANNA MAERSK", "at anchor", "219900555", 80, -0.030, -0.055, 15.0, 0.0, false),
+    ];
+    spec.iter()
+        .map(
+            |(name, state, mmsi, ship_type, dlat, dlon, heading, knots, moving)| Traffic {
+                context: format!("vessels.urn:mrn:imo:mmsi:{mmsi}"),
+                name,
+                state,
+                ship_type: *ship_type,
+                sim: Simulator::new(Course {
+                    lat: centre.lat + dlat,
+                    lon: centre.lon + dlon,
+                    heading_deg: *heading,
+                    speed_kn: *knots,
+                }),
+                moving: *moving,
+            },
+        )
+        .collect()
 }
 
 /// Read a course from a URL-ish string: `sim`, or `sim:lat,lon`, or

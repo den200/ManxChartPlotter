@@ -319,8 +319,8 @@ pub struct RenderState {
     /// The Signal K stream, on its own thread. Also created on first use — a
     /// chart table with no boat around it should not open a socket.
     signalk: Option<crate::signalk::SignalKService>,
-    /// What the boat is doing, as last heard.
-    vessel: crate::signalk::Vessel,
+    /// What every boat is doing, as last heard — ours and the AIS traffic.
+    fleet: crate::signalk::Fleet,
     /// The camera is tracking the boat, so the catalogue clamp must not drag
     /// it back to the middle of the charts.
     following: bool,
@@ -986,7 +986,7 @@ impl RenderState {
             ui: None,
             shop: None,
             signalk: None,
-            vessel: Default::default(),
+            fleet: Default::default(),
             following: false,
             chart_root: None,
             pick_anchor: None,
@@ -1939,6 +1939,8 @@ impl RenderState {
                 [s.x / ppp, s.y / ppp]
             });
             let own_ship = self.own_ship_view();
+            let ais = self.ais_targets();
+            let mpp = self.camera.zoom * self.scale_factor.max(0.01);
             let actions = ui.run(
                 &self.window.clone(),
                 &self.device,
@@ -1950,8 +1952,10 @@ impl RenderState {
                     picked: self.pick_anchor.map(|_| self.pick_objects.as_slice()),
                     pick_anchor: anchor,
                     own_ship,
+                    ais,
+                    mpp,
                 },
-                &self.vessel,
+                &self.fleet,
             );
             self.ui = Some(ui);
             actions
@@ -2033,7 +2037,7 @@ impl RenderState {
                     }
                     // Drop the readings with the connection. Keeping them would
                     // leave a bar of numbers that look live and are not.
-                    self.vessel.clear();
+                    self.fleet.clear();
                     if let Some(ref mut ui) = self.ui {
                         ui.instruments.connected = false;
                         ui.instruments.available.clear();
@@ -3051,7 +3055,7 @@ impl RenderState {
     /// here, and because the UI should not learn about Mercator to draw a
     /// triangle.
     fn own_ship_view(&self) -> Option<crate::render::ui_ownship::OwnShip> {
-        let (lat, lon) = self.vessel.position()?;
+        let (lat, lon) = self.fleet.own.position()?;
         let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
         let screen = self.camera.world_to_screen(wx as f32, wy as f32);
         let ppp = self.scale_factor.max(0.01);
@@ -3059,20 +3063,23 @@ impl RenderState {
         // The fix, not the heading, decides staleness: a boat that has lost
         // its GPS must not keep drawing itself somewhere plausible.
         let stale = self
-            .vessel
+            .fleet
+            .own
             .get("navigation.position")
             .map(|r| r.is_stale())
             .unwrap_or(true);
 
         Some(crate::render::ui_ownship::OwnShip {
             screen: [screen.x / ppp, screen.y / ppp],
-            heading: self.vessel.heading_true().map(|h| h as f32),
+            heading: self.fleet.own.heading_true().map(|h| h as f32),
             cog: self
-                .vessel
+                .fleet
+                .own
                 .number("navigation.courseOverGroundTrue")
                 .map(|c| c as f32),
             sog: self
-                .vessel
+                .fleet
+                .own
                 .number("navigation.speedOverGround")
                 .map(|s| s as f32),
             // Metres per *logical point*, so the course vector is a real
@@ -3080,6 +3087,62 @@ impl RenderState {
             mpp: self.camera.zoom * ppp,
             stale,
         })
+    }
+
+    /// Project the AIS traffic onto the screen, with its closest approaches.
+    ///
+    /// CPA is computed geodesically rather than in the Mercator plane: at 56°
+    /// north a Mercator northing is stretched by nearly a factor of two, so a
+    /// range measured there would be wrong in exactly the situation the number
+    /// exists for.
+    fn ais_targets(&self) -> Vec<crate::render::ui_ais::AisTarget> {
+        use crate::geo::{cpa, LatLon, Motion};
+
+        let ppp = self.scale_factor.max(0.01);
+        let own = self.fleet.own.position().map(|(lat, lon)| Motion {
+            at: LatLon::new(lat, lon),
+            course: self
+                .fleet
+                .own
+                .number("navigation.courseOverGroundTrue")
+                .or_else(|| self.fleet.own.heading_true())
+                .unwrap_or(0.0),
+            speed: self
+                .fleet
+                .own
+                .number("navigation.speedOverGround")
+                .unwrap_or(0.0),
+        });
+
+        self.fleet
+            .targets()
+            .filter_map(|target| {
+                let (lat, lon) = target.position()?;
+                let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
+                let screen = self.camera.world_to_screen(wx as f32, wy as f32);
+
+                let approach = own.and_then(|own| {
+                    let theirs = Motion {
+                        at: LatLon::new(lat, lon),
+                        course: target.course()?,
+                        speed: target.speed()?,
+                    };
+                    let c = cpa(own, theirs)?;
+                    (!c.past).then_some((c.distance_m as f32, c.seconds as f32))
+                });
+
+                Some(crate::render::ui_ais::AisTarget {
+                    screen: [screen.x / ppp, screen.y / ppp],
+                    heading: target.heading().map(|h| h as f32),
+                    cog: target.course().map(|c| c as f32),
+                    sog: target.speed().map(|s| s as f32),
+                    label: target.label().map(str::to_string),
+                    under_way: target.under_way(),
+                    lost: target.is_lost(),
+                    cpa: approach,
+                })
+            })
+            .collect()
     }
 
     /// Fold whatever the boat has said into the vessel state.
@@ -3097,16 +3160,24 @@ impl RenderState {
                         ui.instruments.status = s.summary();
                     }
                 }
-                crate::signalk::service::Event::Delta(d) => self.vessel.apply(&d),
+                crate::signalk::service::Event::Delta(d) => self.fleet.apply(&d),
+                crate::signalk::service::Event::SelfContext(ctx) => {
+                    self.fleet.set_self_context(ctx)
+                }
             }
         }
+        // Drop targets nothing has been heard from in a long time. Done here
+        // rather than on receipt: a fleet that only shrinks when a different
+        // vessel reports would keep a lone ghost for ever on a quiet sea.
+        self.fleet.forget_stale();
+
         let mut follow = false;
         if let Some(ref mut ui) = self.ui {
             // The picker offers what the boat actually sends, which is the
             // only list worth showing: a menu of every path Signal K defines
             // would be hundreds long and mostly absent.
-            if ui.instruments.available.len() != self.vessel.len() {
-                ui.instruments.available = self.vessel.paths().map(str::to_string).collect();
+            if ui.instruments.available.len() != self.fleet.own.len() {
+                ui.instruments.available = self.fleet.own.paths().map(str::to_string).collect();
             }
             follow = ui.instruments.follow;
         }
@@ -3116,9 +3187,10 @@ impl RenderState {
         // chart that keeps recentring on a dead position is worse than one
         // that stays put and lets the stale marker drift off.
         if follow {
-            if let Some((lat, lon)) = self.vessel.position() {
+            if let Some((lat, lon)) = self.fleet.own.position() {
                 let fresh = self
-                    .vessel
+                    .fleet
+                    .own
                     .get("navigation.position")
                     .is_some_and(|r| !r.is_stale());
                 if fresh {

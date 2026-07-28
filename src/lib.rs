@@ -26,6 +26,7 @@
 
 pub mod cache;
 pub mod decrypt;
+pub mod geo;
 pub mod pick;
 pub mod render;
 pub mod shop;

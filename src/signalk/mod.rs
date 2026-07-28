@@ -9,6 +9,7 @@
 //!
 //! - [`delta`] turns a message into path/value pairs
 //! - [`state`] folds those into the vessel's current state, with arrival times
+//! - [`fleet`] routes them to our boat or to an AIS target, by context
 //! - [`catalog`] says what the well-known paths mean
 //! - [`units`] turns SI into something a mariner reads
 //! - [`service`] owns the socket, on its own thread, and reconnects
@@ -19,11 +20,13 @@
 
 pub mod catalog;
 pub mod delta;
+pub mod fleet;
 pub mod service;
 pub mod sim;
 pub mod state;
 pub mod units;
 
 pub use service::{SignalKService, Status};
+pub use fleet::{Fleet, Target};
 pub use state::Vessel;
 pub use units::{Quantity, UnitPrefs};
