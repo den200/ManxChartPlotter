@@ -324,6 +324,12 @@ pub struct RenderState {
     /// The camera is tracking the boat, so the catalogue clamp must not drag
     /// it back to the middle of the charts.
     following: bool,
+    /// S-52 mariner symbols — own ship and AIS — rebuilt whenever the boats
+    /// move, which is why they need an instance buffer of their own rather
+    /// than sharing the tiles'.
+    mariner_buffer: Option<wgpu::Buffer>,
+    mariner_count: u32,
+    mariner_symbols: Option<crate::render::mariner::MarinerSymbols>,
     /// Where chart sets live — the directory navcore was pointed at, which is
     /// also where a downloaded set is unpacked so it sits beside the others.
     chart_root: Option<std::path::PathBuf>,
@@ -988,6 +994,9 @@ impl RenderState {
             signalk: None,
             fleet: Default::default(),
             following: false,
+            mariner_buffer: None,
+            mariner_count: 0,
+            mariner_symbols: crate::render::mariner::MarinerSymbols::resolve(),
             chart_root: None,
             pick_anchor: None,
             pick_objects: Vec::new(),
@@ -1686,6 +1695,13 @@ impl RenderState {
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let render_start = profile_enabled().then(Instant::now);
 
+        // Before anything is drawn: what the boats have said this frame moves
+        // the camera (follow) and the mariner symbols, and both must be
+        // settled before the camera is clamped and the chart is drawn.
+        self.poll_shop();
+        self.poll_signalk();
+        self.update_mariner_symbols();
+
         // In tile mode, keep the camera near the loaded chart extent.
         // This prevents panning/gesture glitches from throwing the view outside the
         // valid Mercator range, which would yield empty tiles (ocean-only).
@@ -1863,6 +1879,7 @@ impl RenderState {
                 if let Some(start) = draw_start {
                     log::info!("profile.draw_tiles: {} ms", start.elapsed().as_millis());
                 }
+                self.draw_mariner_symbols(&mut render_pass);
             } else {
                 // Single chart mode (existing code)
                 // 1. Render areas (land, depth)
@@ -1927,8 +1944,6 @@ impl RenderState {
             }
         }
 
-        self.poll_shop();
-        self.poll_signalk();
 
         // The UI, in its own pass over the resolved surface. After this point
         // the chart is finished with the frame.
@@ -2132,6 +2147,29 @@ impl RenderState {
     const MAX_TILES_PER_FRAME: usize = 32;
 
     /// Confine the following draws to a tile's area, or release the scissor.
+    /// Draw own ship and the AIS traffic, over everything.
+    ///
+    /// After the tiles, and only after: `draw_tiles` leaves the scissor set to
+    /// whichever tile it drew last, so anything that follows is clipped to
+    /// that one rectangle. Releasing it first is not tidiness — without it the
+    /// mariner symbols appear only when the boat happens to be inside the last
+    /// tile drawn, which looks exactly like a bug in the AIS layer.
+    fn draw_mariner_symbols<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        if self.mariner_count == 0 || debug_render_mode() == 3 {
+            return;
+        }
+        let (Some(renderer), Some(bind_group), Some(buffer)) = (
+            &self.symbol_renderer,
+            &self.symbol_camera_bind_group,
+            &self.mariner_buffer,
+        ) else {
+            return;
+        };
+        self.apply_scissor(render_pass, None);
+        renderer.set_state(render_pass, bind_group);
+        renderer.draw_range(render_pass, buffer, 0, self.mariner_count);
+    }
+
     fn apply_scissor<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -3087,6 +3125,47 @@ impl RenderState {
             mpp: self.camera.zoom * ppp,
             stale,
         })
+    }
+
+    /// Rebuild the mariner symbol buffer from where the boats now are.
+    ///
+    /// Called each frame the fleet changed. The buffer only grows: a harbour
+    /// that briefly shows forty targets should not reallocate every frame
+    /// afterwards as they come and go.
+    fn update_mariner_symbols(&mut self) {
+        let Some(symbols) = self.mariner_symbols else {
+            return;
+        };
+        let stale_own = self
+            .fleet
+            .own
+            .get("navigation.position")
+            .map(|r| r.is_stale())
+            .unwrap_or(true);
+        let instances = crate::render::mariner::instances(&self.fleet, &symbols, stale_own);
+        self.mariner_count = instances.len() as u32;
+        if instances.is_empty() {
+            return;
+        }
+
+        let bytes: &[u8] = bytemuck::cast_slice(&instances);
+        let needed = bytes.len() as u64;
+        let big_enough = self
+            .mariner_buffer
+            .as_ref()
+            .is_some_and(|b| b.size() >= needed);
+        if !big_enough {
+            use wgpu::util::DeviceExt;
+            self.mariner_buffer = Some(self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("mariner symbols"),
+                    contents: bytes,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                },
+            ));
+        } else if let Some(ref buffer) = self.mariner_buffer {
+            self.queue.write_buffer(buffer, 0, bytes);
+        }
     }
 
     /// Project the AIS traffic onto the screen, with its closest approaches.

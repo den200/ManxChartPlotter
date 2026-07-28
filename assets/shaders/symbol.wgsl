@@ -79,12 +79,19 @@ fn vs_main(
     let scaled_size = size_px * SYMBOL_SCALE * instance.scale;
     let pixel_offset = offset * scaled_size;
 
-    // Apply rotation
+    // Apply rotation.
+    //
+    // Clockwise, because every rotation that reaches here is a compass
+    // bearing: S-52's ORIENT for a directional light, a heading for an AIS
+    // target. The offset is added to clip space, where y is up, so the
+    // ordinary anticlockwise matrix sends a symbol's own "up" to
+    // (-sin, cos) — west of north for a positive bearing, i.e. mirrored.
+    // This sends it to (sin, cos), which is the bearing itself.
     let c = cos(instance.rotation);
     let s = sin(instance.rotation);
     let rotated_offset = vec2<f32>(
-        pixel_offset.x * c - pixel_offset.y * s,
-        pixel_offset.x * s + pixel_offset.y * c
+        pixel_offset.x * c + pixel_offset.y * s,
+        -pixel_offset.x * s + pixel_offset.y * c
     );
 
     // Transform world position to clip space

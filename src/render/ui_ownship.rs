@@ -59,13 +59,10 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
         egui::Id::new("own-ship"),
     ));
 
-    let (fill, line) = if ship.stale {
-        (Color32::TRANSPARENT, Color32::from_gray(140))
+    let line = if ship.stale {
+        Color32::from_gray(140)
     } else {
-        (
-            Color32::from_rgb(220, 30, 30),
-            Color32::from_rgb(30, 30, 30),
-        )
+        Color32::from_rgb(30, 30, 30)
     };
 
     // Course vector first, so the hull sits on top of it.
@@ -97,34 +94,15 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
         }
     }
 
-    // The hull points along the heading; failing that, along the course, so it
-    // never sits at an arbitrary angle pretending to know something it doesn't.
-    let bearing = ship.heading.or(ship.cog);
-    match bearing {
-        Some(b) => {
-            // Heading line, out beyond the marker.
-            painter.line_segment(
-                [pos, pos + unit(b) * (HULL * 3.5)],
-                Stroke::new(1.5, line),
-            );
-            // A blunt-sterned outline: recognisably a boat, and its bow is
-            // unambiguous at a glance even when small.
-            let points = vec![
-                pos + unit(b) * HULL,
-                pos + unit(b + 2.5) * HULL * 0.85,
-                pos + unit(b + std::f32::consts::PI) * HULL * 0.45,
-                pos + unit(b - 2.5) * HULL * 0.85,
-            ];
-            painter.add(egui::Shape::convex_polygon(
-                points,
-                fill,
-                Stroke::new(1.8, line),
-            ));
-        }
-        None => {
-            // Position but no direction — a circle states exactly that much.
-            painter.circle(pos, HULL * 0.55, fill, Stroke::new(1.8, line));
-        }
+    // The hull itself is an S-52 symbol (OWNSHP01), drawn by the chart
+    // pipeline. What is left here is the heading line — a line of arbitrary
+    // length, which the presentation library has no symbol for — and the
+    // words that go with a dead fix.
+    if let Some(b) = ship.heading.or(ship.cog) {
+        painter.line_segment(
+            [pos + unit(b) * HULL, pos + unit(b) * (HULL * 3.5)],
+            Stroke::new(1.5, line),
+        );
     }
 
     if ship.stale {

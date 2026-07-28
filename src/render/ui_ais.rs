@@ -1,23 +1,21 @@
 //! AIS targets on the chart.
 //!
-//! Drawn to the shape the standards settle on, and for the reasons behind it
-//! rather than the letter of it:
+//! The target symbols themselves are S-52 — `AISVES01`, `AISSLP01`,
+//! `AISDEF01` and the one- and six-minute vector marks — drawn by the chart
+//! pipeline in [`super::mariner`]. What is left in this overlay is everything
+//! the presentation library has no symbol for:
 //!
-//! - **A triangle**, pointing along heading. Distinct from own ship at a
-//!   glance, which matters more than either shape being pretty.
-//! - **Hollow while sleeping, filled once it matters.** A screen with forty
-//!   targets on it is unreadable if all forty shout.
-//! - **A course vector** only for a vessel actually under way. A moored ship
-//!   with a stale course would otherwise sprout a line across the harbour.
+//! - **The vector line** between a target and its time marks — a line of
+//!   arbitrary length, which no symbol can be. Drawn only for a vessel
+//!   actually under way: a moored ship with a stale course would otherwise
+//!   sprout a line across the harbour.
+//! - **The name**, from AIS, or the MMSI when it has not given one.
 //! - **Crossed through when lost.** A target that simply vanishes is
 //!   indistinguishable from one that was never there; a target that quietly
 //!   stays is worse, because it is a ship that is no longer where you think.
-//! - **Red when the closest approach is close and soon.** This is the only
-//!   colour on the layer, so it means one thing.
-//!
-//! Like own ship, this uses egui's painter over the resolved chart. The same
-//! interim reasoning applies: S-52 has proper symbology for these (VESSEL01)
-//! and when navcore grows it, it belongs in the chart pipeline.
+//! - **A ring and a CPA read-out** when the closest approach is both near and
+//!   soon. This is the only emphasis on the layer, so it means one thing, and
+//!   it adds to the S-52 symbol rather than replacing it.
 
 use egui::{Align2, Color32, Context, FontId, Pos2, Stroke, Vec2};
 
@@ -46,7 +44,9 @@ pub struct AisTarget {
 const CPA_ALARM_M: f32 = 370.0;
 const TCPA_ALARM_S: f32 = 12.0 * 60.0;
 
-/// Half-height of the triangle, in points.
+/// Roughly how far the S-52 target symbol reaches from its pivot, in points.
+/// Used only to keep the overlay's text and rings clear of the glyph — the
+/// glyph's real geometry belongs to the presentation library.
 const SIZE: f32 = 9.0;
 /// How far ahead the course vector reaches.
 const VECTOR_MINUTES: f32 = 6.0;
@@ -84,18 +84,10 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32) {
         } else {
             ink
         };
-        // Filled means "this one is worth your attention": moving, or close.
-        let fill = if target.lost {
-            Color32::TRANSPARENT
-        } else if dangerous {
-            Color32::from_rgb(200, 40, 40)
-        } else if target.under_way {
-            colour.gamma_multiply(0.35)
-        } else {
-            Color32::TRANSPARENT
-        };
-
-        // Course vector, under the hull, and only when actually moving.
+        // The vector's *line*. Its symbol — the target itself — and the one-
+        // and six-minute marks along it are S-52 symbols drawn by the chart
+        // pipeline; only the line between them is left here, because the
+        // presentation library has no symbol for a line of arbitrary length.
         if target.under_way && !target.lost {
             if let (Some(cog), Some(sog)) = (target.cog, target.sog) {
                 if sog > 0.2 && mpp > 0.0 {
@@ -110,17 +102,12 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32) {
             }
         }
 
-        let bearing = target.heading.or(target.cog).unwrap_or(0.0);
-        let points = vec![
-            pos + unit(bearing) * SIZE,
-            pos + unit(bearing + 2.4) * SIZE * 0.8,
-            pos + unit(bearing - 2.4) * SIZE * 0.8,
-        ];
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            fill,
-            Stroke::new(1.5, colour),
-        ));
+        // A target close enough to matter is ringed, so the eye finds it among
+        // forty others. The S-52 symbol underneath is unchanged: this adds
+        // emphasis rather than replacing symbology.
+        if dangerous {
+            painter.circle_stroke(pos, SIZE * 1.6, Stroke::new(2.0, colour));
+        }
 
         // A lost target is struck through rather than removed, so it reads as
         // "was here, no longer reporting" instead of silently disappearing.
@@ -137,8 +124,12 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32) {
         }
 
         if let Some(label) = &target.label {
+            // Below and to the right of the reported position. The S-52
+            // symbol extends *ahead* of that position — its pivot sits at the
+            // base of the triangle — so a label placed above would collide
+            // with the glyph on any northerly heading.
             painter.text(
-                pos + Vec2::new(SIZE + 4.0, -SIZE),
+                pos + Vec2::new(SIZE + 5.0, SIZE + 2.0),
                 Align2::LEFT_CENTER,
                 label,
                 FontId::proportional(11.0),
@@ -151,7 +142,7 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32) {
         if dangerous {
             if let Some((distance, seconds)) = target.cpa {
                 painter.text(
-                    pos + Vec2::new(SIZE + 4.0, SIZE * 0.6),
+                    pos + Vec2::new(SIZE + 5.0, SIZE + 15.0),
                     Align2::LEFT_CENTER,
                     format!(
                         "CPA {:.2} NM in {:.0} min",
