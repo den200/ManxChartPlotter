@@ -50,6 +50,12 @@ pub enum UiAction {
     SettingsChanged,
 }
 
+/// A quarter of a nautical mile, and twelve minutes: tight enough not to cry
+/// wolf, loose enough to leave time to act. Defaults, not rules.
+fn default_cpa_nm() -> f32 { 0.25 }
+fn default_tcpa_min() -> f32 { 12.0 }
+fn default_true() -> bool { true }
+
 /// Where the instrument strip sits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum BarPosition {
@@ -74,6 +80,17 @@ pub struct InstrumentView {
     pub units: crate::signalk::UnitPrefs,
     /// Follow the boat: recentre the chart as the position moves.
     pub follow: bool,
+    /// When a target counts as dangerous. Every ECDIS makes these settings,
+    /// because the right answer depends on the water: a quarter-mile CPA is
+    /// prudent offshore and unusable in a busy strait, where every ferry would
+    /// trip it and the warning would stop meaning anything.
+    #[serde(default = "default_cpa_nm")]
+    pub cpa_alarm_nm: f32,
+    #[serde(default = "default_tcpa_min")]
+    pub tcpa_alarm_min: f32,
+    /// Show AIS traffic at all.
+    #[serde(default = "default_true")]
+    pub show_ais: bool,
 
     // Everything below is live state, not preference.
     #[serde(skip)]
@@ -98,6 +115,9 @@ impl Default for InstrumentView {
                 .collect(),
             units: Default::default(),
             follow: true,
+            cpa_alarm_nm: default_cpa_nm(),
+            tcpa_alarm_min: default_tcpa_min(),
+            show_ais: true,
             open: false,
             status: "Not connected".into(),
             connected: false,

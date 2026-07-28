@@ -165,6 +165,24 @@ impl MercatorBounds {
 mod tests {
     use super::*;
 
+    /// `to_wgs84` returns (lat, lon) — in that order, which is the opposite of
+    /// `to_mercator`'s (x, y). Tapping a vessel converts the tap back to
+    /// lat/lon to measure a geodesic range against it, and getting the pair
+    /// the wrong way round there would put every ship in the Indian Ocean
+    /// without failing anything else.
+    #[test]
+    fn to_wgs84_returns_lat_then_lon() {
+        let (lat, lon) = (56.55, 11.60);
+        let (x, y) = Projection::to_mercator(lat, lon);
+        // Mercator x follows longitude and y follows latitude, so at these
+        // values y must be much the larger — a swapped return is obvious.
+        assert!(y > x, "y {y} should exceed x {x} at 56 N, 11 E");
+
+        let (back_lat, back_lon) = Projection::to_wgs84(x, y);
+        assert!((back_lat - lat).abs() < 1e-9, "lat {back_lat}");
+        assert!((back_lon - lon).abs() < 1e-9, "lon {back_lon}");
+    }
+
     #[test]
     fn mercator_roundtrip() {
         let lat = 55.67; // Copenhagen

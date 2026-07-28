@@ -22,7 +22,17 @@ pub fn build(
     // The strip claims its edge before the chart is told how much room it has,
     // so a window opened over it still lands inside the remaining area.
     super::ui_instruments::bar(ctx, instruments, &fleet.own);
-    super::ui_ais::draw(ctx, &state.ais, state.mpp);
+    if instruments.show_ais {
+        super::ui_ais::draw(
+            ctx,
+            &state.ais,
+            state.mpp,
+            super::ui_ais::CpaAlarm {
+                distance_m: instruments.cpa_alarm_nm * 1852.0,
+                seconds: instruments.tcpa_alarm_min * 60.0,
+            },
+        );
+    }
     if let Some(ref ship) = state.own_ship {
         super::ui_ownship::draw(ctx, ship);
     }

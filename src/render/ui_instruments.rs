@@ -245,7 +245,7 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
 
 fn layout(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
     ui.label(RichText::new("Layout").strong());
-    let before = (view.position, view.units, view.follow);
+    let before = after(view);
     ui.horizontal(|ui| {
         ui.label("Bar:");
         ui.selectable_value(&mut view.position, BarPosition::Top, "Top");
@@ -272,10 +272,64 @@ fn layout(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiActi
         ui.selectable_value(&mut view.units.temperature, Fahrenheit, "°F");
     });
     ui.checkbox(&mut view.follow, "Keep the boat centred on the chart");
-    if before != (view.position, view.units, view.follow) {
+
+    ui.add_space(8.0);
+    ui.label(RichText::new("AIS traffic").strong());
+    ui.checkbox(&mut view.show_ais, "Show other vessels");
+    ui.label(
+        RichText::new(
+            "A target is called dangerous only when it passes both tests. The \
+             right numbers depend on the water — a quarter-mile is prudent \
+             offshore and unusable in a busy strait, where every ferry would \
+             trip it.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.horizontal(|ui| {
+        ui.label("Warn within");
+        ui.add(
+            egui::DragValue::new(&mut view.cpa_alarm_nm)
+                .speed(0.05)
+                .range(0.02..=5.0)
+                .fixed_decimals(2)
+                .suffix(" NM"),
+        );
+        ui.label("and");
+        ui.add(
+            egui::DragValue::new(&mut view.tcpa_alarm_min)
+                .speed(1.0)
+                .range(1.0..=60.0)
+                .fixed_decimals(0)
+                .suffix(" min"),
+        );
+    });
+
+    if before != after(view) {
         actions.push(UiAction::SettingsChanged);
     }
 }
+
+/// The settings worth writing to disk, as one comparable value.
+fn after(view: &InstrumentView) -> Settings {
+    (
+        view.position,
+        view.units,
+        view.follow,
+        view.show_ais,
+        view.cpa_alarm_nm.to_bits(),
+        view.tcpa_alarm_min.to_bits(),
+    )
+}
+
+type Settings = (
+    BarPosition,
+    crate::signalk::UnitPrefs,
+    bool,
+    bool,
+    u32,
+    u32,
+);
 
 /// Choosing what the bar shows.
 ///

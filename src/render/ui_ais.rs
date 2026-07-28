@@ -36,13 +36,22 @@ pub struct AisTarget {
     pub cpa: Option<(f32, f32)>,
 }
 
-/// How near, and how soon, before a target is called dangerous.
-///
-/// Two cables and twelve minutes: tight enough not to cry wolf in a busy
-/// strait, loose enough to give time to act. Real ECDIS makes these settings;
-/// so should navcore, once there is somewhere to put them.
-const CPA_ALARM_M: f32 = 370.0;
-const TCPA_ALARM_S: f32 = 12.0 * 60.0;
+/// How near, and how soon, before a target is called dangerous. Set by the
+/// user, because the right answer depends on the water.
+#[derive(Debug, Clone, Copy)]
+pub struct CpaAlarm {
+    pub distance_m: f32,
+    pub seconds: f32,
+}
+
+impl CpaAlarm {
+    /// Both conditions, and the approach still ahead of us. Near-but-in-an-hour
+    /// is not a threat, and neither is soon-but-a-mile-off; sounding on either
+    /// alone is how a warning stops being read.
+    fn triggered_by(&self, cpa: Option<(f32, f32)>) -> bool {
+        cpa.is_some_and(|(d, t)| d < self.distance_m && t < self.seconds && t > 0.0)
+    }
+}
 
 /// Roughly how far the S-52 target symbol reaches from its pivot, in points.
 /// Used only to keep the overlay's text and rings clear of the glyph — the
@@ -51,7 +60,7 @@ const SIZE: f32 = 9.0;
 /// How far ahead the course vector reaches.
 const VECTOR_MINUTES: f32 = 6.0;
 
-pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32) {
+pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
     if targets.is_empty() {
         return;
     }
@@ -74,9 +83,7 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32) {
             continue;
         }
 
-        let dangerous = target
-            .cpa
-            .is_some_and(|(d, t)| d < CPA_ALARM_M && t < TCPA_ALARM_S && t > 0.0);
+        let dangerous = alarm.triggered_by(target.cpa);
         let colour = if target.lost {
             Color32::from_gray(140)
         } else if dangerous {
@@ -179,10 +186,13 @@ mod tests {
         }
     }
 
-    /// The rule that decides the only colour on the layer.
+    /// The default alarm, a quarter-mile and twelve minutes.
+    fn alarm() -> CpaAlarm {
+        CpaAlarm { distance_m: 0.25 * 1852.0, seconds: 12.0 * 60.0 }
+    }
+
     fn dangerous(t: &AisTarget) -> bool {
-        t.cpa
-            .is_some_and(|(d, s)| d < CPA_ALARM_M && s < TCPA_ALARM_S && s > 0.0)
+        alarm().triggered_by(t.cpa)
     }
 
     #[test]
@@ -218,11 +228,17 @@ mod tests {
     }
 
     #[test]
-    fn the_alarm_thresholds_are_the_ones_documented() {
-        // A quarter-mile and twelve minutes. Pinned because changing either
-        // silently changes what the chart calls dangerous.
-        assert!((CPA_ALARM_M - 370.0).abs() < 0.1);
-        assert!((TCPA_ALARM_S - 720.0).abs() < 0.1);
-        assert!(CPA_ALARM_M / 1852.0 < 0.25, "under a quarter of a mile");
+    fn a_tighter_alarm_stops_calling_the_same_target_dangerous() {
+        // The point of making these settings: the same traffic must be able to
+        // read as safe in a busy strait and as a threat offshore.
+        let mut t = target();
+        t.cpa = Some((300.0, 300.0));
+        assert!(alarm().triggered_by(t.cpa), "default: close and soon");
+
+        let tight = CpaAlarm { distance_m: 100.0, seconds: 12.0 * 60.0 };
+        assert!(!tight.triggered_by(t.cpa), "a tighter ring lets it pass");
+
+        let brief = CpaAlarm { distance_m: 0.25 * 1852.0, seconds: 120.0 };
+        assert!(!brief.triggered_by(t.cpa), "a shorter horizon lets it pass");
     }
 }

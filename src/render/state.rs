@@ -2279,6 +2279,14 @@ impl RenderState {
                     self.pick_anchor =
                         Some([answer.position[0] as f32, answer.position[1] as f32]);
                     self.pick_objects = answer.objects;
+                    // Vessels first. A tap that lands on both a ship and the
+                    // depth area under it is asking about the ship: the chart
+                    // will still be there in a minute and the ship will not.
+                    let tolerance =
+                        (2.0 * self.effective_ppmm.max(1.0) * self.camera.zoom) as f64;
+                    let mut vessels = self.picked_vessels(answer.position, tolerance.max(1.0));
+                    vessels.append(&mut self.pick_objects);
+                    self.pick_objects = vessels;
                     self.needs_redraw = true;
                 }
             }
@@ -3125,6 +3133,120 @@ impl RenderState {
             mpp: self.camera.zoom * ppp,
             stale,
         })
+    }
+
+    /// Vessels under a tap, as query results.
+    ///
+    /// Presented as [`PickedObject`]s so the bubble that answers "what is
+    /// that?" for a buoy answers it for a ship too, in the same place, with
+    /// the same gesture. A watch officer should not have to learn that chart
+    /// objects are tapped and vessels are found some other way.
+    fn picked_vessels(
+        &self,
+        world: [f64; 2],
+        tolerance_m: f64,
+    ) -> Vec<crate::pick::PickedObject> {
+        use crate::geo::{cpa, to_nm, LatLon, Motion};
+
+        let (lat, lon) = crate::render::projection::Projection::to_wgs84(world[0], world[1]);
+        let at = LatLon::new(lat, lon);
+        let prefs = self
+            .ui
+            .as_ref()
+            .map(|u| u.instruments.units)
+            .unwrap_or_default();
+        let show_ais = self.ui.as_ref().map(|u| u.instruments.show_ais).unwrap_or(true);
+        if !show_ais {
+            return Vec::new();
+        }
+
+        let own = self.fleet.own.position().map(|(lat, lon)| Motion {
+            at: LatLon::new(lat, lon),
+            course: self
+                .fleet
+                .own
+                .number("navigation.courseOverGroundTrue")
+                .or_else(|| self.fleet.own.heading_true())
+                .unwrap_or(0.0),
+            speed: self
+                .fleet
+                .own
+                .number("navigation.speedOverGround")
+                .unwrap_or(0.0),
+        });
+
+        let mut out = Vec::new();
+        for target in self.fleet.targets() {
+            let Some((tlat, tlon)) = target.position() else {
+                continue;
+            };
+            let there = LatLon::new(tlat, tlon);
+            let distance_m = crate::geo::distance_m(at, there);
+            if distance_m > tolerance_m {
+                continue;
+            }
+
+            let mut attributes: Vec<(String, String)> = Vec::new();
+            let mut push = |k: &str, v: String| attributes.push((k.to_string(), v));
+            if let Some(mmsi) = target.mmsi() {
+                push("MMSI", mmsi.to_string());
+            }
+            if let Some(state) = target.vessel.text("navigation.state") {
+                push("Status", state.to_string());
+            }
+            if let Some(sog) = target.speed() {
+                let r = crate::signalk::Quantity::Speed.format(sog, &prefs);
+                push("SOG", format!("{} {}", r.value, r.unit));
+            }
+            if let Some(cog) = target.course() {
+                let r = crate::signalk::Quantity::Angle.format(cog, &prefs);
+                push("COG", format!("{}{}", r.value, r.unit));
+            }
+            if let Some(hdg) = target.vessel.heading_true() {
+                let r = crate::signalk::Quantity::Angle.format(hdg, &prefs);
+                push("Heading", format!("{}{}", r.value, r.unit));
+            }
+            // Range and bearing *from us*, which is the first thing anyone
+            // wants and the thing a chart cannot show.
+            if let Some(own) = own {
+                let (range, bearing) = crate::geo::range_bearing(own.at, there);
+                push("Range", format!("{:.2} NM", to_nm(range)));
+                push("Bearing", format!("{:03.0}°", bearing.to_degrees()));
+
+                if let (Some(course), Some(speed)) = (target.course(), target.speed()) {
+                    if let Some(c) = cpa(own, Motion { at: there, course, speed }) {
+                        if c.past {
+                            push("CPA", "opening — closest approach is behind us".into());
+                        } else {
+                            push("CPA", format!("{:.2} NM", to_nm(c.distance_m)));
+                            push("TCPA", format!("{:.0} min", c.seconds / 60.0));
+                        }
+                    }
+                }
+            }
+            if target.is_lost() {
+                push(
+                    "Lost",
+                    format!("no report for {:.0} min", target.last_report.elapsed().as_secs_f64() / 60.0),
+                );
+            }
+
+            out.push(crate::pick::PickedObject {
+                acronym: "AIS".into(),
+                title: target
+                    .label()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "AIS target".into()),
+                chart: "Signal K".into(),
+                chart_scale: 0,
+                geometry: crate::senc::FeatureType::Point,
+                attributes,
+                notes: Vec::new(),
+                distance_m,
+            });
+        }
+        out.sort_by(|a, b| a.distance_m.total_cmp(&b.distance_m));
+        out
     }
 
     /// Rebuild the mariner symbol buffer from where the boats now are.
