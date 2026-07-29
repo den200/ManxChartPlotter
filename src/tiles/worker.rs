@@ -336,6 +336,8 @@ fn worker_loop(
                     }
                 }
                 crate::pick::sort_picks(&mut objects);
+                // After sorting, so the copy that survives is the best answer.
+                let objects = crate::pick::dedupe_picks(objects);
                 let _ = pick_tx.send(PickResponse {
                     seq,
                     position: mercator,

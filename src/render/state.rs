@@ -2946,6 +2946,15 @@ impl RenderState {
                 &self.window,
                 self.config.format,
             ));
+            // `NAVCORE_PICK=lat,lon` taps the chart at startup, so the object
+            // bubble can be captured without a click.
+            if let Ok(at) = std::env::var("NAVCORE_PICK") {
+                let parts: Vec<f64> = at.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                if parts.len() == 2 {
+                    let (x, y) = crate::render::projection::Projection::to_mercator(parts[0], parts[1]);
+                    self.pick_at_world(x as f32, y as f32);
+                }
+            }
             // `NAVCORE_SHOP=1` opens the chart shop at startup, so it can be
             // captured without a click.
             if let Some(ui) = self.ui.as_mut() {
@@ -3243,6 +3252,10 @@ impl RenderState {
                 attributes,
                 notes: Vec::new(),
                 distance_m,
+                // A vessel's summary is its own line already: name, then the
+                // numbers. Nothing for S-52 to compose.
+                summary: None,
+                duplicates: 0,
             });
         }
         out.sort_by(|a, b| a.distance_m.total_cmp(&b.distance_m));

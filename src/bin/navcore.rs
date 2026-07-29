@@ -1127,11 +1127,20 @@ fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
         }
     }
     navcore2::pick::sort_picks(&mut found);
+    let found = navcore2::pick::dedupe_picks(found);
 
     println!("{} object(s) within {:.0} m of {:.5},{:.5}\n", found.len(), tolerance_m, lat, lon);
     for o in &found {
-        println!("{} ({})   1:{} {}", o.title, o.acronym, o.chart_scale, o.chart);
-        for (k, v) in &o.attributes {
+        let also = if o.duplicates > 0 {
+            format!("   (+{} identical)", o.duplicates)
+        } else {
+            String::new()
+        };
+        println!("{} ({})   1:{} {}{also}", o.title, o.acronym, o.chart_scale, o.chart);
+        if let Some(summary) = &o.summary {
+            println!("    {summary}");
+        }
+        for (k, v) in o.attributes.iter().filter(|(k, _)| navcore2::pick::is_worth_showing(k)) {
             println!("    {:<8} {}", k, v);
         }
         for n in &o.notes {

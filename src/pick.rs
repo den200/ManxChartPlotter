@@ -36,6 +36,19 @@ pub struct PickedObject {
     /// How far the cursor was from the object, in metres. Areas report 0 when
     /// the cursor is inside them.
     pub distance_m: f64,
+    /// The object read the way a mariner reads it, where the standard says how.
+    ///
+    /// A light carries eight attributes and means one thing: `Fl(1)G 3s 4M`.
+    /// That is a light *list* entry, and it is what someone is looking for; the
+    /// eight rows behind it are the chart's database. Composed by S-52's own
+    /// LITDSN01, the same procedure that labels the light on the chart, so the
+    /// bubble and the chart cannot disagree.
+    pub summary: Option<String>,
+    /// How many further copies of this object were folded into it — the same
+    /// feature carried by other cells, or repeated within one. Zero for the
+    /// common case; shown so the answer does not silently hide that the chart
+    /// set says the same thing more than once.
+    pub duplicates: usize,
 }
 
 /// Chart objects at a point, nearest and most specific first.
@@ -68,6 +81,73 @@ pub fn pick_at(
 
     sort_picks(&mut out);
     out
+}
+
+/// Fold away objects the chart set says more than once.
+///
+/// A tap near a harbour light answers with fifty-odd objects, and most of them
+/// are the same handful of things repeated: quilting means the light exists in
+/// the 1:12000 plan, the 1:22000 approach and the 1:180000 overview, and a
+/// shoreline is carried as many separate segments within one cell. Reading the
+/// same light three times is not more information, it is less — the one entry
+/// that differs gets lost among the copies.
+///
+/// Two objects are the same thing when they are the same class with the same
+/// attributes. That is deliberately strict: a light and its sector partner
+/// differ in `SECTR1`, two identical buoys a hundred metres apart differ in
+/// nothing but position — and within a tap radius, two identical buoys are
+/// very much more likely to be one buoy carried by two cells. What survives is
+/// the nearest copy, and among equals the one from the finest chart, because a
+/// harbour plan says more about a berth than an overview does.
+pub fn dedupe_picks(picks: Vec<PickedObject>) -> Vec<PickedObject> {
+    let mut out: Vec<PickedObject> = Vec::with_capacity(picks.len());
+    for pick in picks {
+        match out.iter_mut().find(|kept| same_object(kept, &pick)) {
+            Some(kept) => {
+                // Keep whichever copy is the better answer, but carry the
+                // count and the finest scale across either way.
+                kept.duplicates += 1;
+                if pick.chart_scale > 0 && (kept.chart_scale == 0 || pick.chart_scale < kept.chart_scale) {
+                    kept.chart = pick.chart;
+                    kept.chart_scale = pick.chart_scale;
+                }
+                kept.distance_m = kept.distance_m.min(pick.distance_m);
+                if kept.notes.is_empty() {
+                    kept.notes = pick.notes;
+                }
+            }
+            None => out.push(pick),
+        }
+    }
+    out
+}
+
+fn same_object(a: &PickedObject, b: &PickedObject) -> bool {
+    a.acronym == b.acronym
+        && a.geometry == b.geometry
+        && a.attributes.iter().filter(|(k, _)| !is_cell_bookkeeping(k)).eq(
+            b.attributes.iter().filter(|(k, _)| !is_cell_bookkeeping(k)),
+        )
+}
+
+/// Attributes that describe the *cell*, not the object in the water.
+///
+/// They differ legitimately between two cells carrying the same feature, so
+/// comparing them defeats the whole point: before this, one daymark appeared
+/// twice because the 1:22000 cell had drawn it with a `SCAMIN` and the 1:12000
+/// cell had not.
+///
+/// `SCAMIN` is also the commonest attribute in a chart set and the least use to
+/// anyone: it is the scale at which S-52 stops drawing the object. It is hidden
+/// from the answer entirely. The source fields stay visible — provenance is
+/// worth knowing — they simply do not decide identity.
+pub fn is_cell_bookkeeping(name: &str) -> bool {
+    matches!(name, "SCAMIN" | "SORDAT" | "SORIND" | "RECDAT" | "RECIND")
+}
+
+/// Attributes worth showing. Excludes the display-internal ones.
+pub fn is_worth_showing(name: &str) -> bool {
+    name != "SCAMIN"
 }
 
 /// Nearest and most specific first, and where two cells hold the same object,
@@ -186,6 +266,43 @@ fn point_in_triangle(p: [f64; 2], t: [[f64; 2]; 3]) -> bool {
     !(neg && pos)
 }
 
+/// A one-line reading, for the classes the standard composes one for.
+///
+/// Only lights today. Adding a class here means finding the S-52 procedure
+/// that already writes its label, not inventing a phrasing: the point is that
+/// the bubble says exactly what the chart says.
+fn summarise(acronym: &str, feature: &Feature, attrs: &[(String, String)]) -> Option<String> {
+    if acronym != "LIGHTS" {
+        return None;
+    }
+    let get = |k: &str| {
+        attrs
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_str())
+    };
+    let mut text = crate::s52::litdsn01(feature)?;
+
+    // For a *sectored* light LITDSN01 deliberately leaves out the colour and
+    // the range, because one label cannot state a colour that changes with
+    // bearing — the chart draws coloured arcs instead. A written answer has no
+    // arcs, so it has to say them, or "Fl 3s 4m" hides that this is the green
+    // sector of a light that is also red somewhere else.
+    if let (Some(from), Some(to)) = (
+        feature.attribute_float("SECTR1"),
+        feature.attribute_float("SECTR2"),
+    ) {
+        if let Some(colour) = get("COLOUR") {
+            text.push_str(&format!(", {colour}"));
+        }
+        text.push_str(&format!(" {from:.0}°–{to:.0}°"));
+        if let Some(range) = get("VALNMR") {
+            text.push_str(&format!(", {range} M"));
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
 fn describe(feature: &Feature, info: &ChartInfo, distance_m: f64) -> PickedObject {
     let acronym = s57_code_to_acronym(feature.type_code).to_string();
     let title = object_class_name(&acronym).unwrap_or(&acronym).to_string();
@@ -212,6 +329,7 @@ fn describe(feature: &Feature, info: &ChartInfo, distance_m: f64) -> PickedObjec
     }
 
     PickedObject {
+        summary: summarise(&acronym, feature, &attributes),
         acronym,
         title,
         // These cells leave the cell name blank in the header, so fall back to
@@ -230,6 +348,7 @@ fn describe(feature: &Feature, info: &ChartInfo, distance_m: f64) -> PickedObjec
         attributes,
         notes,
         distance_m,
+        duplicates: 0,
     }
 }
 
@@ -292,6 +411,168 @@ fn read_note(chart_path: &Path, file: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn obj(acronym: &str, chart: &str, scale: u32, attrs: &[(&str, &str)]) -> PickedObject {
+        PickedObject {
+            acronym: acronym.into(),
+            title: acronym.into(),
+            chart: chart.into(),
+            chart_scale: scale,
+            geometry: FeatureType::Point,
+            attributes: attrs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            notes: Vec::new(),
+            distance_m: 10.0,
+            summary: None,
+            duplicates: 0,
+        }
+    }
+
+    #[test]
+    fn one_light_carried_by_three_cells_answers_once() {
+        // Measured from the real chart set: a tap by Kalvebod light returned
+        // the same light three times, once per cell that carries it.
+        let light = &[("COLOUR", "green"), ("SIGPER", "3")];
+        let picks = vec![
+            obj("LIGHTS", "harbour-plan", 12000, light),
+            obj("LIGHTS", "approach", 22000, light),
+            obj("LIGHTS", "overview", 180000, light),
+        ];
+        let out = dedupe_picks(picks);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].duplicates, 2);
+        // The finest chart wins: a harbour plan says more about a light than an
+        // overview does.
+        assert_eq!(out[0].chart, "harbour-plan");
+        assert_eq!(out[0].chart_scale, 12000);
+    }
+
+    #[test]
+    fn the_finest_chart_wins_whatever_order_they_arrive_in() {
+        let light = &[("COLOUR", "green")];
+        let out = dedupe_picks(vec![
+            obj("LIGHTS", "overview", 180000, light),
+            obj("LIGHTS", "harbour-plan", 12000, light),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chart, "harbour-plan");
+    }
+
+    #[test]
+    fn scamin_does_not_make_two_objects_out_of_one() {
+        // The bug this pins: one cell had drawn the daymark with a SCAMIN and
+        // another had not, so the same daymark answered twice.
+        let out = dedupe_picks(vec![
+            obj("DAYMAR", "plan", 12000, &[("COLOUR", "green")]),
+            obj("DAYMAR", "approach", 22000, &[("COLOUR", "green"), ("SCAMIN", "89999")]),
+        ]);
+        assert_eq!(out.len(), 1, "SCAMIN describes the cell, not the daymark");
+        assert_eq!(out[0].duplicates, 1);
+    }
+
+    #[test]
+    fn objects_that_really_differ_are_kept_apart() {
+        // A light and its sector partner differ in one attribute and are two
+        // different lights. Folding them would lose a sector.
+        let out = dedupe_picks(vec![
+            obj("LIGHTS", "plan", 12000, &[("SECTR1", "165")]),
+            obj("LIGHTS", "plan", 12000, &[("SECTR1", "305")]),
+        ]);
+        assert_eq!(out.len(), 2);
+
+        // Same attributes, different class.
+        let out = dedupe_picks(vec![
+            obj("LIGHTS", "plan", 12000, &[("COLOUR", "green")]),
+            obj("DAYMAR", "plan", 12000, &[("COLOUR", "green")]),
+        ]);
+        assert_eq!(out.len(), 2);
+
+        // Same class and attributes, different geometry: a point islet and an
+        // area of land are not the same object.
+        let mut area = obj("LNDARE", "plan", 12000, &[]);
+        area.geometry = FeatureType::Area;
+        let out = dedupe_picks(vec![obj("LNDARE", "plan", 12000, &[]), area]);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn the_nearest_copy_sets_the_distance() {
+        let light = &[("COLOUR", "green")];
+        let mut far = obj("LIGHTS", "approach", 22000, light);
+        far.distance_m = 40.0;
+        let mut near = obj("LIGHTS", "plan", 12000, light);
+        near.distance_m = 4.0;
+        let out = dedupe_picks(vec![far, near]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].distance_m, 4.0);
+    }
+
+    fn light(attrs: &[(&str, AttributeValue)]) -> Feature {
+        let mut attributes = crate::senc::Attributes::new();
+        for (k, v) in attrs {
+            attributes.insert(k, v.clone());
+        }
+        Feature {
+            type_code: 0,
+            object_class: crate::senc::ObjectClass::Light,
+            feature_type: FeatureType::Point,
+            attributes,
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        }
+    }
+
+    #[test]
+    fn a_sectored_light_reads_as_a_light_list_entry() {
+        // Kalvebod S, from the real chart set. LITDSN01 alone gives
+        // "Fl 3s 4m": correct for a chart *label*, because a sectored light's
+        // colour changes with bearing and the arcs carry it. In a written
+        // answer that hides that this is the green sector of a light which is
+        // also red elsewhere, so the colour and range are said outright.
+        let decoded = [
+            ("COLOUR".to_string(), "green".to_string()),
+            ("VALNMR".to_string(), "4".to_string()),
+        ];
+        let f = light(&[
+            ("LITCHR", AttributeValue::Integer(2)), // flashing
+            ("SIGGRP", AttributeValue::String("(1)".into())),
+            ("COLOUR", AttributeValue::String("3".into())),
+            ("SIGPER", AttributeValue::Float(3.0)),
+            ("HEIGHT", AttributeValue::Float(3.5)),
+            ("VALNMR", AttributeValue::Float(4.0)),
+            ("SECTR1", AttributeValue::Float(165.0)),
+            ("SECTR2", AttributeValue::Float(305.0)),
+        ]);
+        let summary = summarise("LIGHTS", &f, &decoded).expect("a reading");
+        assert!(summary.starts_with("Fl"), "{summary}");
+        assert!(summary.contains("green"), "the sector's colour: {summary}");
+        assert!(summary.contains("165°–305°"), "the sector: {summary}");
+        assert!(summary.contains("4 M"), "the range: {summary}");
+    }
+
+    #[test]
+    fn only_the_classes_the_standard_composes_for_get_a_summary() {
+        // Inventing a phrasing for other classes would make the bubble and the
+        // chart disagree, which is the one thing this must not do.
+        let f = light(&[("CATROD", AttributeValue::Integer(1))]);
+        assert_eq!(summarise("ROADWY", &f, &[]), None);
+        assert_eq!(summarise("DAYMAR", &f, &[]), None);
+    }
+
+    #[test]
+    fn scamin_is_hidden_but_provenance_is_not() {
+        assert!(!is_worth_showing("SCAMIN"));
+        assert!(is_worth_showing("COLOUR"));
+        // Source fields do not decide identity — two cells date the same
+        // survey differently — but they stay visible.
+        assert!(is_cell_bookkeeping("SORDAT"));
+        assert!(is_worth_showing("SORDAT"));
+        assert!(!is_cell_bookkeeping("COLOUR"));
+    }
 
     #[test]
     fn distance_to_segment_handles_the_ends_and_the_middle() {

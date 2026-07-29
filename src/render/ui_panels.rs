@@ -484,6 +484,14 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
 ///
 /// Anchored near the tap but free to be dragged, because on a small screen the
 /// thing you just tapped is exactly what the panel covers.
+/// Does this object describe the cell rather than the water?
+///
+/// The S-57 meta classes, `M_` and `C_`. Kept as one predicate so the bubble
+/// and [`crate::pick::sort_picks`] agree about what counts.
+fn is_cell_description(acronym: &str) -> bool {
+    acronym.starts_with("M_") || acronym.starts_with("C_")
+}
+
 fn object_query(
     ctx: &Context,
     objects: &[PickedObject],
@@ -542,12 +550,42 @@ fn object_query(
         // Scrolls, so nothing is truncated: a tap in a harbour can find forty
         // objects and every one of them is now reachable.
         ScrollArea::vertical().show(ui, |ui| {
-            for (i, o) in objects.iter().enumerate() {
-                if i > 0 {
+            // The meta objects describe the *cell* — which publication it came
+            // from, which buoyage system is in force, how good the survey was.
+            // A tap in a harbour finds all of them and they are never the
+            // answer to "what is that?", so they go behind one line instead of
+            // pushing the thing you actually tapped off the screen.
+            let (cell, real): (Vec<_>, Vec<_>) = objects
+                .iter()
+                .enumerate()
+                .partition(|(_, o)| is_cell_description(&o.acronym));
+
+            for (n, (i, o)) in real.iter().enumerate() {
+                if n > 0 {
                     ui.add_space(4.0);
                     ui.separator();
                 }
-                object(ui, o, i);
+                object(ui, o, *i);
+            }
+
+            if !cell.is_empty() {
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(
+                    RichText::new(format!("About this chart cell ({})", cell.len()))
+                        .small()
+                        .weak(),
+                )
+                .id_salt("pick-cell-meta")
+                .default_open(false)
+                .show(ui, |ui| {
+                    for (n, (i, o)) in cell.iter().enumerate() {
+                        if n > 0 {
+                            ui.add_space(4.0);
+                            ui.separator();
+                        }
+                        object(ui, o, *i);
+                    }
+                });
             }
         });
     });
@@ -575,18 +613,29 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
             }
         });
     });
-    ui.label(
-        RichText::new(format!(
-            "{} \u{2022} 1:{} \u{2022} {}",
-            geometry_name(o.geometry),
-            o.chart_scale,
-            o.chart
-        ))
-        .small()
-        .weak(),
-    );
+    // Provenance, but only as much of it as anyone reads. The cell's name is
+    // what you quote when reporting a chart error and nothing else, so it goes
+    // to the hover; fifteen objects each carrying "• OC-45-HBEOK5" was a
+    // column of noise down the middle of the answer.
+    let mut line = format!("{} \u{2022} 1:{}", geometry_name(o.geometry), o.chart_scale);
+    if o.duplicates > 0 {
+        // Said plainly rather than hidden: the chart set really does carry
+        // this object more than once, and a reader comparing against another
+        // plotter should know the answer was folded.
+        line.push_str(&format!(" \u{2022} +{} identical", o.duplicates));
+    }
+    ui.label(RichText::new(line).small().weak())
+        .on_hover_text(&o.chart);
 
-    if !o.attributes.is_empty() {
+    // The reading, where S-52 composes one. `Fl(1)G 3s 4M, 165°–305°` is what
+    // a light means; the eight attributes behind it are how the chart stores
+    // it, and they go behind a disclosure so they are there without being in
+    // the way.
+    if let Some(summary) = &o.summary {
+        ui.label(RichText::new(summary).strong());
+    }
+
+    let attrs = |ui: &mut egui::Ui| {
         // Keyed by position, not by content: a tap routinely finds two lights
         // of the same class in the same cell, and two grids with one id is an
         // egui collision — which is what those red boxes were.
@@ -594,12 +643,24 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
             .num_columns(2)
             .spacing([12.0, 2.0])
             .show(ui, |ui| {
-                for (k, v) in &o.attributes {
+                for (k, v) in o.attributes.iter().filter(|(k, _)| crate::pick::is_worth_showing(k)) {
                     ui.label(RichText::new(k).monospace().weak());
                     ui.label(v);
                     ui.end_row();
                 }
             });
+    };
+
+    if !o.attributes.is_empty() {
+        match &o.summary {
+            Some(_) => {
+                egui::CollapsingHeader::new(RichText::new("details").small().weak())
+                    .id_salt(("pick-attrs-fold", index))
+                    .default_open(false)
+                    .show(ui, attrs);
+            }
+            None => attrs(ui),
+        }
     }
 
     for note in &o.notes {
@@ -621,7 +682,14 @@ fn as_text(o: &PickedObject) -> String {
         o.chart_scale,
         o.chart
     ));
-    for (k, v) in &o.attributes {
+    // The copied text keeps everything, summary included: it is what gets
+    // pasted into a message to a chart producer, and there the raw attributes
+    // are the evidence.
+    if let Some(summary) = &o.summary {
+        out.push_str(summary);
+        out.push('\n');
+    }
+    for (k, v) in o.attributes.iter().filter(|(k, _)| crate::pick::is_worth_showing(k)) {
         out.push_str(&format!("  {k}  {v}\n"));
     }
     for note in &o.notes {
