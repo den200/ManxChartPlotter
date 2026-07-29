@@ -25,7 +25,7 @@ impl CachedDecryptor {
         let (cache, cache_enabled) = match SencCache::new() {
             Ok(c) => (c, true),
             Err(e) => {
-                eprintln!("Warning: Disk cache unavailable: {}. Running uncached.", e);
+                log::warn!("Disk cache unavailable: {}. Running uncached.", e);
                 // Create a dummy cache that won't be used
                 (SencCache::with_dir(std::env::temp_dir().join("navcore_dummy_cache"))
                     .unwrap_or_else(|_| panic!("Failed to create even temp cache")),
@@ -79,7 +79,7 @@ impl CachedDecryptor {
         // Write to cache (ignore errors - cache is best-effort)
         if self.cache_enabled {
             if let Err(e) = self.cache.write_cache(chart_name, &senc_data) {
-                eprintln!("Warning: Failed to cache {}: {}", chart_name, e);
+                log::warn!("Failed to cache {}: {}", chart_name, e);
             }
         }
 
@@ -109,7 +109,6 @@ impl CachedDecryptor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
 
     // Note: Full integration tests require oexserverd and chart files

@@ -209,7 +209,7 @@ pub fn features_to_instances(
     ref_lat: f64,
     ref_lon: f64,
 ) -> Vec<SymbolInstance> {
-    println!(
+    log::debug!(
         "DEBUG: features_to_instances called with ref_lat={}, ref_lon={}",
         ref_lat, ref_lon
     );
@@ -219,11 +219,11 @@ pub fn features_to_instances(
         .iter()
         .filter(|f| f.feature_type == FeatureType::Point)
         .collect();
-    println!("DEBUG: Point features type codes:");
+    log::debug!("Point features type codes:");
     for f in &point_features {
-        println!("  type_code={} (symbols: BCNCAR=5, BCNLAT=7, BCNSPP=9, BOYCAR=14, BOYLAT=17, UWTROC=153)", f.type_code);
+        log::debug!("  type_code={} (symbols: BCNCAR=5, BCNLAT=7, BCNSPP=9, BOYCAR=14, BOYLAT=17, UWTROC=153)", f.type_code);
     }
-    println!(
+    log::debug!(
         "DEBUG: Total {} point features, checking for matching symbols...",
         point_features.len()
     );
@@ -236,13 +236,13 @@ pub fn features_to_instances(
 
             // Debug: show raw WGS84 coords and converted SM coords for first few symbols
             if let Some(pg) = &f.point_geometry {
-                println!("DEBUG: Symbol type_code={} raw WGS84: lat={:.6}, lon={:.6} -> SM: ({:.0}, {:.0})",
+                log::debug!("Symbol type_code={} raw WGS84: lat={:.6}, lon={:.6} -> SM: ({:.0}, {:.0})",
                     f.type_code, pg.x, pg.y, position[0], position[1]);
                 // Also show attributes for buoys
                 if f.type_code == 17 {  // BOYLAT
                     let colour = get_attr_int(f, "COLOUR");
                     let catlam = get_attr_int(f, "CATLAM");
-                    println!("  BOYLAT attributes: COLOUR={:?}, CATLAM={:?}", colour, catlam);
+                    log::debug!("  BOYLAT attributes: COLOUR={:?}, CATLAM={:?}", colour, catlam);
                 }
             }
 
@@ -284,24 +284,24 @@ pub fn features_to_instances(
         }
     }
 
-    println!("DEBUG: Symbol breakdown:");
-    println!(
+    log::debug!("Symbol breakdown:");
+    log::debug!(
         "  Lateral Buoys - Port(red): {}, Starboard(green): {}",
         port_count, starboard_count
     );
-    println!(
+    log::debug!(
         "  Cardinal Buoys - N: {}, E: {}, S: {}, W: {}",
         car_north, car_east, car_south, car_west
     );
-    println!(
+    log::debug!(
         "  Beacons - Port: {}, Starboard: {}",
         beacon_port, beacon_starboard
     );
-    println!(
+    log::debug!(
         "  Rocks - Awash: {}, Submerged: {}",
         rock_awash, rock_submerged
     );
-    println!("  Total symbols: {}", instances.len());
+    log::debug!("  Total symbols: {}", instances.len());
 
     instances
 }

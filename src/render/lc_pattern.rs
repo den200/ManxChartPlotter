@@ -589,7 +589,6 @@ mod tests {
 
                 // Test at different zoom levels
                 for (zoom, mpp) in [(7, 1200.0), (10, 150.0), (13, 19.0), (16, 2.4)] {
-                    let config = LcRenderConfig::new(96.0, mpp);
                     let advance_m = width_px * mpp;
                     let stamp_size_m = width_px * mpp; // in world coords
 

@@ -1,25 +1,20 @@
-//! The boat, on the chart.
+//! What goes with own ship that S-52 has no symbol for.
 //!
-//! Drawn with egui's painter over the resolved chart rather than as another
-//! wgpu pipeline. That is a deliberate interim choice: S-52 specifies own-ship
-//! symbology properly (OWNSHP02 — a scaled outline once the boat is larger
-//! than a few millimetres on screen, a simplified marker below that), and when
-//! that arrives it belongs in the chart pipeline beside every other symbol.
-//! Until then this puts the boat where it is, pointing where it points, which
-//! is the part a navigator cannot do without.
+//! The boat itself is `OWNSHP01`, drawn by the chart pipeline in
+//! [`super::mariner`] — same atlas, same palette, same shader as every buoy.
+//! The presentation library has no symbol for a line of arbitrary length, so
+//! the heading line and the course vector are drawn here, and so are the words
+//! that go with a fix that has stopped arriving.
 //!
-//! What is drawn, and why each piece earns its pixels:
-//!
-//! - **The hull outline** points along the *heading* — where the bow is aimed.
-//! - **The heading line** extends that, so the aim can be read against a chart
-//!   feature further off than the marker itself.
-//! - **The course vector** points along *COG* and is as long as the boat will
-//!   travel in the next few minutes. Heading and course differ whenever there
-//!   is tide or leeway, and that difference is the single most useful thing on
-//!   the display when closing a hazard.
-//! - **A fix that has gone stale** is hollowed out and greyed. A boat symbol
-//!   sitting confidently on a chart while the GPS is dead is the worst thing a
-//!   plotter can draw.
+//! - **The heading line** extends the hull's aim, so it can be read against a
+//!   chart feature further off than the symbol itself.
+//! - **The course vector** points along COG and reaches as far as the boat
+//!   will travel in six minutes, ticked each minute. Heading and course differ
+//!   whenever there is tide or leeway, and that difference is the single most
+//!   useful thing on the display when closing a hazard.
+//! - **A dead fix** greys the line and says NO FIX. The symbol is suppressed
+//!   entirely upstream: a boat sitting confidently on a chart while the GPS is
+//!   dead is the worst thing a plotter can draw.
 
 use egui::{Color32, Context, FontId, Pos2, Stroke, Vec2};
 

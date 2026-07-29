@@ -181,7 +181,7 @@ impl ChartCatalog {
             let install_key = match keys.lookup(&chart_name) {
                 Some(k) => k.to_string(),
                 None => {
-                    eprintln!("Warning: No key for {}, skipping", chart_name);
+                    log::warn!("No key for {}, skipping", chart_name);
                     continue;
                 }
             };
@@ -190,7 +190,7 @@ impl ChartCatalog {
             let senc_bytes = match decryptor.decrypt_chart(&path, &install_key) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("Warning: Failed to decrypt {}: {}", chart_name, e);
+                    log::warn!("Failed to decrypt {}: {}", chart_name, e);
                     continue;
                 }
             };
@@ -199,7 +199,7 @@ impl ChartCatalog {
             let header = match SencReader::parse_header_only(&senc_bytes) {
                 Ok(h) => h,
                 Err(e) => {
-                    eprintln!("Warning: Failed to parse header for {}: {:?}", chart_name, e);
+                    log::warn!("Failed to parse header for {}: {:?}", chart_name, e);
                     continue;
                 }
             };
@@ -207,7 +207,7 @@ impl ChartCatalog {
             let info = match ChartInfo::from_header(header, path) {
                 Some(i) => i,
                 None => {
-                    eprintln!("Warning: Chart {} has no extent, skipping", chart_name);
+                    log::warn!("Chart {} has no extent, skipping", chart_name);
                     continue;
                 }
             };

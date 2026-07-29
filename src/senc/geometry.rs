@@ -89,9 +89,9 @@ impl TriPrim {
             .iter()
             .any(|v| v[0].abs() > 5_000_000.0 || v[1].abs() > 5_000_000.0);
         if has_nan || has_huge {
-            eprintln!("WARN: Corrupt prim[{}] type=0x{:02x} nvert={} nan={} huge={}",
+            log::warn!("WARN: Corrupt prim[{}] type=0x{:02x} nvert={} nan={} huge={}",
                 prim_index, prim_type_byte, nvert, has_nan, has_huge);
-            eprintln!("  first={:?} last={:?}", vertices.first(), vertices.last());
+            log::warn!("  first={:?} last={:?}", vertices.first(), vertices.last());
         }
 
         Ok(Self { prim_type, vertices })
@@ -103,7 +103,7 @@ impl TriPrim {
             TriPrimType::Triangles => {
                 // Plain triangles - just verify count is divisible by 3
                 if self.vertices.len() % 3 != 0 {
-                    eprintln!("WARN: Plain triangles has {} vertices (not divisible by 3)",
+                    log::warn!("WARN: Plain triangles has {} vertices (not divisible by 3)",
                         self.vertices.len());
                 }
                 self.vertices.clone()
@@ -257,7 +257,7 @@ impl AreaGeometry {
         let pos = cursor.position() as usize;
         let expected_offset = 44 + (contour_count as usize * 4);
         if pos != expected_offset {
-            eprintln!("WARN: TriPrim offset mismatch: cursor at {}, expected {}", pos, expected_offset);
+            log::warn!("WARN: TriPrim offset mismatch: cursor at {}, expected {}", pos, expected_offset);
         }
         if log::log_enabled!(log::Level::Debug) && triprim_count > 0 && pos + 20 <= payload.len() {
             // Expected: byte[0]=0x04/05/06 (type), bytes[1-4]=nvert (little-endian u32)
@@ -344,9 +344,9 @@ impl AreaGeometry {
                 // Check for degenerate (zero-area) triangles
                 if min_edge < 0.001 {
                     degenerate += 1;
-                    eprintln!("WARN: Degenerate tri prim[{}] tri[{}]: edges={:.4}/{:.4}/{:.4}",
+                    log::warn!("WARN: Degenerate tri prim[{}] tri[{}]: edges={:.4}/{:.4}/{:.4}",
                         prim_idx, tri_idx, edge1, edge2, edge3);
-                    eprintln!("      verts: ({:.2},{:.2}), ({:.2},{:.2}), ({:.2},{:.2})",
+                    log::warn!("      verts: ({:.2},{:.2}), ({:.2},{:.2}), ({:.2},{:.2})",
                         v0[0], v0[1], v1[0], v1[1], v2[0], v2[1]);
                     continue;
                 }
@@ -355,9 +355,9 @@ impl AreaGeometry {
                 let ratio = max_edge / min_edge;
                 if ratio > 50.0 {
                     skinny += 1;
-                    eprintln!("WARN: Skinny tri prim[{}] tri[{}]: ratio={:.1} edges={:.1}/{:.1}/{:.1}",
+                    log::warn!("WARN: Skinny tri prim[{}] tri[{}]: ratio={:.1} edges={:.1}/{:.1}/{:.1}",
                         prim_idx, tri_idx, ratio, edge1, edge2, edge3);
-                    eprintln!("      verts: ({:.2},{:.2}), ({:.2},{:.2}), ({:.2},{:.2})",
+                    log::warn!("      verts: ({:.2},{:.2}), ({:.2},{:.2}), ({:.2},{:.2})",
                         v0[0], v0[1], v1[0], v1[1], v2[0], v2[1]);
                 }
             }
@@ -1004,7 +1004,7 @@ impl EdgeTable {
 
         for _ in 0..total_edges {
             if cursor.position() + 8 > payload.len() as u64 {
-                eprintln!("WARN: Edge table truncated at edge {}/{}", parsed_count, total_edges);
+                log::warn!("WARN: Edge table truncated at edge {}/{}", parsed_count, total_edges);
                 break;
             }
 
@@ -1014,7 +1014,7 @@ impl EdgeTable {
             // Relaxed sanity check (was 10000, now 100000)
             // Use continue instead of break to skip just this edge, not abort all parsing
             if vertex_count > 100000 {
-                eprintln!("WARN: Edge {} has {} vertices, skipping", edge_id, vertex_count);
+                log::warn!("WARN: Edge {} has {} vertices, skipping", edge_id, vertex_count);
                 // Skip this edge's vertex data (vertex_count * 8 bytes per vertex)
                 let skip_bytes = vertex_count as i64 * 8;
                 cursor.seek(SeekFrom::Current(skip_bytes))?;
@@ -1034,7 +1034,7 @@ impl EdgeTable {
 
         // Warn on incomplete parsing
         if parsed_count < total_edges {
-            eprintln!("WARN: Edge table incomplete: parsed {}/{} edges", parsed_count, total_edges);
+            log::warn!("WARN: Edge table incomplete: parsed {}/{} edges", parsed_count, total_edges);
         }
 
         Ok(())
@@ -1057,7 +1057,7 @@ impl EdgeTable {
 
         for _ in 0..total_nodes {
             if cursor.position() + 12 > payload.len() as u64 {
-                eprintln!("WARN: Node table truncated at node {}/{}", parsed_count, total_nodes);
+                log::warn!("WARN: Node table truncated at node {}/{}", parsed_count, total_nodes);
                 break;
             }
             let node_id = cursor.read_u32::<LittleEndian>()?;

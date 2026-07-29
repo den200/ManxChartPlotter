@@ -474,7 +474,7 @@ impl RenderState {
 
         let adapter_info = adapter.get_info();
         super::set_msaa_samples(super::choose_msaa_samples(&adapter_info));
-        println!(
+        log::debug!(
             "DEBUG: Using GPU: {} ({:?}), MSAA {}x",
             adapter_info.name,
             adapter_info.device_type,
@@ -508,8 +508,8 @@ impl RenderState {
             .find(|f| !f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        println!("DEBUG: Surface format: {:?}", surface_format);
-        println!("DEBUG: Available formats: {:?}", surface_caps.formats);
+        log::debug!("Surface format: {:?}", surface_format);
+        log::debug!("Available formats: {:?}", surface_caps.formats);
 
         let config = wgpu::SurfaceConfiguration {
             // COPY_SRC lets NAVCORE_SHOT read the rendered frame back for headless captures.
@@ -887,11 +887,11 @@ impl RenderState {
         ) {
             Ok(renderer) => {
                 let bind_group = renderer.create_camera_bind_group(&device, &uniform_buffer);
-                println!("DEBUG: Symbol renderer initialized");
+                log::debug!("Symbol renderer initialized");
                 (Some(renderer), Some(bind_group))
             }
             Err(e) => {
-                eprintln!("WARNING: Failed to initialize symbol renderer: {}", e);
+                log::warn!("Failed to initialize symbol renderer: {}", e);
                 (None, None)
             }
         };
@@ -912,11 +912,11 @@ impl RenderState {
                         resource: uniform_buffer.as_entire_binding(),
                     }],
                 });
-                println!("DEBUG: Pattern renderer initialized");
+                log::debug!("Pattern renderer initialized");
                 (Some(renderer), Some(bind_group))
             }
             Err(e) => {
-                eprintln!("WARNING: Failed to initialize pattern renderer: {}", e);
+                log::warn!("Failed to initialize pattern renderer: {}", e);
                 (None, None)
             }
         };
@@ -930,11 +930,11 @@ impl RenderState {
             Ok(renderer) => {
                 let bind_group =
                     renderer.create_camera_bind_group(&device, &uniform_buffer, &palette_buffer);
-                println!("DEBUG: Text renderer initialized");
+                log::debug!("Text renderer initialized");
                 (Some(renderer), Some(bind_group))
             }
             Err(e) => {
-                eprintln!("WARNING: Failed to initialize text renderer: {}", e);
+                log::warn!("Failed to initialize text renderer: {}", e);
                 (None, None)
             }
         };
@@ -948,11 +948,11 @@ impl RenderState {
             Ok(renderer) => {
                 let bind_group =
                     renderer.create_camera_bind_group(&device, &uniform_buffer, &palette_buffer);
-                println!("DEBUG: Label renderer initialized");
+                log::debug!("Label renderer initialized");
                 (Some(renderer), Some(bind_group))
             }
             Err(e) => {
-                eprintln!("WARNING: Failed to initialize label renderer: {}", e);
+                log::warn!("Failed to initialize label renderer: {}", e);
                 (None, None)
             }
         };
@@ -1053,11 +1053,11 @@ impl RenderState {
         for feature in chart.areas() {
             *area_type_counts.entry(feature.type_code).or_insert(0) += 1;
         }
-        println!("DEBUG: Area feature type breakdown:");
+        log::debug!("Area feature type breakdown:");
         let mut sorted_types: Vec<_> = area_type_counts.iter().collect();
         sorted_types.sort_by_key(|(code, _)| *code);
         for (type_code, count) in sorted_types {
-            println!("  type_code={}: {} features", type_code, count);
+            log::debug!("  type_code={}: {} features", type_code, count);
         }
 
         // Process area features - only land and depth areas
@@ -1117,18 +1117,18 @@ impl RenderState {
                 }
             }
         }
-        println!("DEBUG: Actually rendered area types: {:?}", rendered_area_types);
-        println!("DEBUG: Primitive stats - plain: {}, strip: {}, fan: {} triangles",
+        log::debug!("Actually rendered area types: {:?}", rendered_area_types);
+        log::debug!("Primitive stats - plain: {}, strip: {}, fan: {} triangles",
             total_plain_triangles, total_strip_triangles, total_fan_triangles);
         if total_skinny_triangles > 0 || total_degenerate_triangles > 0 {
-            println!("DEBUG: Triangle quality - skinny: {}, degenerate: {}",
+            log::debug!("Triangle quality - skinny: {}, degenerate: {}",
                 total_skinny_triangles, total_degenerate_triangles);
         }
 
         // Debug: Check which recognized features have geometry
         let land_with_geom = chart.land_areas().filter(|f| f.area_geometry.is_some()).count();
         let depth_with_geom = chart.depth_areas().filter(|f| f.area_geometry.is_some()).count();
-        println!("DEBUG: Land areas with geometry: {}, Depth areas with geometry: {}", land_with_geom, depth_with_geom);
+        log::debug!("Land areas with geometry: {}, Depth areas with geometry: {}", land_with_geom, depth_with_geom);
 
         let area_vertex_count = vertices.len();
 
@@ -1137,11 +1137,11 @@ impl RenderState {
         for feature in chart.lines() {
             *line_type_counts.entry(feature.type_code).or_insert(0) += 1;
         }
-        println!("DEBUG: Line feature type breakdown:");
+        log::debug!("Line feature type breakdown:");
         let mut sorted_line_types: Vec<_> = line_type_counts.iter().collect();
         sorted_line_types.sort_by_key(|(code, _)| *code);
         for (type_code, count) in sorted_line_types {
-            println!("  type_code={}: {} features", type_code, count);
+            log::debug!("  type_code={}: {} features", type_code, count);
         }
 
         // Process line features using new shader-based polyline rendering
@@ -1170,7 +1170,7 @@ impl RenderState {
             }
         }
 
-        println!("DEBUG: Lines: coastlines={} polylines, contours={} polylines",
+        log::debug!("Lines: coastlines={} polylines, contours={} polylines",
             coastline_polylines.len(), contour_polylines.len());
 
         // Calculate bounds FIRST (before polylines are consumed)
@@ -1219,7 +1219,7 @@ impl RenderState {
                     index_count: coastline_indices.len() as u32,
                     vertex_count: coastline_verts.len() as u32,
                 });
-                println!("DEBUG: Coastline batch: {} vertices, {} indices", coastline_verts.len(), coastline_indices.len());
+                log::debug!("Coastline batch: {} vertices, {} indices", coastline_verts.len(), coastline_indices.len());
             }
         }
 
@@ -1242,16 +1242,16 @@ impl RenderState {
                     index_count: contour_indices.len() as u32,
                     vertex_count: contour_verts.len() as u32,
                 });
-                println!("DEBUG: Contour batch: {} vertices, {} indices", contour_verts.len(), contour_indices.len());
+                log::debug!("Contour batch: {} vertices, {} indices", contour_verts.len(), contour_indices.len());
             }
         }
 
         // Total line index count for logging
         let total_line_indices: u32 = self.line_batches.iter().map(|b| b.index_count).sum();
-        println!("DEBUG: Loaded {} area vertices, {} line indices in {} batches",
+        log::debug!("Loaded {} area vertices, {} line indices in {} batches",
             area_vertex_count, total_line_indices, self.line_batches.len());
 
-        println!("Loaded {} total area vertices from chart", vertices.len());
+        log::debug!("Loaded {} total area vertices from chart", vertices.len());
 
         // Create vertex buffer for areas (if any)
         if !vertices.is_empty() {
@@ -1265,13 +1265,13 @@ impl RenderState {
 
         // Check if we have any geometry at all
         if min_x == f32::MAX {
-            println!("DEBUG: No geometry to render");
+            log::debug!("No geometry to render");
             return;
         }
 
-        println!("DEBUG: Combined bounds: X=[{:.0}, {:.0}], Y=[{:.0}, {:.0}]", min_x, max_x, min_y, max_y);
+        log::debug!("Combined bounds: X=[{:.0}, {:.0}], Y=[{:.0}, {:.0}]", min_x, max_x, min_y, max_y);
         if !vertices.is_empty() {
-            println!("DEBUG: First 3 area vertices: {:?}", &vertices[..3.min(vertices.len())]);
+            log::debug!("First 3 area vertices: {:?}", &vertices[..3.min(vertices.len())]);
         }
 
         // Update camera to fit all geometry (areas + lines)
@@ -1294,11 +1294,11 @@ impl RenderState {
         let center_x = (min_x + max_x) / 2.0;
         let center_y = (min_y + max_y) / 2.0;
         self.camera = Camera::new(center_x, center_y, zoom, screen_w, screen_h);
-        println!("DEBUG: Camera at ({:.0}, {:.0}), zoom: {:.2} m/px (SM bounds: {:.0}x{:.0})", center_x, center_y, zoom, width, height);
+        log::debug!("Camera at ({:.0}, {:.0}), zoom: {:.2} m/px (SM bounds: {:.0}x{:.0})", center_x, center_y, zoom, width, height);
 
         // Log view_proj matrix to verify it's sensible
         let vp = self.camera.view_projection_matrix();
-        println!("DEBUG: View-proj matrix:\n  {:?}\n  {:?}\n  {:?}\n  {:?}",
+        log::debug!("View-proj matrix:\n  {:?}\n  {:?}\n  {:?}\n  {:?}",
             vp.row(0), vp.row(1), vp.row(2), vp.row(3));
 
         // Update symbol instances
@@ -1306,7 +1306,7 @@ impl RenderState {
             let ref_lat = chart.header.ref_lat;
             let ref_lon = chart.header.ref_lon;
             let instances = features_to_instances(&chart.features, ref_lat, ref_lon);
-            println!("DEBUG: Created {} symbol instances", instances.len());
+            log::debug!("Created {} symbol instances", instances.len());
             symbol_renderer.update_instances(&self.queue, &instances);
         }
 
@@ -1325,7 +1325,7 @@ impl RenderState {
     /// Load a test triangle to verify the rendering pipeline works.
     /// Uses NDC coordinates (-1 to 1) with identity-like matrix.
     pub fn load_test_triangle(&mut self) {
-        println!("DEBUG: Loading test triangle to verify pipeline...");
+        log::debug!("Loading test triangle to verify pipeline...");
 
         // Simple triangle in NDC space
         let vertices = vec![
@@ -1350,11 +1350,11 @@ impl RenderState {
         self.camera = Camera::new(0.0, 0.0, zoom, self.size.width as f32, self.size.height as f32);
 
         let vp = self.camera.view_projection_matrix();
-        println!("DEBUG: Test triangle view_proj matrix:");
-        println!("  {:?}", vp.row(0));
-        println!("  {:?}", vp.row(1));
-        println!("  {:?}", vp.row(2));
-        println!("  {:?}", vp.row(3));
+        log::debug!("Test triangle view_proj matrix:");
+        log::debug!("  {:?}", vp.row(0));
+        log::debug!("  {:?}", vp.row(1));
+        log::debug!("  {:?}", vp.row(2));
+        log::debug!("  {:?}", vp.row(3));
     }
 
     /// Upload the active palette colors to the GPU storage buffer.
@@ -1479,12 +1479,12 @@ impl RenderState {
                     mx as f32, my as f32, parts[2],
                     self.size.width as f32, self.size.height as f32,
                 );
-                println!(
+                log::debug!(
                     "NAVCORE_VIEW override: lat={} lon={} mpp={} -> Mercator ({:.0},{:.0})",
                     parts[0], parts[1], parts[2], mx, my
                 );
             } else {
-                eprintln!("NAVCORE_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
+                log::warn!("NAVCORE_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
             }
         }
 
@@ -1496,13 +1496,13 @@ impl RenderState {
                 Ok(deg) => {
                     self.camera.tilt =
                         deg.to_radians().clamp(0.0, crate::render::camera::MAX_TILT);
-                    println!("NAVCORE_TILT: {:.1}°", self.camera.tilt.to_degrees());
+                    log::debug!("NAVCORE_TILT: {:.1}°", self.camera.tilt.to_degrees());
                 }
-                Err(_) => eprintln!("NAVCORE_TILT must be a number of degrees; ignoring '{}'", t),
+                Err(_) => log::warn!("NAVCORE_TILT must be a number of degrees; ignoring '{}'", t),
             }
         }
 
-        println!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
+        log::debug!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
             catalog.charts.len(), center_x, center_y, zoom);
 
         let catalog_arc = Arc::new(catalog);
@@ -1524,7 +1524,7 @@ impl RenderState {
         match S52Engine::load("assets/s52/chartsymbols.xml") {
             Ok(mut engine) => {
                 engine.set_settings(env_settings.clone());
-                println!("{}", engine.summary());
+                log::debug!("{}", engine.summary());
                 // Upload active palette to GPU
                 self.upload_palette(&engine.tables);
                 self.s52_engine = Some(engine);
@@ -1535,8 +1535,8 @@ impl RenderState {
                 }
             }
             Err(e) => {
-                eprintln!("Warning: Could not load S-52 engine: {}", e);
-                eprintln!("Display category filtering will be disabled.");
+                log::warn!("Could not load S-52 engine: {}", e);
+                log::warn!("Display category filtering will be disabled.");
             }
         }
 
@@ -1550,7 +1550,7 @@ impl RenderState {
                 "dusk" => Some("DUSK"),
                 "night" | "dark" => Some("NIGHT"),
                 other => {
-                    eprintln!("NAVCORE_PALETTE: unknown value {:?}", other);
+                    log::warn!("NAVCORE_PALETTE: unknown value {:?}", other);
                     None
                 }
             };
@@ -1571,7 +1571,7 @@ impl RenderState {
         self.tile_worker = Some(worker);
         self.pending_tiles.clear();
         self.deferred_tile_results.clear();
-        println!("Background tile worker spawned");
+        log::debug!("Background tile worker spawned");
 
         // NAVCORE_PICK=lat,lon opens the info bubble at a position, so a
         // headless capture can show it.
@@ -1581,7 +1581,7 @@ impl RenderState {
                 let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
                 self.pick_at_world(mx as f32, my as f32);
             } else {
-                eprintln!("NAVCORE_PICK must be 'lat,lon'; ignoring {:?}", spec);
+                log::warn!("NAVCORE_PICK must be 'lat,lon'; ignoring {:?}", spec);
             }
         }
 
@@ -2233,7 +2233,7 @@ impl RenderState {
                     uploads_this_frame += 1;
                     self.needs_redraw = true;
                 }
-                Err(e) => eprintln!("Tile {:?} failed: {}", response.tile_id, e),
+                Err(e) => log::warn!("Tile {:?} failed: {}", response.tile_id, e),
             }
         }
 
@@ -2262,7 +2262,7 @@ impl RenderState {
                         uploads_this_frame += 1;
                         self.needs_redraw = true;
                     }
-                    Err(e) => eprintln!("Tile {:?} failed: {}", response.tile_id, e),
+                    Err(e) => log::warn!("Tile {:?} failed: {}", response.tile_id, e),
                 }
             }
         }
@@ -2486,7 +2486,7 @@ impl RenderState {
                     other += 1;
                 }
             }
-            eprintln!(
+            log::warn!(
                 "TILES visible={} resident={} pending={} empty={} unknown={} drawn={} empties=[{}]",
                 self.visible_tiles_cache.len(),
                 res, pend, empty, other,
@@ -3674,7 +3674,7 @@ impl RenderState {
         });
         self.device.poll(wgpu::Maintain::Wait);
         if rx.recv().map(|r| r.is_err()).unwrap_or(true) {
-            eprintln!("NAVCORE_SHOT: failed to map readback buffer");
+            log::warn!("NAVCORE_SHOT: failed to map readback buffer");
             return;
         }
 
@@ -3701,7 +3701,7 @@ impl RenderState {
         match image::RgbaImage::from_raw(width, height, pixels) {
             Some(img) => match img.save(path) {
                 Ok(()) => {
-                    eprintln!("NAVCORE_SHOT: wrote {} ({}x{})", path, width, height);
+                    log::warn!("NAVCORE_SHOT: wrote {} ({}x{})", path, width, height);
                     if let (Ok(dump), Some(log)) =
                         (std::env::var("NAVCORE_DUMP_DRAW"), &self.draw_log)
                     {
@@ -3711,7 +3711,7 @@ impl RenderState {
                             .map(|v| v.to_string())
                             .collect();
                         if std::fs::write(&dump, lines.join("\n") + "\n").is_ok() {
-                            eprintln!(
+                            log::warn!(
                                 "NAVCORE_DUMP_DRAW: wrote {} draw records to {}",
                                 lines.len(),
                                 dump
@@ -3719,9 +3719,9 @@ impl RenderState {
                         }
                     }
                 }
-                Err(e) => eprintln!("NAVCORE_SHOT: save failed: {}", e),
+                Err(e) => log::warn!("NAVCORE_SHOT: save failed: {}", e),
             },
-            None => eprintln!("NAVCORE_SHOT: bad capture buffer dimensions"),
+            None => log::warn!("NAVCORE_SHOT: bad capture buffer dimensions"),
         }
     }
 }

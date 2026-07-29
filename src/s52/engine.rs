@@ -144,9 +144,9 @@ impl S52Engine {
         let depth_colors = ["DEPIT", "DEPVS", "DEPMS", "DEPMD", "DEPDW"];
         for color_name in &depth_colors {
             if let Some([r, g, b]) = tables.get_color(color_name) {
-                eprintln!("DEBUG S52: {} = RGB({},{},{})", color_name, r, g, b);
+                log::warn!("DEBUG S52: {} = RGB({},{},{})", color_name, r, g, b);
             } else {
-                eprintln!("DEBUG S52: {} NOT FOUND in color table!", color_name);
+                log::warn!("DEBUG S52: {} NOT FOUND in color table!", color_name);
             }
         }
 

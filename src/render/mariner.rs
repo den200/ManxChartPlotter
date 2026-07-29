@@ -42,10 +42,6 @@ const MARINER_PRIO: u32 = 9;
 const ONE_MINUTE: f64 = 60.0;
 const SIX_MINUTES: f64 = 360.0;
 
-/// How far ahead a course vector reaches. Six minutes is the S-52 default and
-/// the interval its own mark symbol is named for.
-pub const VECTOR_SECONDS: f64 = SIX_MINUTES;
-
 /// The symbols this layer needs, resolved once.
 #[derive(Debug, Clone, Copy)]
 pub struct MarinerSymbols {

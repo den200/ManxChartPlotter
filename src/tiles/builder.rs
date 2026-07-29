@@ -997,7 +997,7 @@ impl<'a> TileBuilder<'a> {
                 Ok(chart) => Some(chart),
                 Err(e) => {
                     // Log but continue - don't fail entire tile for one bad chart
-                    eprintln!("Warning: Skipping chart {}: {}", info.name, e);
+                    log::warn!("Skipping chart {}: {}", info.name, e);
                     continue;
                 }
             };

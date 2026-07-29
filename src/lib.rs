@@ -21,7 +21,7 @@
 //!
 //! // Parse features
 //! let chart = ChartData::parse(senc_bytes).unwrap();
-//! println!("{}", chart.summary());
+//! log::debug!("{}", chart.summary());
 //! ```
 
 pub mod cache;

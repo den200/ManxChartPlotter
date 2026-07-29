@@ -746,20 +746,20 @@ impl ChartData {
                 RecordType::MultipointGeometry => {
                     if let Some(ref mut partial) = current_feature {
                         if let Err(e) = partial.set_multipoint_geometry(record) {
-                            eprintln!("WARN: Multipoint geometry parse error: {}", e);
+                            log::warn!("WARN: Multipoint geometry parse error: {}", e);
                         }
                     }
                 }
                 RecordType::VectorEdge => {
                     // Edge table record contains multiple edges
                     if let Err(e) = edge_table.parse_edge_table(&record.payload) {
-                        eprintln!("WARN: Edge table parse error: {}", e);
+                        log::warn!("WARN: Edge table parse error: {}", e);
                     }
                 }
                 RecordType::VectorConnectedNode => {
                     // Node table record contains multiple nodes
                     if let Err(e) = edge_table.parse_node_table(&record.payload) {
-                        eprintln!("WARN: Node table parse error: {}", e);
+                        log::warn!("WARN: Node table parse error: {}", e);
                     }
                 }
                 _ => {}

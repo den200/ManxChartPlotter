@@ -257,7 +257,7 @@ fn worker_loop(
                         }
                         if let Some(info) = catalog.charts.iter().find(|c| c.id == id) {
                             if let Err(e) = warmer.load_chart(info) {
-                                eprintln!("Warning: Skipping chart {}: {}", info.name, e);
+                                log::warn!("Skipping chart {}: {}", info.name, e);
                             }
                         }
                     });

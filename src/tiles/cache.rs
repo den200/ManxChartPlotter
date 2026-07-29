@@ -206,7 +206,7 @@ impl TileGpuCache {
         // If a single tile exceeds the cache budget, don't cache it at all.
         // Otherwise it would immediately evict everything and still be evicted.
         if packet.byte_size > self.max_bytes {
-            eprintln!(
+            log::warn!(
                 "Warning: Tile {:?} is {} bytes (> cache budget {}), skipping upload",
                 packet.tile_id, packet.byte_size, self.max_bytes
             );
