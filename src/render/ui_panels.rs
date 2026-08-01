@@ -16,6 +16,7 @@ pub fn build(
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
     routes: &mut crate::render::ui::RoutesView,
+    weather: &mut crate::render::ui::WeatherView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -52,7 +53,7 @@ pub fn build(
         super::ui_instruments::settings(ctx, instruments, &fleet.own, actions);
     }
     if routes.open {
-        super::ui_routes::window(ctx, routes, actions);
+        super::ui_routes::window(ctx, routes, weather, actions);
     }
 }
 

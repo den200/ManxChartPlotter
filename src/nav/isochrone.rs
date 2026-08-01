@@ -65,9 +65,11 @@ struct ClosingLeg {
     end_pos: [f64; 2],
     heading: Bam,
     twa_deg: f64,
+    tws_kt: f64,
     stw_kt: f64,
     tack: TackState,
     end_time_ms: i64,
+    motoring: bool,
 }
 
 #[derive(Debug)]
@@ -341,6 +343,7 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 if r2 <= slots[min_slot].0 {
                     continue;
                 }
+                let _ = motoring; // recorded via twa/stw; stepped motor legs are rare
                 arena.push(Node {
                     pos: child_pos,
                     time_ms: child_time,
@@ -428,9 +431,11 @@ fn closing_legs(
                 end_pos: finish_m,
                 heading: bearing,
                 twa_deg: twa_direct,
+                tws_kt: tws,
                 stw_kt: v,
                 tack: tack_of(twa_direct),
                 end_time_ms: t,
+                motoring: false,
             }]);
         }
     }
@@ -442,9 +447,11 @@ fn closing_legs(
                 end_pos: finish_m,
                 heading: bearing,
                 twa_deg: twa_direct,
+                tws_kt: tws,
                 stw_kt: m,
                 tack: tack_now,
                 end_time_ms: t,
+                motoring: true,
             }]);
         }
     }
@@ -508,17 +515,21 @@ fn closing_legs(
                     end_pos: mid,
                     heading: h1,
                     twa_deg: twa1,
+                    tws_kt: tws,
                     stw_kt: stw,
                     tack: tack_of(twa1),
                     end_time_ms: mid_t,
+                    motoring: false,
                 },
                 ClosingLeg {
                     end_pos: finish_m,
                     heading: h2,
                     twa_deg: twa2,
+                    tws_kt: tws,
                     stw_kt: stw,
                     tack: tack_of(twa2),
                     end_time_ms: end_t,
+                    motoring: false,
                 },
             ]);
         }
@@ -605,10 +616,10 @@ fn extract(
             time_ms: leg.end_time_ms,
             heading_deg: super::angles::bam_to_deg(leg.heading),
             twa_deg: leg.twa_deg,
-            tws_kt: 0.0,
+            tws_kt: leg.tws_kt,
             stw_kt: leg.stw_kt,
             tack: leg.tack,
-            motoring: false,
+            motoring: leg.motoring,
         });
     }
     if closing.is_empty() {

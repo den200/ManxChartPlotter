@@ -20,9 +20,16 @@ pub struct RouteRow {
     pub legs: usize,
     pub distance_nm: f64,
     pub active: bool,
+    /// "GFS run 2026-08-01 06Z · built-in cruiser" for generated routes.
+    pub provenance: Option<String>,
 }
 
-pub fn window(ctx: &Context, view: &mut RoutesView, actions: &mut Vec<UiAction>) {
+pub fn window(
+    ctx: &Context,
+    view: &mut RoutesView,
+    weather: &mut crate::render::ui::WeatherView,
+    actions: &mut Vec<UiAction>,
+) {
     let mut open = view.open;
     egui::Window::new("Routes")
         .open(&mut open)
@@ -88,12 +95,59 @@ pub fn window(ctx: &Context, view: &mut RoutesView, actions: &mut Vec<UiAction>)
                                 {
                                     actions.push(UiAction::RoutePublish { route_id: row.id });
                                 }
+                                if ui
+                                    .add_enabled(!weather.busy, egui::Button::new("Wx").small())
+                                    .on_hover_text(
+                                        "Weather-route between this route's endpoints, on the \
+                                         latest forecast and the polar below",
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(UiAction::WeatherRoute { route_id: row.id });
+                                }
                             },
                         );
                     });
+                    if let Some(p) = &row.provenance {
+                        ui.label(RichText::new(p).small().weak());
+                    }
                     ui.separator();
                 }
             });
+
+            // The weather engine's own corner: which forecast feeds it, how
+            // far out, and whose boat it thinks it is planning for. Shown,
+            // not buried — a route is only as good as the forecast and the
+            // polar behind it.
+            ui.add_space(6.0);
+            ui.label(RichText::new("Weather routing").strong());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Forecast:").weak());
+                ui.label("NOAA GFS 0.25° (NOMADS)");
+                ui.add_space(10.0);
+                ui.label(RichText::new("hours:").weak());
+                ui.add(
+                    egui::DragValue::new(&mut weather.hours)
+                        .speed(3)
+                        .range(12..=120),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Polar:").weak());
+                ui.add(
+                    egui::TextEdit::singleline(&mut weather.polar_path)
+                        .hint_text("built-in ~10 m cruiser — set a .pol path for your boat")
+                        .desired_width(280.0),
+                );
+            });
+            if weather.busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(&weather.status).small());
+                });
+            } else if !weather.status.is_empty() {
+                ui.label(RichText::new(&weather.status).small());
+            }
 
             if !view.status.is_empty() {
                 ui.separator();

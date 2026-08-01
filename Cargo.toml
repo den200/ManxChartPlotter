@@ -83,3 +83,4 @@ geographiclib-rs = "0.2.7"
 # spec requires round-trips through other plotters to be lossless.
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+gribberish = "1.6.0"

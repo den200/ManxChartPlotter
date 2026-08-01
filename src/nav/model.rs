@@ -105,6 +105,8 @@ pub enum PointOfSail {
     BeamReach,
     BroadReach,
     Run,
+    /// Under engine — the routing engine's motoring legs.
+    Motor,
 }
 
 /// What the weather router planned for one leg. Absent on hand-drawn routes.

@@ -9,6 +9,8 @@
 //! - [`autoroute`] — the land-avoiding grid router; owns confined waters (M3)
 //! - [`polar`] — the boat's performance and its VMG tables (M4)
 //! - [`isochrone`] — the minimum-time sailing router, offshore (M4)
+//! - [`grib`] — forecast wind: download, decode, interpolate U/V (M5)
+//! - [`wxroute`] — the weather-routing job: forecast + polar + charts (M5)
 //! - [`angles`] — BAM u16 angles, where wraparound bugs go to die
 //!
 //! Steering data leaves navcore over **Signal K only** — Den's call, no NMEA
@@ -21,8 +23,10 @@ pub mod angles;
 pub mod autoroute;
 pub mod follow;
 pub mod gpx;
+pub mod grib;
 pub mod isochrone;
 pub mod polar;
+pub mod wxroute;
 pub mod model;
 pub mod store;
 

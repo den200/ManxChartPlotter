@@ -266,6 +266,14 @@ fn create_msaa_view(
 pub(crate) enum RouteNetEvent {
     Status(String),
     Fetched(Vec<(crate::nav::Route, Vec<crate::nav::model::Waypoint>)>),
+    /// A weather-routing job finished.
+    WxPlanned {
+        route: crate::nav::Route,
+        waypoints: Vec<crate::nav::model::Waypoint>,
+        summary: String,
+    },
+    WxFailed(String),
+    WxProgress(String),
 }
 
 pub struct RenderState {
@@ -2130,6 +2138,89 @@ impl RenderState {
                         (_, None) => {}
                     }
                 }
+                crate::render::ui::UiAction::WeatherRoute { route_id } => {
+                    self.ensure_route_store();
+                    self.save_settings();
+                    let endpoints = self.route_store.as_ref().and_then(|s| {
+                        let r = s.route(route_id)?;
+                        let a = s.waypoints.get(*r.waypoints.first()?)?.position;
+                        let b = s.waypoints.get(*r.waypoints.last()?)?.position;
+                        Some((r.name.clone(), a, b))
+                    });
+                    let chart_dir = self.chart_root.clone();
+                    let (hours, polar_path) = self
+                        .ui
+                        .as_ref()
+                        .map(|u| (u.weather.hours, u.weather.polar_path.clone()))
+                        .unwrap_or((48, String::new()));
+                    match (endpoints, chart_dir) {
+                        (Some((name, a, b)), Some(dir)) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.weather.busy = true;
+                                ui.weather.status = "starting…".into();
+                            }
+                            let tx = self.route_net_sender();
+                            std::thread::spawn(move || {
+                                let cache = dirs::config_dir()
+                                    .map(|d| d.join("navcore").join("grib"))
+                                    .unwrap_or_else(|| "grib-cache".into());
+                                let (polar_text, polar_name) = if polar_path.trim().is_empty() {
+                                    (crate::nav::wxroute::DEFAULT_POLAR.to_string(),
+                                     "built-in cruiser".to_string())
+                                } else {
+                                    match std::fs::read_to_string(polar_path.trim()) {
+                                        Ok(t) => (t, polar_path.trim().to_string()),
+                                        Err(e) => {
+                                            let _ = tx.send(RouteNetEvent::WxFailed(format!(
+                                                "polar unreadable: {e}"
+                                            )));
+                                            return;
+                                        }
+                                    }
+                                };
+                                let progress_tx = tx.clone();
+                                let result = crate::nav::wxroute::plan_from_chart_dir(
+                                    &dir,
+                                    a,
+                                    b,
+                                    hours,
+                                    &cache,
+                                    &polar_text,
+                                    &polar_name,
+                                    &crate::nav::RoutingConfig::default(),
+                                    &crate::nav::autoroute::SafetyConfig::default(),
+                                    &format!("{name} (wx)"),
+                                    move |msg| {
+                                        let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
+                                    },
+                                );
+                                let _ = tx.send(match result {
+                                    Ok(p) => RouteNetEvent::WxPlanned {
+                                        summary: format!(
+                                            "{}: arrival {} ({} warnings)",
+                                            p.route.name,
+                                            p.arrival.format("%d %b %H:%M UTC"),
+                                            p.warnings.len()
+                                        ),
+                                        route: p.route,
+                                        waypoints: p.waypoints,
+                                    },
+                                    Err(e) => RouteNetEvent::WxFailed(e),
+                                });
+                            });
+                        }
+                        (None, _) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.weather.status = "that route has no endpoints".into();
+                            }
+                        }
+                        (_, None) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.weather.status = "no chart directory loaded".into();
+                            }
+                        }
+                    }
+                }
                 crate::render::ui::UiAction::RoutesFetchSignalK => {
                     self.ensure_route_store();
                     match self
@@ -3069,6 +3160,14 @@ impl RenderState {
                     self.pick_at_world(x as f32, y as f32);
                 }
             }
+            // `NAVCORE_ROUTES_OPEN=1` opens the routes window at startup.
+            if std::env::var("NAVCORE_ROUTES_OPEN").is_ok_and(|v| v != "0") {
+                self.ensure_route_store();
+                self.refresh_route_rows();
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.open = true;
+                }
+            }
             // `NAVCORE_FOLLOW=1` activates the first stored route at startup,
             // so the guidance strip can be captured without a click.
             if std::env::var("NAVCORE_FOLLOW").is_ok_and(|v| v != "0") {
@@ -3205,7 +3304,15 @@ impl RenderState {
         let (Some(ui), Some(path)) = (self.ui.as_ref(), Self::settings_path()) else {
             return;
         };
-        let Ok(json) = serde_json::to_string_pretty(&ui.instruments) else {
+        #[derive(serde::Serialize)]
+        struct Persisted<'a> {
+            instruments: &'a crate::render::ui::InstrumentView,
+            weather: &'a crate::render::ui::WeatherView,
+        }
+        let Ok(json) = serde_json::to_string_pretty(&Persisted {
+            instruments: &ui.instruments,
+            weather: &ui.weather,
+        }) else {
             return;
         };
         if let Some(parent) = path.parent() {
@@ -3220,6 +3327,15 @@ impl RenderState {
     pub(crate) fn load_settings() -> Option<crate::render::ui::InstrumentView> {
         let path = Self::settings_path()?;
         let text = std::fs::read_to_string(&path).ok()?;
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            instruments: crate::render::ui::InstrumentView,
+        }
+        // Current shape first, then the pre-weather file that was the
+        // instruments alone — the user keeps their layout across the change.
+        if let Ok(p) = serde_json::from_str::<Persisted>(&text) {
+            return Some(p.instruments);
+        }
         match serde_json::from_str(&text) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -3229,6 +3345,23 @@ impl RenderState {
                 None
             }
         }
+    }
+
+    pub(crate) fn load_weather_settings() -> crate::render::ui::WeatherView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            weather: crate::render::ui::WeatherView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.weather)
+            .unwrap_or_default()
     }
 
     /// Project the boat onto the screen for the overlay.
@@ -3694,6 +3827,16 @@ impl RenderState {
                         legs: r.legs.len(),
                         distance_nm: r.total_distance_nm(),
                         active: active == Some(r.id),
+                        provenance: r.generated.as_ref().map(|g| {
+                            format!(
+                                "wx: {} run {} · {}",
+                                g.grib_source.as_deref().unwrap_or("?"),
+                                g.grib_run
+                                    .map(|t| t.format("%d %b %HZ").to_string())
+                                    .unwrap_or_default(),
+                                g.polar
+                            )
+                        }),
                     })
                     .collect()
             })
@@ -3724,6 +3867,36 @@ impl RenderState {
                 RouteNetEvent::Status(msg) => {
                     if let Some(ref mut ui) = self.ui {
                         ui.routes.status = msg;
+                    }
+                }
+                RouteNetEvent::WxProgress(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.weather.status = msg;
+                    }
+                }
+                RouteNetEvent::WxFailed(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.weather.busy = false;
+                        ui.weather.status = msg;
+                    }
+                }
+                RouteNetEvent::WxPlanned {
+                    route,
+                    waypoints,
+                    summary,
+                } => {
+                    self.ensure_route_store();
+                    if let Some(store) = self.route_store.as_mut() {
+                        for wp in waypoints {
+                            store.waypoints.insert(wp);
+                        }
+                        if let Err(e) = store.upsert_route(route) {
+                            log::warn!("wx: could not save: {e}");
+                        }
+                    }
+                    if let Some(ref mut ui) = self.ui {
+                        ui.weather.busy = false;
+                        ui.weather.status = summary;
                     }
                 }
                 RouteNetEvent::Fetched(routes) => {

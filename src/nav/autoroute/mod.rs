@@ -96,18 +96,7 @@ pub fn plan(
     let min = [a[0].min(b[0]) - margin, a[1].min(b[1]) - margin];
     let max = [a[0].max(b[0]) + margin, a[1].max(b[1]) + margin];
 
-    let mut grid = Grid::new(min, max, safety.grid_res_m * k);
-
-    // Coarse first, fine last: a finer chart erases its own coverage before
-    // stamping, so where surveys disagree the better survey wins — that is
-    // quilting, the same rule the display uses.
-    let mut ordered: Vec<&ChartSource> = sources.iter().collect();
-    ordered.sort_by(|x, y| y.info.native_scale.cmp(&x.info.native_scale));
-
-    for source in &ordered {
-        stamp_chart(&mut grid, source, safety);
-    }
-    grid.finalize();
+    let grid = build_hazard_grid(sources, min, max, safety, k);
 
     let offing_min_m = safety.offing_min_nm * METRES_PER_NM * k;
     let params = SearchParams {
@@ -178,8 +167,10 @@ pub fn plan(
     }
 
     let mut waypoints = Vec::new();
+    // "to", not "→": the arrow is not in egui's default font and a route
+    // name full of boxes helps nobody.
     let mut route = Route::new(format!(
-        "Auto {:.3},{:.3} → {:.3},{:.3}",
+        "Auto {:.3},{:.3} to {:.3},{:.3}",
         start.lat, start.lon, finish.lat, finish.lon
     ));
     for (i, p) in points.iter().enumerate() {
@@ -217,6 +208,29 @@ fn cell_dist_nm(grid: &Grid, a: (usize, usize), b: (usize, usize)) -> f64 {
     let ca = grid.centre(a.0, a.1);
     let cb = grid.centre(b.0, b.1);
     (cb[0] - ca[0]).hypot(cb[1] - ca[1]) / METRES_PER_NM
+}
+
+/// The quilted hazard grid over a box — shared by this router and the
+/// weather router, so both forbid exactly the same water.
+///
+/// Coarse first, fine last: a finer chart erases its own coverage before
+/// stamping, so where surveys disagree the better survey wins — that is
+/// quilting, the same rule the display uses.
+pub fn build_hazard_grid(
+    sources: &[ChartSource<'_>],
+    min: [f64; 2],
+    max: [f64; 2],
+    safety: &SafetyConfig,
+    k: f64,
+) -> Grid {
+    let mut grid = Grid::new(min, max, safety.grid_res_m * k);
+    let mut ordered: Vec<&ChartSource> = sources.iter().collect();
+    ordered.sort_by(|x, y| y.info.native_scale.cmp(&x.info.native_scale));
+    for source in &ordered {
+        stamp_chart(&mut grid, source, safety);
+    }
+    grid.finalize();
+    grid
 }
 
 /// Rasterize one chart: erase its own coverage, then stamp what it forbids.

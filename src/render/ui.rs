@@ -58,6 +58,34 @@ pub enum UiAction {
     RoutePublish { route_id: uuid::Uuid },
     /// Read the server's route resources into the store.
     RoutesFetchSignalK,
+    /// Weather-route between a route's endpoints, on the current forecast.
+    WeatherRoute { route_id: uuid::Uuid },
+}
+
+/// Weather-routing preferences, persisted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WeatherView {
+    /// Forecast horizon requested from the source.
+    pub hours: u32,
+    /// A polar file of the user's own; empty means the built-in cruiser.
+    pub polar_path: String,
+    // Live state below.
+    #[serde(skip)]
+    pub busy: bool,
+    #[serde(skip)]
+    pub status: String,
+}
+
+impl Default for WeatherView {
+    fn default() -> Self {
+        Self {
+            hours: 48,
+            polar_path: String::new(),
+            busy: false,
+            status: String::new(),
+        }
+    }
 }
 
 /// The routes window and the state of following.
@@ -218,6 +246,8 @@ pub struct Ui {
     pub instruments: InstrumentView,
     /// The routes window and following state.
     pub routes: RoutesView,
+    /// Weather-routing preferences.
+    pub weather: WeatherView,
 }
 
 impl Ui {
@@ -250,6 +280,7 @@ impl Ui {
             instruments: crate::render::state::RenderState::load_settings().unwrap_or_default(),
             shop: ShopView::default(),
             routes: RoutesView::default(),
+            weather: crate::render::state::RenderState::load_weather_settings(),
         }
     }
 
@@ -320,8 +351,9 @@ impl Ui {
         let shop = &mut self.shop;
         let instruments = &mut self.instruments;
         let routes = &mut self.routes;
+        let weather = &mut self.weather;
         let output = self.ctx.run(input, |ctx| {
-            super::ui_panels::build(ctx, &state, shop, instruments, routes, fleet, actions);
+            super::ui_panels::build(ctx, &state, shop, instruments, routes, weather, fleet, actions);
         });
         self.state
             .handle_platform_output(window, output.platform_output);
