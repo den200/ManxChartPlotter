@@ -4200,6 +4200,16 @@ impl RenderState {
     /// by value; returning `false` abandons the edit untouched.
     fn edit_route(&mut self, id: uuid::Uuid, edit: impl FnOnce(&mut crate::nav::Route) -> bool) {
         self.ensure_route_store();
+        // Which mark are we steering to? Reordering, reversing or removing a
+        // waypoint renumbers the legs, and a follower holding a bare index
+        // would silently start guiding somewhere the crew never chose. The
+        // index is restored below from the identity of the target.
+        let steering_to = self
+            .route_follow
+            .as_ref()
+            .filter(|f| f.route_id == id)
+            .and_then(|f| f.target(self.route_store.as_ref()?.route(id)?));
+
         let Some(store) = self.route_store.as_mut() else { return };
         let Some(mut route) = store.route(id).cloned() else { return };
         if !edit(&mut route) {
@@ -4212,6 +4222,13 @@ impl RenderState {
             }
             log::warn!("route edit not saved: {e}");
             return;
+        }
+
+        if let Some(target) = steering_to {
+            let route = self.route_store.as_ref().and_then(|s| s.route(id)).cloned();
+            if let (Some(follow), Some(route)) = (self.route_follow.as_mut(), route) {
+                follow.retarget(&route, target);
+            }
         }
         // A route the user is editing is a route they want to watch.
         if let Some(ref mut ui) = self.ui {

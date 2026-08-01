@@ -77,6 +77,27 @@ impl Following {
         })
     }
 
+    /// The mark this follower is steering to, while the route still has it.
+    pub fn target(&self, route: &Route) -> Option<Uuid> {
+        route.legs.get(self.leg).map(|l| l.to)
+    }
+
+    /// Re-point the follower after the route's waypoint list was edited.
+    ///
+    /// A follower holds a leg *index*. Reordering, reversing or removing a
+    /// waypoint renumbers the legs, so the index alone would quietly start
+    /// guiding towards a mark the crew never chose — the worst kind of bug
+    /// on a boat, because nothing looks wrong. Given the waypoint it was
+    /// steering to, this finds that mark's new leg; if the mark itself was
+    /// deleted, it lands on the last leg rather than anywhere arbitrary.
+    pub fn retarget(&mut self, route: &Route, steering_to: Uuid) {
+        self.leg = route
+            .legs
+            .iter()
+            .position(|l| l.to == steering_to)
+            .unwrap_or(route.legs.len().saturating_sub(1));
+    }
+
     /// Advance the state with a new fix and report guidance.
     ///
     /// Waypoint advance happens here: entering the active waypoint's arrival
@@ -183,6 +204,72 @@ mod tests {
             .push(set.insert(Waypoint::new("end", 57.0, 11.0)));
         route.recompute_legs(&set);
         (route, set)
+    }
+
+    /// A four-mark route up the coast, for the editing cases.
+    fn four_marks() -> (Route, WaypointSet) {
+        let mut set = WaypointSet::default();
+        let mut route = Route::new("four");
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            route
+                .waypoints
+                .push(set.insert(Waypoint::new(*name, 56.0 + i as f64 * 0.2, 11.0)));
+        }
+        route.recompute_legs(&set);
+        (route, set)
+    }
+
+    /// Editing the route under a follower must not silently retarget it.
+    /// The crew chose a mark, not a leg number.
+    #[test]
+    fn editing_the_route_keeps_the_follower_on_its_mark() {
+        let (mut route, set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        f.leg = 2; // steering to "d", the last mark
+        let target = f.target(&route).expect("a target");
+        assert_eq!(set.get(target).unwrap().name, "d");
+
+        // Drop "b" from the middle: "d" is now the end of leg 1.
+        route.waypoints.remove(1);
+        route.recompute_legs(&set);
+        f.retarget(&route, target);
+        assert_eq!(f.leg, 1);
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "d");
+
+        // Reverse the whole route: "d" leads it, so nothing follows it and
+        // the follower lands on the last leg rather than off the end.
+        route.waypoints.reverse();
+        route.recompute_legs(&set);
+        f.retarget(&route, target);
+        assert!(f.leg < route.legs.len(), "leg {} is past the end", f.leg);
+
+        // Delete the mark we were steering to: land on the last leg, and
+        // never index past it.
+        let (mut route, set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        f.leg = 1;
+        let target = f.target(&route).unwrap();
+        let gone = route.waypoints.iter().position(|w| *w == target).unwrap();
+        route.waypoints.remove(gone);
+        route.recompute_legs(&set);
+        f.retarget(&route, target);
+        assert_eq!(f.leg, route.legs.len() - 1);
+        assert!(f.update(&route, &set, LatLon::new(56.1, 11.0), None, None).is_some());
+    }
+
+    /// Down to a single mark there are no legs at all; the follower must not
+    /// index into an empty list.
+    #[test]
+    fn a_route_edited_down_to_one_mark_does_not_panic() {
+        let (mut route, set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        f.leg = 2;
+        let target = f.target(&route).unwrap();
+        route.waypoints.truncate(1);
+        route.recompute_legs(&set);
+        f.retarget(&route, target);
+        assert_eq!(f.leg, 0);
+        assert!(f.update(&route, &set, LatLon::new(56.0, 11.0), None, None).is_none());
     }
 
     /// The spec's own M2 verification: a track 0.2 nm to port of the leg
