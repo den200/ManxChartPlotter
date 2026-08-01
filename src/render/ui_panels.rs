@@ -29,6 +29,8 @@ pub fn build(
     // The strip claims its edge before the chart is told how much room it has,
     // so a window opened over it still lands inside the remaining area.
     super::ui_instruments::bar(ctx, instruments, &fleet.own);
+    // Routes under the vessels: the boat sails over its plan, not beneath it.
+    super::ui_routes::draw_overlay(ctx, &state.routes);
     if instruments.show_ais {
         super::ui_ais::draw(
             ctx,

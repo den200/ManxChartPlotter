@@ -12,6 +12,121 @@ use uuid::Uuid;
 use super::ui::{RoutesView, UiAction};
 use crate::nav::Guidance;
 
+/// A route projected for the chart overlay: screen points, the active leg,
+/// and whatever the plan knows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteDisplay {
+    pub name: String,
+    pub is_active: bool,
+    /// Index of the leg currently being sailed, when this route is active.
+    pub active_leg: Option<usize>,
+    pub points: Vec<RoutePointDisplay>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoutePointDisplay {
+    /// Logical points.
+    pub screen: [f32; 2],
+    pub name: String,
+    /// "14:32" from the weather plan, when there is one.
+    pub eta: Option<String>,
+    /// The arrival circle in points, drawn on the active waypoint.
+    pub arrival_radius_px: Option<f32>,
+}
+
+/// S-52's own mariner colours, read from the DAY_BRIGHT palette:
+/// planned route PLRTE, active planned route APLRT.
+const PLRTE: Color32 = Color32::from_rgb(220, 64, 37);
+const APLRT: Color32 = Color32::from_rgb(235, 125, 54);
+
+/// Routes on the chart. Dashed in PLRTE as S-52 draws a planned route; the
+/// active route in APLRT with its current leg solid and heavier; legs already
+/// sailed fall back to quiet.
+pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
+    if routes.is_empty() {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("routes-overlay"),
+    ));
+    let screen = ctx.screen_rect().expand(2_000.0);
+
+    for route in routes {
+        let colour = if route.is_active { APLRT } else { PLRTE };
+        for (i, w) in route.points.windows(2).enumerate() {
+            let a = egui::pos2(w[0].screen[0], w[0].screen[1]);
+            let b = egui::pos2(w[1].screen[0], w[1].screen[1]);
+            if !screen.contains(a) && !screen.contains(b) {
+                continue;
+            }
+            let sailed = route.active_leg.map(|l| i < l).unwrap_or(false);
+            let current = route.active_leg == Some(i);
+            if current {
+                painter.line_segment([a, b], egui::Stroke::new(3.0, colour));
+            } else {
+                let stroke = egui::Stroke::new(
+                    2.0,
+                    if sailed { colour.gamma_multiply(0.4) } else { colour },
+                );
+                painter.add(egui::Shape::dashed_line(&[a, b], stroke, 8.0, 6.0));
+            }
+        }
+        for (i, p) in route.points.iter().enumerate() {
+            let pos = egui::pos2(p.screen[0], p.screen[1]);
+            if !screen.contains(pos) {
+                continue;
+            }
+            painter.circle(
+                pos,
+                4.0,
+                Color32::TRANSPARENT,
+                egui::Stroke::new(1.8, colour),
+            );
+            if let Some(r) = p.arrival_radius_px {
+                painter.add(egui::Shape::dashed_line(
+                    &circle_points(pos, r),
+                    egui::Stroke::new(1.0, colour),
+                    4.0,
+                    4.0,
+                ));
+            }
+            // Names right of the mark; ETAs below the name. First and last
+            // points always speak; intermediates only when the route is
+            // active or planned, to keep a dense wx route readable.
+            let ends = i == 0 || i + 1 == route.points.len();
+            if ends || route.is_active || p.eta.is_some() {
+                painter.text(
+                    pos + egui::vec2(7.0, -6.0),
+                    egui::Align2::LEFT_CENTER,
+                    &p.name,
+                    egui::FontId::proportional(11.0),
+                    colour,
+                );
+                if let Some(eta) = &p.eta {
+                    painter.text(
+                        pos + egui::vec2(7.0, 7.0),
+                        egui::Align2::LEFT_CENTER,
+                        eta,
+                        egui::FontId::proportional(10.0),
+                        colour.gamma_multiply(0.85),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A polygonal circle for dashed rendering — epaint dashes lines, not arcs.
+fn circle_points(centre: egui::Pos2, r: f32) -> Vec<egui::Pos2> {
+    (0..=32)
+        .map(|i| {
+            let a = i as f32 / 32.0 * std::f32::consts::TAU;
+            egui::pos2(centre.x + r * a.cos(), centre.y + r * a.sin())
+        })
+        .collect()
+}
+
 /// One row of the routes table, prepared by the renderer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteRow {
@@ -20,6 +135,7 @@ pub struct RouteRow {
     pub legs: usize,
     pub distance_nm: f64,
     pub active: bool,
+    pub visible: bool,
     /// "GFS run 2026-08-01 06Z · built-in cruiser" for generated routes.
     pub provenance: Option<String>,
 }
@@ -64,6 +180,18 @@ pub fn window(
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                 for row in view.rows.clone() {
                     ui.horizontal(|ui| {
+                        let mut shown = row.visible;
+                        if ui
+                            .checkbox(&mut shown, "")
+                            .on_hover_text("Show this route on the chart")
+                            .changed()
+                        {
+                            if shown {
+                                view.visible.insert(row.id);
+                            } else {
+                                view.visible.remove(&row.id);
+                            }
+                        }
                         let name = if row.active {
                             RichText::new(&row.name).strong()
                         } else {

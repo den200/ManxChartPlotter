@@ -1974,6 +1974,9 @@ impl RenderState {
 
         // The UI, in its own pass over the resolved surface. After this point
         // the chart is finished with the frame.
+        // Projected before the take: routes_display reads ui.routes for the
+        // visible set, and inside the block self.ui is temporarily None.
+        let routes_display = self.routes_display();
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
@@ -1996,6 +1999,7 @@ impl RenderState {
                     own_ship,
                     ais,
                     mpp,
+                    routes: routes_display,
                 },
                 &self.fleet,
             );
@@ -3563,6 +3567,73 @@ impl RenderState {
         }
     }
 
+    /// Project the visible routes for the chart overlay.
+    fn routes_display(&self) -> Vec<crate::render::ui_routes::RouteDisplay> {
+        let Some(store) = self.route_store.as_ref() else {
+            return Vec::new();
+        };
+        let Some(ui) = self.ui.as_ref() else {
+            return Vec::new();
+        };
+        let ppp = self.scale_factor.max(0.01);
+        let active = ui.routes.active;
+        let active_leg = self.route_follow.as_ref().map(|f| f.leg);
+        // Metres per logical point and the latitude stretch, for the arrival
+        // circle's on-screen radius.
+        let mpp = (self.camera.zoom * ppp) as f64;
+
+        store
+            .routes()
+            .filter(|r| ui.routes.visible.contains(&r.id) || active == Some(r.id))
+            .map(|r| {
+                let is_active = active == Some(r.id);
+                let to_wp = is_active
+                    .then(|| {
+                        active_leg
+                            .and_then(|l| r.legs.get(l))
+                            .map(|l| l.to)
+                    })
+                    .flatten();
+                let points = r
+                    .waypoints
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| {
+                        let wp = store.waypoints.get(*id)?;
+                        let (x, y) = crate::render::projection::Projection::to_mercator(
+                            wp.position.lat,
+                            wp.position.lon,
+                        );
+                        let s = self.camera.world_to_screen(x as f32, y as f32);
+                        // The plan's ETA lives on the leg ENDING here.
+                        let eta = (i > 0)
+                            .then(|| r.legs.get(i - 1))
+                            .flatten()
+                            .and_then(|l| l.plan.as_ref())
+                            .map(|p| p.eta.format("%H:%M").to_string());
+                        let arrival_radius_px = (to_wp == Some(*id)).then(|| {
+                            let k = 1.0 / wp.position.lat.to_radians().cos();
+                            let radius_nm = wp.arrival_radius_nm.unwrap_or(0.1);
+                            ((radius_nm * crate::geo::METRES_PER_NM * k) / mpp) as f32
+                        });
+                        Some(crate::render::ui_routes::RoutePointDisplay {
+                            screen: [s.x / ppp as f32, s.y / ppp as f32],
+                            name: wp.name.clone(),
+                            eta,
+                            arrival_radius_px,
+                        })
+                    })
+                    .collect();
+                crate::render::ui_routes::RouteDisplay {
+                    name: r.name.clone(),
+                    is_active,
+                    active_leg: is_active.then(|| active_leg).flatten(),
+                    points,
+                }
+            })
+            .collect()
+    }
+
     /// Project the AIS traffic onto the screen, with its closest approaches.
     ///
     /// CPA is computed geodesically rather than in the Mercator plane: at 56°
@@ -3798,6 +3869,7 @@ impl RenderState {
                 self.route_follow = Some(f);
                 if let Some(ref mut ui) = self.ui {
                     ui.routes.active = Some(route_id);
+                    ui.routes.visible.insert(route_id);
                     ui.routes.status = format!("Following {name}");
                 }
             }
@@ -3827,6 +3899,7 @@ impl RenderState {
                         legs: r.legs.len(),
                         distance_nm: r.total_distance_nm(),
                         active: active == Some(r.id),
+                        visible: ui.routes.visible.contains(&r.id) || active == Some(r.id),
                         provenance: r.generated.as_ref().map(|g| {
                             format!(
                                 "wx: {} run {} · {}",
@@ -3886,6 +3959,7 @@ impl RenderState {
                     summary,
                 } => {
                     self.ensure_route_store();
+                    let planned_id = route.id;
                     if let Some(store) = self.route_store.as_mut() {
                         for wp in waypoints {
                             store.waypoints.insert(wp);
@@ -3897,6 +3971,9 @@ impl RenderState {
                     if let Some(ref mut ui) = self.ui {
                         ui.weather.busy = false;
                         ui.weather.status = summary;
+                        // The plan someone just waited for belongs on the
+                        // chart, not behind a checkbox.
+                        ui.routes.visible.insert(planned_id);
                     }
                 }
                 RouteNetEvent::Fetched(routes) => {

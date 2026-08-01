@@ -95,6 +95,8 @@ pub struct RoutesView {
     pub rows: Vec<super::ui_routes::RouteRow>,
     /// The route being followed, if any.
     pub active: Option<uuid::Uuid>,
+    /// Routes drawn on the chart.
+    pub visible: std::collections::HashSet<uuid::Uuid>,
     /// This frame's guidance, for the strip.
     pub guidance: Option<crate::nav::Guidance>,
     pub status: String,
@@ -230,6 +232,8 @@ pub struct UiState<'a> {
     pub ais: Vec<super::ui_ais::AisTarget>,
     /// Metres per logical point, so a course vector is a real distance.
     pub mpp: f32,
+    /// Visible routes, projected for the overlay.
+    pub routes: Vec<super::ui_routes::RouteDisplay>,
 }
 
 pub struct Ui {
