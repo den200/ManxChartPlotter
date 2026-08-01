@@ -278,6 +278,20 @@ pub(crate) enum RouteNetEvent {
     OrcResults(Vec<crate::nav::orc::OrcHit>),
     OrcFailed(String),
     OrcProgress(String),
+    /// A worker thread has ended, however it ended. Sent by a drop guard, so
+    /// it arrives even if the worker panicked — which is what keeps a busy
+    /// flag from sticking on for the rest of the session.
+    JobDone,
+}
+
+/// Sends [`RouteNetEvent::JobDone`] when a worker thread ends, on every path
+/// including a panic unwind.
+struct JobGuard(std::sync::mpsc::Sender<RouteNetEvent>);
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        let _ = self.0.send(RouteNetEvent::JobDone);
+    }
 }
 
 pub struct RenderState {
@@ -360,6 +374,10 @@ pub struct RenderState {
     chart_root: Option<std::path::PathBuf>,
     /// The NAVCORE_PLAN capture hook has run (it must fire exactly once).
     env_plan_fired: bool,
+    /// Worker threads reporting to the route-network channel that have not
+    /// yet ended. The event loop keeps polling while any are outstanding —
+    /// nothing else would wake it to collect their results.
+    route_net_jobs: usize,
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
@@ -1030,6 +1048,7 @@ impl RenderState {
             mariner_symbols: crate::render::mariner::MarinerSymbols::resolve(),
             chart_root: None,
             env_plan_fired: false,
+            route_net_jobs: 0,
             pick_anchor: None,
             pick_objects: Vec::new(),
             pick_pending: None,
@@ -1634,9 +1653,13 @@ impl RenderState {
         // headless capture can show it. This is the second firing of the
         // hook (init_ui runs before the tile worker exists); when the pick
         // was aimed at a planner pin, that firing already consumed it.
-        let pick_env = std::env::var("NAVCORE_PICK")
-            .ok()
-            .filter(|_| std::env::var("NAVCORE_PLAN_PICK").is_err());
+        // Any hook that claims the tap has already consumed this pick during
+        // init_ui; firing it again here would place a second waypoint or
+        // refill a planner field.
+        let pick_env = std::env::var("NAVCORE_PICK").ok().filter(|_| {
+            std::env::var("NAVCORE_PLAN_PICK").is_err()
+                && std::env::var("NAVCORE_ROUTE_NEW").is_err()
+        });
         if let Some(spec) = pick_env {
             let parts: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
             if parts.len() == 2 {
@@ -2162,6 +2185,7 @@ impl RenderState {
                         (Some(base), Some((route, set))) => {
                             let tx = self.route_net_sender();
                             std::thread::spawn(move || {
+                                let _done = JobGuard(tx.clone());
                                 let client =
                                     crate::signalk::resources::ResourcesClient::new(base);
                                 let msg = match client.put_route(&route, &set) {
@@ -2275,50 +2299,64 @@ impl RenderState {
                     }
                     self.needs_redraw = true;
                 }
-                crate::render::ui::UiAction::RouteWaypointDelete { route_id, index } => {
+                crate::render::ui::UiAction::RouteWaypointDelete {
+                    route_id,
+                    index,
+                    waypoint,
+                } => {
                     self.edit_route(route_id, |route| {
-                        if index >= route.waypoints.len() {
+                        let Some(at) = resolve_waypoint(route, index, waypoint) else {
                             return false;
-                        }
-                        route.waypoints.remove(index);
+                        };
+                        route.waypoints.remove(at);
                         true
                     });
                 }
                 crate::render::ui::UiAction::RouteWaypointMove {
                     route_id,
                     index,
+                    waypoint,
                     delta,
                 } => {
                     self.edit_route(route_id, |route| {
-                        let Some(to) = index.checked_add_signed(delta as isize) else {
+                        let Some(at) = resolve_waypoint(route, index, waypoint) else {
                             return false;
                         };
-                        if index >= route.waypoints.len() || to >= route.waypoints.len() {
+                        let Some(to) = at.checked_add_signed(delta as isize) else {
+                            return false;
+                        };
+                        if to >= route.waypoints.len() {
                             return false;
                         }
-                        route.waypoints.swap(index, to);
+                        route.waypoints.swap(at, to);
                         true
                     });
                 }
                 crate::render::ui::UiAction::RouteWaypointRename {
                     route_id,
                     index,
+                    waypoint,
                     name,
                 } => {
                     self.ensure_route_store();
-                    let wp_id = self
-                        .route_store
-                        .as_ref()
-                        .and_then(|s| s.route(route_id))
-                        .and_then(|r| r.waypoints.get(index).copied());
-                    if let (Some(store), Some(wp_id)) = (self.route_store.as_mut(), wp_id) {
-                        if let Some(wp) = store.waypoints.get_mut(wp_id) {
-                            wp.name = name;
+                    let wp = self.route_store.as_ref().and_then(|s| {
+                        let route = s.route(route_id)?;
+                        let at = resolve_waypoint(route, index, waypoint)?;
+                        let mut wp = s.waypoints.get(route.waypoints[at])?.clone();
+                        wp.name = name;
+                        Some(wp)
+                    });
+                    if let (Some(store), Some(wp)) = (self.route_store.as_mut(), wp) {
+                        // Each route's GPX inlines its marks by value, so a
+                        // mark renamed here is stale in every sibling route
+                        // that shares it until they are written too. The
+                        // store knows which those are.
+                        if let Err(e) = store.update_waypoint(wp) {
+                            log::warn!("waypoint rename not saved: {e}");
                         }
                     }
-                    // The name lives in the route's own GPX, so the route is
-                    // what has to be rewritten.
-                    self.edit_route(route_id, |_| true);
+                    self.refresh_route_rows();
+                    self.needs_redraw = true;
                 }
                 crate::render::ui::UiAction::RouteReverse { route_id } => {
                     self.edit_route(route_id, |route| {
@@ -2343,6 +2381,7 @@ impl RenderState {
                         Some(base) => {
                             let tx = self.route_net_sender();
                             std::thread::spawn(move || {
+                                let _done = JobGuard(tx.clone());
                                 let client =
                                     crate::signalk::resources::ResourcesClient::new(base);
                                 match client.list_routes() {
@@ -2903,6 +2942,12 @@ impl RenderState {
 
     fn draw_tiles<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, line_style_offsets: &HashMap<LineStyleKey, u32>) {
         use std::sync::atomic::{AtomicU32, Ordering};
+        // The dump is a record of *this* frame. Keeping every frame's records
+        // grew without bound in a live session, and buried the captured frame
+        // under a hundred warm-up ones in a NAVCORE_SHOT dump.
+        if let Some(log) = &self.draw_log {
+            log.borrow_mut().clear();
+        }
         static DRAW_FRAME_COUNT: AtomicU32 = AtomicU32::new(0);
         let draw_frame = DRAW_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
         let debug_mode = debug_render_mode();
@@ -4136,6 +4181,7 @@ impl RenderState {
                                 .filter_map(|(i, wid)| {
                                     let wp = store.waypoints.get(*wid)?;
                                     Some(crate::render::ui_routes::RouteWaypointRow {
+                                        id: wp.id,
                                         name: wp.name.clone(),
                                         lat: wp.position.lat,
                                         lon: wp.position.lon,
@@ -4172,13 +4218,30 @@ impl RenderState {
             .unwrap_or_default();
     }
 
+    /// A sender for a worker about to be spawned. Taking one counts a job:
+    /// its [`JobGuard`] reports the end, whatever the ending.
     fn route_net_sender(&mut self) -> std::sync::mpsc::Sender<RouteNetEvent> {
+        self.route_net_jobs += 1;
         if self.route_net_tx.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
             self.route_net_tx = Some(tx);
             self.route_net_rx = Some(rx);
         }
         self.route_net_tx.as_ref().unwrap().clone()
+    }
+
+    /// Take the guidance strip down.
+    ///
+    /// A strip of steering numbers that stopped updating is worse than no
+    /// strip: XTE, bearing and time-to-go all still look live, and nothing
+    /// on screen says the fix behind them is minutes old. The same reasoning
+    /// as the instrument bar clearing itself when Signal K drops.
+    fn clear_guidance(&mut self) {
+        if let Some(ref mut ui) = self.ui {
+            if ui.routes.guidance.take().is_some() {
+                self.needs_redraw = true;
+            }
+        }
     }
 
     /// Stop following, and forget the guidance the strip was drawing.
@@ -4276,6 +4339,7 @@ impl RenderState {
         }
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
+            let _done = JobGuard(tx.clone());
             let cache = dirs::config_dir()
                 .map(|d| d.join("navcore").join("orc"))
                 .unwrap_or_else(|| "orc-cache".into());
@@ -4411,6 +4475,7 @@ impl RenderState {
         let safety = self.safety_from_boat();
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
+            let _done = JobGuard(tx.clone());
             let cache = dirs::config_dir()
                 .map(|d| d.join("navcore").join("grib"))
                 .unwrap_or_else(|| "grib-cache".into());
@@ -4479,6 +4544,7 @@ impl RenderState {
         let safety = self.safety_from_boat();
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
+            let _done = JobGuard(tx.clone());
             let result = crate::nav::wxroute::with_chart_sources(&dir, a, b, |sources| {
                 crate::nav::autoroute::plan(sources, a, b, &safety)
             });
@@ -4531,6 +4597,25 @@ impl RenderState {
                         ui.boat.status = msg;
                     }
                 }
+                RouteNetEvent::JobDone => {
+                    self.route_net_jobs = self.route_net_jobs.saturating_sub(1);
+                    // With nothing left running, no busy flag can still be
+                    // true honestly. A worker that panicked never sent its
+                    // own result, and without this the spinner would turn
+                    // for the rest of the session.
+                    if self.route_net_jobs == 0 {
+                        if let Some(ref mut ui) = self.ui {
+                            if ui.weather.busy {
+                                ui.weather.busy = false;
+                                ui.weather.status = "the planner stopped unexpectedly".into();
+                            }
+                            if ui.boat.busy {
+                                ui.boat.busy = false;
+                                ui.boat.status = "the search stopped unexpectedly".into();
+                            }
+                        }
+                    }
+                }
                 RouteNetEvent::OrcFailed(msg) => {
                     if let Some(ref mut ui) = self.ui {
                         ui.boat.busy = false;
@@ -4579,6 +4664,15 @@ impl RenderState {
                 }
                 RouteNetEvent::Fetched(routes) => {
                     self.ensure_route_store();
+                    // A fetched route can replace the very route being
+                    // followed — publish and fetch round-trip the same id, so
+                    // another client's edit arrives here and renumbers the
+                    // legs underneath the follower. Same reasoning as a
+                    // manual edit: hold on to the mark, not the index.
+                    let steering_to = self.route_follow.as_ref().and_then(|f| {
+                        let route = self.route_store.as_ref()?.route(f.route_id)?;
+                        f.target(route).map(|t| (f.route_id, t))
+                    });
                     if let Some(store) = self.route_store.as_mut() {
                         for (route, wps) in routes {
                             for wp in wps {
@@ -4589,6 +4683,15 @@ impl RenderState {
                                     ui.routes.status = format!("Could not save: {e}");
                                 }
                             }
+                        }
+                    }
+                    if let Some((id, target)) = steering_to {
+                        let route =
+                            self.route_store.as_ref().and_then(|s| s.route(id)).cloned();
+                        if let (Some(follow), Some(route)) =
+                            (self.route_follow.as_mut(), route)
+                        {
+                            follow.retarget(&route, target);
                         }
                     }
                 }
@@ -4605,9 +4708,11 @@ impl RenderState {
             let (Some(follow), Some(store)) =
                 (self.route_follow.as_mut(), self.route_store.as_ref())
             else {
+                self.clear_guidance();
                 return;
             };
             let Some(route) = store.route(follow.route_id) else {
+                self.clear_guidance();
                 return;
             };
             let fresh = self
@@ -4616,6 +4721,9 @@ impl RenderState {
                 .get("navigation.position")
                 .is_some_and(|r| !r.is_stale());
             let Some((lat, lon)) = self.fleet.own.position().filter(|_| fresh) else {
+                // No fix, or a fix gone stale: the last guidance is not
+                // guidance any more, it is a photograph of one.
+                self.clear_guidance();
                 return;
             };
             // Signal K is SI: m/s and radians. Guidance speaks knots/degrees.
@@ -4639,6 +4747,8 @@ impl RenderState {
                 )
         };
         let Some(guidance) = update else {
+            // Nothing left to steer to — the route lost its legs under us.
+            self.clear_guidance();
             return;
         };
 
@@ -4786,13 +4896,19 @@ impl RenderState {
             && self.previous_visible_tiles.is_empty()
     }
 
-    /// Is a worker (weather plan, motor plan, polar search) still at it?
-    /// The capture harness holds the shot — and the exit — for this.
+    /// Is a worker (weather plan, motor plan, polar search, a Signal K
+    /// exchange) still at it? The capture harness holds the shot — and the
+    /// exit — for this, and the event loop keeps polling for it: nothing
+    /// else would wake the app to collect a worker's answer, so without it a
+    /// fetched route can sit in the channel until the user happens to move
+    /// the mouse.
     pub fn routing_busy(&self) -> bool {
-        self.ui
-            .as_ref()
-            .map(|u| u.weather.busy || u.boat.busy)
-            .unwrap_or(false)
+        self.route_net_jobs > 0
+            || self
+                .ui
+                .as_ref()
+                .map(|u| u.weather.busy || u.boat.busy)
+                .unwrap_or(false)
     }
 
     /// Mark that a redraw is needed (called on camera move, etc.)
@@ -4933,6 +5049,25 @@ impl Drop for RenderState {
 /// cheap enough to run per candidate tile during the quadtree walk. Testing the
 /// footprint's *bounding box* instead would pull in the two large wedges either
 /// side of the trapezium, which at a 45 degree tilt is most of the tiles.
+/// Where in the route a waypoint action means, given both the position the
+/// UI saw and the mark's identity.
+///
+/// The position wins when it still holds that mark — a route may legally
+/// visit the same mark twice, and then only the position distinguishes them.
+/// Otherwise an earlier action in the same batch has renumbered the list, and
+/// the identity is what survives that. `None` when the mark has gone
+/// altogether, which is the correct no-op.
+fn resolve_waypoint(
+    route: &crate::nav::Route,
+    index: usize,
+    waypoint: uuid::Uuid,
+) -> Option<usize> {
+    if route.waypoints.get(index) == Some(&waypoint) {
+        return Some(index);
+    }
+    route.waypoints.iter().position(|w| *w == waypoint)
+}
+
 /// A name for a new route that no existing route already answers to.
 /// "Route 1", then "Route 2" — a plotter full of identical "New route"s is
 /// a plotter you cannot navigate by name.

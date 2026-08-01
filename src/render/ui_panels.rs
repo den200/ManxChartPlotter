@@ -24,14 +24,14 @@ pub fn build(
     actions: &mut Vec<UiAction>,
 ) {
     menu_bar(ctx, shop, instruments, plan, boat, weather, actions);
-    // Declared before the instrument bar claims its edge, so the strip sits
-    // directly above the bar rather than under it.
+    // The instrument bar takes the bottom edge first. egui gives the outermost
+    // edge to the panel declared first, so declaring the strip first — as this
+    // did — put the strip *below* the bar, hard against the screen edge under
+    // the helm's hand, which is the opposite of what was wanted.
+    super::ui_instruments::bar(ctx, instruments, &fleet.own);
     if let Some(ref g) = routes.guidance {
         super::ui_routes::guidance_strip(ctx, g);
     }
-    // The strip claims its edge before the chart is told how much room it has,
-    // so a window opened over it still lands inside the remaining area.
-    super::ui_instruments::bar(ctx, instruments, &fleet.own);
     // Routes under the vessels: the boat sails over its plan, not beneath it.
     super::ui_routes::draw_overlay(ctx, &state.routes);
     draw_plan_pins(ctx, &state.plan_pins);

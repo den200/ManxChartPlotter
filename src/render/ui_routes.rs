@@ -130,6 +130,7 @@ fn circle_points(centre: egui::Pos2, r: f32) -> Vec<egui::Pos2> {
 /// One waypoint of a route, as the editor lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteWaypointRow {
+    pub id: Uuid,
     pub name: String,
     pub lat: f64,
     pub lon: f64,
@@ -201,6 +202,7 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
                 actions.push(UiAction::RouteWaypointRename {
                     route_id: row.id,
                     index: i,
+                    waypoint: wp.id,
                     name,
                 });
             }
@@ -227,6 +229,7 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
                     actions.push(UiAction::RouteWaypointDelete {
                         route_id: row.id,
                         index: i,
+                        waypoint: wp.id,
                     });
                 }
                 if ui
@@ -237,6 +240,7 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
                     actions.push(UiAction::RouteWaypointMove {
                         route_id: row.id,
                         index: i,
+                        waypoint: wp.id,
                         delta: 1,
                     });
                 }
@@ -248,6 +252,7 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
                     actions.push(UiAction::RouteWaypointMove {
                         route_id: row.id,
                         index: i,
+                        waypoint: wp.id,
                         delta: -1,
                     });
                 }

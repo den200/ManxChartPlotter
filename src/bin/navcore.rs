@@ -2004,6 +2004,15 @@ impl ApplicationHandler for App {
                     std::time::Instant::now() + std::time::Duration::from_millis(16),
                 ));
                 state.window().request_redraw();
+            } else if state.routing_busy() {
+                // A worker's answer is drained during a frame, and nothing
+                // else would ask for one: a fetched route or a finished plan
+                // would otherwise sit in its channel until the user happened
+                // to touch the screen. Slow poll — these take seconds.
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    std::time::Instant::now() + std::time::Duration::from_millis(150),
+                ));
+                state.window().request_redraw();
             } else {
                 // Idle — block until next event
                 event_loop.set_control_flow(ControlFlow::Wait);

@@ -61,6 +61,47 @@ impl WaveField for ConstantWaves {
     }
 }
 
+/// §7.5's hard limits at one place and time: wind over `max_tws_kt` or a sea
+/// over `max_wave_m` is a wall, not a cost. Absent wave data means no wall —
+/// the global models cannot see sheltered water, and inventing a sea there
+/// would forbid exactly the passages that have none.
+fn conditions_ok(input: &IsochroneInput<'_>, pos: [f64; 2], time_ms: i64) -> bool {
+    let (_, tws) = input.wind.wind(pos, time_ms);
+    if tws > input.config.max_tws_kt {
+        return false;
+    }
+    match input.waves.and_then(|w| w.wave_height_m(pos, time_ms)) {
+        Some(hs) => hs <= input.config.max_wave_m,
+        None => true,
+    }
+}
+
+/// The same limits *along* a segment, walked at about two miles of ground.
+///
+/// Sampling the ends is not enough and the midpoint is not either: a band of
+/// heavy sea narrower than half the leg slips between the samples, and the
+/// leg that jumps it is the fastest one on offer, so it wins. Legs here run
+/// from a single step (a few miles) to a closing leg's horizon (24 steps),
+/// hence the cap — beyond it the walk coarsens rather than growing without
+/// bound.
+fn conditions_ok_along(
+    input: &IsochroneInput<'_>,
+    a: [f64; 2],
+    b: [f64; 2],
+    time_ms: i64,
+    k: f64,
+) -> bool {
+    const SPACING_NM: f64 = 2.0;
+    const MAX_SAMPLES: usize = 32;
+    let len_ground_nm = (b[0] - a[0]).hypot(b[1] - a[1]) / (METRES_PER_NM * k);
+    let steps = ((len_ground_nm / SPACING_NM).ceil() as usize).clamp(1, MAX_SAMPLES);
+    (0..=steps).all(|i| {
+        let t = i as f64 / steps as f64;
+        let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        conditions_ok(input, p, time_ms)
+    })
+}
+
 /// The §5 wave penalty: a speed factor 1/(1 + c·Hs²), applied to sail and
 /// motor alike (a motor boat pitching into a head sea slows too). Heuristic
 /// by declaration — see [`RoutingConfig::wave_penalty_coef`].
@@ -302,6 +343,15 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
     let fan_half = (cfg.max_diverted_deg / cfg.heading_step_deg).floor() as i32;
 
     let mut best_arrival: Option<(u32, i64, Vec<ClosingLeg>)> = None;
+    // Closest the frontier has ever come to the mark, and how many rings ago.
+    // A frontier that cannot get nearer for this many rings is not working
+    // its way round anything — it is milling about behind a closed door, and
+    // grinding out the full step limit to say so costs the better part of a
+    // minute on a Pi. A beat gains ground every ring; even a foul current
+    // does, or the passage was never going to happen.
+    const STALL_RINGS: usize = 40;
+    let mut nearest_d2 = dist2(start_m, finish_m);
+    let mut rings_since_nearer = 0usize;
 
     for ring in 0..MAX_STEPS {
         // Rings are equal-time, so once the ring's own clock has caught up
@@ -466,6 +516,13 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 }
 
                 let child_time = parent.time_ms + (input.dt_s as i64) * 1000;
+                // The parent's own conditions were checked before the fan was
+                // built; the rest of the step is checked here, because a step
+                // is up to three hours long and the weather at its far end is
+                // not the weather at its start.
+                if !conditions_ok_along(input, parent.pos, child_pos, child_time, k) {
+                    continue;
+                }
                 // Tidal gates: a segment through a gate's water outside its
                 // window is as blocked as land is.
                 if gate_blocks(input.gates, parent.pos, child_pos, child_time, k) {
@@ -516,6 +573,29 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             .filter(|(_, i)| *i != u32::MAX)
             .map(|&(_, i)| i)
             .collect();
+
+        // Progress, or the lack of it. Only while no arrival is in hand —
+        // once one is, the loop is already bounded by the optimal-stop rule
+        // above and must not be cut short.
+        if best_arrival.is_none() {
+            let ring_nearest = frontier
+                .iter()
+                .map(|&i| dist2(arena[i as usize].pos, finish_m))
+                .fold(f64::INFINITY, f64::min);
+            if ring_nearest < nearest_d2 {
+                nearest_d2 = ring_nearest;
+                rings_since_nearer = 0;
+            } else {
+                rings_since_nearer += 1;
+                if rings_since_nearer >= STALL_RINGS {
+                    log::info!(
+                        "isochrone: no ground gained on the mark for {STALL_RINGS} rings — \
+                         giving up at ring {ring}"
+                    );
+                    return Err(IsoError::Unreachable);
+                }
+            }
+        }
     }
     match best_arrival {
         Some((node, t, plan)) => {
@@ -629,7 +709,15 @@ fn closing_legs(
             Some(g) => g.segment_clear(a, b, input.offing_min_m * k),
             None => true,
         };
-        chart && !gate_blocks(input.gates, a, b, t_ms, k)
+        // §7.5's hard limits hold along the leg, not merely where it starts.
+        // A closing leg is not short — offshore the horizon is 24·dt, some
+        // 72 nm at a three-hour step — so a leg that begins in calm water can
+        // cross a gale or a sea over the limit entirely unseen. Worse, a
+        // straight line through the weather beats any honest detour around
+        // it, so the unchecked leg does not merely slip through: it wins.
+        chart
+            && conditions_ok_along(input, a, b, t_ms, k)
+            && !gate_blocks(input.gates, a, b, t_ms, k)
     };
     let tack_of = |twa: f64| if twa >= 0.0 { TackState::Port } else { TackState::Starboard };
     let pen = |from: TackState, twa: f64| -> i64 {
@@ -1455,6 +1543,74 @@ mod tests {
             gates: &[],
         });
         assert!(matches!(r, Err(IsoError::Unreachable)));
+    }
+
+    /// A sea over the limit lying between a node and the mark must stop the
+    /// route even though the node itself is in calm water.
+    ///
+    /// This is the case the analytic closing legs used to sail straight
+    /// through: the limit was sampled where the leg *began*, and offshore a
+    /// closing leg reaches 24 time-steps ahead. Worse than merely missing
+    /// the hazard, a straight line through it beats every honest detour, so
+    /// the illegal route won.
+    #[test]
+    fn a_band_of_heavy_sea_across_the_approach_is_a_wall() {
+        /// Calm everywhere except a band of latitude before the finish.
+        struct BandWaves {
+            lat_from: f64,
+            lat_to: f64,
+            hs_m: f64,
+        }
+        impl WaveField for BandWaves {
+            fn wave_height_m(&self, pos: [f64; 2], _t: i64) -> Option<f64> {
+                let (lat, _) = Projection::to_wgs84(pos[0], pos[1]);
+                Some(if lat >= self.lat_from && lat <= self.lat_to {
+                    self.hs_m
+                } else {
+                    0.0
+                })
+            }
+        }
+
+        let p = polar();
+        let cfg = config();
+        // Due north, with the band straddling the middle of the passage.
+        let finish = mark(START, 0.0, 24.0);
+        let waves = BandWaves {
+            lat_from: START.lat + 0.10,
+            lat_to: START.lat + 0.20,
+            hs_m: cfg.max_wave_m + 2.0,
+        };
+        let input = IsochroneInput {
+            polar: &p,
+            wind: &ConstantWind { from_deg: 270.0, tws_kt: 12.0 },
+            grid: None,
+            start: START,
+            finish,
+            depart_ms: 0,
+            config: &cfg,
+            dt_s: 1800,
+            offing_min_m: 0.0,
+            waves: Some(&waves),
+            current: None,
+            gates: &[],
+        };
+        let r = solve(&input);
+        assert!(
+            r.is_err(),
+            "a sea over the limit spanning the whole approach must stop the route"
+        );
+
+        // And the control: the same passage with the band merely rough — not
+        // over the limit — does sail, so the wall above is the limit doing
+        // its work and not the fixture being unsailable.
+        let rough = BandWaves {
+            lat_from: START.lat + 0.10,
+            lat_to: START.lat + 0.20,
+            hs_m: cfg.max_wave_m - 1.0,
+        };
+        let ok = solve(&IsochroneInput { waves: Some(&rough), ..input });
+        assert!(ok.is_ok(), "a rough but legal sea must still be sailable");
     }
 
     #[test]

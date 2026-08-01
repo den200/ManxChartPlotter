@@ -67,19 +67,32 @@ pub enum UiAction {
     /// Open a route for editing — while one is open, a chart tap appends a
     /// waypoint to it. `None` closes the editor.
     RouteEdit { route_id: Option<uuid::Uuid> },
-    /// Drop the waypoint at this position from the route. The mark itself
-    /// survives: a plan changing its mind does not unmake a place.
-    RouteWaypointDelete { route_id: uuid::Uuid, index: usize },
+    /// Drop this waypoint from the route. The mark itself survives: a plan
+    /// changing its mind does not unmake a place.
+    ///
+    /// Carrying both the position and the identity is deliberate. The UI
+    /// builds its actions from a snapshot of the row, so by the time one is
+    /// applied an earlier action in the same batch may already have
+    /// renumbered the list; the identity survives that. The index is still
+    /// the primary key because a route may legally visit the same mark
+    /// twice, and then only the position says which one was meant.
+    RouteWaypointDelete {
+        route_id: uuid::Uuid,
+        index: usize,
+        waypoint: uuid::Uuid,
+    },
     /// Move a waypoint one place earlier (`-1`) or later (`+1`).
     RouteWaypointMove {
         route_id: uuid::Uuid,
         index: usize,
+        waypoint: uuid::Uuid,
         delta: i32,
     },
-    /// Rename the waypoint at this position.
+    /// Give this waypoint a new name.
     RouteWaypointRename {
         route_id: uuid::Uuid,
         index: usize,
+        waypoint: uuid::Uuid,
         name: String,
     },
     /// Sail the route the other way round.

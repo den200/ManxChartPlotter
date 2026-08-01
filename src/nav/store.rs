@@ -228,10 +228,25 @@ impl RouteStore {
     /// Add or replace a standalone waypoint and write the waypoints file.
     pub fn upsert_waypoint(&mut self, wp: Waypoint) -> Result<(), StoreError> {
         let id = wp.id;
-        self.waypoints.insert(wp);
         if !self.loose.contains(&id) {
             self.loose.push(id);
         }
+        self.update_waypoint(wp)?;
+        self.save_loose()
+    }
+
+    /// Change a mark that already exists, and rewrite every route carrying
+    /// it.
+    ///
+    /// Each route's GPX inlines its marks by value, so a mark edited in one
+    /// route stays stale in its siblings until they are written too — and
+    /// the divergence only shows after a restart, when the files are read
+    /// back. Unlike [`upsert_waypoint`](Self::upsert_waypoint) this does not
+    /// make the mark standalone: a route's own waypoint has no business
+    /// appearing in the loose waypoint file.
+    pub fn update_waypoint(&mut self, wp: Waypoint) -> Result<(), StoreError> {
+        let id = wp.id;
+        self.waypoints.insert(wp);
         // A moved mark changes the measure of every leg through it.
         let affected: Vec<Uuid> = self
             .routes
@@ -244,7 +259,10 @@ impl RouteStore {
             self.routes[i].route.recompute_legs(&self.waypoints);
             self.save_route_at(i)?;
         }
-        self.save_loose()
+        if self.loose.contains(&id) {
+            self.save_loose()?;
+        }
+        Ok(())
     }
 
     /// Remove a standalone waypoint. Refused while a route still uses it —
@@ -481,6 +499,45 @@ mod tests {
         store.delete_route(id).unwrap();
         assert_eq!(count_gpx(dir.path()), 0);
         assert!(store.waypoints.get(a_mark).is_some(), "marks outlive plans");
+    }
+
+    /// Two routes sharing a mark: editing it must rewrite both files, or the
+    /// sibling silently reverts to the old name at the next restart — each
+    /// route's GPX carries its own copy of the mark.
+    #[test]
+    fn editing_a_shared_mark_rewrites_every_route_that_carries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = RouteStore::open(dir.path()).unwrap();
+        let a = kattegat_route(&mut store);
+        let shared = a.waypoints[1];
+        let mut b = Route::new("the other way");
+        b.waypoints = a.waypoints.iter().rev().copied().collect();
+        store.upsert_route(a).unwrap();
+        store.upsert_route(b).unwrap();
+
+        let mut mark = store.waypoints.get(shared).unwrap().clone();
+        mark.name = "Renamed".to_string();
+        store.update_waypoint(mark).unwrap();
+
+        // Re-read from disk: both files must carry the new name.
+        let (fresh, problems) = RouteStore::open(dir.path()).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(fresh.routes().count(), 2);
+        for route in fresh.routes() {
+            let names: Vec<&str> = route
+                .waypoints
+                .iter()
+                .filter_map(|w| fresh.waypoints.get(*w))
+                .map(|w| w.name.as_str())
+                .collect();
+            assert!(
+                names.contains(&"Renamed"),
+                "route '{}' kept a stale copy: {names:?}",
+                route.name
+            );
+        }
+        // And a route's own mark must not have become a standalone one.
+        assert_eq!(fresh.loose_waypoints().count(), 0);
     }
 
     #[test]

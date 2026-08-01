@@ -60,13 +60,27 @@ pub fn search(
 
     let needle = query.trim().to_lowercase();
     let mut hits = Vec::new();
+    let mut answered = 0usize;
+    let mut consecutive_failures = 0usize;
+    let mut last_error = None;
     for c in countries {
         progress(format!("searching {c}"));
         let text = match fetch_country(&agent, c, cache_dir) {
-            Ok(t) => t,
+            Ok(t) => {
+                answered += 1;
+                consecutive_failures = 0;
+                t
+            }
             Err(e) => {
-                // One nation down must not sink a sweep.
+                // One nation down must not sink a sweep — but three in a row
+                // is the connection, not the country, and eighteen of them at
+                // a sixty-second timeout is a quarter of an hour of spinner.
                 log::warn!("orc: {c}: {e}");
+                last_error = Some(e);
+                consecutive_failures += 1;
+                if consecutive_failures >= 3 {
+                    break;
+                }
                 continue;
             }
         };
@@ -74,6 +88,15 @@ pub fn search(
         if hits.len() >= 60 {
             break;
         }
+    }
+    // Nothing answered at all is a failure, not an empty result. Reporting
+    // "no certificates match" to someone with no signal tells them their boat
+    // does not exist.
+    if answered == 0 {
+        return Err(match last_error {
+            Some(e) => format!("could not reach the ORC certificate service: {e}"),
+            None => "no country selected to search".to_string(),
+        });
     }
     hits.truncate(60);
     Ok(hits)
@@ -158,14 +181,18 @@ fn hit_from_cert(b: &serde_json::Value) -> Option<OrcHit> {
 /// and DW180 land as-is. R150 and DW150 disagree by sail choice; the boat
 /// carries the better sail, so the row keeps the faster of the two.
 fn allowances_to_pol(al: &serde_json::Value) -> Option<String> {
+    // Every value or none: a `null` in the middle of an allowance row used to
+    // be dropped silently, which shortened the row and shifted every wind
+    // speed after the gap one column left — the 14 kt allowance filed under
+    // the 12 kt heading, for ever, with nothing to see. Refusing the row (and
+    // with it the certificate, for a row the polar needs) is the only honest
+    // answer, because the columns are positional.
     let arr = |k: &str| -> Option<Vec<f64>> {
-        Some(
-            al.get(k)?
-                .as_array()?
-                .iter()
-                .filter_map(|v| v.as_f64())
-                .collect(),
-        )
+        al.get(k)?
+            .as_array()?
+            .iter()
+            .map(|v| v.as_f64())
+            .collect::<Option<Vec<f64>>>()
     };
     let ws = arr("WindSpeeds")?;
     let n = ws.len();
@@ -196,6 +223,11 @@ fn allowances_to_pol(al: &serde_json::Value) -> Option<String> {
     }
     let r150 = arr("R150")?;
     let dw150 = arr("DW150").unwrap_or_else(|| r150.clone());
+    // The same length check its siblings get: zip() would otherwise stop at
+    // the shorter row and leave the 150° line short of a column.
+    if r150.len() != n || dw150.len() != n {
+        return None;
+    }
     rows.push((
         150.0,
         r150.iter()
@@ -281,6 +313,22 @@ mod tests {
         // The search is case-insensitive and misses politely.
         assert_eq!(parse_and_filter(FIXTURE, "SHOGUN".to_lowercase().as_str()).len(), 1);
         assert!(parse_and_filter(FIXTURE, "bavaria").is_empty());
+    }
+
+    /// A gap in an allowance row must not shift the columns after it. The
+    /// certificate is refused instead: the wind speeds are positional, so a
+    /// short row files every later allowance under the wrong wind.
+    #[test]
+    fn a_gap_in_an_allowance_row_refuses_the_certificate() {
+        let holed = FIXTURE.replacen("393.3", "null", 1);
+        assert!(holed.contains("null"), "the fixture edit must land");
+        assert!(
+            parse_and_filter(&holed, "shogun").is_empty(),
+            "a row with a hole must not become a polar with shifted columns"
+        );
+        // And the untouched fixture still converts, so the guard is not
+        // simply refusing everything.
+        assert_eq!(parse_and_filter(FIXTURE, "shogun").len(), 1);
     }
 
     #[test]
