@@ -55,6 +55,8 @@ pub struct WxJob<'a> {
     /// Sea state, when the wave fetch succeeded. Waves are a refinement:
     /// a passage plans without them, never without wind.
     pub waves: Option<&'a WaveForecast>,
+    /// Surface currents, same rule as waves.
+    pub currents: Option<&'a super::currents::CurrentForecast>,
     pub config: &'a RoutingConfig,
     pub safety: &'a SafetyConfig,
 }
@@ -127,9 +129,11 @@ pub fn plan(job: &WxJob<'_>, name: &str) -> Result<WxPlanned, WxError> {
         config: job.config,
         dt_s,
         offing_min_m: job.safety.offing_min_nm * crate::geo::METRES_PER_NM,
-        // GRIB current fields are a source addition away; gates await a UI.
-        current: None,
+        current: job
+            .currents
+            .map(|c| c as &dyn isochrone::CurrentField),
         waves: job.waves.map(|w| w as &dyn isochrone::WaveField),
+        // Gates await a UI.
         gates: &[],
     })
     .map_err(WxError::Engine)?;
@@ -185,10 +189,15 @@ pub fn plan(job: &WxJob<'_>, name: &str) -> Result<WxPlanned, WxError> {
     }
     route.generated = Some(RouteProvenance {
         generated_at: Utc::now(),
-        grib_source: Some(if job.waves.is_some() {
-            format!("{} + waves", job.forecast.source.label())
-        } else {
-            job.forecast.source.label().to_string()
+        grib_source: Some({
+            let mut s = job.forecast.source.label().to_string();
+            if job.waves.is_some() {
+                s.push_str(" + waves");
+            }
+            if job.currents.is_some() {
+                s.push_str(" + currents");
+            }
+            s
         }),
         grib_run: Some(job.forecast.run),
         polar: job.polar_name.to_string(),
@@ -243,6 +252,7 @@ pub fn plan_from_chart_dir(
     config: &RoutingConfig,
     safety: &SafetyConfig,
     use_waves: bool,
+    use_currents: bool,
     name: &str,
     mut progress: impl FnMut(String),
 ) -> Result<WxPlanned, String> {
@@ -281,6 +291,20 @@ pub fn plan_from_chart_dir(
             Ok(w) => Some(w),
             Err(e) => {
                 wave_warning = Some(format!("waves unavailable, routing on wind alone: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut current_warning = None;
+    let currents = if use_currents {
+        progress("fetching currents".into());
+        match super::currents::CurrentForecast::fetch(area, hours) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                current_warning = Some(format!("currents unavailable, routing without: {e}"));
                 None
             }
         }
@@ -335,6 +359,7 @@ pub fn plan_from_chart_dir(
             polar_name,
             forecast: &forecast,
             waves: waves.as_ref(),
+            currents: currents.as_ref(),
             config,
             safety,
         },
@@ -342,6 +367,9 @@ pub fn plan_from_chart_dir(
     )
     .map_err(|e| e.to_string())?;
     if let Some(w) = wave_warning {
+        planned.warnings.push(w);
+    }
+    if let Some(w) = current_warning {
         planned.warnings.push(w);
     }
     Ok(planned)

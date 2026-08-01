@@ -2152,11 +2152,18 @@ impl RenderState {
                         Some((r.name.clone(), a, b))
                     });
                     let chart_dir = self.chart_root.clone();
-                    let (hours, polar_path, use_waves) = self
+                    let (hours, polar_path, use_waves, use_currents) = self
                         .ui
                         .as_ref()
-                        .map(|u| (u.weather.hours, u.weather.polar_path.clone(), u.weather.use_waves))
-                        .unwrap_or((48, String::new(), true));
+                        .map(|u| {
+                            (
+                                u.weather.hours,
+                                u.weather.polar_path.clone(),
+                                u.weather.use_waves,
+                                u.weather.use_currents,
+                            )
+                        })
+                        .unwrap_or((48, String::new(), true, true));
                     match (endpoints, chart_dir) {
                         (Some((name, a, b)), Some(dir)) => {
                             if let Some(ref mut ui) = self.ui {
@@ -2194,6 +2201,7 @@ impl RenderState {
                                     &crate::nav::RoutingConfig::default(),
                                     &crate::nav::autoroute::SafetyConfig::default(),
                                     use_waves,
+                                    use_currents,
                                     &format!("{name} (wx)"),
                                     move |msg| {
                                         let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));

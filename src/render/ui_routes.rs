@@ -275,6 +275,16 @@ pub fn window(
                      maximum are treated as impassable. If the wave file is not \
                      yet published the route falls back to wind alone.",
                 );
+            ui.checkbox(
+                &mut weather.use_currents,
+                format!("Currents ({})", crate::nav::currents::CURRENT_SOURCE_LABEL),
+            )
+            .on_hover_text(
+                "Fetches surface currents over the passage box and lets the \
+                 water carry the boat — in Danish waters the tidal streams \
+                 this includes are often worth more than the wind detail. \
+                 If the fetch fails the route plans in still water.",
+            );
             if weather.busy {
                 ui.horizontal(|ui| {
                     ui.spinner();

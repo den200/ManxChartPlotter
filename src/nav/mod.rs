@@ -21,6 +21,7 @@
 
 pub mod angles;
 pub mod autoroute;
+pub mod currents;
 pub mod follow;
 pub mod gpx;
 pub mod grib;

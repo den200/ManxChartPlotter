@@ -1169,6 +1169,14 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
             None
         }
     };
+    println!("Fetching currents ({})…", navcore2::nav::currents::CURRENT_SOURCE_LABEL);
+    let currents = match navcore2::nav::currents::CurrentForecast::fetch(area, hours) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            println!("  currents unavailable, routing without: {e}");
+            None
+        }
+    };
 
     // Charts, same loading as --auto-route.
     let dir = PathBuf::from(dir_path);
@@ -1236,6 +1244,7 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
             polar_name: "built-in cruiser",
             forecast: &forecast,
             waves: waves.as_ref(),
+            currents: currents.as_ref(),
             config: &config,
             safety: &safety,
         },

@@ -73,6 +73,9 @@ pub struct WeatherView {
     /// Fetch GFS waves and let sea state slow (and, over the limit, block)
     /// the boat.
     pub use_waves: bool,
+    /// Fetch surface currents (Open-Meteo/SMOC) and let the water carry the
+    /// boat.
+    pub use_currents: bool,
     // Live state below.
     #[serde(skip)]
     pub busy: bool,
@@ -86,6 +89,7 @@ impl Default for WeatherView {
             hours: 48,
             polar_path: String::new(),
             use_waves: true,
+            use_currents: true,
             busy: false,
             status: String::new(),
         }
