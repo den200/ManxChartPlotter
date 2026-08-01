@@ -29,6 +29,12 @@ pub struct SafetyConfig {
     pub grid_res_m: f64,
     /// Unsurveyed areas: unsafe by default (decision §10.4).
     pub unsare_navigable: bool,
+    /// The LEAST tide height above chart datum expected during the passage,
+    /// metres. §6.1's `− tide_height(t)`, made static and conservative: the
+    /// hazard grid is built once, so it is built for the worst water the
+    /// passage can meet. Zero — chart datum, roughly LAT — is the safe
+    /// default; a positive value credits water the tide guarantees.
+    pub tide_height_min_m: f64,
 }
 
 impl Default for SafetyConfig {
@@ -42,15 +48,17 @@ impl Default for SafetyConfig {
             offing_soft_nm: 0.5,
             grid_res_m: 60.0,
             unsare_navigable: false,
+            tide_height_min_m: 0.0,
         }
     }
 }
 
 impl SafetyConfig {
-    /// The depth that divides water into safe and not, before tide (M6 adds
-    /// `− tide_height(t)`).
+    /// The depth that divides water into safe and not: §6.1's
+    /// `draft + squat + UKC − tide_height`, with tide entered as the least
+    /// height the passage window guarantees.
     pub fn safety_contour_m(&self) -> f64 {
-        self.draft_m + self.ukc_m + self.squat_m
+        self.draft_m + self.ukc_m + self.squat_m - self.tide_height_min_m
     }
 }
 
@@ -165,6 +173,18 @@ mod tests {
 
     fn cfg() -> SafetyConfig {
         SafetyConfig::default() // contour 2.5 m
+    }
+
+    #[test]
+    fn guaranteed_tide_buys_back_charted_shallows() {
+        // 2.5 m boat, 2.0 m charted depth: blocked at datum…
+        let shallow = feature("DEPARE", &[("DRVAL1", AttributeValue::Float(2.0))]);
+        assert_eq!(classify(&shallow, &cfg()), Some(Severity::Hard));
+        // …but with a guaranteed metre of tide the same area carries her.
+        let mut with_tide = cfg();
+        with_tide.tide_height_min_m = 1.0;
+        assert_eq!(classify(&shallow, &with_tide), None);
+        assert!((with_tide.safety_contour_m() - 1.5).abs() < 1e-9);
     }
 
     #[test]

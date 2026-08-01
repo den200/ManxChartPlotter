@@ -32,6 +32,53 @@ pub trait WindField {
     fn wind(&self, pos_merc: [f64; 2], time_ms: i64) -> (Bam, f64);
 }
 
+/// Water movement, m/s as (east, north) components — the same §8.5 rule as
+/// wind: components interpolate, directions do not.
+pub trait CurrentField {
+    fn current(&self, pos_merc: [f64; 2], time_ms: i64) -> (f64, f64);
+    /// The strongest current the field can produce, for the Π₂ = C/V guard.
+    fn max_speed_ms(&self) -> f64;
+}
+
+/// A uniform set and drift — M6's analytic test current, and a usable model
+/// for a strait with a known stream.
+pub struct ConstantCurrent {
+    /// Direction the water flows TOWARD, degrees true.
+    pub set_deg: f64,
+    pub drift_kt: f64,
+}
+
+impl CurrentField for ConstantCurrent {
+    fn current(&self, _pos: [f64; 2], _time: i64) -> (f64, f64) {
+        let ms = self.drift_kt / MS_TO_KNOTS_INV;
+        let rad = self.set_deg.to_radians();
+        (ms * rad.sin(), ms * rad.cos())
+    }
+    fn max_speed_ms(&self) -> f64 {
+        self.drift_kt / MS_TO_KNOTS_INV
+    }
+}
+
+const MS_TO_KNOTS_INV: f64 = 3600.0 / 1852.0;
+
+/// A tidal gate: a stretch of water that may only be transited inside its
+/// time windows — the hour either side of slack in a sound, the flood
+/// through a narrows. §8.3's Π₂ note is why gates come before full current
+/// fields: in Danish waters the gates carry most of the value.
+#[derive(Debug, Clone)]
+pub struct TidalGate {
+    pub pos: crate::geo::LatLon,
+    pub radius_nm: f64,
+    /// Open intervals, ms UTC, ascending.
+    pub windows: Vec<(i64, i64)>,
+}
+
+impl TidalGate {
+    fn open_at(&self, time_ms: i64) -> bool {
+        self.windows.iter().any(|(a, b)| (*a..=*b).contains(&time_ms))
+    }
+}
+
 /// The M4 wind: the same everywhere, forever.
 pub struct ConstantWind {
     pub from_deg: f64,
@@ -112,6 +159,9 @@ pub struct Isoroute {
     /// Start to finish, post-processed: collinear runs merged, tacks kept.
     pub points: Vec<PlannedPoint>,
     pub arrival_ms: i64,
+    /// Π₂ tripped: current can outrun the boat somewhere, so radial pruning
+    /// is not strictly valid and the frontier was widened. Logged too.
+    pub pruning_fallback: bool,
     /// Candidate propagations attempted — the §8.2 scaling regression reads
     /// this: halving Δt must roughly double it, never square it.
     pub propagations: u64,
@@ -120,6 +170,7 @@ pub struct Isoroute {
     pub raw_tack_changes: usize,
 }
 
+#[derive(Clone, Copy)]
 pub struct IsochroneInput<'a> {
     pub polar: &'a Polar,
     pub wind: &'a dyn WindField,
@@ -134,6 +185,10 @@ pub struct IsochroneInput<'a> {
     pub dt_s: u32,
     /// Ground metres the route must keep from hazards (with `grid`).
     pub offing_min_m: f64,
+    /// Water movement, if any.
+    pub current: Option<&'a dyn CurrentField>,
+    /// Tidal gates the passage must respect.
+    pub gates: &'a [TidalGate],
 }
 
 /// Hard ceiling on isochrone rings. 2000 rings at one hour each is 83 days
@@ -173,6 +228,28 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
     let tack_pen_ms = clamp_pen(cfg.tack_penalty_day_s as i64 * 1000);
     let gybe_pen_ms = clamp_pen(cfg.gybe_penalty_day_s as i64 * 1000);
 
+    // Π₂ = C/V: current faster than the boat makes pockets radial pruning
+    // cannot see. The fallback is a wider frontier — more survivors per
+    // sector — which is the affordable version of exact region pruning.
+    let v_max_kt = (0..=60)
+        .map(|tws| input.polar.vmg_at(tws as f64).beat_stw_kt.max(
+            input.polar.speed_kt(90.0, tws as f64).unwrap_or(0.0) as f32,
+        ))
+        .fold(0.0f32, f32::max) as f64;
+    let c_max_kt = input
+        .current
+        .map(|c| c.max_speed_ms() * MS_TO_KNOTS_INV)
+        .unwrap_or(0.0);
+    let pruning_fallback = c_max_kt > 0.0 && v_max_kt > 0.0 && c_max_kt / v_max_kt > 1.0;
+    let per_sector = if pruning_fallback {
+        log::warn!(
+            "Π₂ guard: current up to {c_max_kt:.1} kt vs boat {v_max_kt:.1} kt —              radial pruning widened (C/V > 1)"
+        );
+        8
+    } else {
+        PER_SECTOR
+    };
+
     let mut arena: Vec<Node> = vec![Node {
         pos: start_m,
         time_ms: input.depart_ms,
@@ -200,11 +277,13 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
         if let Some((node, t, ref plan)) = best_arrival {
             if t <= ring_time {
                 let plan = plan.clone();
-                return Ok(extract(input, &arena, node, t, plan, propagations));
+                let mut r = extract(input, &arena, node, t, plan, propagations);
+                r.pruning_fallback = pruning_fallback;
+                return Ok(r);
             }
         }
-        let mut sectors: Vec<[(f32, u32); PER_SECTOR]> =
-            vec![[(f32::MIN, u32::MAX); PER_SECTOR]; N_SECTORS];
+        let mut sectors: Vec<Vec<(f32, u32)>> =
+            vec![vec![(f32::MIN, u32::MAX); per_sector]; N_SECTORS];
         let mut any_child = false;
 
         for &pi in &frontier {
@@ -213,6 +292,10 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             if tws > cfg.max_tws_kt {
                 continue; // §7.5 hard weather limit: do not sail out of here
             }
+            let current_ms = input
+                .current
+                .map(|c| c.current(parent.pos, parent.time_ms))
+                .unwrap_or((0.0, 0.0));
             let (lat, _) = Projection::to_wgs84(parent.pos[0], parent.pos[1]);
             let k = 1.0 / lat.to_radians().cos();
 
@@ -232,7 +315,7 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             if d_plane <= horizon {
                 if let Some(legs) = closing_legs(
                     input, parent.pos, parent.time_ms, parent.tack, finish_m, k,
-                    wind_from, tws, tack_pen_ms, gybe_pen_ms,
+                    wind_from, tws, current_ms, tack_pen_ms, gybe_pen_ms,
                 ) {
                     let t = legs.last().map(|l| l.end_time_ms).unwrap_or(parent.time_ms);
                     if best_arrival.as_ref().map(|(_, bt, _)| t < *bt).unwrap_or(true) {
@@ -266,7 +349,14 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                     .speed_kt(signed_diff_deg(bearing_fin, wind_from).abs(), tws)
                     .unwrap_or(0.0);
                 if sail_toward < cfg.motor_threshold_kt {
-                    candidates.push((bearing_fin, Some(motor)));
+                    // The whole fan under engine: in a cross-stream the
+                    // compensated heading beats aiming at the mark, and only
+                    // a fan candidate can hold it.
+                    for i in -fan_half..=fan_half {
+                        let h = bearing_fin
+                            .wrapping_add(deg_to_bam(i as f64 * cfg.heading_step_deg as f64));
+                        candidates.push((h, Some(motor)));
+                    }
                 }
             }
 
@@ -310,9 +400,13 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                     .max(0.0);
                 let step = stw * sail_h * METRES_PER_NM * k;
                 let dir = bam_to_rad(heading);
+                // The water carries the boat the whole step, penalty time
+                // included — a tack in a 2 kt stream still drifts.
+                let (cu, cv) = current_ms;
+                let drift = input.dt_s as f64; // seconds of set and drift
                 let child_pos = [
-                    parent.pos[0] + step * dir.sin(),
-                    parent.pos[1] + step * dir.cos(),
+                    parent.pos[0] + step * dir.sin() + cu * drift * k,
+                    parent.pos[1] + step * dir.cos() + cv * drift * k,
                 ];
 
                 // Constraint tests, cheapest first (§7.5).
@@ -330,6 +424,11 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 }
 
                 let child_time = parent.time_ms + (input.dt_s as i64) * 1000;
+                // Tidal gates: a segment through a gate's water outside its
+                // window is as blocked as land is.
+                if gate_blocks(input.gates, parent.pos, child_pos, child_time, k) {
+                    continue;
+                }
 
                 // §7.6 pruning: a child that reaches no further out in its
                 // sector than the ones already kept is dominated.
@@ -337,7 +436,7 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 let sector =
                     (plane_bearing(start_m, child_pos) >> SECTOR_SHIFT) as usize & (N_SECTORS - 1);
                 let slots = &mut sectors[sector];
-                let min_slot = (0..PER_SECTOR)
+                let min_slot = (0..per_sector)
                     .min_by(|&a, &b| slots[a].0.total_cmp(&slots[b].0))
                     .unwrap();
                 if r2 <= slots[min_slot].0 {
@@ -361,7 +460,11 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
 
         if !any_child {
             return match best_arrival {
-                Some((node, t, plan)) => Ok(extract(input, &arena, node, t, plan, propagations)),
+                Some((node, t, plan)) => {
+                    let mut r = extract(input, &arena, node, t, plan, propagations);
+                    r.pruning_fallback = pruning_fallback;
+                    Ok(r)
+                }
                 None => Err(IsoError::Unreachable),
             };
         }
@@ -373,15 +476,88 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             .collect();
     }
     match best_arrival {
-        Some((node, t, plan)) => Ok(extract(input, &arena, node, t, plan, propagations)),
+        Some((node, t, plan)) => {
+            let mut r = extract(input, &arena, node, t, plan, propagations);
+            r.pruning_fallback = pruning_fallback;
+            Ok(r)
+        }
         None => Err(IsoError::TookTooLong),
     }
 }
 
+/// Does any gate forbid this segment at this time? The check is coarse on
+/// purpose — a segment passing within the gate's radius while it is shut —
+/// because a gate is itself a modelling of something coarser still.
+fn gate_blocks(
+    gates: &[TidalGate],
+    a: [f64; 2],
+    b: [f64; 2],
+    time_ms: i64,
+    k: f64,
+) -> bool {
+    for gate in gates {
+        let (gx, gy) = Projection::to_mercator(gate.pos.lat, gate.pos.lon);
+        let r = gate.radius_nm * METRES_PER_NM * k;
+        if segment_near(a, b, [gx, gy], r) && !gate.open_at(time_ms) {
+            return true;
+        }
+    }
+    false
+}
+
+fn segment_near(a: [f64; 2], b: [f64; 2], c: [f64; 2], radius: f64) -> bool {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let ac = [c[0] - a[0], c[1] - a[1]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if len2 <= f64::EPSILON {
+        0.0
+    } else {
+        ((ac[0] * ab[0] + ac[1] * ab[1]) / len2).clamp(0.0, 1.0)
+    };
+    let p = [a[0] + ab[0] * t, a[1] + ab[1] * t];
+    dist2(p, c) <= radius * radius
+}
+
+/// M6's DoD in one function: try several departures, keep the best arrival.
+/// A tidal gate that shuts the direct water makes "leave later, arrive
+/// earlier" a real phenomenon, and this is how the engine finds it.
+pub fn best_departure(
+    input: &IsochroneInput<'_>,
+    departures_ms: &[i64],
+) -> Option<(i64, Isoroute)> {
+    let mut best: Option<(i64, Isoroute)> = None;
+    for &depart in departures_ms {
+        let candidate = IsochroneInput {
+            depart_ms: depart,
+            ..*input
+        };
+        match solve(&candidate) {
+            Ok(route) => {
+                if best
+                    .as_ref()
+                    .map(|(_, b)| route.arrival_ms < b.arrival_ms)
+                    .unwrap_or(true)
+                {
+                    best = Some((depart, route));
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    best
+}
+
 /// The analytic final approach from a node: the cheapest of the straight
-/// heading and (inside a no-go cone) the two-leg VMG wedge, with tack and
-/// gybe penalties charged and every implied segment checked against the
-/// chart. `None` when nothing legal closes.
+/// heading and (inside a no-go cone) the two-leg VMG wedge — now with the
+/// water's own movement folded in exactly.
+///
+/// With a constant current C this is Zermelo in closed form: a motor leg
+/// solves the quadratic |d − C·t| = V·t; a sailing wedge solves the 2×2
+/// system (V·e₊ + C)x + (V·e₋ + C)y = d for the two leg times; a sailed
+/// straight line iterates heading-against-drift to a fixed point, which
+/// converges whenever the boat outruns the stream. Penalties are charged,
+/// both wedge orders tried, and every implied segment checked against the
+/// chart and the tidal gates.
 #[allow(clippy::too_many_arguments)]
 fn closing_legs(
     input: &IsochroneInput<'_>,
@@ -392,18 +568,25 @@ fn closing_legs(
     k: f64,
     wind_from: Bam,
     tws: f64,
+    current_ms: (f64, f64),
     tack_pen_ms: i64,
     gybe_pen_ms: i64,
 ) -> Option<Vec<ClosingLeg>> {
-    let d_plane = dist2(pos, finish_m).sqrt();
+    let d_vec = [finish_m[0] - pos[0], finish_m[1] - pos[1]];
+    let d_plane = (d_vec[0] * d_vec[0] + d_vec[1] * d_vec[1]).sqrt();
     if d_plane < 1.0 {
         return Some(Vec::new());
     }
-    let d_nm = d_plane / (METRES_PER_NM * k);
+    // Everything in plane metres and seconds; k converts ground speeds in.
+    let c_pl = [current_ms.0 * k, current_ms.1 * k];
+    let kt_to_pl = |kt: f64| kt / (3600.0 / METRES_PER_NM) * k; // kt → plane m/s
     let bearing = plane_bearing(pos, finish_m);
-    let seg_ok = |a: [f64; 2], b: [f64; 2]| match input.grid {
-        Some(g) => g.segment_clear(a, b, input.offing_min_m * k),
-        None => true,
+    let seg_ok = |a: [f64; 2], b: [f64; 2], t_ms: i64| {
+        let chart = match input.grid {
+            Some(g) => g.segment_clear(a, b, input.offing_min_m * k),
+            None => true,
+        };
+        chart && !gate_blocks(input.gates, a, b, t_ms, k)
     };
     let tack_of = |twa: f64| if twa >= 0.0 { TackState::Port } else { TackState::Starboard };
     let pen = |from: TackState, twa: f64| -> i64 {
@@ -422,42 +605,90 @@ fn closing_legs(
         }
     };
 
-    // Straight at it, where the polar allows.
-    let twa_direct = signed_diff_deg(bearing, wind_from);
-    if let Some(v) = input.polar.speed_kt(twa_direct.abs(), tws) {
-        if v > 0.05 && seg_ok(pos, finish_m) {
-            let t = time_ms + pen(tack_now, twa_direct) + (d_nm / v * 3_600_000.0) as i64;
-            consider(vec![ClosingLeg {
-                end_pos: finish_m,
-                heading: bearing,
-                twa_deg: twa_direct,
-                tws_kt: tws,
-                stw_kt: v,
-                tack: tack_of(twa_direct),
-                end_time_ms: t,
-                motoring: false,
-            }]);
+    // Zermelo's quadratic for a fixed speed: (C²−V²)t² − 2(d·C)t + d² = 0,
+    // smallest positive root. `None` when the stream wins outright.
+    let fixed_speed_time = |v_pl: f64| -> Option<f64> {
+        let c2 = c_pl[0] * c_pl[0] + c_pl[1] * c_pl[1];
+        let dc = d_vec[0] * c_pl[0] + d_vec[1] * c_pl[1];
+        let a = c2 - v_pl * v_pl;
+        if a.abs() < 1e-9 {
+            let t = d_plane * d_plane / (2.0 * dc);
+            return (dc > 0.0 && t > 0.0).then_some(t);
+        }
+        let disc = dc * dc - a * d_plane * d_plane;
+        if disc < 0.0 {
+            return None;
+        }
+        let sq = disc.sqrt();
+        [(dc - sq) / a, (dc + sq) / a]
+            .into_iter()
+            .filter(|t| *t > 0.0)
+            .fold(None, |acc: Option<f64>, t| Some(acc.map_or(t, |a| a.min(t))))
+    };
+
+    // Straight at it under sail: heading and speed depend on each other
+    // through the drift, so iterate — 6 rounds is metres.
+    {
+        let mut t_s = None;
+        let mut heading = bearing;
+        let mut stw = 0.0;
+        for _ in 0..6 {
+            let twa = signed_diff_deg(heading, wind_from);
+            let Some(v) = input.polar.speed_kt(twa.abs(), tws) else {
+                t_s = None;
+                break;
+            };
+            stw = v;
+            let Some(t) = fixed_speed_time(kt_to_pl(v)) else {
+                t_s = None;
+                break;
+            };
+            t_s = Some(t);
+            // Steer for where the mark will be relative to the water.
+            let aim = [d_vec[0] - c_pl[0] * t, d_vec[1] - c_pl[1] * t];
+            heading = deg_to_bam(aim[0].atan2(aim[1]).to_degrees());
+        }
+        if let Some(t) = t_s {
+            let twa = signed_diff_deg(heading, wind_from);
+            if stw > 0.05 && seg_ok(pos, finish_m, time_ms) {
+                let end = time_ms + pen(tack_now, twa) + (t * 1000.0) as i64;
+                consider(vec![ClosingLeg {
+                    end_pos: finish_m,
+                    heading,
+                    twa_deg: twa,
+                    tws_kt: tws,
+                    stw_kt: stw,
+                    tack: tack_of(twa),
+                    end_time_ms: end,
+                    motoring: false,
+                }]);
+            }
         }
     }
-    // Motoring closes anything, at motor speed.
+    // Motoring: fixed speed, exact Zermelo.
     if let Some(m) = input.config.motor_speed_kt {
-        if seg_ok(pos, finish_m) {
-            let t = time_ms + (d_nm / m * 3_600_000.0) as i64;
-            consider(vec![ClosingLeg {
-                end_pos: finish_m,
-                heading: bearing,
-                twa_deg: twa_direct,
-                tws_kt: tws,
-                stw_kt: m,
-                tack: tack_now,
-                end_time_ms: t,
-                motoring: true,
-            }]);
+        if let Some(t) = fixed_speed_time(kt_to_pl(m)) {
+            if seg_ok(pos, finish_m, time_ms) {
+                let aim = [d_vec[0] - c_pl[0] * t, d_vec[1] - c_pl[1] * t];
+                let heading = deg_to_bam(aim[0].atan2(aim[1]).to_degrees());
+                consider(vec![ClosingLeg {
+                    end_pos: finish_m,
+                    heading,
+                    twa_deg: signed_diff_deg(heading, wind_from),
+                    tws_kt: tws,
+                    stw_kt: m,
+                    tack: tack_now,
+                    end_time_ms: time_ms + (t * 1000.0) as i64,
+                    motoring: true,
+                }]);
+            }
         }
     }
 
-    // The wedges: mark inside the upwind or downwind cone → two VMG legs.
+    // The wedges, drift folded into the basis: leg times x, y solve
+    // (V·e₊ + C)x + (V·e₋ + C)y = d.
     let vmg = input.polar.vmg_at(tws);
+    let twa_direct = signed_diff_deg(bearing, wind_from);
     for (cone_twa, stw) in [
         (vmg.beat_twa_deg as f64, vmg.beat_stw_kt as f64),
         (vmg.run_twa_deg as f64, vmg.run_stw_kt as f64),
@@ -473,43 +704,40 @@ fn closing_legs(
         if !inside {
             continue;
         }
-        // Solve a·e₊ + b·e₋ = target in the plane. Both orders are tried and
-        // the one whose first leg keeps the current tack is cheaper.
+        let v_pl = kt_to_pl(stw);
         let h_plus = wind_from.wrapping_add(deg_to_bam(cone_twa));
         let h_minus = wind_from.wrapping_add(deg_to_bam(-cone_twa));
         let (rp, rm) = (bam_to_rad(h_plus), bam_to_rad(h_minus));
-        let (ep, em) = ([rp.sin(), rp.cos()], [rm.sin(), rm.cos()]);
-        let target = [finish_m[0] - pos[0], finish_m[1] - pos[1]];
-        let det = ep[0] * em[1] - ep[1] * em[0];
+        let gp = [v_pl * rp.sin() + c_pl[0], v_pl * rp.cos() + c_pl[1]];
+        let gm = [v_pl * rm.sin() + c_pl[0], v_pl * rm.cos() + c_pl[1]];
+        let det = gp[0] * gm[1] - gp[1] * gm[0];
         if det.abs() < 1e-9 {
             continue;
         }
-        let a = (target[0] * em[1] - target[1] * em[0]) / det;
-        let b = (ep[0] * target[1] - ep[1] * target[0]) / det;
-        if a < 0.0 || b < 0.0 {
-            continue; // outside this cone after all
+        let x = (d_vec[0] * gm[1] - d_vec[1] * gm[0]) / det;
+        let y = (gp[0] * d_vec[1] - gp[1] * d_vec[0]) / det;
+        if x < 0.0 || y < 0.0 {
+            continue;
         }
         for first_plus in [true, false] {
-            let (len1, h1, twa1, e1) = if first_plus {
-                (a, h_plus, cone_twa, ep)
+            let (t1, h1, twa1, g1) = if first_plus {
+                (x, h_plus, cone_twa, gp)
             } else {
-                (b, h_minus, -cone_twa, em)
+                (y, h_minus, -cone_twa, gm)
             };
-            let (len2, h2, twa2) = if first_plus {
-                (b, h_minus, -cone_twa)
+            let (t2, h2, twa2) = if first_plus {
+                (y, h_minus, -cone_twa)
             } else {
-                (a, h_plus, cone_twa)
+                (x, h_plus, cone_twa)
             };
-            let mid = [pos[0] + e1[0] * len1, pos[1] + e1[1] * len1];
-            if !seg_ok(pos, mid) || !seg_ok(mid, finish_m) {
-                continue;
-            }
-            let t1_ms = (len1 / (METRES_PER_NM * k) / stw * 3_600_000.0) as i64;
-            let t2_ms = (len2 / (METRES_PER_NM * k) / stw * 3_600_000.0) as i64;
+            let mid = [pos[0] + g1[0] * t1, pos[1] + g1[1] * t1];
             let p1 = pen(tack_now, twa1);
             let p2 = pen(tack_of(twa1), twa2);
-            let mid_t = time_ms + p1 + t1_ms;
-            let end_t = mid_t + p2 + t2_ms;
+            let mid_t = time_ms + p1 + (t1 * 1000.0) as i64;
+            let end_t = mid_t + p2 + (t2 * 1000.0) as i64;
+            if !seg_ok(pos, mid, mid_t) || !seg_ok(mid, finish_m, end_t) {
+                continue;
+            }
             consider(vec![
                 ClosingLeg {
                     end_pos: mid,
@@ -657,6 +885,7 @@ fn extract(
         arrival_ms,
         propagations,
         raw_tack_changes,
+        pruning_fallback: false, // overwritten by solve()
     }
 }
 
@@ -749,6 +978,8 @@ mod tests {
             config: cfg,
             dt_s,
             offing_min_m: 0.0,
+            current: None,
+            gates: &[],
         })
     }
 
@@ -923,6 +1154,124 @@ mod tests {
         );
     }
 
+    /// §9.1 case 4: constant wind + constant current has Zermelo's closed
+    /// form. Under engine at V with a cross-stream C, T = L/√(V²−C²).
+    #[test]
+    fn case_4_constant_current_matches_zermelo() {
+        let l_nm = 10.0;
+        let finish = mark(START, 0.0, l_nm);
+        let mut cfg = config();
+        cfg.motor_speed_kt = Some(5.0);
+        let p = polar();
+        let current = ConstantCurrent { set_deg: 90.0, drift_kt: 2.0 };
+        let r = solve(&IsochroneInput {
+            polar: &p,
+            wind: &ConstantWind { from_deg: 0.0, tws_kt: 0.0 }, // calm: engine only
+            grid: None,
+            start: START,
+            finish,
+            depart_ms: 0,
+            config: &cfg,
+            dt_s: 300,
+            offing_min_m: 0.0,
+            current: Some(&current),
+            gates: &[],
+        })
+        .expect("motors across the stream");
+        let expected_h = l_nm / (5.0f64.powi(2) - 2.0f64.powi(2)).sqrt();
+        let got = hours(&r);
+        assert!(
+            (got - expected_h).abs() / expected_h < 0.01,
+            "Zermelo says {expected_h:.3} h, engine {got:.3} h"
+        );
+        assert!(!r.pruning_fallback, "C/V = 0.4 must not trip the guard");
+    }
+
+    /// §9.1 case 8: current faster than the boat trips the Π₂ guard and the
+    /// engine says so rather than quietly pruning wrong.
+    #[test]
+    fn case_8_overwhelming_current_engages_the_fallback() {
+        let finish = mark(START, 90.0, 8.0);
+        let p = polar();
+        let cfg = config();
+        // 12 kt of stream against a 7.5 kt boat, running WITH us — reachable,
+        // but the reachable set is nothing like star-shaped.
+        let current = ConstantCurrent { set_deg: 90.0, drift_kt: 12.0 };
+        let r = solve(&IsochroneInput {
+            polar: &p,
+            wind: &ConstantWind { from_deg: 0.0, tws_kt: 10.0 },
+            grid: None,
+            start: START,
+            finish,
+            depart_ms: 0,
+            config: &cfg,
+            dt_s: 300,
+            offing_min_m: 0.0,
+            current: Some(&current),
+            gates: &[],
+        })
+        .expect("a following stream can only help");
+        assert!(r.pruning_fallback, "C/V > 1 must engage the fallback");
+        // Carried by the stream, arrival beats still water.
+        let still = run(
+            ConstantWind { from_deg: 0.0, tws_kt: 10.0 },
+            START,
+            finish,
+            &config(),
+            300,
+        )
+        .unwrap();
+        assert!(r.arrival_ms < still.arrival_ms);
+    }
+
+    /// M6's DoD: a tidal gate across the passage delays departure to carry
+    /// fair tide — leaving later arrives earlier.
+    #[test]
+    fn a_tidal_gate_delays_departure_to_carry_fair_tide() {
+        let l_nm = 12.0;
+        let finish = mark(START, 90.0, l_nm);
+        // First attempt at this fixture used a 5 nm gate disc — and the
+        // engine sailed around it, which is correct seamanship and a wrong
+        // test. The gate must BE the sound: wide enough that every path
+        // crosses it.
+        let gate = TidalGate {
+            pos: mark(START, 90.0, l_nm / 2.0),
+            radius_nm: 40.0,
+            // Open only from t=2 h to t=4 h.
+            windows: vec![(2 * 3_600_000, 4 * 3_600_000)],
+        };
+        let p = polar();
+        let cfg = config();
+        let gates = [gate];
+        let input = IsochroneInput {
+            polar: &p,
+            wind: &ConstantWind { from_deg: 0.0, tws_kt: 10.0 },
+            grid: None,
+            start: START,
+            finish,
+            depart_ms: 0,
+            config: &cfg,
+            dt_s: 600,
+            offing_min_m: 0.0,
+            current: None,
+            gates: &gates,
+        };
+        // Departing at once, the boat reaches the shut gate and dies there.
+        assert!(solve(&input).is_err(), "the gate is shut for an immediate start");
+
+        // The scan finds a departure that carries the tide.
+        let departures: Vec<i64> = (0..8).map(|h| h * 1_800_000).collect(); // every 30 min
+        let (depart, route) =
+            best_departure(&input, &departures).expect("some departure works");
+        assert!(
+            depart >= 2 * 3_600_000,
+            "departure must wait for the window, got {} min",
+            depart / 60_000
+        );
+        // And the transit of the gate itself happened inside the window.
+        assert!(route.arrival_ms > 2 * 3_600_000);
+    }
+
     /// §9.1 case 9, the shape of it: a two-sided island between the
     /// endpoints. The engine must find a way round — the second per-sector
     /// slot is what keeps both branches alive.
@@ -960,6 +1309,8 @@ mod tests {
             config: &cfg,
             dt_s: 300,
             offing_min_m: 200.0,
+            current: None,
+            gates: &[],
         })
         .expect("a way round exists");
 

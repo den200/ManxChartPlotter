@@ -124,6 +124,9 @@ pub fn plan(job: &WxJob<'_>, name: &str) -> Result<WxPlanned, WxError> {
         config: job.config,
         dt_s,
         offing_min_m: job.safety.offing_min_nm * crate::geo::METRES_PER_NM,
+        // GRIB current fields are a source addition away; gates await a UI.
+        current: None,
+        gates: &[],
     })
     .map_err(WxError::Engine)?;
 
