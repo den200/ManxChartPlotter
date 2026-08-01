@@ -268,6 +268,13 @@ pub fn window(
                         .desired_width(280.0),
                 );
             });
+            ui.checkbox(&mut weather.use_waves, "Waves (GFS Hs: slows the boat, blocks over the limit)")
+                .on_hover_text(
+                    "Fetches significant wave height alongside the wind. Speed is \
+                     reduced by 1/(1 + 0.03·Hs²) and seas over the configured \
+                     maximum are treated as impassable. If the wave file is not \
+                     yet published the route falls back to wind alone.",
+                );
             if weather.busy {
                 ui.horizontal(|ui| {
                     ui.spinner();

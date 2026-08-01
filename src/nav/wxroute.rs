@@ -15,7 +15,7 @@ use crate::geo::LatLon;
 use crate::render::projection::Projection;
 
 use super::autoroute::{self, ChartSource, SafetyConfig};
-use super::grib::GribForecast;
+use super::grib::{GribForecast, WaveForecast};
 use super::isochrone::{self, IsochroneInput};
 use super::model::{LegPlan, PointOfSail, Route, RouteProvenance, RoutingConfig, Waypoint};
 use super::polar::Polar;
@@ -52,6 +52,9 @@ pub struct WxJob<'a> {
     /// For provenance: what to call the polar in the route's record.
     pub polar_name: &'a str,
     pub forecast: &'a GribForecast,
+    /// Sea state, when the wave fetch succeeded. Waves are a refinement:
+    /// a passage plans without them, never without wind.
+    pub waves: Option<&'a WaveForecast>,
     pub config: &'a RoutingConfig,
     pub safety: &'a SafetyConfig,
 }
@@ -126,6 +129,7 @@ pub fn plan(job: &WxJob<'_>, name: &str) -> Result<WxPlanned, WxError> {
         offing_min_m: job.safety.offing_min_nm * crate::geo::METRES_PER_NM,
         // GRIB current fields are a source addition away; gates await a UI.
         current: None,
+        waves: job.waves.map(|w| w as &dyn isochrone::WaveField),
         gates: &[],
     })
     .map_err(WxError::Engine)?;
@@ -181,7 +185,11 @@ pub fn plan(job: &WxJob<'_>, name: &str) -> Result<WxPlanned, WxError> {
     }
     route.generated = Some(RouteProvenance {
         generated_at: Utc::now(),
-        grib_source: Some(job.forecast.source.label().to_string()),
+        grib_source: Some(if job.waves.is_some() {
+            format!("{} + waves", job.forecast.source.label())
+        } else {
+            job.forecast.source.label().to_string()
+        }),
         grib_run: Some(job.forecast.run),
         polar: job.polar_name.to_string(),
         engine_params: job.config.clone(),
@@ -234,6 +242,7 @@ pub fn plan_from_chart_dir(
     polar_name: &str,
     config: &RoutingConfig,
     safety: &SafetyConfig,
+    use_waves: bool,
     name: &str,
     mut progress: impl FnMut(String),
 ) -> Result<WxPlanned, String> {
@@ -256,6 +265,28 @@ pub fn plan_from_chart_dir(
         &mut progress,
     )
     .map_err(|e| e.to_string())?;
+
+    // Waves are a refinement, so their failure is a warning, not an error:
+    // the wave file for a run sometimes lags the atmosphere by an hour.
+    let mut wave_warning = None;
+    let waves = if use_waves {
+        progress("fetching waves".into());
+        match WaveForecast::fetch(
+            super::grib::GribSource::NoaaGfs025,
+            area,
+            hours,
+            grib_cache,
+            &mut progress,
+        ) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                wave_warning = Some(format!("waves unavailable, routing on wind alone: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     progress("loading charts".into());
     let mut keys = KeyStore::new();
@@ -294,7 +325,7 @@ pub fn plan_from_chart_dir(
         .collect();
 
     progress(format!("routing across {} chart(s)", sources.len()));
-    plan(
+    let mut planned = plan(
         &WxJob {
             sources: &sources,
             start,
@@ -303,12 +334,17 @@ pub fn plan_from_chart_dir(
             polar: &polar,
             polar_name,
             forecast: &forecast,
+            waves: waves.as_ref(),
             config,
             safety,
         },
         name,
     )
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    if let Some(w) = wave_warning {
+        planned.warnings.push(w);
+    }
+    Ok(planned)
 }
 
 fn merc(p: LatLon) -> [f64; 2] {

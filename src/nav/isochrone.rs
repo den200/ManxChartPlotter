@@ -40,6 +40,37 @@ pub trait CurrentField {
     fn max_speed_ms(&self) -> f64;
 }
 
+/// Sea state, where known. `None` is "no data here" — a land-masked wave
+/// cell, or a position outside the fetched box — and honestly means *no
+/// penalty*: near-coast cells the global wave model cannot see are usually
+/// sheltered water, and inventing waves there would punish exactly the
+/// legs that have none.
+pub trait WaveField {
+    /// Significant wave height, metres.
+    fn wave_height_m(&self, pos_merc: [f64; 2], time_ms: i64) -> Option<f64>;
+}
+
+/// The same sea everywhere — the analytic test wave field.
+pub struct ConstantWaves {
+    pub hs_m: f64,
+}
+
+impl WaveField for ConstantWaves {
+    fn wave_height_m(&self, _pos: [f64; 2], _time: i64) -> Option<f64> {
+        Some(self.hs_m)
+    }
+}
+
+/// The §5 wave penalty: a speed factor 1/(1 + c·Hs²), applied to sail and
+/// motor alike (a motor boat pitching into a head sea slows too). Heuristic
+/// by declaration — see [`RoutingConfig::wave_penalty_coef`].
+fn wave_speed_factor(hs_m: Option<f64>, coef: f64) -> f64 {
+    match hs_m {
+        Some(h) if h > 0.0 && coef > 0.0 => 1.0 / (1.0 + coef * h * h),
+        _ => 1.0,
+    }
+}
+
 /// A uniform set and drift — M6's analytic test current, and a usable model
 /// for a strait with a known stream.
 pub struct ConstantCurrent {
@@ -187,6 +218,9 @@ pub struct IsochroneInput<'a> {
     pub offing_min_m: f64,
     /// Water movement, if any.
     pub current: Option<&'a dyn CurrentField>,
+    /// Sea state, if known; the §7.5 wave limit and the §5 speed penalty
+    /// both live off it.
+    pub waves: Option<&'a dyn WaveField>,
     /// Tidal gates the passage must respect.
     pub gates: &'a [TidalGate],
 }
@@ -292,6 +326,13 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             if tws > cfg.max_tws_kt {
                 continue; // §7.5 hard weather limit: do not sail out of here
             }
+            let hs = input
+                .waves
+                .and_then(|w| w.wave_height_m(parent.pos, parent.time_ms));
+            if hs.map(|h| h > cfg.max_wave_m).unwrap_or(false) {
+                continue; // §7.5 again: seas over the limit are a wall
+            }
+            let wave_f = wave_speed_factor(hs, cfg.wave_penalty_coef);
             let current_ms = input
                 .current
                 .map(|c| c.current(parent.pos, parent.time_ms))
@@ -315,7 +356,7 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             if d_plane <= horizon {
                 if let Some(legs) = closing_legs(
                     input, parent.pos, parent.time_ms, parent.tack, finish_m, k,
-                    wind_from, tws, current_ms, tack_pen_ms, gybe_pen_ms,
+                    wind_from, tws, current_ms, wave_f, tack_pen_ms, gybe_pen_ms,
                 ) {
                     let t = legs.last().map(|l| l.end_time_ms).unwrap_or(parent.time_ms);
                     if best_arrival.as_ref().map(|(_, bt, _)| t < *bt).unwrap_or(true) {
@@ -347,7 +388,8 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 let sail_toward = input
                     .polar
                     .speed_kt(signed_diff_deg(bearing_fin, wind_from).abs(), tws)
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    * wave_f;
                 if sail_toward < cfg.motor_threshold_kt {
                     // The whole fan under engine: in a cross-stream the
                     // compensated heading beats aiming at the mark, and only
@@ -364,9 +406,9 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 propagations += 1;
                 let twa_signed = signed_diff_deg(heading, wind_from);
                 let (stw, motoring) = match motor {
-                    Some(m) => (m, true),
+                    Some(m) => (m * wave_f, true),
                     None => match input.polar.speed_kt(twa_signed.abs(), tws) {
-                        Some(s) if s > 0.05 => (s, false),
+                        Some(s) if s > 0.05 => (s * wave_f, false),
                         _ => continue, // no-go or becalmed on this heading
                     },
                 };
@@ -569,6 +611,7 @@ fn closing_legs(
     wind_from: Bam,
     tws: f64,
     current_ms: (f64, f64),
+    wave_f: f64,
     tack_pen_ms: i64,
     gybe_pen_ms: i64,
 ) -> Option<Vec<ClosingLeg>> {
@@ -634,7 +677,7 @@ fn closing_legs(
         let mut stw = 0.0;
         for _ in 0..6 {
             let twa = signed_diff_deg(heading, wind_from);
-            let Some(v) = input.polar.speed_kt(twa.abs(), tws) else {
+            let Some(v) = input.polar.speed_kt(twa.abs(), tws).map(|v| v * wave_f) else {
                 t_s = None;
                 break;
             };
@@ -666,7 +709,7 @@ fn closing_legs(
         }
     }
     // Motoring: fixed speed, exact Zermelo.
-    if let Some(m) = input.config.motor_speed_kt {
+    if let Some(m) = input.config.motor_speed_kt.map(|m| m * wave_f) {
         if let Some(t) = fixed_speed_time(kt_to_pl(m)) {
             if seg_ok(pos, finish_m, time_ms) {
                 let aim = [d_vec[0] - c_pl[0] * t, d_vec[1] - c_pl[1] * t];
@@ -690,8 +733,8 @@ fn closing_legs(
     let vmg = input.polar.vmg_at(tws);
     let twa_direct = signed_diff_deg(bearing, wind_from);
     for (cone_twa, stw) in [
-        (vmg.beat_twa_deg as f64, vmg.beat_stw_kt as f64),
-        (vmg.run_twa_deg as f64, vmg.run_stw_kt as f64),
+        (vmg.beat_twa_deg as f64, vmg.beat_stw_kt as f64 * wave_f),
+        (vmg.run_twa_deg as f64, vmg.run_stw_kt as f64 * wave_f),
     ] {
         if stw <= 0.05 {
             continue;
@@ -978,6 +1021,7 @@ mod tests {
             config: cfg,
             dt_s,
             offing_min_m: 0.0,
+            waves: None,
             current: None,
             gates: &[],
         })
@@ -1174,6 +1218,7 @@ mod tests {
             config: &cfg,
             dt_s: 300,
             offing_min_m: 0.0,
+            waves: None,
             current: Some(&current),
             gates: &[],
         })
@@ -1207,6 +1252,7 @@ mod tests {
             config: &cfg,
             dt_s: 300,
             offing_min_m: 0.0,
+            waves: None,
             current: Some(&current),
             gates: &[],
         })
@@ -1253,6 +1299,7 @@ mod tests {
             config: &cfg,
             dt_s: 600,
             offing_min_m: 0.0,
+            waves: None,
             current: None,
             gates: &gates,
         };
@@ -1309,6 +1356,7 @@ mod tests {
             config: &cfg,
             dt_s: 300,
             offing_min_m: 200.0,
+            waves: None,
             current: None,
             gates: &[],
         })
@@ -1349,5 +1397,71 @@ mod tests {
         )
         .expect("half a mile on a beam reach");
         assert!(hours(&r) < 0.2, "{} h", hours(&r));
+    }
+
+    /// The wave penalty is a pure speed factor, so on case 2's beam reach a
+    /// constant 2 m sea must stretch the passage by exactly 1 + c·Hs².
+    #[test]
+    fn waves_stretch_a_beam_reach_by_the_declared_factor() {
+        let l_nm = 20.0;
+        let finish = mark(START, 90.0, l_nm);
+        let p = polar();
+        let cfg = config();
+        let waves = ConstantWaves { hs_m: 2.0 };
+        let r = solve(&IsochroneInput {
+            polar: &p,
+            wind: &ConstantWind { from_deg: 0.0, tws_kt: 10.0 },
+            grid: None,
+            start: START,
+            finish,
+            depart_ms: 0,
+            config: &cfg,
+            dt_s: 600,
+            offing_min_m: 0.0,
+            waves: Some(&waves),
+            current: None,
+            gates: &[],
+        })
+        .expect("a rough beam reach still sails");
+        let factor = 1.0 + cfg.wave_penalty_coef * 4.0;
+        let expected_h = l_nm / 6.0 * factor; // polar(90°, 10 kt) = 6.0
+        let got = hours(&r);
+        assert!(
+            (got - expected_h).abs() / expected_h < 0.005,
+            "expected {expected_h:.3} h, got {got:.3} h"
+        );
+    }
+
+    /// §7.5: seas over the limit are a wall, exactly like wind over the
+    /// limit — everywhere over means no route at all.
+    #[test]
+    fn waves_over_the_limit_block_the_passage() {
+        let finish = mark(START, 90.0, 10.0);
+        let p = polar();
+        let cfg = config();
+        let waves = ConstantWaves { hs_m: cfg.max_wave_m + 0.5 };
+        let r = solve(&IsochroneInput {
+            polar: &p,
+            wind: &ConstantWind { from_deg: 0.0, tws_kt: 10.0 },
+            grid: None,
+            start: START,
+            finish,
+            depart_ms: 0,
+            config: &cfg,
+            dt_s: 600,
+            offing_min_m: 0.0,
+            waves: Some(&waves),
+            current: None,
+            gates: &[],
+        });
+        assert!(matches!(r, Err(IsoError::Unreachable)));
+    }
+
+    #[test]
+    fn the_wave_factor_is_neutral_without_data_or_coefficient() {
+        assert_eq!(wave_speed_factor(None, 0.03), 1.0);
+        assert_eq!(wave_speed_factor(Some(2.0), 0.0), 1.0);
+        let f = wave_speed_factor(Some(2.0), 0.03);
+        assert!((f - 1.0 / 1.12).abs() < 1e-12);
     }
 }

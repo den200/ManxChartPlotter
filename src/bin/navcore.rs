@@ -1155,6 +1155,20 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
             std::process::exit(1);
         }
     };
+    println!("Fetching waves…");
+    let waves = match grib::WaveForecast::fetch(
+        grib::GribSource::NoaaGfs025,
+        area,
+        hours,
+        &cache,
+        |msg| println!("  {msg}"),
+    ) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            println!("  waves unavailable, routing on wind alone: {e}");
+            None
+        }
+    };
 
     // Charts, same loading as --auto-route.
     let dir = PathBuf::from(dir_path);
@@ -1221,6 +1235,7 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
             polar: &polar,
             polar_name: "built-in cruiser",
             forecast: &forecast,
+            waves: waves.as_ref(),
             config: &config,
             safety: &safety,
         },

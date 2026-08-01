@@ -160,6 +160,12 @@ pub struct RoutingConfig {
     pub reroute_margin: f64,
     pub max_tws_kt: f64,
     pub max_wave_m: f64,
+    /// Waves slow a boat; the polar does not know it. The heuristic —
+    /// stw × 1/(1 + c·Hs²) — is the standard quadratic drag guess, not
+    /// physics: at the default c = 0.03 a 2 m sea costs ~11 % of boat speed
+    /// and a 4 m sea ~32 %. Owners who know their boat's real behaviour tune
+    /// c; zero turns the penalty off.
+    pub wave_penalty_coef: f64,
     pub offing_min_nm: f64,
     pub simplify_tolerance_nm: f64,
     /// Engine speed, if the boat will motor when sailing crawls. `None`
@@ -187,6 +193,7 @@ impl Default for RoutingConfig {
             reroute_margin: 0.02,
             max_tws_kt: 35.0,
             max_wave_m: 4.0,
+            wave_penalty_coef: 0.03,
             offing_min_nm: 0.2,
             simplify_tolerance_nm: 0.1,
             motor_speed_kt: None,

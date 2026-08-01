@@ -333,6 +333,202 @@ impl WindField for GribForecast {
     }
 }
 
+/// The NOMADS filter URL for one step of the GFS wave model. Same runs, same
+/// 0.25° grid, one field: HTSGW, the significant height of the combined sea.
+fn wave_filter_url(source: GribSource, run: DateTime<Utc>, fh: u32, area: GeoBox) -> String {
+    match source {
+        GribSource::NoaaGfs025 => format!(
+            "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfswave.pl?\
+             dir=%2Fgfs.{date}%2F{cyc:02}%2Fwave%2Fgridded\
+             &file=gfswave.t{cyc:02}z.global.0p25.f{fh:03}.grib2\
+             &var_HTSGW=on\
+             &subregion=&toplat={top}&bottomlat={bottom}&leftlon={left}&rightlon={right}",
+            date = run.format("%Y%m%d"),
+            cyc = run.hour(),
+            fh = fh,
+            top = area.north.ceil(),
+            bottom = area.south.floor(),
+            left = area.west.floor(),
+            right = area.east.ceil(),
+        ),
+    }
+}
+
+/// Sea state: a stack of (time, Hs-grid), the wave sibling of
+/// [`GribForecast`]. Land-masked cells decode as NaN and stay NaN — the
+/// sampler renormalizes around them, and a point with no wave data at all
+/// answers `None`, which the engine reads as "no penalty" on purpose.
+pub struct WaveForecast {
+    pub run: DateTime<Utc>,
+    times: Vec<i64>,
+    lats: Vec<f64>,
+    lons: Vec<f64>,
+    hs: Vec<Vec<f32>>,
+}
+
+impl WaveForecast {
+    /// Fetch waves for the same box and span as the wind. Blocking; run it
+    /// on a worker, and treat failure as a warning — a passage plans without
+    /// waves, never without wind.
+    pub fn fetch(
+        source: GribSource,
+        area: GeoBox,
+        hours_ahead: u32,
+        cache_dir: &std::path::Path,
+        mut progress: impl FnMut(String),
+    ) -> Result<Self, GribError> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(60)))
+            .build()
+            .into();
+        std::fs::create_dir_all(cache_dir).map_err(|e| GribError::Download(e.to_string()))?;
+
+        let now = Utc::now();
+        let mut run = None;
+        for candidate in candidate_runs(source, now) {
+            match fetch_wave_step(&agent, source, candidate, 0, area, cache_dir) {
+                Ok(bytes) => {
+                    run = Some((candidate, bytes));
+                    break;
+                }
+                Err(e) => {
+                    log::info!("grib: wave run {} unavailable: {e}", candidate.format("%d/%HZ"))
+                }
+            }
+        }
+        let Some((run, first)) = run else {
+            return Err(GribError::NoRunAvailable);
+        };
+
+        let mut forecast = Self {
+            run,
+            times: Vec::new(),
+            lats: Vec::new(),
+            lons: Vec::new(),
+            hs: Vec::new(),
+        };
+        forecast.absorb(&first)?;
+
+        let step = source.step_hours();
+        let mut fh = step;
+        while fh <= hours_ahead {
+            progress(format!("waves +{fh:03}h"));
+            let bytes = fetch_wave_step(&agent, source, run, fh, area, cache_dir)?;
+            forecast.absorb(&bytes)?;
+            fh += step;
+        }
+        log::info!(
+            "grib: waves run {} — {} steps, {}×{} grid",
+            run.format("%Y-%m-%d %HZ"),
+            forecast.times.len(),
+            forecast.lats.len(),
+            forecast.lons.len()
+        );
+        Ok(forecast)
+    }
+
+    fn absorb(&mut self, bytes: &[u8]) -> Result<(), GribError> {
+        for message in gribberish::message::read_messages(bytes) {
+            // Skip what fails to identify rather than dying on it: the wave
+            // file may carry parameters gribberish has no table entry for.
+            let Ok(var) = message.variable_abbrev() else { continue };
+            if var != "HTSGW" {
+                continue;
+            }
+            let when = message
+                .forecast_date()
+                .map_err(|e| GribError::Decode(e.to_string()))?
+                .timestamp_millis();
+            if self.lats.is_empty() {
+                let (lats, lons) = message
+                    .latlng_projector()
+                    .map_err(|e| GribError::Decode(e.to_string()))?
+                    .lat_lng();
+                self.lats = lats;
+                self.lons = lons.into_iter().map(normalize_lon).collect();
+            }
+            let data: Vec<f32> = message
+                .data()
+                .map_err(|e| GribError::Decode(e.to_string()))?
+                .into_iter()
+                .map(|x| x as f32)
+                .collect();
+            if data.len() != self.lats.len() * self.lons.len() {
+                return Err(GribError::Decode(format!(
+                    "wave grid mismatch: {} values for {}×{}",
+                    data.len(),
+                    self.lats.len(),
+                    self.lons.len()
+                )));
+            }
+            self.times.push(when);
+            self.hs.push(data);
+            return Ok(());
+        }
+        Err(GribError::Decode("wave file lacks HTSGW".into()))
+    }
+
+    #[cfg(test)]
+    fn synthetic(times: Vec<i64>, lats: Vec<f64>, lons: Vec<f64>, hs: Vec<Vec<f32>>) -> Self {
+        Self { run: Utc::now(), times, lats, lons, hs }
+    }
+
+    /// Hs at a place and time, or `None` where the model has no sea (land
+    /// mask, or outside the box on a coastal fetch). Space is bilinear with
+    /// NaN corners dropped and the weights renormalized; time is linear,
+    /// falling back to whichever bracketing step has data.
+    fn hs_at(&self, lat: f64, lon: f64, time_ms: i64) -> Option<f64> {
+        if self.times.is_empty() {
+            return None;
+        }
+        let lon = normalize_lon(lon);
+        let (i0, i1, fy) = bracket_axis(&self.lats, lat);
+        let (j0, j1, fx) = bracket_axis(&self.lons, lon);
+        let (t0, t1, ft) = bracket_axis_i64(&self.times, time_ms);
+
+        let sample = |grid: &Vec<f32>| -> Option<f64> {
+            let w = self.lons.len();
+            let corners = [
+                (grid[i0 * w + j0] as f64, (1.0 - fy) * (1.0 - fx)),
+                (grid[i0 * w + j1] as f64, (1.0 - fy) * fx),
+                (grid[i1 * w + j0] as f64, fy * (1.0 - fx)),
+                (grid[i1 * w + j1] as f64, fy * fx),
+            ];
+            let (mut acc, mut wsum) = (0.0, 0.0);
+            for (v, wt) in corners {
+                if v.is_finite() {
+                    acc += v * wt;
+                    wsum += wt;
+                }
+            }
+            (wsum > 1e-9).then(|| acc / wsum)
+        };
+        match (sample(&self.hs[t0]), sample(&self.hs[t1])) {
+            (Some(a), Some(b)) => Some(a + (b - a) * ft),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+impl super::isochrone::WaveField for WaveForecast {
+    fn wave_height_m(&self, pos_merc: [f64; 2], time_ms: i64) -> Option<f64> {
+        let (lat, lon) = Projection::to_wgs84(pos_merc[0], pos_merc[1]);
+        self.hs_at(lat, lon, time_ms)
+    }
+}
+
+fn fetch_wave_step(
+    agent: &ureq::Agent,
+    source: GribSource,
+    run: DateTime<Utc>,
+    fh: u32,
+    area: GeoBox,
+    cache_dir: &std::path::Path,
+) -> Result<Vec<u8>, GribError> {
+    let path = cache_dir.join(cache_key("gfswave", run, fh, area));
+    fetch_cached(agent, &wave_filter_url(source, run, fh, area), &path)
+}
+
 /// One step's bytes, from cache or the wire. A cached file is keyed by run,
 /// step and area, so a new run or a different passage never collides.
 fn fetch_step(
@@ -343,8 +539,13 @@ fn fetch_step(
     area: GeoBox,
     cache_dir: &std::path::Path,
 ) -> Result<Vec<u8>, GribError> {
-    let key = format!(
-        "gfs-{}-{:02}z-f{:03}-{}-{}-{}-{}.grib2",
+    let path = cache_dir.join(cache_key("gfs", run, fh, area));
+    fetch_cached(agent, &filter_url(source, run, fh, area), &path)
+}
+
+fn cache_key(prefix: &str, run: DateTime<Utc>, fh: u32, area: GeoBox) -> String {
+    format!(
+        "{prefix}-{}-{:02}z-f{:03}-{}-{}-{}-{}.grib2",
         run.format("%Y%m%d"),
         run.hour(),
         fh,
@@ -352,16 +553,21 @@ fn fetch_step(
         area.north.ceil(),
         area.west.floor(),
         area.east.ceil()
-    );
-    let path = cache_dir.join(key);
-    if let Ok(bytes) = std::fs::read(&path) {
+    )
+}
+
+fn fetch_cached(
+    agent: &ureq::Agent,
+    url: &str,
+    path: &std::path::Path,
+) -> Result<Vec<u8>, GribError> {
+    if let Ok(bytes) = std::fs::read(path) {
         if !bytes.is_empty() {
             return Ok(bytes);
         }
     }
-    let url = filter_url(source, run, fh, area);
     let mut response = agent
-        .get(&url)
+        .get(url)
         .call()
         .map_err(|e| GribError::Download(e.to_string()))?;
     let mut bytes = Vec::new();
@@ -381,7 +587,7 @@ fn fetch_step(
     // otherwise poison every later fetch of this step.
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        let _ = std::fs::rename(&tmp, path);
     }
     Ok(bytes)
 }
@@ -540,6 +746,58 @@ mod tests {
         assert!(url.contains("var_UGRD=on") && url.contains("var_VGRD=on"));
         assert!(url.contains("lev_10_m_above_ground=on"));
         assert!(url.contains("toplat=58") && url.contains("bottomlat=54"));
+    }
+
+    #[test]
+    fn the_wave_url_asks_the_wave_filter_for_htsgw() {
+        let run = chrono::DateTime::parse_from_rfc3339("2026-08-01T06:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let url = wave_filter_url(
+            GribSource::NoaaGfs025,
+            run,
+            9,
+            GeoBox { south: 54.2, north: 57.8, west: 9.1, east: 13.9 },
+        );
+        assert!(url.contains("filter_gfswave.pl"));
+        assert!(url.contains("gfswave.t06z.global.0p25.f009.grib2"));
+        assert!(url.contains("var_HTSGW=on"));
+        assert!(url.contains("%2Fwave%2Fgridded"));
+    }
+
+    /// The wave grid's land mask arrives as NaN; a sample next to the coast
+    /// must renormalize around it, and a sample wholly on land must answer
+    /// `None` — not zero, and never NaN.
+    #[test]
+    fn wave_sampling_renormalizes_around_the_land_mask() {
+        let f = WaveForecast::synthetic(
+            vec![0, 3_600_000],
+            vec![57.0, 56.0],
+            vec![11.0, 12.0],
+            // t0: NW corner is land; the three sea corners all read 2 m.
+            // t1: everything is land.
+            vec![
+                vec![f32::NAN, 2.0, 2.0, 2.0],
+                vec![f32::NAN; 4],
+            ],
+        );
+        // Dead centre at t0: the NaN corner drops out, the rest agree on 2.
+        assert!((f.hs_at(56.5, 11.5, 0).unwrap() - 2.0).abs() < 1e-6);
+        // Halfway in time: t1 has no data, so t0's answer stands alone.
+        assert!((f.hs_at(56.5, 11.5, 1_800_000).unwrap() - 2.0).abs() < 1e-6);
+        // On the land corner itself at t1: no data at all.
+        assert!(f.hs_at(57.0, 11.0, 3_600_000).is_none());
+    }
+
+    #[test]
+    fn wave_time_interpolation_is_linear() {
+        let f = WaveForecast::synthetic(
+            vec![0, 3_600_000],
+            vec![57.0, 56.0],
+            vec![11.0, 12.0],
+            vec![vec![1.0; 4], vec![3.0; 4]],
+        );
+        assert!((f.hs_at(56.5, 11.5, 1_800_000).unwrap() - 2.0).abs() < 1e-6);
     }
 
     #[test]

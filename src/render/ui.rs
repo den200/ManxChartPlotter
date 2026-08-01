@@ -70,6 +70,9 @@ pub struct WeatherView {
     pub hours: u32,
     /// A polar file of the user's own; empty means the built-in cruiser.
     pub polar_path: String,
+    /// Fetch GFS waves and let sea state slow (and, over the limit, block)
+    /// the boat.
+    pub use_waves: bool,
     // Live state below.
     #[serde(skip)]
     pub busy: bool,
@@ -82,6 +85,7 @@ impl Default for WeatherView {
         Self {
             hours: 48,
             polar_path: String::new(),
+            use_waves: true,
             busy: false,
             status: String::new(),
         }
