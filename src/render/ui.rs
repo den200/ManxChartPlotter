@@ -58,6 +58,32 @@ pub enum UiAction {
     RoutePublish { route_id: uuid::Uuid },
     /// Read the server's route resources into the store.
     RoutesFetchSignalK,
+    /// Start a new, empty route and open it for editing.
+    RouteCreate,
+    /// Delete a route and its file.
+    RouteDelete { route_id: uuid::Uuid },
+    /// Give a route a new name.
+    RouteRename { route_id: uuid::Uuid, name: String },
+    /// Open a route for editing — while one is open, a chart tap appends a
+    /// waypoint to it. `None` closes the editor.
+    RouteEdit { route_id: Option<uuid::Uuid> },
+    /// Drop the waypoint at this position from the route. The mark itself
+    /// survives: a plan changing its mind does not unmake a place.
+    RouteWaypointDelete { route_id: uuid::Uuid, index: usize },
+    /// Move a waypoint one place earlier (`-1`) or later (`+1`).
+    RouteWaypointMove {
+        route_id: uuid::Uuid,
+        index: usize,
+        delta: i32,
+    },
+    /// Rename the waypoint at this position.
+    RouteWaypointRename {
+        route_id: uuid::Uuid,
+        index: usize,
+        name: String,
+    },
+    /// Sail the route the other way round.
+    RouteReverse { route_id: uuid::Uuid },
     /// Plan a passage between two typed positions, straight from the menu
     /// bar. `from` empty means "the boat, wherever she is"; `sail` picks the
     /// weather router, otherwise the shortest safe (motor) route.
@@ -195,6 +221,9 @@ pub struct RoutesView {
     /// This frame's guidance, for the strip.
     pub guidance: Option<crate::nav::Guidance>,
     pub status: String,
+    /// The route open in the editor. While one is open its waypoints are
+    /// listed and a chart tap appends to it.
+    pub editing: Option<uuid::Uuid>,
 }
 
 /// A quarter of a nautical mile, and twelve minutes: tight enough not to cry

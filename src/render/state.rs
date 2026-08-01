@@ -2143,13 +2143,10 @@ impl RenderState {
                     self.activate_route(route_id);
                 }
                 crate::render::ui::UiAction::RouteDeactivate => {
-                    self.route_follow = None;
+                    self.deactivate_route();
                     if let Some(ref mut ui) = self.ui {
-                        ui.routes.active = None;
-                        ui.routes.guidance = None;
                         ui.routes.status = "Following stopped".into();
                     }
-                    self.refresh_route_rows();
                 }
                 crate::render::ui::UiAction::RoutePublish { route_id } => {
                     self.ensure_route_store();
@@ -2202,6 +2199,132 @@ impl RenderState {
                 }
                 crate::render::ui::UiAction::PlanRoute { from, to, sail } => {
                     self.plan_passage(&from, &to, sail);
+                }
+                crate::render::ui::UiAction::RouteCreate => {
+                    self.ensure_route_store();
+                    let route = crate::nav::Route::new(unique_route_name(
+                        self.route_store.as_ref(),
+                    ));
+                    let id = route.id;
+                    let saved = self
+                        .route_store
+                        .as_mut()
+                        .map(|s| s.upsert_route(route))
+                        .transpose();
+                    match saved {
+                        Ok(_) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.routes.editing = Some(id);
+                                ui.routes.visible.insert(id);
+                                ui.routes.status =
+                                    "tap the chart to place the first waypoint".into();
+                            }
+                            self.refresh_route_rows();
+                            self.needs_redraw = true;
+                        }
+                        Err(e) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.routes.status = format!("could not create the route: {e}");
+                            }
+                        }
+                    }
+                }
+                crate::render::ui::UiAction::RouteDelete { route_id } => {
+                    self.ensure_route_store();
+                    // Following a route that is about to stop existing would
+                    // leave the strip guiding towards nothing.
+                    if self.ui.as_ref().and_then(|u| u.routes.active) == Some(route_id) {
+                        self.deactivate_route();
+                    }
+                    let result = self
+                        .route_store
+                        .as_mut()
+                        .map(|s| s.delete_route(route_id))
+                        .transpose();
+                    if let Some(ref mut ui) = self.ui {
+                        match result {
+                            Ok(_) => {
+                                ui.routes.status = "route deleted".into();
+                                ui.routes.visible.remove(&route_id);
+                                if ui.routes.editing == Some(route_id) {
+                                    ui.routes.editing = None;
+                                }
+                            }
+                            Err(e) => ui.routes.status = format!("could not delete: {e}"),
+                        }
+                    }
+                    self.refresh_route_rows();
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::RouteRename { route_id, name } => {
+                    self.edit_route(route_id, |route| {
+                        route.name = name;
+                        true
+                    });
+                }
+                crate::render::ui::UiAction::RouteEdit { route_id } => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.editing = route_id;
+                        ui.routes.status = match route_id {
+                            Some(_) => "tap the chart to add a waypoint".into(),
+                            None => String::new(),
+                        };
+                        if let Some(id) = route_id {
+                            ui.routes.visible.insert(id);
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::RouteWaypointDelete { route_id, index } => {
+                    self.edit_route(route_id, |route| {
+                        if index >= route.waypoints.len() {
+                            return false;
+                        }
+                        route.waypoints.remove(index);
+                        true
+                    });
+                }
+                crate::render::ui::UiAction::RouteWaypointMove {
+                    route_id,
+                    index,
+                    delta,
+                } => {
+                    self.edit_route(route_id, |route| {
+                        let Some(to) = index.checked_add_signed(delta as isize) else {
+                            return false;
+                        };
+                        if index >= route.waypoints.len() || to >= route.waypoints.len() {
+                            return false;
+                        }
+                        route.waypoints.swap(index, to);
+                        true
+                    });
+                }
+                crate::render::ui::UiAction::RouteWaypointRename {
+                    route_id,
+                    index,
+                    name,
+                } => {
+                    self.ensure_route_store();
+                    let wp_id = self
+                        .route_store
+                        .as_ref()
+                        .and_then(|s| s.route(route_id))
+                        .and_then(|r| r.waypoints.get(index).copied());
+                    if let (Some(store), Some(wp_id)) = (self.route_store.as_mut(), wp_id) {
+                        if let Some(wp) = store.waypoints.get_mut(wp_id) {
+                            wp.name = name;
+                        }
+                    }
+                    // The name lives in the route's own GPX, so the route is
+                    // what has to be rewritten.
+                    self.edit_route(route_id, |_| true);
+                }
+                crate::render::ui::UiAction::RouteReverse { route_id } => {
+                    self.edit_route(route_id, |route| {
+                        route.waypoints.reverse();
+                        true
+                    });
                 }
                 crate::render::ui::UiAction::BoatSearch { query, country } => {
                     self.spawn_orc_search(query, country);
@@ -3140,6 +3263,33 @@ impl RenderState {
                 &self.window,
                 self.config.format,
             ));
+            // `NAVCORE_ROUTE_NEW="lat,lon;lat,lon;…"` builds a route by the
+            // same path a tap takes, so the editor can be captured without
+            // a pointer.
+            if let Ok(spec) = std::env::var("NAVCORE_ROUTE_NEW") {
+                self.ensure_route_store();
+                let route = crate::nav::Route::new(unique_route_name(self.route_store.as_ref()));
+                let id = route.id;
+                if let Some(store) = self.route_store.as_mut() {
+                    let _ = store.upsert_route(route);
+                }
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.open = true;
+                    ui.routes.editing = Some(id);
+                    ui.routes.visible.insert(id);
+                }
+                for point in spec.split(';').filter(|s| !s.trim().is_empty()) {
+                    match crate::geo::parse_latlon(point) {
+                        Some(p) => {
+                            let (x, y) =
+                                crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+                            self.route_edit_append(x, y);
+                        }
+                        None => log::warn!("NAVCORE_ROUTE_NEW: cannot read '{point}'"),
+                    }
+                }
+                self.refresh_route_rows();
+            }
             // `NAVCORE_BOAT="query[;country]"` opens the boat window and
             // fires the polar search, for captures. "1" just opens it.
             if let Ok(spec) = std::env::var("NAVCORE_BOAT") {
@@ -3274,9 +3424,13 @@ impl RenderState {
     /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
     /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
     pub fn pick_at_world(&mut self, x: f32, y: f32) {
-        // An armed planner pin claims the tap: the user said "the next tap
-        // is a place, not a question".
+        // An armed planner pin claims the tap first — it is a deliberate
+        // one-shot — then an open route editor, which is a standing mode.
+        // Only if neither wants it does the tap ask "what is that?".
         if self.plan_pick_fill(x as f64, y as f64) {
+            return;
+        }
+        if self.route_edit_append(x as f64, y as f64) {
             return;
         }
         // A fingertip is about 9 mm across; a mouse pointer is exact. Sizing
@@ -3960,6 +4114,7 @@ impl RenderState {
     fn refresh_route_rows(&mut self) {
         let Some(ref mut ui) = self.ui else { return };
         let active = ui.routes.active;
+        let editing = ui.routes.editing;
         ui.routes.rows = self
             .route_store
             .as_ref()
@@ -3973,6 +4128,34 @@ impl RenderState {
                         distance_nm: r.total_distance_nm(),
                         active: active == Some(r.id),
                         visible: ui.routes.visible.contains(&r.id) || active == Some(r.id),
+                        // Only the route under the editor pays for its list.
+                        waypoints: if editing == Some(r.id) {
+                            r.waypoints
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, wid)| {
+                                    let wp = store.waypoints.get(*wid)?;
+                                    Some(crate::render::ui_routes::RouteWaypointRow {
+                                        name: wp.name.clone(),
+                                        lat: wp.position.lat,
+                                        lon: wp.position.lon,
+                                        leg: i.checked_sub(1).and_then(|p| {
+                                            let prev = store.waypoints.get(r.waypoints[p])?;
+                                            let (m, brg) = crate::geo::range_bearing(
+                                                prev.position,
+                                                wp.position,
+                                            );
+                                            Some((
+                                                m / crate::geo::METRES_PER_NM,
+                                                brg.to_degrees().rem_euclid(360.0),
+                                            ))
+                                        }),
+                                    })
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
                         provenance: r.generated.as_ref().map(|g| {
                             format!(
                                 "wx: {} run {} · {}",
@@ -3996,6 +4179,75 @@ impl RenderState {
             self.route_net_rx = Some(rx);
         }
         self.route_net_tx.as_ref().unwrap().clone()
+    }
+
+    /// Stop following, and forget the guidance the strip was drawing.
+    fn deactivate_route(&mut self) {
+        self.route_follow = None;
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.active = None;
+            ui.routes.guidance = None;
+        }
+        self.refresh_route_rows();
+        self.needs_redraw = true;
+    }
+
+    /// Apply an edit to a stored route and write it back.
+    ///
+    /// Every manual edit goes through here so that saving, re-deriving the
+    /// legs (which `upsert_route` does), refreshing the table and reporting
+    /// a failure all happen in exactly one place. The closure sees the route
+    /// by value; returning `false` abandons the edit untouched.
+    fn edit_route(&mut self, id: uuid::Uuid, edit: impl FnOnce(&mut crate::nav::Route) -> bool) {
+        self.ensure_route_store();
+        let Some(store) = self.route_store.as_mut() else { return };
+        let Some(mut route) = store.route(id).cloned() else { return };
+        if !edit(&mut route) {
+            return;
+        }
+        let result = store.upsert_route(route);
+        if let Err(e) = result {
+            if let Some(ref mut ui) = self.ui {
+                ui.routes.status = format!("could not save the route: {e}");
+            }
+            log::warn!("route edit not saved: {e}");
+            return;
+        }
+        // A route the user is editing is a route they want to watch.
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.visible.insert(id);
+        }
+        self.refresh_route_rows();
+        self.update_route_following();
+        self.needs_redraw = true;
+    }
+
+    /// Append a waypoint at a tapped position to the route being edited.
+    /// Answers whether the tap was claimed.
+    fn route_edit_append(&mut self, x: f64, y: f64) -> bool {
+        let Some(id) = self.ui.as_ref().and_then(|u| u.routes.editing) else {
+            return false;
+        };
+        let (lat, lon) = crate::render::projection::Projection::to_wgs84(x, y);
+        self.ensure_route_store();
+        let Some(store) = self.route_store.as_mut() else { return false };
+        if store.route(id).is_none() {
+            // The route went away under the editor; drop the mode rather
+            // than swallowing taps forever.
+            if let Some(ref mut ui) = self.ui {
+                ui.routes.editing = None;
+            }
+            return false;
+        }
+        let n = store.route(id).map(|r| r.waypoints.len()).unwrap_or(0);
+        let wp = crate::nav::model::Waypoint::new(format!("WP {}", n + 1), lat, lon);
+        let wp_id = wp.id;
+        store.waypoints.insert(wp);
+        self.edit_route(id, |route| {
+            route.waypoints.push(wp_id);
+            true
+        });
+        true
     }
 
     /// Search ORC certificates on a worker thread; results drain back into
@@ -4664,6 +4916,19 @@ impl Drop for RenderState {
 /// cheap enough to run per candidate tile during the quadtree walk. Testing the
 /// footprint's *bounding box* instead would pull in the two large wedges either
 /// side of the trapezium, which at a 45 degree tilt is most of the tiles.
+/// A name for a new route that no existing route already answers to.
+/// "Route 1", then "Route 2" — a plotter full of identical "New route"s is
+/// a plotter you cannot navigate by name.
+fn unique_route_name(store: Option<&crate::nav::RouteStore>) -> String {
+    let Some(store) = store else { return "Route 1".into() };
+    let taken: std::collections::HashSet<&str> =
+        store.routes().map(|r| r.name.as_str()).collect();
+    (1..)
+        .map(|n| format!("Route {n}"))
+        .find(|name| !taken.contains(name.as_str()))
+        .unwrap_or_else(|| "Route".into())
+}
+
 fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::Vec2; 4]) -> bool {
     let rect = [
         glam::Vec2::new(b.min_x as f32, b.min_y as f32),

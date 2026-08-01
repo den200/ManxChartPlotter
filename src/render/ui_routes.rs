@@ -127,6 +127,16 @@ fn circle_points(centre: egui::Pos2, r: f32) -> Vec<egui::Pos2> {
         .collect()
 }
 
+/// One waypoint of a route, as the editor lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteWaypointRow {
+    pub name: String,
+    pub lat: f64,
+    pub lon: f64,
+    /// Distance and bearing from the previous waypoint; `None` for the first.
+    pub leg: Option<(f64, f64)>,
+}
+
 /// One row of the routes table, prepared by the renderer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteRow {
@@ -138,6 +148,112 @@ pub struct RouteRow {
     pub visible: bool,
     /// "GFS run 2026-08-01 06Z · built-in cruiser" for generated routes.
     pub provenance: Option<String>,
+    /// The route's waypoints in order — listed while it is being edited.
+    pub waypoints: Vec<RouteWaypointRow>,
+}
+
+/// The waypoint list of the route being edited: rename, reorder, remove,
+/// and the standing invitation to tap the chart for one more.
+fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction>) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("tap the chart to add a waypoint")
+                .small()
+                .color(APLRT),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .small_button("Delete route")
+                .on_hover_text("Remove this route. Its waypoints stay in the store.")
+                .clicked()
+            {
+                actions.push(UiAction::RouteDelete { route_id: row.id });
+            }
+            if ui
+                .add_enabled(
+                    row.waypoints.len() > 1,
+                    egui::Button::new("Reverse").small(),
+                )
+                .on_hover_text("Sail it the other way round")
+                .clicked()
+            {
+                actions.push(UiAction::RouteReverse { route_id: row.id });
+            }
+        });
+    });
+    if row.waypoints.is_empty() {
+        ui.label(
+            RichText::new("No waypoints yet — the first tap places the start.")
+                .small()
+                .weak(),
+        );
+        return;
+    }
+    let last = row.waypoints.len() - 1;
+    for (i, wp) in row.waypoints.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!("{:>2}.", i + 1)).small().weak());
+            let mut name = wp.name.clone();
+            if ui
+                .add(egui::TextEdit::singleline(&mut name).desired_width(110.0))
+                .changed()
+            {
+                actions.push(UiAction::RouteWaypointRename {
+                    route_id: row.id,
+                    index: i,
+                    name,
+                });
+            }
+            ui.label(
+                RichText::new(format!("{:.4}, {:.4}", wp.lat, wp.lon))
+                    .small()
+                    .weak(),
+            );
+            if let Some((nm, brg)) = wp.leg {
+                ui.label(
+                    RichText::new(format!("{nm:.2} nm {brg:03.0}°"))
+                        .small()
+                        .weak(),
+                );
+            }
+            // Words, not arrows: egui's default font has no ↑ ↓ ✕ and draws
+            // them as empty boxes. The same trap as "→" in a route name.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Del")
+                    .on_hover_text("Remove this waypoint from the route")
+                    .clicked()
+                {
+                    actions.push(UiAction::RouteWaypointDelete {
+                        route_id: row.id,
+                        index: i,
+                    });
+                }
+                if ui
+                    .add_enabled(i < last, egui::Button::new("Dn").small())
+                    .on_hover_text("Later in the route")
+                    .clicked()
+                {
+                    actions.push(UiAction::RouteWaypointMove {
+                        route_id: row.id,
+                        index: i,
+                        delta: 1,
+                    });
+                }
+                if ui
+                    .add_enabled(i > 0, egui::Button::new("Up").small())
+                    .on_hover_text("Earlier in the route")
+                    .clicked()
+                {
+                    actions.push(UiAction::RouteWaypointMove {
+                        route_id: row.id,
+                        index: i,
+                        delta: -1,
+                    });
+                }
+            });
+        });
+    }
 }
 
 pub fn window(
@@ -149,7 +265,9 @@ pub fn window(
     let mut open = view.open;
     egui::Window::new("Routes")
         .open(&mut open)
-        .default_size([460.0, 320.0])
+        // Wide enough that a row of buttons and the editor's waypoint lines
+        // fit without the labels being squeezed into wraps.
+        .default_size([620.0, 380.0])
         .constrain(true)
         .collapsible(false)
         .show(ctx, |ui| {
@@ -169,12 +287,22 @@ pub fn window(
                     {
                         actions.push(UiAction::RoutesFetchSignalK);
                     }
+                    if ui
+                        .button("New route")
+                        .on_hover_text("Start an empty route and place its waypoints by tapping the chart")
+                        .clicked()
+                    {
+                        actions.push(UiAction::RouteCreate);
+                    }
                 });
             });
             ui.separator();
 
             if view.rows.is_empty() {
-                ui.label("No routes yet. Import a GPX into the routes folder, or fetch from Signal K.");
+                ui.label(
+                    "No routes yet. Press New route and tap the chart, import a GPX into the \
+                     routes folder, or fetch from Signal K.",
+                );
             }
 
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
@@ -192,23 +320,56 @@ pub fn window(
                                 view.visible.remove(&row.id);
                             }
                         }
-                        let name = if row.active {
-                            RichText::new(&row.name).strong()
+                        let editing = view.editing == Some(row.id);
+                        if editing {
+                            let mut name = row.name.clone();
+                            let edit = ui.add(
+                                egui::TextEdit::singleline(&mut name).desired_width(150.0),
+                            );
+                            if edit.changed() {
+                                actions.push(UiAction::RouteRename {
+                                    route_id: row.id,
+                                    name,
+                                });
+                            }
                         } else {
-                            RichText::new(&row.name)
-                        };
-                        ui.label(name);
-                        ui.label(
-                            RichText::new(format!(
-                                "{} legs · {:.1} nm",
-                                row.legs, row.distance_nm
-                            ))
-                            .small()
-                            .weak(),
+                            let name = if row.active {
+                                RichText::new(&row.name).strong()
+                            } else {
+                                RichText::new(&row.name)
+                            };
+                            ui.label(name);
+                        }
+                        // Extend, not wrap: a wrapped summary breaks into
+                        // fragments that interleave with the buttons of the
+                        // right-to-left group beside it.
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!(
+                                    "{} legs · {:.1} nm",
+                                    row.legs, row.distance_nm
+                                ))
+                                .small()
+                                .weak(),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend),
                         );
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                if editing {
+                                    if ui.button("Done").clicked() {
+                                        actions.push(UiAction::RouteEdit { route_id: None });
+                                    }
+                                } else if ui
+                                    .button("Edit")
+                                    .on_hover_text("Show the waypoints and add more by tapping the chart")
+                                    .clicked()
+                                {
+                                    actions.push(UiAction::RouteEdit {
+                                        route_id: Some(row.id),
+                                    });
+                                }
                                 if row.active {
                                     if ui.button("Deactivate").clicked() {
                                         actions.push(UiAction::RouteDeactivate);
@@ -238,6 +399,9 @@ pub fn window(
                     });
                     if let Some(p) = &row.provenance {
                         ui.label(RichText::new(p).small().weak());
+                    }
+                    if view.editing == Some(row.id) {
+                        waypoint_editor(ui, &row, actions);
                     }
                     ui.separator();
                 }
