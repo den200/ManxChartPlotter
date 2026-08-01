@@ -66,6 +66,10 @@ pub enum UiAction {
         to: String,
         sail: bool,
     },
+    /// Search ORC certificates for a class or boat name.
+    BoatSearch { query: String, country: String },
+    /// Install the polar (and specs) of a search hit by index.
+    BoatUsePolar { index: usize },
     /// Weather-route between a route's endpoints, on the current forecast.
     WeatherRoute { route_id: uuid::Uuid },
 }
@@ -98,6 +102,53 @@ impl Default for WeatherView {
             polar_path: String::new(),
             use_waves: true,
             use_currents: true,
+            busy: false,
+            status: String::new(),
+        }
+    }
+}
+
+/// The boat: who she is and what she needs under her and above her.
+/// Persisted — a boat does not change between sessions. The draft and air
+/// draft feed the routers' safety envelope; the polar found here feeds
+/// their speed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct BoatView {
+    pub name: String,
+    pub boat_type: String,
+    pub loa_m: f64,
+    pub beam_m: f64,
+    pub draft_m: f64,
+    pub air_draft_m: f64,
+    // Live state below.
+    #[serde(skip)]
+    pub open: bool,
+    #[serde(skip)]
+    pub search: String,
+    #[serde(skip)]
+    pub country: String,
+    #[serde(skip)]
+    pub results: Vec<crate::nav::orc::OrcHit>,
+    #[serde(skip)]
+    pub busy: bool,
+    #[serde(skip)]
+    pub status: String,
+}
+
+impl Default for BoatView {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            boat_type: String::new(),
+            loa_m: 0.0,
+            beam_m: 0.0,
+            draft_m: 0.0,
+            air_draft_m: 0.0,
+            open: false,
+            search: String::new(),
+            country: "DEN".into(),
+            results: Vec::new(),
             busy: false,
             status: String::new(),
         }
@@ -300,6 +351,8 @@ pub struct Ui {
     pub weather: WeatherView,
     /// The menu bar's passage planner.
     pub plan: PlanView,
+    /// The boat's specs and polar.
+    pub boat: BoatView,
 }
 
 impl Ui {
@@ -334,6 +387,7 @@ impl Ui {
             routes: RoutesView::default(),
             weather: crate::render::state::RenderState::load_weather_settings(),
             plan: PlanView::default(),
+            boat: crate::render::state::RenderState::load_boat_settings(),
         }
     }
 
@@ -406,9 +460,10 @@ impl Ui {
         let routes = &mut self.routes;
         let weather = &mut self.weather;
         let plan = &mut self.plan;
+        let boat = &mut self.boat;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
-                ctx, &state, shop, instruments, routes, weather, plan, fleet, actions,
+                ctx, &state, shop, instruments, routes, weather, plan, boat, fleet, actions,
             );
         });
         self.state

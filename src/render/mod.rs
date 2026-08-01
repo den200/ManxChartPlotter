@@ -55,6 +55,7 @@ pub mod ui;
 mod ui_instruments;
 pub mod mariner;
 pub mod ui_ais;
+pub mod ui_boat;
 pub mod ui_ownship;
 mod ui_panels;
 pub mod ui_routes;

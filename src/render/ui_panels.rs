@@ -19,10 +19,11 @@ pub fn build(
     routes: &mut crate::render::ui::RoutesView,
     weather: &mut crate::render::ui::WeatherView,
     plan: &mut crate::render::ui::PlanView,
+    boat: &mut crate::render::ui::BoatView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
-    menu_bar(ctx, shop, instruments, plan, weather, actions);
+    menu_bar(ctx, shop, instruments, plan, boat, weather, actions);
     // Declared before the instrument bar claims its edge, so the strip sits
     // directly above the bar rather than under it.
     if let Some(ref g) = routes.guidance {
@@ -59,6 +60,9 @@ pub fn build(
     }
     if routes.open {
         super::ui_routes::window(ctx, routes, weather, actions);
+    }
+    if boat.open {
+        super::ui_boat::window(ctx, boat, weather, actions);
     }
 }
 
@@ -109,6 +113,7 @@ fn menu_bar(
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
     plan: &mut crate::render::ui::PlanView,
+    boat: &mut crate::render::ui::BoatView,
     weather: &crate::render::ui::WeatherView,
     actions: &mut Vec<UiAction>,
 ) {
@@ -122,6 +127,9 @@ fn menu_bar(
             }
             if ui.button("Routes").clicked() {
                 actions.push(UiAction::RoutesOpen);
+            }
+            if ui.button("Boat").clicked() {
+                boat.open = !boat.open;
             }
             ui.separator();
 

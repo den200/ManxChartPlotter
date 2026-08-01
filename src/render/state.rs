@@ -274,6 +274,10 @@ pub(crate) enum RouteNetEvent {
     },
     WxFailed(String),
     WxProgress(String),
+    /// An ORC certificate search finished.
+    OrcResults(Vec<crate::nav::orc::OrcHit>),
+    OrcFailed(String),
+    OrcProgress(String),
 }
 
 pub struct RenderState {
@@ -2199,6 +2203,13 @@ impl RenderState {
                 crate::render::ui::UiAction::PlanRoute { from, to, sail } => {
                     self.plan_passage(&from, &to, sail);
                 }
+                crate::render::ui::UiAction::BoatSearch { query, country } => {
+                    self.spawn_orc_search(query, country);
+                }
+                crate::render::ui::UiAction::BoatUsePolar { index } => {
+                    self.adopt_orc_polar(index);
+                    self.save_settings();
+                }
                 crate::render::ui::UiAction::RoutesFetchSignalK => {
                     self.ensure_route_store();
                     match self
@@ -3129,6 +3140,24 @@ impl RenderState {
                 &self.window,
                 self.config.format,
             ));
+            // `NAVCORE_BOAT="query[;country]"` opens the boat window and
+            // fires the polar search, for captures. "1" just opens it.
+            if let Ok(spec) = std::env::var("NAVCORE_BOAT") {
+                if let Some(ref mut ui) = self.ui {
+                    ui.boat.open = true;
+                }
+                if spec != "1" {
+                    let (query, country) = match spec.split_once(';') {
+                        Some((q, c)) => (q.to_string(), c.to_string()),
+                        None => (spec.clone(), "DEN".to_string()),
+                    };
+                    if let Some(ref mut ui) = self.ui {
+                        ui.boat.search = query.clone();
+                        ui.boat.country = country.clone();
+                    }
+                    self.spawn_orc_search(query, country);
+                }
+            }
             // `NAVCORE_PLAN_PICK=from|to` arms a planner pin at startup, so
             // the tap-to-fill path can be driven by NAVCORE_PICK below.
             if let Ok(which) = std::env::var("NAVCORE_PLAN_PICK") {
@@ -3337,10 +3366,12 @@ impl RenderState {
         struct Persisted<'a> {
             instruments: &'a crate::render::ui::InstrumentView,
             weather: &'a crate::render::ui::WeatherView,
+            boat: &'a crate::render::ui::BoatView,
         }
         let Ok(json) = serde_json::to_string_pretty(&Persisted {
             instruments: &ui.instruments,
             weather: &ui.weather,
+            boat: &ui.boat,
         }) else {
             return;
         };
@@ -3390,6 +3421,23 @@ impl RenderState {
         }
         serde_json::from_str::<Persisted>(&text)
             .map(|p| p.weather)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn load_boat_settings() -> crate::render::ui::BoatView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            boat: crate::render::ui::BoatView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.boat)
             .unwrap_or_default()
     }
 
@@ -3950,6 +3998,81 @@ impl RenderState {
         self.route_net_tx.as_ref().unwrap().clone()
     }
 
+    /// Search ORC certificates on a worker thread; results drain back into
+    /// the boat window.
+    fn spawn_orc_search(&mut self, query: String, country: String) {
+        if let Some(ref mut ui) = self.ui {
+            ui.boat.busy = true;
+            ui.boat.status = "searching…".into();
+        }
+        let tx = self.route_net_sender();
+        std::thread::spawn(move || {
+            let cache = dirs::config_dir()
+                .map(|d| d.join("navcore").join("orc"))
+                .unwrap_or_else(|| "orc-cache".into());
+            let progress_tx = tx.clone();
+            let result = crate::nav::orc::search(&country, &query, &cache, move |m| {
+                let _ = progress_tx.send(RouteNetEvent::OrcProgress(m));
+            });
+            let _ = tx.send(match result {
+                Ok(hits) => RouteNetEvent::OrcResults(hits),
+                Err(e) => RouteNetEvent::OrcFailed(e),
+            });
+        });
+    }
+
+    /// Install a search hit: write its polar next to the settings, point
+    /// the weather router at it, and let the certificate fill in whichever
+    /// specs the user has not typed — the certificate knows the class, the
+    /// user knows their boat, and a typed number always wins.
+    fn adopt_orc_polar(&mut self, index: usize) {
+        let Some(ref mut ui) = self.ui else { return };
+        let Some(hit) = ui.boat.results.get(index).cloned() else { return };
+        let dir = dirs::config_dir()
+            .map(|d| d.join("navcore").join("polars"))
+            .unwrap_or_else(|| "polars".into());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            ui.boat.status = format!("could not create {}: {e}", dir.display());
+            return;
+        }
+        let slug = crate::nav::orc::slug(&hit.class);
+        let path = dir.join(format!("{slug}.pol"));
+        if let Err(e) = std::fs::write(&path, &hit.pol) {
+            ui.boat.status = format!("could not write the polar: {e}");
+            return;
+        }
+        ui.weather.polar_path = path.display().to_string();
+        if ui.boat.boat_type.trim().is_empty() {
+            ui.boat.boat_type = hit.class.clone();
+        }
+        if ui.boat.loa_m == 0.0 {
+            ui.boat.loa_m = hit.loa_m;
+        }
+        if ui.boat.beam_m == 0.0 {
+            ui.boat.beam_m = hit.beam_m;
+        }
+        if ui.boat.draft_m == 0.0 {
+            ui.boat.draft_m = hit.draft_m;
+        }
+        ui.boat.status = format!("polar installed: {} ({})", hit.class, path.display());
+        log::info!("orc: installed polar for {} at {}", hit.class, path.display());
+    }
+
+    /// The routers' safety envelope, from the boat's own numbers where the
+    /// user has entered them; the cautious defaults where not.
+    fn safety_from_boat(&self) -> crate::nav::autoroute::SafetyConfig {
+        let mut s = crate::nav::autoroute::SafetyConfig::default();
+        if let Some(ref ui) = self.ui {
+            if ui.boat.draft_m > 0.0 {
+                s.draft_m = ui.boat.draft_m;
+            }
+            if ui.boat.air_draft_m > 0.0 {
+                s.air_draft_m = ui.boat.air_draft_m;
+            }
+        }
+        s
+    }
+
     /// The menu bar's two fields, resolved and dispatched: an empty start
     /// means the boat, both positions must parse, and the verb picks the
     /// engine. Every refusal lands in the status line the bar shows.
@@ -4016,6 +4139,7 @@ impl RenderState {
             ui.weather.busy = true;
             ui.weather.status = "starting…".into();
         }
+        let safety = self.safety_from_boat();
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let cache = dirs::config_dir()
@@ -4045,7 +4169,7 @@ impl RenderState {
                 &polar_text,
                 &polar_name,
                 &crate::nav::RoutingConfig::default(),
-                &crate::nav::autoroute::SafetyConfig::default(),
+                &safety,
                 use_waves,
                 use_currents,
                 &name,
@@ -4083,9 +4207,9 @@ impl RenderState {
             ui.weather.busy = true;
             ui.weather.status = "planning…".into();
         }
+        let safety = self.safety_from_boat();
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
-            let safety = crate::nav::autoroute::SafetyConfig::default();
             let result = crate::nav::wxroute::with_chart_sources(&dir, a, b, |sources| {
                 crate::nav::autoroute::plan(sources, a, b, &safety)
             });
@@ -4131,6 +4255,28 @@ impl RenderState {
                 RouteNetEvent::WxProgress(msg) => {
                     if let Some(ref mut ui) = self.ui {
                         ui.weather.status = msg;
+                    }
+                }
+                RouteNetEvent::OrcProgress(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.boat.status = msg;
+                    }
+                }
+                RouteNetEvent::OrcFailed(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.boat.busy = false;
+                        ui.boat.status = msg;
+                    }
+                }
+                RouteNetEvent::OrcResults(hits) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.boat.busy = false;
+                        ui.boat.status = if hits.is_empty() {
+                            "no certificates match — try fewer letters or another country".into()
+                        } else {
+                            format!("{} boat(s) found", hits.len())
+                        };
+                        ui.boat.results = hits;
                     }
                 }
                 RouteNetEvent::WxFailed(msg) => {
@@ -4371,10 +4517,13 @@ impl RenderState {
             && self.previous_visible_tiles.is_empty()
     }
 
-    /// Is a routing worker (weather or motor plan) still at it? The capture
-    /// harness holds the shot — and the exit — for this.
+    /// Is a worker (weather plan, motor plan, polar search) still at it?
+    /// The capture harness holds the shot — and the exit — for this.
     pub fn routing_busy(&self) -> bool {
-        self.ui.as_ref().map(|u| u.weather.busy).unwrap_or(false)
+        self.ui
+            .as_ref()
+            .map(|u| u.weather.busy || u.boat.busy)
+            .unwrap_or(false)
     }
 
     /// Mark that a redraw is needed (called on camera move, etc.)
