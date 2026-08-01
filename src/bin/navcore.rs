@@ -1971,7 +1971,14 @@ impl ApplicationHandler for App {
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(120);
-                    if self.frame_count >= warmup && size_ready && state.pending_tiles_empty() {
+                    // A routing worker still planning is the same kind of
+                    // unsettled as an undrained tile queue: the capture
+                    // would race it, and exiting would kill it mid-plan.
+                    if self.frame_count >= warmup
+                        && size_ready
+                        && state.pending_tiles_empty()
+                        && !state.routing_busy()
+                    {
                         state.request_capture(path);
                         self.shot_requested = true;
                     }

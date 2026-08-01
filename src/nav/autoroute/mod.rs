@@ -186,6 +186,16 @@ pub fn plan(
         waypoints.push(wp);
     }
 
+    // Derive the legs before handing the route out: a Planned with empty
+    // legs is a route that reads as zero miles long.
+    {
+        let mut set = super::model::WaypointSet::default();
+        for wp in &waypoints {
+            set.insert(wp.clone());
+        }
+        route.recompute_legs(&set);
+    }
+
     log::info!(
         "auto-route: {} waypoints over {:.1} nm in {} ms",
         points.len(),

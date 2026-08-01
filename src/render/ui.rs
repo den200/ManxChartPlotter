@@ -58,6 +58,14 @@ pub enum UiAction {
     RoutePublish { route_id: uuid::Uuid },
     /// Read the server's route resources into the store.
     RoutesFetchSignalK,
+    /// Plan a passage between two typed positions, straight from the menu
+    /// bar. `from` empty means "the boat, wherever she is"; `sail` picks the
+    /// weather router, otherwise the shortest safe (motor) route.
+    PlanRoute {
+        from: String,
+        to: String,
+        sail: bool,
+    },
     /// Weather-route between a route's endpoints, on the current forecast.
     WeatherRoute { route_id: uuid::Uuid },
 }
@@ -94,6 +102,16 @@ impl Default for WeatherView {
             status: String::new(),
         }
     }
+}
+
+/// The passage-planning fields in the menu bar. Runtime only: half-typed
+/// coordinates are not worth persisting.
+#[derive(Default)]
+pub struct PlanView {
+    /// Departure, "lat, lon". Empty means the boat's own position.
+    pub from: String,
+    /// Destination, "lat, lon".
+    pub to: String,
 }
 
 /// The routes window and the state of following.
@@ -260,6 +278,8 @@ pub struct Ui {
     pub routes: RoutesView,
     /// Weather-routing preferences.
     pub weather: WeatherView,
+    /// The menu bar's passage planner.
+    pub plan: PlanView,
 }
 
 impl Ui {
@@ -293,6 +313,7 @@ impl Ui {
             shop: ShopView::default(),
             routes: RoutesView::default(),
             weather: crate::render::state::RenderState::load_weather_settings(),
+            plan: PlanView::default(),
         }
     }
 
@@ -364,8 +385,11 @@ impl Ui {
         let instruments = &mut self.instruments;
         let routes = &mut self.routes;
         let weather = &mut self.weather;
+        let plan = &mut self.plan;
         let output = self.ctx.run(input, |ctx| {
-            super::ui_panels::build(ctx, &state, shop, instruments, routes, weather, fleet, actions);
+            super::ui_panels::build(
+                ctx, &state, shop, instruments, routes, weather, plan, fleet, actions,
+            );
         });
         self.state
             .handle_platform_output(window, output.platform_output);

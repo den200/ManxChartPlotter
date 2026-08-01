@@ -256,13 +256,6 @@ pub fn plan_from_chart_dir(
     name: &str,
     mut progress: impl FnMut(String),
 ) -> Result<WxPlanned, String> {
-    use crate::cache::CachedDecryptor;
-    use crate::decrypt::{ChartDecryptor, KeyStore};
-    use crate::senc::ChartCatalog;
-    use crate::tiles::builder::TileBuilder;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
     let polar = Polar::parse(polar_text).map_err(|e| e.to_string())?;
 
     progress(format!("fetching {}", super::grib::GribSource::NoaaGfs025.label()));
@@ -313,6 +306,55 @@ pub fn plan_from_chart_dir(
     };
 
     progress("loading charts".into());
+    let mut planned = with_chart_sources(chart_dir, start, finish, |sources| {
+        progress(format!("routing across {} chart(s)", sources.len()));
+        plan(
+            &WxJob {
+                sources,
+                start,
+                finish,
+                depart: Utc::now(),
+                polar: &polar,
+                polar_name,
+                forecast: &forecast,
+                waves: waves.as_ref(),
+                currents: currents.as_ref(),
+                config,
+                safety,
+            },
+            name,
+        )
+    })?
+    .map_err(|e| e.to_string())?;
+    if let Some(w) = wave_warning {
+        planned.warnings.push(w);
+    }
+    if let Some(w) = current_warning {
+        planned.warnings.push(w);
+    }
+    Ok(planned)
+}
+
+/// Load every chart touching the passage box and hand the sources to `f`.
+///
+/// A callback rather than a return value because the sources borrow the
+/// catalog, the keys and the decryptor: the whole chain has to outlive the
+/// use, and the closure scope is the honest way to say so. Shared by the
+/// weather router and the plain (motor) router so both plan on exactly the
+/// same charts.
+pub fn with_chart_sources<T>(
+    chart_dir: &std::path::Path,
+    start: LatLon,
+    finish: LatLon,
+    f: impl FnOnce(&[ChartSource<'_>]) -> T,
+) -> Result<T, String> {
+    use crate::cache::CachedDecryptor;
+    use crate::decrypt::{ChartDecryptor, KeyStore};
+    use crate::senc::ChartCatalog;
+    use crate::tiles::builder::TileBuilder;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
     let mut keys = KeyStore::new();
     let _ = keys.load_keylists_in_dir(chart_dir);
     let base = ChartDecryptor::new("license").map_err(|e| e.to_string())?;
@@ -340,39 +382,14 @@ pub fn plan_from_chart_dir(
     }) {
         match builder.load_chart(info) {
             Ok(chart) => loaded.push((chart, info)),
-            Err(e) => log::warn!("wx: skipping {}: {e}", info.name),
+            Err(e) => log::warn!("route: skipping {}: {e}", info.name),
         }
     }
     let sources: Vec<ChartSource> = loaded
         .iter()
         .map(|(data, info)| ChartSource { data, info })
         .collect();
-
-    progress(format!("routing across {} chart(s)", sources.len()));
-    let mut planned = plan(
-        &WxJob {
-            sources: &sources,
-            start,
-            finish,
-            depart: Utc::now(),
-            polar: &polar,
-            polar_name,
-            forecast: &forecast,
-            waves: waves.as_ref(),
-            currents: currents.as_ref(),
-            config,
-            safety,
-        },
-        name,
-    )
-    .map_err(|e| e.to_string())?;
-    if let Some(w) = wave_warning {
-        planned.warnings.push(w);
-    }
-    if let Some(w) = current_warning {
-        planned.warnings.push(w);
-    }
-    Ok(planned)
+    Ok(f(&sources))
 }
 
 fn merc(p: LatLon) -> [f64; 2] {

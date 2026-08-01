@@ -10,6 +10,7 @@ use crate::shop::protocol::choose_download;
 use crate::pick::PickedObject;
 use crate::senc::FeatureType;
 
+#[allow(clippy::too_many_arguments)]
 pub fn build(
     ctx: &Context,
     state: &UiState<'_>,
@@ -17,10 +18,11 @@ pub fn build(
     instruments: &mut crate::render::ui::InstrumentView,
     routes: &mut crate::render::ui::RoutesView,
     weather: &mut crate::render::ui::WeatherView,
+    plan: &mut crate::render::ui::PlanView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
-    menu_bar(ctx, shop, instruments, actions);
+    menu_bar(ctx, shop, instruments, plan, weather, actions);
     // Declared before the instrument bar claims its edge, so the strip sits
     // directly above the bar rather than under it.
     if let Some(ref g) = routes.guidance {
@@ -61,10 +63,17 @@ pub fn build(
 
 /// A thin strip along the top. Deliberately thin: the chart is the instrument,
 /// and every row of pixels the interface takes is a row of sea it does not show.
+///
+/// The passage planner lives here because it is the question a plotter
+/// exists to answer: where from, where to, sail or motor. Two fields and
+/// two verbs — everything else (forecast, polar, waves, currents) is
+/// arranged in the Routes window and simply applies.
 fn menu_bar(
     ctx: &Context,
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
+    plan: &mut crate::render::ui::PlanView,
+    weather: &crate::render::ui::WeatherView,
     actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -79,11 +88,52 @@ fn menu_bar(
                 actions.push(UiAction::RoutesOpen);
             }
             ui.separator();
-            ui.label(
-                RichText::new("tap the chart to identify an object")
-                    .small()
-                    .weak(),
+
+            ui.label(RichText::new("from").weak());
+            ui.add(
+                egui::TextEdit::singleline(&mut plan.from)
+                    .hint_text("boat position")
+                    .desired_width(120.0),
             );
+            ui.label(RichText::new("to").weak());
+            let to_edit = ui.add(
+                egui::TextEdit::singleline(&mut plan.to)
+                    .hint_text("lat, lon")
+                    .desired_width(120.0),
+            );
+            // Enter in the destination field is the promise the layout makes:
+            // type where you are going, press enter, sail.
+            let entered = to_edit.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let go = |sail: bool| UiAction::PlanRoute {
+                from: plan.from.clone(),
+                to: plan.to.clone(),
+                sail,
+            };
+            if (ui.button("Sail").clicked() || entered) && !weather.busy {
+                actions.push(go(true));
+            }
+            if ui
+                .button("Motor")
+                .on_hover_text("Shortest safe route, no weather")
+                .clicked()
+                && !weather.busy
+            {
+                actions.push(go(false));
+            }
+            ui.separator();
+            if weather.busy {
+                ui.spinner();
+                ui.label(RichText::new(&weather.status).small());
+            } else if !weather.status.is_empty() {
+                ui.label(RichText::new(&weather.status).small().weak());
+            } else {
+                ui.label(
+                    RichText::new("tap the chart to identify an object")
+                        .small()
+                        .weak(),
+                );
+            }
         });
     });
 }

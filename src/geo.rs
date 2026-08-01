@@ -58,6 +58,20 @@ pub fn advance(from: LatLon, bearing: f64, distance_m: f64) -> LatLon {
 /// One nautical mile, by definition.
 pub const METRES_PER_NM: f64 = 1852.0;
 
+/// Read a position a user typed: "lat, lon" in decimal degrees, the form
+/// every phone map hands out. Anything else — one number, three, letters,
+/// out-of-range values — is `None`, never a guess.
+pub fn parse_latlon(s: &str) -> Option<LatLon> {
+    let parts: Vec<f64> = s
+        .split(',')
+        .map(str::trim)
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let [lat, lon] = parts[..] else { return None };
+    (lat.abs() <= 90.0 && lon.abs() <= 180.0).then(|| LatLon::new(lat, lon))
+}
+
 pub fn to_nm(metres: f64) -> f64 {
     metres / METRES_PER_NM
 }
@@ -236,6 +250,18 @@ mod tests {
             "it should close from two miles"
         );
         assert!(!c.past);
+    }
+
+    #[test]
+    fn typed_positions_parse_or_refuse() {
+        let p = parse_latlon("56.41, 10.98").expect("plain decimal degrees");
+        assert!((p.lat - 56.41).abs() < 1e-9 && (p.lon - 10.98).abs() < 1e-9);
+        assert!(parse_latlon(" -33.9,151.2 ").is_some(), "southern hemisphere");
+        assert!(parse_latlon("56.41").is_none(), "one number is not a place");
+        assert!(parse_latlon("56.41,10.98,3").is_none());
+        assert!(parse_latlon("91,0").is_none(), "off the planet");
+        assert!(parse_latlon("56°24'N 10°58'E").is_none(), "DMS is not parsed, not misparsed");
+        assert!(parse_latlon("").is_none());
     }
 
     #[test]

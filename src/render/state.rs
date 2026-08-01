@@ -354,6 +354,8 @@ pub struct RenderState {
     /// Where chart sets live — the directory navcore was pointed at, which is
     /// also where a downloaded set is unpacked so it sits beside the others.
     chart_root: Option<std::path::PathBuf>,
+    /// The NAVCORE_PLAN capture hook has run (it must fire exactly once).
+    env_plan_fired: bool,
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
@@ -1023,6 +1025,7 @@ impl RenderState {
             mariner_count: 0,
             mariner_symbols: crate::render::mariner::MarinerSymbols::resolve(),
             chart_root: None,
+            env_plan_fired: false,
             pick_anchor: None,
             pick_objects: Vec::new(),
             pick_pending: None,
@@ -1464,6 +1467,31 @@ impl RenderState {
     /// Remember where chart sets live, so a download lands beside them.
     pub fn set_chart_root(&mut self, root: std::path::PathBuf) {
         self.chart_root = Some(root);
+        self.maybe_env_plan();
+    }
+
+    /// `NAVCORE_PLAN="from;to[;motor]"` types the passage planner's fields
+    /// and presses the button, so the whole flow can be captured without a
+    /// keyboard. An empty `from` means the boat. Called from both init_ui
+    /// and set_chart_root because the plan needs the pair of them and their
+    /// order is an accident of startup; fires once.
+    fn maybe_env_plan(&mut self) {
+        if self.env_plan_fired || self.ui.is_none() || self.chart_root.is_none() {
+            return;
+        }
+        self.env_plan_fired = true;
+        let Ok(spec) = std::env::var("NAVCORE_PLAN") else { return };
+        let parts: Vec<String> = spec.split(';').map(str::to_string).collect();
+        if parts.len() >= 2 {
+            let sail = parts.get(2).map(|m| m != "motor").unwrap_or(true);
+            if let Some(ref mut ui) = self.ui {
+                ui.plan.from = parts[0].clone();
+                ui.plan.to = parts[1].clone();
+            }
+            self.plan_passage(&parts[0], &parts[1], sail);
+        } else {
+            log::warn!("NAVCORE_PLAN must be 'from;to[;motor]'; ignoring '{spec}'");
+        }
     }
 
     pub fn load_catalog(
@@ -2144,95 +2172,23 @@ impl RenderState {
                 }
                 crate::render::ui::UiAction::WeatherRoute { route_id } => {
                     self.ensure_route_store();
-                    self.save_settings();
                     let endpoints = self.route_store.as_ref().and_then(|s| {
                         let r = s.route(route_id)?;
                         let a = s.waypoints.get(*r.waypoints.first()?)?.position;
                         let b = s.waypoints.get(*r.waypoints.last()?)?.position;
                         Some((r.name.clone(), a, b))
                     });
-                    let chart_dir = self.chart_root.clone();
-                    let (hours, polar_path, use_waves, use_currents) = self
-                        .ui
-                        .as_ref()
-                        .map(|u| {
-                            (
-                                u.weather.hours,
-                                u.weather.polar_path.clone(),
-                                u.weather.use_waves,
-                                u.weather.use_currents,
-                            )
-                        })
-                        .unwrap_or((48, String::new(), true, true));
-                    match (endpoints, chart_dir) {
-                        (Some((name, a, b)), Some(dir)) => {
-                            if let Some(ref mut ui) = self.ui {
-                                ui.weather.busy = true;
-                                ui.weather.status = "starting…".into();
-                            }
-                            let tx = self.route_net_sender();
-                            std::thread::spawn(move || {
-                                let cache = dirs::config_dir()
-                                    .map(|d| d.join("navcore").join("grib"))
-                                    .unwrap_or_else(|| "grib-cache".into());
-                                let (polar_text, polar_name) = if polar_path.trim().is_empty() {
-                                    (crate::nav::wxroute::DEFAULT_POLAR.to_string(),
-                                     "built-in cruiser".to_string())
-                                } else {
-                                    match std::fs::read_to_string(polar_path.trim()) {
-                                        Ok(t) => (t, polar_path.trim().to_string()),
-                                        Err(e) => {
-                                            let _ = tx.send(RouteNetEvent::WxFailed(format!(
-                                                "polar unreadable: {e}"
-                                            )));
-                                            return;
-                                        }
-                                    }
-                                };
-                                let progress_tx = tx.clone();
-                                let result = crate::nav::wxroute::plan_from_chart_dir(
-                                    &dir,
-                                    a,
-                                    b,
-                                    hours,
-                                    &cache,
-                                    &polar_text,
-                                    &polar_name,
-                                    &crate::nav::RoutingConfig::default(),
-                                    &crate::nav::autoroute::SafetyConfig::default(),
-                                    use_waves,
-                                    use_currents,
-                                    &format!("{name} (wx)"),
-                                    move |msg| {
-                                        let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
-                                    },
-                                );
-                                let _ = tx.send(match result {
-                                    Ok(p) => RouteNetEvent::WxPlanned {
-                                        summary: format!(
-                                            "{}: arrival {} ({} warnings)",
-                                            p.route.name,
-                                            p.arrival.format("%d %b %H:%M UTC"),
-                                            p.warnings.len()
-                                        ),
-                                        route: p.route,
-                                        waypoints: p.waypoints,
-                                    },
-                                    Err(e) => RouteNetEvent::WxFailed(e),
-                                });
-                            });
-                        }
-                        (None, _) => {
+                    match endpoints {
+                        Some((name, a, b)) => self.spawn_wx_plan(a, b, format!("{name} (wx)")),
+                        None => {
                             if let Some(ref mut ui) = self.ui {
                                 ui.weather.status = "that route has no endpoints".into();
                             }
                         }
-                        (_, None) => {
-                            if let Some(ref mut ui) = self.ui {
-                                ui.weather.status = "no chart directory loaded".into();
-                            }
-                        }
                     }
+                }
+                crate::render::ui::UiAction::PlanRoute { from, to, sail } => {
+                    self.plan_passage(&from, &to, sail);
                 }
                 crate::render::ui::UiAction::RoutesFetchSignalK => {
                     self.ensure_route_store();
@@ -3209,6 +3165,7 @@ impl RenderState {
                     }
                 }
             }
+            self.maybe_env_plan();
             // Open the stream to the server this plotter was last using. A
             // chart plotter that has to be told to reconnect every time the
             // boat's power cycles is not a chart plotter.
@@ -3934,6 +3891,167 @@ impl RenderState {
         self.route_net_tx.as_ref().unwrap().clone()
     }
 
+    /// The menu bar's two fields, resolved and dispatched: an empty start
+    /// means the boat, both positions must parse, and the verb picks the
+    /// engine. Every refusal lands in the status line the bar shows.
+    fn plan_passage(&mut self, from: &str, to: &str, sail: bool) {
+        let start = if from.trim().is_empty() {
+            self.fleet
+                .own
+                .position()
+                .map(|(lat, lon)| crate::geo::LatLon::new(lat, lon))
+        } else {
+            crate::geo::parse_latlon(from)
+        };
+        let finish = crate::geo::parse_latlon(to);
+        let status = |s: &mut Self, msg: &str| {
+            if let Some(ref mut ui) = s.ui {
+                ui.weather.status = msg.into();
+            }
+        };
+        match (start, finish) {
+            (Some(a), Some(b)) => {
+                let name = format!(
+                    "{} {:.3},{:.3} to {:.3},{:.3}",
+                    if sail { "Sail" } else { "Motor" },
+                    a.lat, a.lon, b.lat, b.lon
+                );
+                if sail {
+                    self.spawn_wx_plan(a, b, name);
+                } else {
+                    self.spawn_motor_plan(a, b, name);
+                }
+            }
+            (None, _) if from.trim().is_empty() => {
+                status(self, "no boat position yet — type a start as lat, lon");
+            }
+            (None, _) => status(self, "start must be lat, lon in decimal degrees"),
+            (_, None) => status(self, "destination must be lat, lon in decimal degrees"),
+        }
+    }
+
+    /// Weather-route between two positions on a worker thread, with the
+    /// forecast, polar and sea-state settings the Routes window holds.
+    fn spawn_wx_plan(&mut self, a: crate::geo::LatLon, b: crate::geo::LatLon, name: String) {
+        self.ensure_route_store();
+        self.save_settings();
+        let Some(dir) = self.chart_root.clone() else {
+            if let Some(ref mut ui) = self.ui {
+                ui.weather.status = "no chart directory loaded".into();
+            }
+            return;
+        };
+        let (hours, polar_path, use_waves, use_currents) = self
+            .ui
+            .as_ref()
+            .map(|u| {
+                (
+                    u.weather.hours,
+                    u.weather.polar_path.clone(),
+                    u.weather.use_waves,
+                    u.weather.use_currents,
+                )
+            })
+            .unwrap_or((48, String::new(), true, true));
+        if let Some(ref mut ui) = self.ui {
+            ui.weather.busy = true;
+            ui.weather.status = "starting…".into();
+        }
+        let tx = self.route_net_sender();
+        std::thread::spawn(move || {
+            let cache = dirs::config_dir()
+                .map(|d| d.join("navcore").join("grib"))
+                .unwrap_or_else(|| "grib-cache".into());
+            let (polar_text, polar_name) = if polar_path.trim().is_empty() {
+                (crate::nav::wxroute::DEFAULT_POLAR.to_string(),
+                 "built-in cruiser".to_string())
+            } else {
+                match std::fs::read_to_string(polar_path.trim()) {
+                    Ok(t) => (t, polar_path.trim().to_string()),
+                    Err(e) => {
+                        let _ = tx.send(RouteNetEvent::WxFailed(format!(
+                            "polar unreadable: {e}"
+                        )));
+                        return;
+                    }
+                }
+            };
+            let progress_tx = tx.clone();
+            let result = crate::nav::wxroute::plan_from_chart_dir(
+                &dir,
+                a,
+                b,
+                hours,
+                &cache,
+                &polar_text,
+                &polar_name,
+                &crate::nav::RoutingConfig::default(),
+                &crate::nav::autoroute::SafetyConfig::default(),
+                use_waves,
+                use_currents,
+                &name,
+                move |msg| {
+                    let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
+                },
+            );
+            let _ = tx.send(match result {
+                Ok(p) => RouteNetEvent::WxPlanned {
+                    summary: format!(
+                        "{}: arrival {} ({} warnings)",
+                        p.route.name,
+                        p.arrival.format("%d %b %H:%M UTC"),
+                        p.warnings.len()
+                    ),
+                    route: p.route,
+                    waypoints: p.waypoints,
+                },
+                Err(e) => RouteNetEvent::WxFailed(e),
+            });
+        });
+    }
+
+    /// The shortest safe route between two positions — the M3 grid router on
+    /// a worker thread, same charts, no weather. What you steer under engine.
+    fn spawn_motor_plan(&mut self, a: crate::geo::LatLon, b: crate::geo::LatLon, name: String) {
+        self.ensure_route_store();
+        let Some(dir) = self.chart_root.clone() else {
+            if let Some(ref mut ui) = self.ui {
+                ui.weather.status = "no chart directory loaded".into();
+            }
+            return;
+        };
+        if let Some(ref mut ui) = self.ui {
+            ui.weather.busy = true;
+            ui.weather.status = "planning…".into();
+        }
+        let tx = self.route_net_sender();
+        std::thread::spawn(move || {
+            let safety = crate::nav::autoroute::SafetyConfig::default();
+            let result = crate::nav::wxroute::with_chart_sources(&dir, a, b, |sources| {
+                crate::nav::autoroute::plan(sources, a, b, &safety)
+            });
+            let _ = tx.send(match result {
+                Ok(Ok(mut p)) => {
+                    p.route.name = name;
+                    let nm: f64 = p.route.legs.iter().map(|l| l.distance_nm).sum();
+                    RouteNetEvent::WxPlanned {
+                        summary: format!(
+                            "{}: {:.1} nm, {} waypoints ({} warnings)",
+                            p.route.name,
+                            nm,
+                            p.route.waypoints.len(),
+                            p.warnings.len()
+                        ),
+                        route: p.route,
+                        waypoints: p.waypoints,
+                    }
+                }
+                Ok(Err(e)) => RouteNetEvent::WxFailed(e.to_string()),
+                Err(e) => RouteNetEvent::WxFailed(e),
+            });
+        });
+    }
+
     /// Fold in results from route network jobs.
     fn drain_route_net(&mut self) {
         let Some(rx) = self.route_net_rx.as_ref() else { return };
@@ -4192,6 +4310,12 @@ impl RenderState {
         self.pending_tiles.is_empty()
             && self.deferred_tile_results.is_empty()
             && self.previous_visible_tiles.is_empty()
+    }
+
+    /// Is a routing worker (weather or motor plan) still at it? The capture
+    /// harness holds the shot — and the exit — for this.
+    pub fn routing_busy(&self) -> bool {
+        self.ui.as_ref().map(|u| u.weather.busy).unwrap_or(false)
     }
 
     /// Mark that a redraw is needed (called on camera move, etc.)
