@@ -74,6 +74,22 @@ fn main() {
         return;
     }
 
+    // M3 auto-routing: a safe route between two points, from the charts.
+    // navcore --auto-route <chart_dir> lat1,lon1 lat2,lon2 [draft_m]
+    if args.len() >= 5 && args[1] == "--auto-route" {
+        let parse_pos = |s: &str| -> Option<(f64, f64)> {
+            let mut it = s.split(',').filter_map(|v| v.trim().parse::<f64>().ok());
+            Some((it.next()?, it.next()?))
+        };
+        let (Some(a), Some(b)) = (parse_pos(&args[3]), parse_pos(&args[4])) else {
+            eprintln!("--auto-route: positions must be 'lat,lon'");
+            return;
+        };
+        let draft = args.get(5).and_then(|v| v.parse::<f64>().ok());
+        auto_route_mode(&args[2], a, b, draft);
+        return;
+    }
+
     // The o-charts chart shop: what does this account own, and what is stale.
     if args.len() >= 3 && args[1] == "--shop-list" {
         shop_list_mode(&args[2], args.get(3).map(String::as_str));
@@ -1093,6 +1109,130 @@ fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::
 ///
 /// The same query the info bubble runs, on the command line, so the picking can
 /// be checked against a chart without a window in the way.
+/// M3's surface: plan a safe route on the real charts and drop it in the
+/// route store, where the Routes window and GPX export pick it up.
+fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f64>) {
+    use navcore2::geo::LatLon;
+    use navcore2::nav::autoroute::{self, SafetyConfig};
+
+    let dir = PathBuf::from(dir_path);
+    let mut keys = navcore2::decrypt::KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(&dir) {
+        eprintln!("Warning: could not load keys: {e}");
+    }
+    let Ok(base) = ChartDecryptor::new("license") else {
+        eprintln!("Failed to create decryptor");
+        return;
+    };
+    let mut decryptor = CachedDecryptor::new(base);
+    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build catalog: {e}");
+            return;
+        }
+    };
+
+    let mut safety = SafetyConfig::default();
+    if let Some(d) = draft {
+        safety.draft_m = d;
+    }
+
+    // Charts whose extent meets the passage box, with margin to route round
+    // headlands near the ends.
+    let (ax, ay) = navcore2::tiles::latlon_to_mercator(a.0, a.1);
+    let (bx, by) = navcore2::tiles::latlon_to_mercator(b.0, b.1);
+    let span = ((bx - ax).hypot(by - ay)).max(1_000.0);
+    let margin = (span * 0.35).max(15_000.0);
+    let (min_x, max_x) = ((ax.min(bx) - margin), (ax.max(bx) + margin));
+    let (min_y, max_y) = ((ay.min(by) - margin), (ay.max(by) + margin));
+
+    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let decryptor = Mutex::new(decryptor);
+    let builder =
+        TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
+
+    let mut loaded = Vec::new();
+    for info in catalog.charts.iter().filter(|c| {
+        c.extent_mercator.min_x <= max_x
+            && c.extent_mercator.max_x >= min_x
+            && c.extent_mercator.min_y <= max_y
+            && c.extent_mercator.max_y >= min_y
+    }) {
+        match builder.load_chart(info) {
+            Ok(chart) => loaded.push((chart, info)),
+            Err(e) => eprintln!("  (skipping {}: {e})", info.name),
+        }
+    }
+    println!(
+        "Planning {:.1} nm passage across {} chart(s), draft {:.1} m…",
+        navcore2::geo::distance_m(
+            navcore2::geo::LatLon::new(a.0, a.1),
+            navcore2::geo::LatLon::new(b.0, b.1)
+        ) / 1852.0,
+        loaded.len(),
+        safety.draft_m
+    );
+
+    let sources: Vec<autoroute::ChartSource> = loaded
+        .iter()
+        .map(|(data, info)| autoroute::ChartSource { data, info })
+        .collect();
+
+    let planned = match autoroute::plan(
+        &sources,
+        LatLon::new(a.0, a.1),
+        LatLon::new(b.0, b.1),
+        &safety,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("No route: {e}");
+            std::process::exit(1);
+        }
+    };
+    for w in &planned.warnings {
+        println!("  note: {w}");
+    }
+
+    // Into the store, so the Routes window sees it immediately.
+    let store_dir = std::env::var("NAVCORE_ROUTES")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(navcore2::nav::RouteStore::default_dir)
+        .unwrap_or_else(|| PathBuf::from("routes"));
+    match navcore2::nav::RouteStore::open(store_dir) {
+        Ok((mut store, _)) => {
+            let mut route = planned.route.clone();
+            for wp in &planned.waypoints {
+                store.waypoints.insert(wp.clone());
+            }
+            route.recompute_legs(&store.waypoints);
+            println!(
+                "\n{}: {} waypoints, {:.1} nm",
+                route.name,
+                route.waypoints.len(),
+                route.total_distance_nm()
+            );
+            for (i, leg) in route.legs.iter().enumerate() {
+                println!(
+                    "  leg {:>2}: {:>6.2} nm  {:>5.1}°",
+                    i + 1,
+                    leg.distance_nm,
+                    leg.initial_bearing_deg
+                );
+            }
+            if let Err(e) = store.upsert_route(route) {
+                eprintln!("could not save the route: {e}");
+            } else {
+                println!("saved to the route store");
+            }
+        }
+        Err(e) => eprintln!("route store unavailable: {e}"),
+    }
+}
+
 fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
     let dir = PathBuf::from(dir_path);
     let mut keys = KeyStore::new();

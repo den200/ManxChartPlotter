@@ -533,6 +533,12 @@ impl ObjectClass {
     }
 }
 
+/// The reverse of [`s57_code_to_acronym`], by scanning the same table — the
+/// range is tiny and callers cache the result. `None` for unknown acronyms.
+pub fn s57_acronym_to_code(acronym: &str) -> Option<u16> {
+    (1..=600).find(|&code| s57_code_to_acronym(code) == acronym)
+}
+
 /// Map ANY S-57 numeric object class code to its 6-char acronym.
 /// Source of truth: IHO S-57 specification / s57objectclasses.csv (251 entries).
 /// Returns "UNKNWN" for truly unrecognized codes.

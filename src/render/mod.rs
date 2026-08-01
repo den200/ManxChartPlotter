@@ -65,7 +65,7 @@ mod label;
 mod line_vertices;
 pub mod lc_pattern;
 pub mod text_layout;
-mod projection;
+pub mod projection;
 pub mod s52_styles;
 mod state;
 pub mod patterns;
