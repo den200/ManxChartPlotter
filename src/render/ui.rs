@@ -104,6 +104,13 @@ impl Default for WeatherView {
     }
 }
 
+/// Which planner field the next chart tap should fill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanPickTarget {
+    From,
+    To,
+}
+
 /// The passage-planning fields in the menu bar. Runtime only: half-typed
 /// coordinates are not worth persisting.
 #[derive(Default)]
@@ -112,6 +119,17 @@ pub struct PlanView {
     pub from: String,
     /// Destination, "lat, lon".
     pub to: String,
+    /// Armed pin: the next chart tap fills this field instead of running
+    /// the object query. One tap, then it disarms itself.
+    pub picking: Option<PlanPickTarget>,
+}
+
+/// A planner endpoint, projected for drawing: the pin that shows where the
+/// typed (or tapped) position actually is.
+pub struct PlanPin {
+    /// Logical points, same space as the route overlay.
+    pub screen: [f32; 2],
+    pub is_start: bool,
 }
 
 /// The routes window and the state of following.
@@ -260,6 +278,8 @@ pub struct UiState<'a> {
     pub mpp: f32,
     /// Visible routes, projected for the overlay.
     pub routes: Vec<super::ui_routes::RouteDisplay>,
+    /// The planner's endpoints, projected, for the pins.
+    pub plan_pins: Vec<PlanPin>,
 }
 
 pub struct Ui {

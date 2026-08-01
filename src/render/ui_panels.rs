@@ -33,6 +33,7 @@ pub fn build(
     super::ui_instruments::bar(ctx, instruments, &fleet.own);
     // Routes under the vessels: the boat sails over its plan, not beneath it.
     super::ui_routes::draw_overlay(ctx, &state.routes);
+    draw_plan_pins(ctx, &state.plan_pins);
     if instruments.show_ais {
         super::ui_ais::draw(
             ctx,
@@ -58,6 +59,41 @@ pub fn build(
     }
     if routes.open {
         super::ui_routes::window(ctx, routes, weather, actions);
+    }
+}
+
+/// The planner's pins: a classic map pin — a filled head on a stem whose
+/// point is the position — green for the start, red for the destination.
+/// Drawn whenever a field holds a real position, so what the router will be
+/// given is visible before anyone presses Sail.
+fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
+    if pins.is_empty() {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("plan-pins"),
+    ));
+    for pin in pins {
+        let tip = egui::pos2(pin.screen[0], pin.screen[1]);
+        let color = if pin.is_start {
+            egui::Color32::from_rgb(30, 140, 60)
+        } else {
+            egui::Color32::from_rgb(200, 40, 40)
+        };
+        let r = 7.0;
+        let head = egui::pos2(tip.x, tip.y - 14.0);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                tip,
+                egui::pos2(head.x - r * 0.55, head.y + r * 0.4),
+                egui::pos2(head.x + r * 0.55, head.y + r * 0.4),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+        painter.circle(head, r, color, egui::Stroke::new(1.5, egui::Color32::WHITE));
+        painter.circle_filled(head, 2.5, egui::Color32::WHITE);
     }
 }
 
@@ -89,18 +125,39 @@ fn menu_bar(
             }
             ui.separator();
 
+            use crate::render::ui::PlanPickTarget;
+            // The pin toggles: arm one and the next chart tap fills its
+            // field instead of identifying an object. Tapping the chart is
+            // how a sailor points at water; typing coordinates is the
+            // fallback, not the primary.
             ui.label(RichText::new("from").weak());
             ui.add(
                 egui::TextEdit::singleline(&mut plan.from)
                     .hint_text("boat position")
-                    .desired_width(120.0),
+                    .desired_width(110.0),
             );
+            let armed = plan.picking == Some(PlanPickTarget::From);
+            if ui
+                .selectable_label(armed, "📍")
+                .on_hover_text("Tap the chart to set the start")
+                .clicked()
+            {
+                plan.picking = (!armed).then_some(PlanPickTarget::From);
+            }
             ui.label(RichText::new("to").weak());
             let to_edit = ui.add(
                 egui::TextEdit::singleline(&mut plan.to)
                     .hint_text("lat, lon")
-                    .desired_width(120.0),
+                    .desired_width(110.0),
             );
+            let armed = plan.picking == Some(PlanPickTarget::To);
+            if ui
+                .selectable_label(armed, "📍")
+                .on_hover_text("Tap the chart to set the destination")
+                .clicked()
+            {
+                plan.picking = (!armed).then_some(PlanPickTarget::To);
+            }
             // Enter in the destination field is the promise the layout makes:
             // type where you are going, press enter, sail.
             let entered = to_edit.lost_focus()
@@ -125,6 +182,14 @@ fn menu_bar(
             if weather.busy {
                 ui.spinner();
                 ui.label(RichText::new(&weather.status).small());
+            } else if let Some(target) = plan.picking {
+                ui.label(
+                    RichText::new(match target {
+                        PlanPickTarget::From => "tap the chart to set the start",
+                        PlanPickTarget::To => "tap the chart to set the destination",
+                    })
+                    .small(),
+                );
             } else if !weather.status.is_empty() {
                 ui.label(RichText::new(&weather.status).small().weak());
             } else {

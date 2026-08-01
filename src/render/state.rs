@@ -1627,8 +1627,13 @@ impl RenderState {
         log::debug!("Background tile worker spawned");
 
         // NAVCORE_PICK=lat,lon opens the info bubble at a position, so a
-        // headless capture can show it.
-        if let Ok(spec) = std::env::var("NAVCORE_PICK") {
+        // headless capture can show it. This is the second firing of the
+        // hook (init_ui runs before the tile worker exists); when the pick
+        // was aimed at a planner pin, that firing already consumed it.
+        let pick_env = std::env::var("NAVCORE_PICK")
+            .ok()
+            .filter(|_| std::env::var("NAVCORE_PLAN_PICK").is_err());
+        if let Some(spec) = pick_env {
             let parts: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
             if parts.len() == 2 {
                 let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
@@ -2004,7 +2009,10 @@ impl RenderState {
         // the chart is finished with the frame.
         // Projected before the take: routes_display reads ui.routes for the
         // visible set, and inside the block self.ui is temporarily None.
+        // Projected before the take, like routes_display: inside the block
+        // self.ui is temporarily None and the pins would silently vanish.
         let routes_display = self.routes_display();
+        let plan_pins = self.plan_pins();
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
@@ -2028,6 +2036,7 @@ impl RenderState {
                     ais,
                     mpp,
                     routes: routes_display,
+                    plan_pins,
                 },
                 &self.fleet,
             );
@@ -3120,6 +3129,17 @@ impl RenderState {
                 &self.window,
                 self.config.format,
             ));
+            // `NAVCORE_PLAN_PICK=from|to` arms a planner pin at startup, so
+            // the tap-to-fill path can be driven by NAVCORE_PICK below.
+            if let Ok(which) = std::env::var("NAVCORE_PLAN_PICK") {
+                if let Some(ref mut ui) = self.ui {
+                    ui.plan.picking = match which.as_str() {
+                        "from" => Some(crate::render::ui::PlanPickTarget::From),
+                        "to" => Some(crate::render::ui::PlanPickTarget::To),
+                        _ => None,
+                    };
+                }
+            }
             // `NAVCORE_PICK=lat,lon` taps the chart at startup, so the object
             // bubble can be captured without a click.
             if let Ok(at) = std::env::var("NAVCORE_PICK") {
@@ -3225,6 +3245,11 @@ impl RenderState {
     /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
     /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
     pub fn pick_at_world(&mut self, x: f32, y: f32) {
+        // An armed planner pin claims the tap: the user said "the next tap
+        // is a place, not a question".
+        if self.plan_pick_fill(x as f64, y as f64) {
+            return;
+        }
         // A fingertip is about 9 mm across; a mouse pointer is exact. Sizing
         // the tolerance in millimetres rather than pixels makes the same tap
         // work on a plotter's touchscreen and on a desktop, at any density.
@@ -3238,6 +3263,40 @@ impl RenderState {
             ));
         }
         self.needs_redraw = true;
+    }
+
+    /// If a planner pin is armed, fill its field from this tap and disarm.
+    /// Answers whether the tap was claimed.
+    fn plan_pick_fill(&mut self, x: f64, y: f64) -> bool {
+        let Some(ref mut ui) = self.ui else { return false };
+        let Some(target) = ui.plan.picking.take() else { return false };
+        let (lat, lon) = crate::render::projection::Projection::to_wgs84(x, y);
+        let text = format!("{lat:.4},{lon:.4}");
+        match target {
+            crate::render::ui::PlanPickTarget::From => ui.plan.from = text,
+            crate::render::ui::PlanPickTarget::To => ui.plan.to = text,
+        }
+        self.needs_redraw = true;
+        true
+    }
+
+    /// The planner's endpoints, projected for the pins. Same discipline as
+    /// [`routes_display`](Self::routes_display): runs before the frame takes
+    /// `self.ui`, or it would see None and draw nothing.
+    fn plan_pins(&self) -> Vec<crate::render::ui::PlanPin> {
+        let Some(ref ui) = self.ui else { return Vec::new() };
+        let ppp = self.scale_factor.max(0.01);
+        let mut pins = Vec::new();
+        for (text, is_start) in [(&ui.plan.from, true), (&ui.plan.to, false)] {
+            let Some(p) = crate::geo::parse_latlon(text) else { continue };
+            let (wx, wy) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+            let s = self.camera.world_to_screen(wx as f32, wy as f32);
+            pins.push(crate::render::ui::PlanPin {
+                screen: [s.x / ppp, s.y / ppp],
+                is_start,
+            });
+        }
+        pins
     }
 
     /// Is a query still with the worker?
