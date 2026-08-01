@@ -160,6 +160,13 @@ pub struct RoutingConfig {
     pub max_wave_m: f64,
     pub offing_min_nm: f64,
     pub simplify_tolerance_nm: f64,
+    /// Engine speed, if the boat will motor when sailing crawls. `None`
+    /// means sail or stay: the spec left this open and the decision fell to
+    /// the architect — minimal support, off by default.
+    pub motor_speed_kt: Option<f64>,
+    /// Below this sailing speed toward the mark, the motor candidate joins
+    /// the fan.
+    pub motor_threshold_kt: f64,
 }
 
 impl Default for RoutingConfig {
@@ -180,6 +187,8 @@ impl Default for RoutingConfig {
             max_wave_m: 4.0,
             offing_min_nm: 0.2,
             simplify_tolerance_nm: 0.1,
+            motor_speed_kt: None,
+            motor_threshold_kt: 2.0,
         }
     }
 }
