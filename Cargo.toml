@@ -75,3 +75,11 @@ tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 geographiclib-rs = "0.2.7"
+
+# Routes and waypoints (routing spec §4). Uuid is the id type the spec's data
+# model names, and chrono is its DateTime<Utc> at the API boundary — plus the
+# RFC3339 timestamps GPX carries. GPX itself is read and written by hand on
+# quick-xml: the `gpx` crate drops unknown extension elements on parse, and the
+# spec requires round-trips through other plotters to be lossless.
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
