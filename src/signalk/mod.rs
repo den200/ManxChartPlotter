@@ -13,6 +13,7 @@
 //! - [`catalog`] says what the well-known paths mean
 //! - [`units`] turns SI into something a mariner reads
 //! - [`service`] owns the socket, on its own thread, and reconnects
+//! - [`resources`] is the HTTP side: route resources published and consumed
 //! - [`sim`] is a boat that isn't there, for testing away from the water
 //!
 //! Nothing here knows about egui or wgpu; the instrument bar is a view of
@@ -21,6 +22,7 @@
 pub mod catalog;
 pub mod delta;
 pub mod fleet;
+pub mod resources;
 pub mod service;
 pub mod sim;
 pub mod state;

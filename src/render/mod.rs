@@ -57,6 +57,7 @@ pub mod mariner;
 pub mod ui_ais;
 pub mod ui_ownship;
 mod ui_panels;
+pub mod ui_routes;
 pub use camera::MAX_TILT;
 pub mod font;
 mod colors;

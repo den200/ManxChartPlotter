@@ -15,10 +15,16 @@ pub fn build(
     state: &UiState<'_>,
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
+    routes: &mut crate::render::ui::RoutesView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
-    menu_bar(ctx, shop, instruments);
+    menu_bar(ctx, shop, instruments, actions);
+    // Declared before the instrument bar claims its edge, so the strip sits
+    // directly above the bar rather than under it.
+    if let Some(ref g) = routes.guidance {
+        super::ui_routes::guidance_strip(ctx, g);
+    }
     // The strip claims its edge before the chart is told how much room it has,
     // so a window opened over it still lands inside the remaining area.
     super::ui_instruments::bar(ctx, instruments, &fleet.own);
@@ -45,6 +51,9 @@ pub fn build(
     if instruments.open {
         super::ui_instruments::settings(ctx, instruments, &fleet.own, actions);
     }
+    if routes.open {
+        super::ui_routes::window(ctx, routes, actions);
+    }
 }
 
 /// A thin strip along the top. Deliberately thin: the chart is the instrument,
@@ -53,6 +62,7 @@ fn menu_bar(
     ctx: &Context,
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
+    actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -61,6 +71,9 @@ fn menu_bar(
             }
             if ui.button("Instruments").clicked() {
                 instruments.open = !instruments.open;
+            }
+            if ui.button("Routes").clicked() {
+                actions.push(UiAction::RoutesOpen);
             }
             ui.separator();
             ui.label(

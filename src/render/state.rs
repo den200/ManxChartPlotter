@@ -262,6 +262,12 @@ fn create_msaa_view(
 
 
 /// Complete render state for chart visualization
+/// What a route network job (Signal K resources) reports back.
+pub(crate) enum RouteNetEvent {
+    Status(String),
+    Fetched(Vec<(crate::nav::Route, Vec<crate::nav::model::Waypoint>)>),
+}
+
 pub struct RenderState {
     pub window: Arc<Window>,
     pub surface: wgpu::Surface<'static>,
@@ -324,6 +330,13 @@ pub struct RenderState {
     /// The camera is tracking the boat, so the catalogue clamp must not drag
     /// it back to the middle of the charts.
     following: bool,
+    /// The user's waypoints and routes, loaded on first use.
+    route_store: Option<crate::nav::RouteStore>,
+    /// Active-route following state, when a route is activated.
+    route_follow: Option<crate::nav::Following>,
+    /// Results coming back from route network jobs (Signal K PUT/GET).
+    route_net_rx: Option<std::sync::mpsc::Receiver<RouteNetEvent>>,
+    route_net_tx: Option<std::sync::mpsc::Sender<RouteNetEvent>>,
     /// S-52 mariner symbols — own ship and AIS — rebuilt whenever the boats
     /// move, which is why they need an instance buffer of their own rather
     /// than sharing the tiles'.
@@ -994,6 +1007,10 @@ impl RenderState {
             signalk: None,
             fleet: Default::default(),
             following: false,
+            route_store: None,
+            route_follow: None,
+            route_net_rx: None,
+            route_net_tx: None,
             mariner_buffer: None,
             mariner_count: 0,
             mariner_symbols: crate::render::mariner::MarinerSymbols::resolve(),
@@ -1700,6 +1717,8 @@ impl RenderState {
         // settled before the camera is clamped and the chart is drawn.
         self.poll_shop();
         self.poll_signalk();
+        self.update_route_following();
+        self.drain_route_net();
         self.update_mariner_symbols();
 
         // In tile mode, keep the camera near the loaded chart extent.
@@ -2060,6 +2079,101 @@ impl RenderState {
                     self.needs_redraw = true;
                 }
                 crate::render::ui::UiAction::SettingsChanged => self.save_settings(),
+                crate::render::ui::UiAction::RoutesOpen => {
+                    self.ensure_route_store();
+                    self.refresh_route_rows();
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.open = !ui.routes.open;
+                    }
+                }
+                crate::render::ui::UiAction::RouteActivate { route_id } => {
+                    self.activate_route(route_id);
+                }
+                crate::render::ui::UiAction::RouteDeactivate => {
+                    self.route_follow = None;
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.active = None;
+                        ui.routes.guidance = None;
+                        ui.routes.status = "Following stopped".into();
+                    }
+                    self.refresh_route_rows();
+                }
+                crate::render::ui::UiAction::RoutePublish { route_id } => {
+                    self.ensure_route_store();
+                    let base = self
+                        .ui
+                        .as_ref()
+                        .and_then(|u| crate::signalk::resources::http_base(&u.instruments.url));
+                    let job = self.route_store.as_ref().and_then(|s| {
+                        s.route(route_id)
+                            .map(|r| (r.clone(), s.waypoints.clone()))
+                    });
+                    match (base, job) {
+                        (Some(base), Some((route, set))) => {
+                            let tx = self.route_net_sender();
+                            std::thread::spawn(move || {
+                                let client =
+                                    crate::signalk::resources::ResourcesClient::new(base);
+                                let msg = match client.put_route(&route, &set) {
+                                    Ok(()) => format!("Published \"{}\" to Signal K", route.name),
+                                    Err(e) => format!("Signal K refused the route: {e}"),
+                                };
+                                let _ = tx.send(RouteNetEvent::Status(msg));
+                            });
+                        }
+                        (None, _) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.routes.status =
+                                    "Set a Signal K server under Instruments first".into();
+                            }
+                        }
+                        (_, None) => {}
+                    }
+                }
+                crate::render::ui::UiAction::RoutesFetchSignalK => {
+                    self.ensure_route_store();
+                    match self
+                        .ui
+                        .as_ref()
+                        .and_then(|u| crate::signalk::resources::http_base(&u.instruments.url))
+                    {
+                        Some(base) => {
+                            let tx = self.route_net_sender();
+                            std::thread::spawn(move || {
+                                let client =
+                                    crate::signalk::resources::ResourcesClient::new(base);
+                                match client.list_routes() {
+                                    Ok(entries) => {
+                                        let routes: Vec<_> = entries
+                                            .iter()
+                                            .filter_map(|(id, v)| {
+                                                crate::signalk::resources::resource_to_route(
+                                                    id, v,
+                                                )
+                                            })
+                                            .collect();
+                                        let n = routes.len();
+                                        let _ = tx.send(RouteNetEvent::Fetched(routes));
+                                        let _ = tx.send(RouteNetEvent::Status(format!(
+                                            "Fetched {n} route(s) from Signal K"
+                                        )));
+                                    }
+                                    Err(e) => {
+                                        let _ = tx.send(RouteNetEvent::Status(format!(
+                                            "Could not list Signal K routes: {e}"
+                                        )));
+                                    }
+                                }
+                            });
+                        }
+                        None => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.routes.status =
+                                    "Set a Signal K server under Instruments first".into();
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -2955,6 +3069,19 @@ impl RenderState {
                     self.pick_at_world(x as f32, y as f32);
                 }
             }
+            // `NAVCORE_FOLLOW=1` activates the first stored route at startup,
+            // so the guidance strip can be captured without a click.
+            if std::env::var("NAVCORE_FOLLOW").is_ok_and(|v| v != "0") {
+                self.ensure_route_store();
+                if let Some(id) = self
+                    .route_store
+                    .as_ref()
+                    .and_then(|s| s.routes().next())
+                    .map(|r| r.id)
+                {
+                    self.activate_route(id);
+                }
+            }
             // `NAVCORE_SHOP=1` opens the chart shop at startup, so it can be
             // captured without a click.
             if let Some(ui) = self.ui.as_mut() {
@@ -3488,6 +3615,188 @@ impl RenderState {
             edition,
             because,
         });
+    }
+
+    /// Load the route store on first use, reporting problems into the window.
+    fn ensure_route_store(&mut self) {
+        if self.route_store.is_some() {
+            return;
+        }
+        // `NAVCORE_ROUTES=<dir>` points the store elsewhere — captures and
+        // tests must not write into the user's real route folder.
+        let dir = std::env::var("NAVCORE_ROUTES")
+            .map(std::path::PathBuf::from)
+            .ok()
+            .or_else(crate::nav::RouteStore::default_dir)
+            .unwrap_or_else(|| std::path::PathBuf::from("routes"));
+        match crate::nav::RouteStore::open(dir) {
+            Ok((store, problems)) => {
+                if let (Some(ui), false) = (self.ui.as_mut(), problems.is_empty()) {
+                    ui.routes.status = problems
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                }
+                self.route_store = Some(store);
+            }
+            Err(e) => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.status = format!("Route store unavailable: {e}");
+                }
+            }
+        }
+    }
+
+    /// Begin following a route: the action handler and the capture hook share
+    /// this.
+    fn activate_route(&mut self, route_id: uuid::Uuid) {
+        self.ensure_route_store();
+        let started = self
+            .route_store
+            .as_ref()
+            .and_then(|s| s.route(route_id))
+            .and_then(|r| {
+                crate::nav::Following::start(r, crate::nav::FollowConfig::default())
+                    .map(|f| (f, r.name.clone()))
+            });
+        match started {
+            Some((f, name)) => {
+                self.route_follow = Some(f);
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.active = Some(route_id);
+                    ui.routes.status = format!("Following {name}");
+                }
+            }
+            None => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.status =
+                        "That route cannot be followed (fewer than two waypoints)".into();
+                }
+            }
+        }
+        self.refresh_route_rows();
+    }
+
+    /// Rebuild the routes window's table from the store.
+    fn refresh_route_rows(&mut self) {
+        let Some(ref mut ui) = self.ui else { return };
+        let active = ui.routes.active;
+        ui.routes.rows = self
+            .route_store
+            .as_ref()
+            .map(|store| {
+                store
+                    .routes()
+                    .map(|r| crate::render::ui_routes::RouteRow {
+                        id: r.id,
+                        name: r.name.clone(),
+                        legs: r.legs.len(),
+                        distance_nm: r.total_distance_nm(),
+                        active: active == Some(r.id),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    fn route_net_sender(&mut self) -> std::sync::mpsc::Sender<RouteNetEvent> {
+        if self.route_net_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.route_net_tx = Some(tx);
+            self.route_net_rx = Some(rx);
+        }
+        self.route_net_tx.as_ref().unwrap().clone()
+    }
+
+    /// Fold in results from route network jobs.
+    fn drain_route_net(&mut self) {
+        let Some(rx) = self.route_net_rx.as_ref() else { return };
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        if events.is_empty() {
+            return;
+        }
+        for event in events {
+            match event {
+                RouteNetEvent::Status(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.status = msg;
+                    }
+                }
+                RouteNetEvent::Fetched(routes) => {
+                    self.ensure_route_store();
+                    if let Some(store) = self.route_store.as_mut() {
+                        for (route, wps) in routes {
+                            for wp in wps {
+                                store.waypoints.insert(wp);
+                            }
+                            if let Err(e) = store.upsert_route(route) {
+                                if let Some(ref mut ui) = self.ui {
+                                    ui.routes.status = format!("Could not save: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.refresh_route_rows();
+        self.needs_redraw = true;
+    }
+
+    /// Advance the follower with the latest fix and feed strip and pilot.
+    fn update_route_following(&mut self) {
+        // Compute everything with short borrows, then write to the UI.
+        let update = {
+            let (Some(follow), Some(store)) =
+                (self.route_follow.as_mut(), self.route_store.as_ref())
+            else {
+                return;
+            };
+            let Some(route) = store.route(follow.route_id) else {
+                return;
+            };
+            let fresh = self
+                .fleet
+                .own
+                .get("navigation.position")
+                .is_some_and(|r| !r.is_stale());
+            let Some((lat, lon)) = self.fleet.own.position().filter(|_| fresh) else {
+                return;
+            };
+            // Signal K is SI: m/s and radians. Guidance speaks knots/degrees.
+            let sog_kt = self
+                .fleet
+                .own
+                .number("navigation.speedOverGround")
+                .map(|v| v * 3600.0 / 1852.0);
+            let cog_deg = self
+                .fleet
+                .own
+                .number("navigation.courseOverGroundTrue")
+                .map(f64::to_degrees);
+            follow
+                .update(
+                    route,
+                    &store.waypoints,
+                    crate::geo::LatLon::new(lat, lon),
+                    sog_kt,
+                    cog_deg,
+                )
+        };
+        let Some(guidance) = update else {
+            return;
+        };
+
+        if let Some(ref mut ui) = self.ui {
+            if ui.routes.guidance.as_ref() != Some(&guidance) {
+                self.needs_redraw = true;
+            }
+            ui.routes.guidance = Some(guidance);
+        }
     }
 
     fn machine_fingerprint() -> Option<crate::shop::Fingerprint> {

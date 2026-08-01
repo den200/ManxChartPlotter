@@ -48,6 +48,28 @@ pub enum UiAction {
     SignalKDisconnect,
     /// The instrument layout changed and should be written to disk.
     SettingsChanged,
+    /// Open (and lazily load) the routes window.
+    RoutesOpen,
+    /// Follow this route.
+    RouteActivate { route_id: uuid::Uuid },
+    /// Stop following.
+    RouteDeactivate,
+    /// PUT this route to the Signal K server's resources.
+    RoutePublish { route_id: uuid::Uuid },
+    /// Read the server's route resources into the store.
+    RoutesFetchSignalK,
+}
+
+/// The routes window and the state of following.
+#[derive(Default)]
+pub struct RoutesView {
+    pub open: bool,
+    pub rows: Vec<super::ui_routes::RouteRow>,
+    /// The route being followed, if any.
+    pub active: Option<uuid::Uuid>,
+    /// This frame's guidance, for the strip.
+    pub guidance: Option<crate::nav::Guidance>,
+    pub status: String,
 }
 
 /// A quarter of a nautical mile, and twelve minutes: tight enough not to cry
@@ -194,6 +216,8 @@ pub struct Ui {
     pub shop: ShopView,
     /// The instrument strip and its Signal K connection.
     pub instruments: InstrumentView,
+    /// The routes window and following state.
+    pub routes: RoutesView,
 }
 
 impl Ui {
@@ -225,6 +249,7 @@ impl Ui {
             // is expected to answer without being asked.
             instruments: crate::render::state::RenderState::load_settings().unwrap_or_default(),
             shop: ShopView::default(),
+            routes: RoutesView::default(),
         }
     }
 
@@ -294,8 +319,9 @@ impl Ui {
         let actions = &mut self.actions;
         let shop = &mut self.shop;
         let instruments = &mut self.instruments;
+        let routes = &mut self.routes;
         let output = self.ctx.run(input, |ctx| {
-            super::ui_panels::build(ctx, &state, shop, instruments, fleet, actions);
+            super::ui_panels::build(ctx, &state, shop, instruments, routes, fleet, actions);
         });
         self.state
             .handle_platform_output(window, output.platform_output);
