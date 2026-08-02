@@ -2900,7 +2900,15 @@ impl RenderState {
         }
 
         // 5. Evict tiles over budget
-        self.tile_cache.evict_to_budget();
+        // Touch every tile this frame will draw before evicting, so the LRU
+        // is ordered by use rather than by upload age — without this it was
+        // pure FIFO, and the tiles most likely to be thrown away were the
+        // ones on screen longest, i.e. exactly what the user is looking at.
+        let drawing: Vec<TileCacheKey> = self.tile_draw_list.iter().map(|(k, _)| *k).collect();
+        for key in &drawing {
+            self.tile_cache.touch(key);
+        }
+        self.tile_cache.evict_to_budget_keeping(&drawing);
     }
 
     /// Draw tiles using cached visible_tiles from build_visible_tiles()

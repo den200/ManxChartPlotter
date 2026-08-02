@@ -279,6 +279,14 @@ fn text_of(reader: &mut Reader<&[u8]>, tag: &str) -> Result<String, GpxError> {
             Ok(Event::Text(t)) => {
                 out.push_str(&t.unescape().map_err(|e| GpxError::Xml(e.to_string()))?)
             }
+            // CDATA is a separate event, not Text — without this arm a
+            // <name><![CDATA[Fornæs & Anholt]]></name> written by another
+            // plotter arrived here as an empty name. Its content is by
+            // definition not entity-encoded, so it is taken verbatim.
+            Ok(Event::CData(t)) => match std::str::from_utf8(&t) {
+                Ok(text) => out.push_str(text),
+                Err(e) => return Err(GpxError::Xml(e.to_string())),
+            },
             Ok(Event::End(e)) if e.name().as_ref() == tag.as_bytes() => break,
             Ok(Event::Eof) => return Err(GpxError::Malformed(format!("unclosed <{tag}>"))),
             Err(e) => return Err(GpxError::Xml(e.to_string())),
@@ -576,6 +584,31 @@ fn esc(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Some plotters write names in CDATA to avoid escaping ampersands. The
+    /// promise of this module is a lossless round-trip, so those names must
+    /// survive.
+    #[test]
+    fn cdata_names_survive_the_round_trip() {
+        let xml = r#"<?xml version="1.0"?>
+<gpx version="1.1" creator="other">
+  <rte><name><![CDATA[Grenaa & Anholt]]></name>
+    <rtept lat="56.4" lon="10.9"><name><![CDATA[Fornæs]]></name></rtept>
+    <rtept lat="56.7" lon="11.5"><name>Plain</name></rtept>
+  </rte>
+</gpx>"#;
+        let doc = super::parse(xml).expect("parses");
+        assert_eq!(doc.routes.len(), 1);
+        assert_eq!(doc.routes[0].name, "Grenaa & Anholt");
+        let names: Vec<&str> = doc
+            .routes[0]
+            .waypoints
+            .iter()
+            .filter_map(|id| doc.waypoints.get(*id))
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Fornæs", "Plain"]);
+    }
+
     use super::*;
 
     fn five_leg_route() -> (Route, WaypointSet) {

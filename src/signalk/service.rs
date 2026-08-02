@@ -296,6 +296,14 @@ fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), 
 
     let (mut socket, _response) =
         tungstenite::connect(url).map_err(|e| describe(&e.to_string()))?;
+
+    // A read timeout is what makes a dead link detectable. Without one,
+    // `read()` blocks for ever the moment the peer goes quiet without closing
+    // the connection — the wifi bridge between cockpit and saloon dropping,
+    // or a router forgetting the NAT entry. The loop below never got back to
+    // its stop check, so the retry never ran, Disconnect did nothing, and the
+    // bar kept saying Connected over a frozen position.
+    set_read_timeout(&mut socket, READ_TIMEOUT);
     let _ = events.send(Event::Status(Status::Connected(url.to_string())));
 
     // Ask for everything at the fastest the server will give. A plotter wants
@@ -307,6 +315,7 @@ fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), 
         return Err(describe(&e.to_string()));
     }
 
+    let mut silent_reads = 0u32;
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = socket.close(None);
@@ -333,8 +342,52 @@ fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), 
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => {}
             Ok(Message::Close(_)) => return Ok(()),
             Ok(Message::Frame(_)) => {}
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Quiet, not dead — go round, which re-checks the stop flag.
+                // A server we asked for everything every 500 ms has nothing
+                // to say for a whole minute only if the link is gone.
+                silent_reads += 1;
+                if silent_reads >= SILENT_READS_BEFORE_DEAD {
+                    return Err("the connection went quiet — reconnecting".into());
+                }
+                continue;
+            }
             Err(e) => return Err(describe(&e.to_string())),
         }
+        silent_reads = 0;
+    }
+}
+
+/// How long a single read may block before the loop looks up.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Consecutive silent reads that mean the link, not the server, is quiet.
+const SILENT_READS_BEFORE_DEAD: u32 = 3;
+
+/// Put a read deadline on the TCP socket underneath the WebSocket, plain or
+/// TLS. Failure to set it is logged and tolerated: a socket without a
+/// deadline is the old behaviour, not a reason to refuse the connection.
+fn set_read_timeout(
+    socket: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    timeout: std::time::Duration,
+) {
+    use tungstenite::stream::MaybeTlsStream;
+    let tcp: Option<&std::net::TcpStream> = match socket.get_ref() {
+        MaybeTlsStream::Plain(s) => Some(s),
+        MaybeTlsStream::Rustls(t) => Some(&t.sock),
+        _ => None,
+    };
+    match tcp {
+        Some(s) => {
+            if let Err(e) = s.set_read_timeout(Some(timeout)) {
+                log::warn!("signalk: could not set a read timeout: {e}");
+            }
+        }
+        None => log::warn!("signalk: unknown stream type; no read timeout set"),
     }
 }
 

@@ -60,6 +60,20 @@ pub struct TriPrim {
     pub vertices: Vec<[f32; 2]>,
 }
 
+/// A capacity hint that a corrupt count cannot turn into an abort.
+///
+/// Counts here are `u32`s read straight from the file. Handing one to
+/// `Vec::with_capacity` unchecked means a bogus `0xFFFFFFFF` asks for tens of
+/// gigabytes *before* any read can fail — and a failed allocation calls
+/// `handle_alloc_error`, which aborts the process. No `Result`, no `?`, no
+/// catch: one corrupt record takes the whole plotter down. Capacity is only a
+/// hint, so capping it costs nothing: a real count still allocates once, and a
+/// bogus one now fails cleanly on the short read that follows.
+fn capacity_hint(count: u32) -> usize {
+    const MAX_HINT: usize = 4096;
+    (count as usize).min(MAX_HINT)
+}
+
 impl TriPrim {
     /// Parse a triangle primitive from binary data
     /// prim_index is for diagnostic logging only
@@ -73,7 +87,7 @@ impl TriPrim {
         reader.read_exact(&mut bbox)?;
 
         // Read vertex data
-        let mut vertices = Vec::with_capacity(nvert as usize);
+        let mut vertices = Vec::with_capacity(capacity_hint(nvert));
         for _ in 0..nvert {
             let x = reader.read_f32::<LittleEndian>()?;
             let y = reader.read_f32::<LittleEndian>()?;
@@ -272,14 +286,14 @@ impl AreaGeometry {
         }
 
         // Read pre-triangulated data directly
-        let mut triangles = Vec::with_capacity(triprim_count as usize);
+        let mut triangles = Vec::with_capacity(capacity_hint(triprim_count));
         for i in 0..triprim_count {
             triangles.push(TriPrim::read(&mut cursor, i)?);
         }
 
         // Read edge refs for outline/ring reconstruction (if present).
         let has_reversed = senc_version > 200;
-        let mut edge_refs = Vec::with_capacity(edge_count as usize);
+        let mut edge_refs = Vec::with_capacity(capacity_hint(edge_count));
         for _ in 0..edge_count {
             let start_node = cursor.read_u32::<LittleEndian>()?;
             let edge_index = cursor.read_i32::<LittleEndian>()?;
@@ -700,7 +714,7 @@ impl MultipointGeometry {
             )));
         }
 
-        let mut points = Vec::with_capacity(point_count as usize);
+        let mut points = Vec::with_capacity(capacity_hint(point_count));
         for _ in 0..point_count {
             let x = cursor.read_f32::<LittleEndian>()?;
             let y = cursor.read_f32::<LittleEndian>()?;
@@ -779,7 +793,7 @@ impl LineGeometry {
         let has_reversed = senc_version > 200;
 
         // Read edge references
-        let mut edge_refs = Vec::with_capacity(edge_count as usize);
+        let mut edge_refs = Vec::with_capacity(capacity_hint(edge_count));
         for _ in 0..edge_count {
             let start_node = cursor.read_u32::<LittleEndian>()?;
             let edge_index = cursor.read_i32::<LittleEndian>()?;
@@ -941,7 +955,7 @@ impl EdgeTable {
         let edge_id = cursor.read_u32::<LittleEndian>()?;
         let vertex_count = cursor.read_u32::<LittleEndian>()?;
 
-        let mut vertices = Vec::with_capacity(vertex_count as usize);
+        let mut vertices = Vec::with_capacity(capacity_hint(vertex_count));
         for _ in 0..vertex_count {
             let x = cursor.read_f32::<LittleEndian>()?;
             let y = cursor.read_f32::<LittleEndian>()?;
@@ -1021,7 +1035,7 @@ impl EdgeTable {
                 continue;
             }
 
-            let mut vertices = Vec::with_capacity(vertex_count as usize);
+            let mut vertices = Vec::with_capacity(capacity_hint(vertex_count));
             for _ in 0..vertex_count {
                 let x = cursor.read_f32::<LittleEndian>()?;
                 let y = cursor.read_f32::<LittleEndian>()?;

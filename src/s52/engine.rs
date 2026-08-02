@@ -18,6 +18,14 @@ use super::settings::MarinerSettings;
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct CsCacheKey {
     object_class: u16,
+    /// The feature's own primitive. OBSTRN04 and WRECKS02 branch on it and
+    /// return entirely different instructions — a point obstruction gets a
+    /// symbol, an area one gets a fill and no symbol at all. Without this in
+    /// the key, two obstructions of the same class with the same attributes
+    /// but different geometry share an entry, and whichever resolved first
+    /// decides how both are drawn: the area silently loses its fill, or the
+    /// point becomes invisible.
+    feature_type: crate::senc::FeatureType,
     procedure: String,
     attr_hash: u64,
 }
@@ -269,6 +277,7 @@ impl S52Engine {
                     let hash = *cached_attr_hash.get_or_insert_with(|| feature_attr_hash(feature));
                     let cache_key = CsCacheKey {
                         object_class: feature.type_code,
+                        feature_type: feature.feature_type,
                         procedure: procedure.clone(),
                         attr_hash: hash,
                     };

@@ -116,6 +116,13 @@ impl Polar {
             return Err(PolarError::Empty);
         }
         rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // …and every row's wind-speed pairs, for the same reason the angles
+        // are sorted: the lookup brackets by a forward scan and assumes an
+        // ascending axis. A header written strongest-first used to return the
+        // speed for the wrong wind entirely, silently.
+        for row in rows.iter_mut() {
+            row.1.sort_by(|a, b| a.0.total_cmp(&b.0));
+        }
 
         let min_twa_deg = rows.first().map(|r| r.0).unwrap_or(0.0).max(0.0);
         let min_tws_kt = header.iter().cloned().fold(f64::MAX, f64::min);
@@ -255,6 +262,26 @@ fn split_fields(line: &str) -> Vec<&str> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A header written strongest-first is unusual but legal, and used to
+    /// return the boat speed for the wrong wind without a word: the lookup
+    /// brackets by a forward scan and assumes the axis ascends.
+    #[test]
+    fn a_descending_wind_header_still_reads_the_right_column() {
+        let ascending = "twa/tws\t6\t10\t14\n90\t4.0\t6.0\t7.0\n";
+        let descending = "twa/tws\t14\t10\t6\n90\t7.0\t6.0\t4.0\n";
+        let a = Polar::parse(ascending).expect("valid");
+        let d = Polar::parse(descending).expect("valid");
+        for tws in [6.0, 8.0, 10.0, 12.0, 14.0] {
+            let (x, y) = (a.speed_kt(90.0, tws), d.speed_kt(90.0, tws));
+            assert_eq!(
+                x.map(|v| (v * 100.0).round()),
+                y.map(|v| (v * 100.0).round()),
+                "column order changed the answer at {tws} kt"
+            );
+        }
+        assert!((d.speed_kt(90.0, 10.0).unwrap() - 6.0).abs() < 1e-6);
+    }
 
     /// A tidy cruising polar: no-go below 45°, best speed on the beam.
     pub(crate) const TEST_POLAR: &str = "\

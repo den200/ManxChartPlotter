@@ -456,7 +456,7 @@ impl<'a> IntoIterator for &'a Attributes {
 }
 
 /// Type of geometry a feature contains
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FeatureType {
     Point,
     Line,

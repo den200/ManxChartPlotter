@@ -105,6 +105,9 @@ pub struct Session {
 
 pub struct ShopClient {
     agent: ureq::Agent,
+    /// Chart packages: no whole-call deadline, only one for the reply to
+    /// start. See [`ShopClient::new`].
+    downloads: ureq::Agent,
 }
 
 impl Default for ShopClient {
@@ -118,8 +121,18 @@ impl ShopClient {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))
             .build();
+        // A second agent for the chart packages. `timeout_global` is a cap on
+        // the *whole* call including the body, so the twenty seconds that
+        // suit a small XML reply guarantee that a few hundred megabytes over
+        // a marina's wifi fails every time. This one bounds the wait for the
+        // response to start, and then lets the transfer take as long as the
+        // link takes.
+        let downloads = ureq::Agent::config_builder()
+            .timeout_recv_response(Some(TIMEOUT))
+            .build();
         Self {
             agent: config.into(),
+            downloads: downloads.into(),
         }
     }
 
@@ -289,7 +302,7 @@ impl ShopClient {
         use sha2::{Digest, Sha256};
 
         let mut response = self
-            .agent
+            .downloads
             .get(url)
             .call()
             .map_err(|e| Error::Transport(e.to_string()))?;

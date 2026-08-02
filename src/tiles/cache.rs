@@ -342,13 +342,33 @@ impl TileGpuCache {
 
     /// Evict oldest tiles until under budget
     pub fn evict_to_budget(&mut self) {
+        self.evict_to_budget_keeping(&[]);
+    }
+
+    /// Evict to the byte budget without ever dropping a tile in `keep`.
+    ///
+    /// The frame's draw list is built before this runs, and a tile evicted
+    /// after it joined that list simply does not draw: a hole in the chart
+    /// for a frame, exactly where the user is looking. Pinning the visible
+    /// tiles costs nothing — if they alone exceed the budget the cache is
+    /// briefly over it, which is the right way to be wrong.
+    pub fn evict_to_budget_keeping(&mut self, keep: &[TileCacheKey]) {
+        let mut skipped: Vec<TileCacheKey> = Vec::new();
         while self.total_bytes > self.max_bytes && !self.lru_order.is_empty() {
-            if let Some(key) = self.lru_order.pop_front() {
-                if let Some(buffers) = self.tiles.remove(&key) {
-                    self.total_bytes -= buffers.byte_size;
-                    self.revision = self.revision.wrapping_add(1);
-                }
+            let Some(key) = self.lru_order.pop_front() else { break };
+            if keep.contains(&key) {
+                skipped.push(key);
+                continue;
             }
+            if let Some(buffers) = self.tiles.remove(&key) {
+                self.total_bytes -= buffers.byte_size;
+                self.revision = self.revision.wrapping_add(1);
+            }
+        }
+        // Pinned tiles go back at the front: they are the newest in use, and
+        // the next frame will touch them again anyway.
+        for key in skipped.into_iter().rev() {
+            self.lru_order.push_front(key);
         }
     }
 
