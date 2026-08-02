@@ -290,6 +290,39 @@ impl GribForecast {
         Some((*self.times.first()?, *self.times.last()?))
     }
 
+    /// The valid times of the decoded steps, ascending — what a time control
+    /// steps through.
+    pub fn steps(&self) -> &[i64] {
+        &self.times
+    }
+
+    /// Is this position inside the fetched box? The sampler clamps at the
+    /// edges, which is right for a passage fetched *for* those endpoints and
+    /// quite wrong for a display: clamping would paint the edge's wind
+    /// across the whole ocean beyond it.
+    pub fn covers(&self, lat: f64, lon: f64) -> bool {
+        let lon = normalize_lon(lon);
+        let within = |axis: &[f64], x: f64| match (
+            axis.iter().cloned().fold(f64::INFINITY, f64::min),
+            axis.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        ) {
+            (lo, hi) if lo.is_finite() && hi.is_finite() => x >= lo && x <= hi,
+            _ => false,
+        };
+        within(&self.lats, lat) && within(&self.lons, lon)
+    }
+
+    /// Wind at a position and time for display: `None` outside the box.
+    pub fn sample(&self, lat: f64, lon: f64, time_ms: i64) -> Option<(f64, f64)> {
+        if !self.covers(lat, lon) {
+            return None;
+        }
+        let (u, v) = self.uv(lat, lon, time_ms);
+        let kt = (u * u + v * v).sqrt() * MS_TO_KNOTS;
+        let from_deg = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
+        Some((from_deg, kt))
+    }
+
     /// U/V in m/s at a position and time — bilinear in space, linear in
     /// time, clamped at the edges of the fetched box and span. Clamping is
     /// the honest option for a forecast fetched *for* this passage: any

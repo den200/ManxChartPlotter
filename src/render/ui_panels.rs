@@ -20,10 +20,14 @@ pub fn build(
     weather: &mut crate::render::ui::WeatherView,
     plan: &mut crate::render::ui::PlanView,
     boat: &mut crate::render::ui::BoatView,
+    wind: &mut crate::render::ui::WindView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
-    menu_bar(ctx, shop, instruments, plan, boat, weather, actions);
+    menu_bar(ctx, shop, instruments, plan, boat, wind, weather, actions);
+    // Weather first: it is the background the chart sits on, and everything
+    // that matters more — the boat, her plan, the traffic — draws over it.
+    super::ui_wind::draw(ctx, &state.wind);
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
@@ -63,6 +67,9 @@ pub fn build(
     }
     if boat.open {
         super::ui_boat::window(ctx, boat, weather, actions);
+    }
+    if wind.show {
+        super::ui_wind::window(ctx, wind, actions);
     }
 }
 
@@ -114,6 +121,7 @@ fn menu_bar(
     instruments: &mut crate::render::ui::InstrumentView,
     plan: &mut crate::render::ui::PlanView,
     boat: &mut crate::render::ui::BoatView,
+    wind: &mut crate::render::ui::WindView,
     weather: &crate::render::ui::WeatherView,
     actions: &mut Vec<UiAction>,
 ) {
@@ -130,6 +138,13 @@ fn menu_bar(
             }
             if ui.button("Boat").clicked() {
                 boat.open = !boat.open;
+            }
+            if ui
+                .selectable_label(wind.show, "Wind")
+                .on_hover_text("Show the wind forecast over the chart")
+                .clicked()
+            {
+                actions.push(UiAction::WindToggle);
             }
             ui.separator();
 

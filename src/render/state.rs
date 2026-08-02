@@ -278,6 +278,10 @@ pub(crate) enum RouteNetEvent {
     OrcResults(Vec<crate::nav::orc::OrcHit>),
     OrcFailed(String),
     OrcProgress(String),
+    /// A wind field for the overlay arrived.
+    WindLoaded(Box<crate::nav::grib::GribForecast>),
+    WindFailed(String),
+    WindProgress(String),
     /// A worker thread has ended, however it ended. Sent by a drop guard, so
     /// it arrives even if the worker panicked — which is what keeps a busy
     /// flag from sticking on for the rest of the session.
@@ -374,6 +378,8 @@ pub struct RenderState {
     chart_root: Option<std::path::PathBuf>,
     /// The NAVCORE_PLAN capture hook has run (it must fire exactly once).
     env_plan_fired: bool,
+    /// The wind field the overlay draws, when one is loaded.
+    wind_forecast: Option<crate::nav::grib::GribForecast>,
     /// Worker threads reporting to the route-network channel that have not
     /// yet ended. The event loop keeps polling while any are outstanding —
     /// nothing else would wake it to collect their results.
@@ -1048,6 +1054,7 @@ impl RenderState {
             mariner_symbols: crate::render::mariner::MarinerSymbols::resolve(),
             chart_root: None,
             env_plan_fired: false,
+            wind_forecast: None,
             route_net_jobs: 0,
             pick_anchor: None,
             pick_objects: Vec::new(),
@@ -1490,7 +1497,6 @@ impl RenderState {
     /// Remember where chart sets live, so a download lands beside them.
     pub fn set_chart_root(&mut self, root: std::path::PathBuf) {
         self.chart_root = Some(root);
-        self.maybe_env_plan();
     }
 
     /// `NAVCORE_PLAN="from;to[;motor]"` types the passage planner's fields
@@ -1503,6 +1509,19 @@ impl RenderState {
             return;
         }
         self.env_plan_fired = true;
+
+        // `NAVCORE_WIND=1` turns the wind overlay on (and `NAVCORE_WIND=<n>`
+        // picks the forecast hour). Like the plan hook it has to wait for a
+        // view: at init_ui the camera is still looking at 0°N 0°E, and the
+        // fetch would ask for the wind over the Gulf of Guinea.
+        if let Ok(spec) = std::env::var("NAVCORE_WIND") {
+            if let Some(ref mut ui) = self.ui {
+                ui.wind.show = true;
+                ui.wind.step = spec.trim().parse().unwrap_or(0);
+            }
+            self.spawn_wind_fetch();
+        }
+
         let Ok(spec) = std::env::var("NAVCORE_PLAN") else { return };
         let parts: Vec<String> = spec.split(';').map(str::to_string).collect();
         if parts.len() >= 2 {
@@ -1577,6 +1596,11 @@ impl RenderState {
                 Err(_) => log::warn!("NAVCORE_TILT must be a number of degrees; ignoring '{}'", t),
             }
         }
+
+        // Only now does the camera look at the chart rather than at 0°N 0°E,
+        // and a hook that asks "what is on screen?" — the wind fetch does —
+        // must not be answered before that.
+        self.maybe_env_plan();
 
         log::debug!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
             catalog.charts.len(), center_x, center_y, zoom);
@@ -2040,6 +2064,11 @@ impl RenderState {
         // self.ui is temporarily None and the pins would silently vanish.
         let routes_display = self.routes_display();
         let plan_pins = self.plan_pins();
+        // The step slider is the window's own state, so the label that says
+        // which hour is on screen is restated here rather than at the click.
+        self.refresh_wind_label();
+        let wind_barbs = self.wind_barbs();
+        self.refresh_wind_coverage(wind_barbs.len());
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
@@ -2064,6 +2093,7 @@ impl RenderState {
                     mpp,
                     routes: routes_display,
                     plan_pins,
+                    wind: wind_barbs,
                 },
                 &self.fleet,
             );
@@ -2364,6 +2394,24 @@ impl RenderState {
                         true
                     });
                 }
+                crate::render::ui::UiAction::WindToggle => {
+                    let showing = self
+                        .ui
+                        .as_mut()
+                        .map(|u| {
+                            u.wind.show = !u.wind.show;
+                            u.wind.show
+                        })
+                        .unwrap_or(false);
+                    // Turning it on with nothing loaded fetches for what is
+                    // on screen — one click, not two.
+                    let empty = self.wind_forecast.is_none();
+                    if showing && empty {
+                        self.spawn_wind_fetch();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::WindRefresh => self.spawn_wind_fetch(),
                 crate::render::ui::UiAction::BoatSearch { query, country } => {
                     self.spawn_orc_search(query, country);
                 }
@@ -4330,6 +4378,142 @@ impl RenderState {
         true
     }
 
+    /// The lat/lon box now on screen, padded a little so a small pan does
+    /// not immediately walk off the fetched field.
+    fn visible_geo_box(&self) -> crate::nav::grib::GeoBox {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        let corners = [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)];
+        let points: Vec<crate::geo::LatLon> = corners
+            .iter()
+            .map(|&(x, y)| {
+                let world = self.camera.screen_to_world(x, y);
+                let (lat, lon) =
+                    crate::render::projection::Projection::to_wgs84(world.x as f64, world.y as f64);
+                crate::geo::LatLon::new(lat.clamp(-89.0, 89.0), lon)
+            })
+            .collect();
+        crate::nav::grib::GeoBox::around(&points, 0.5)
+    }
+
+    /// Fetch the wind for the visible area on a worker thread.
+    fn spawn_wind_fetch(&mut self) {
+        let area = self.visible_geo_box();
+        let hours = self
+            .ui
+            .as_ref()
+            .map(|u| u.weather.hours.min(48))
+            .unwrap_or(24);
+        if let Some(ref mut ui) = self.ui {
+            ui.wind.busy = true;
+            ui.wind.status = "fetching…".into();
+            ui.wind.source = crate::nav::grib::GribSource::NoaaGfs025.label().into();
+        }
+        let tx = self.route_net_sender();
+        std::thread::spawn(move || {
+            let _done = JobGuard(tx.clone());
+            let cache = dirs::config_dir()
+                .map(|d| d.join("navcore").join("grib"))
+                .unwrap_or_else(|| "grib-cache".into());
+            let progress_tx = tx.clone();
+            let result = crate::nav::grib::GribForecast::fetch(
+                crate::nav::grib::GribSource::NoaaGfs025,
+                area,
+                hours,
+                &cache,
+                move |m| {
+                    let _ = progress_tx.send(RouteNetEvent::WindProgress(m));
+                },
+            );
+            let _ = tx.send(match result {
+                Ok(f) => RouteNetEvent::WindLoaded(Box::new(f)),
+                Err(e) => RouteNetEvent::WindFailed(e.to_string()),
+            });
+        });
+    }
+
+    /// Restate which hour the overlay is showing, in local terms a crew can
+    /// use: the valid time and how far ahead of now it is.
+    fn refresh_wind_label(&mut self) {
+        let Some(ref mut ui) = self.ui else { return };
+        let Some(&t) = ui.wind.steps.get(ui.wind.step) else {
+            ui.wind.valid_label.clear();
+            return;
+        };
+        use chrono::TimeZone as _;
+        let valid = chrono::Utc
+            .timestamp_millis_opt(t)
+            .single()
+            .unwrap_or_else(chrono::Utc::now);
+        let ahead = (t - chrono::Utc::now().timestamp_millis()) as f64 / 3_600_000.0;
+        ui.wind.valid_label = format!(
+            "valid {} ({}{:.0} h)",
+            valid.format("%d %b %H:%M UTC"),
+            if ahead < -0.05 { "−" } else { "+" },
+            ahead.abs()
+        );
+    }
+
+    /// The wind field projected onto a screen grid, for the overlay.
+    ///
+    /// Runs before the frame takes `self.ui`, like every other projector
+    /// here — inside that block the option is None and the overlay would
+    /// silently draw nothing.
+    fn wind_barbs(&self) -> Vec<crate::render::ui_wind::WindBarb> {
+        let (Some(ui), Some(forecast)) = (self.ui.as_ref(), self.wind_forecast.as_ref()) else {
+            return Vec::new();
+        };
+        if !ui.wind.show || ui.wind.steps.is_empty() {
+            return Vec::new();
+        }
+        let time_ms = ui.wind.steps[ui.wind.step.min(ui.wind.steps.len() - 1)];
+        let ppp = self.scale_factor.max(0.01);
+        let (w, h) = (
+            self.config.width as f32 / ppp,
+            self.config.height as f32 / ppp,
+        );
+        // One barb every ~64 points: dense enough to show a shift across the
+        // screen, sparse enough that the feathers never collide.
+        const SPACING: f32 = 64.0;
+        let mut barbs = Vec::new();
+        let mut y = SPACING * 0.75;
+        while y < h {
+            let mut x = SPACING * 0.75;
+            while x < w {
+                let world = self.camera.screen_to_world(x * ppp, y * ppp);
+                let (lat, lon) = crate::render::projection::Projection::to_wgs84(
+                    world.x as f64,
+                    world.y as f64,
+                );
+                if let Some((from_deg, kt)) = forecast.sample(lat, lon, time_ms) {
+                    barbs.push(crate::render::ui_wind::WindBarb {
+                        screen: [x, y],
+                        from_deg: from_deg as f32,
+                        kt: kt as f32,
+                    });
+                }
+                x += SPACING;
+            }
+            y += SPACING;
+        }
+        barbs
+    }
+
+    /// Say so when the loaded field has nothing to show here, rather than
+    /// drawing an empty sea and letting it read as calm.
+    fn refresh_wind_coverage(&mut self, drawn: usize) {
+        let loaded = self.wind_forecast.is_some();
+        let Some(ref mut ui) = self.ui else { return };
+        if !ui.wind.show || ui.wind.busy || !loaded {
+            return;
+        }
+        let uncovered = "the loaded wind does not reach this view — press Refresh here";
+        if drawn == 0 && !ui.wind.steps.is_empty() {
+            ui.wind.status = uncovered.into();
+        } else if ui.wind.status == uncovered {
+            ui.wind.status.clear();
+        }
+    }
+
     /// Search ORC certificates on a worker thread; results drain back into
     /// the boat window.
     fn spawn_orc_search(&mut self, query: String, country: String) {
@@ -4591,6 +4775,36 @@ impl RenderState {
                     if let Some(ref mut ui) = self.ui {
                         ui.weather.status = msg;
                     }
+                }
+                RouteNetEvent::WindProgress(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.wind.status = msg;
+                    }
+                }
+                RouteNetEvent::WindFailed(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.wind.busy = false;
+                        ui.wind.status = msg;
+                    }
+                }
+                RouteNetEvent::WindLoaded(forecast) => {
+                    let steps = forecast.steps().to_vec();
+                    let run = forecast.run;
+                    let source = forecast.source.label().to_string();
+                    self.wind_forecast = Some(*forecast);
+                    if let Some(ref mut ui) = self.ui {
+                        ui.wind.busy = false;
+                        ui.wind.source = source;
+                        // Keep the hour the user was looking at if it still
+                        // exists; otherwise start at the top of the run.
+                        ui.wind.step = ui.wind.step.min(steps.len().saturating_sub(1));
+                        ui.wind.steps = steps;
+                        ui.wind.status =
+                            format!("run {}", run.format("%d %b %HZ"));
+                        ui.wind.show = true;
+                    }
+                    self.refresh_wind_label();
+                    self.needs_redraw = true;
                 }
                 RouteNetEvent::OrcProgress(msg) => {
                     if let Some(ref mut ui) = self.ui {

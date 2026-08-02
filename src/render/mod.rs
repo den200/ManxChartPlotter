@@ -59,6 +59,7 @@ pub mod ui_boat;
 pub mod ui_ownship;
 mod ui_panels;
 pub mod ui_routes;
+pub mod ui_wind;
 pub use camera::MAX_TILT;
 pub mod font;
 mod colors;

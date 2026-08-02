@@ -105,6 +105,10 @@ pub enum UiAction {
         to: String,
         sail: bool,
     },
+    /// Show or hide the wind forecast over the chart.
+    WindToggle,
+    /// Fetch the wind for the area now on screen.
+    WindRefresh,
     /// Search ORC certificates for a class or boat name.
     BoatSearch { query: String, country: String },
     /// Install the polar (and specs) of a search hit by index.
@@ -192,6 +196,24 @@ impl Default for BoatView {
             status: String::new(),
         }
     }
+}
+
+/// The wind overlay's own state. Runtime only: the field belongs to a
+/// forecast and an area, and a plotter that silently redisplayed yesterday's
+/// wind at boot would be worse than one that asks.
+#[derive(Default)]
+pub struct WindView {
+    /// Drawing the field, and showing its window.
+    pub show: bool,
+    /// Which forecast step is on screen.
+    pub step: usize,
+    /// Valid times of the loaded steps; empty until one is loaded.
+    pub steps: Vec<i64>,
+    /// "valid 02 Aug 06:00 UTC (+9 h)".
+    pub valid_label: String,
+    pub source: String,
+    pub busy: bool,
+    pub status: String,
 }
 
 /// Which planner field the next chart tap should fill.
@@ -373,6 +395,8 @@ pub struct UiState<'a> {
     pub routes: Vec<super::ui_routes::RouteDisplay>,
     /// The planner's endpoints, projected, for the pins.
     pub plan_pins: Vec<PlanPin>,
+    /// The wind field, projected onto the screen grid.
+    pub wind: Vec<super::ui_wind::WindBarb>,
 }
 
 pub struct Ui {
@@ -395,6 +419,8 @@ pub struct Ui {
     pub plan: PlanView,
     /// The boat's specs and polar.
     pub boat: BoatView,
+    /// The wind overlay.
+    pub wind: WindView,
 }
 
 impl Ui {
@@ -430,6 +456,7 @@ impl Ui {
             weather: crate::render::state::RenderState::load_weather_settings(),
             plan: PlanView::default(),
             boat: crate::render::state::RenderState::load_boat_settings(),
+            wind: WindView::default(),
         }
     }
 
@@ -503,9 +530,10 @@ impl Ui {
         let weather = &mut self.weather;
         let plan = &mut self.plan;
         let boat = &mut self.boat;
+        let wind = &mut self.wind;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
-                ctx, &state, shop, instruments, routes, weather, plan, boat, fleet, actions,
+                ctx, &state, shop, instruments, routes, weather, plan, boat, wind, fleet, actions,
             );
         });
         self.state
