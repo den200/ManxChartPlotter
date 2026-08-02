@@ -24,19 +24,18 @@ pub fn build(
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
-    menu_bar(ctx, shop, instruments, plan, boat, wind, weather, actions);
-    // Weather first: it is the background the chart sits on, and everything
-    // that matters more — the boat, her plan, the traffic — draws over it.
+    // Everything drawn on the chart goes into the panels' own background
+    // layer, and goes in FIRST. egui orders layers of the same rank by
+    // insertion, and layers that are not registered areas — which is what a
+    // bare layer painter creates — end up in a hash map whose iteration
+    // order is not stable. That is why the AIS targets sometimes drew over
+    // the menus and sometimes did not. Sharing one layer with the panels
+    // makes the order a fact rather than a coin toss: chart first, interface
+    // over it, always.
+    //
+    // Within the chart, bottom to top: weather, the plan, then the vessels.
+    // The boat sails over her plan, not beneath it.
     super::ui_wind::draw(ctx, &state.wind);
-    // The instrument bar takes the bottom edge first. egui gives the outermost
-    // edge to the panel declared first, so declaring the strip first — as this
-    // did — put the strip *below* the bar, hard against the screen edge under
-    // the helm's hand, which is the opposite of what was wanted.
-    super::ui_instruments::bar(ctx, instruments, &fleet.own);
-    if let Some(ref g) = routes.guidance {
-        super::ui_routes::guidance_strip(ctx, g);
-    }
-    // Routes under the vessels: the boat sails over its plan, not beneath it.
     super::ui_routes::draw_overlay(ctx, &state.routes);
     draw_plan_pins(ctx, &state.plan_pins);
     if instruments.show_ais {
@@ -52,6 +51,16 @@ pub fn build(
     }
     if let Some(ref ship) = state.own_ship {
         super::ui_ownship::draw(ctx, ship);
+    }
+
+    menu_bar(ctx, shop, instruments, plan, boat, wind, weather, actions);
+    // The instrument bar takes the bottom edge first. egui gives the outermost
+    // edge to the panel declared first, so declaring the strip first — as this
+    // did — put the strip *below* the bar, hard against the screen edge under
+    // the helm's hand, which is the opposite of what was wanted.
+    super::ui_instruments::bar(ctx, instruments, &fleet.own);
+    if let Some(ref g) = routes.guidance {
+        super::ui_routes::guidance_strip(ctx, g);
     }
     if let Some(objects) = state.picked {
         object_query(ctx, objects, state.pick_anchor, actions);
@@ -81,10 +90,7 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
     if pins.is_empty() {
         return;
     }
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("plan-pins"),
-    ));
+    let painter = ctx.layer_painter(egui::LayerId::background());
     for pin in pins {
         let tip = egui::pos2(pin.screen[0], pin.screen[1]);
         let color = if pin.is_start {

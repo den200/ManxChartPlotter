@@ -49,10 +49,7 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
         return;
     }
 
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("own-ship"),
-    ));
+    let painter = ctx.layer_painter(egui::LayerId::background());
 
     let line = if ship.stale {
         Color32::from_gray(140)

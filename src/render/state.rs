@@ -5156,6 +5156,26 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
+    /// The user has taken the chart in hand: stop keeping the boat centred.
+    ///
+    /// Every plotter behaves this way, and the reason is what happens
+    /// otherwise — the camera is re-centred on the fix every time one
+    /// arrives, so a drag is undone before the hand has left the screen and
+    /// the chart simply refuses to move. "Keep the boat centred" is then a
+    /// mode with no way out except finding the checkbox that turns it off.
+    pub fn release_follow(&mut self) {
+        let released = self
+            .ui
+            .as_mut()
+            .map(|u| std::mem::replace(&mut u.instruments.follow, false))
+            .unwrap_or(false);
+        if released {
+            self.following = false;
+            self.save_settings();
+            log::debug!("follow released: the chart was panned by hand");
+        }
+    }
+
     /// Request that the next rendered frame be saved to `path` as a PNG (headless capture).
     pub fn request_capture(&mut self, path: String) {
         self.pending_capture = Some(path);

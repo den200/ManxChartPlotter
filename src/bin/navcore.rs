@@ -2173,6 +2173,9 @@ impl ApplicationHandler for App {
                         }
                     }
                     if self.panning {
+                        // Taking the chart in hand takes it off follow, or
+                        // the next fix would undo the drag.
+                        state.release_follow();
                         let dx = (position.x - self.last_mouse_pos.x) as f32;
                         let dy = (position.y - self.last_mouse_pos.y) as f32;
                         state.camera.pan(dx, dy);
@@ -2208,6 +2211,7 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::PanGesture { delta, .. } => {
+                state.release_follow();
                 state.camera.pan(delta.x, delta.y);
                 state.mark_dirty();
             }
@@ -2266,6 +2270,7 @@ impl ApplicationHandler for App {
                                 }
                             }
                             if let (true, Some(old_loc)) = (self.panning, old_location) {
+                                state.release_follow();
                                 let dx = (location.x - old_loc.x) as f32;
                                 let dy = (location.y - old_loc.y) as f32;
                                 state.camera.pan(dx, dy);

@@ -64,10 +64,7 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
     if targets.is_empty() {
         return;
     }
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("ais"),
-    ));
+    let painter = ctx.layer_painter(egui::LayerId::background());
     let screen = ctx.screen_rect().expand(SIZE * 4.0);
     let dark = ctx.style().visuals.dark_mode;
     // Enough contrast on both palettes without becoming a third colour.

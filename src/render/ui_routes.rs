@@ -46,10 +46,7 @@ pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
     if routes.is_empty() {
         return;
     }
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::new("routes-overlay"),
-    ));
+    let painter = ctx.layer_painter(egui::LayerId::background());
     let screen = ctx.screen_rect().expand(2_000.0);
 
     for route in routes {

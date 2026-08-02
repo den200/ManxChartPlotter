@@ -48,10 +48,7 @@ pub fn draw(ctx: &Context, barbs: &[WindBarb]) {
     if barbs.is_empty() {
         return;
     }
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Background,
-        egui::Id::new("wind-overlay"),
-    ));
+    let painter = ctx.layer_painter(egui::LayerId::background());
     for barb in barbs {
         draw_one(&painter, barb);
     }
