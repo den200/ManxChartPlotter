@@ -378,6 +378,10 @@ pub struct RenderState {
     chart_root: Option<std::path::PathBuf>,
     /// The NAVCORE_PLAN capture hook has run (it must fire exactly once).
     env_plan_fired: bool,
+    /// The address the user configured, while `NAVCORE_SIGNALK` overrides it
+    /// for this run. Written back on save so a test address cannot become
+    /// the boat's.
+    signalk_override_saved: Option<String>,
     /// The wind field the overlay draws, when one is loaded.
     wind_forecast: Option<crate::nav::grib::GribForecast>,
     /// Worker threads reporting to the route-network channel that have not
@@ -1054,6 +1058,7 @@ impl RenderState {
             mariner_symbols: crate::render::mariner::MarinerSymbols::resolve(),
             chart_root: None,
             env_plan_fired: false,
+            signalk_override_saved: None,
             wind_forecast: None,
             route_net_jobs: 0,
             pick_anchor: None,
@@ -3452,19 +3457,27 @@ impl RenderState {
             }
             // `NAVCORE_SHOP=1` opens the chart shop at startup, so it can be
             // captured without a click.
+            let mut signalk_override_saved: Option<String> = None;
             if let Some(ui) = self.ui.as_mut() {
                 if std::env::var("NAVCORE_SHOP").is_ok_and(|v| v != "0") {
                     ui.shop.open = true;
                     ui.shop.email = std::env::var("NAVCORE_SHOP_EMAIL").unwrap_or_default();
                 }
-                // `NAVCORE_SIGNALK=<address>` overrides the saved server, for
-                // testing against a particular one without touching settings.
+                // `NAVCORE_SIGNALK=<address>` overrides the saved server for
+                // this run only. It used to claim it did not touch settings
+                // while quietly doing exactly that: the override went into
+                // the live view, and the next save — which any settings
+                // change triggers — wrote it over the address the user had
+                // actually configured. The real one is kept here and put
+                // back at save time.
                 if let Ok(url) = std::env::var("NAVCORE_SIGNALK") {
                     if !url.is_empty() {
+                        signalk_override_saved = Some(ui.instruments.url.clone());
                         ui.instruments.url = url;
                     }
                 }
             }
+            self.signalk_override_saved = signalk_override_saved;
             self.maybe_env_plan();
             // Open the stream to the server this plotter was last using. A
             // chart plotter that has to be told to reconnect every time the
@@ -3623,8 +3636,13 @@ impl RenderState {
             weather: &'a crate::render::ui::WeatherView,
             boat: &'a crate::render::ui::BoatView,
         }
+        // An env override is for this run; the file keeps what the user set.
+        let mut instruments = ui.instruments.clone();
+        if let Some(ref saved) = self.signalk_override_saved {
+            instruments.url = saved.clone();
+        }
         let Ok(json) = serde_json::to_string_pretty(&Persisted {
-            instruments: &ui.instruments,
+            instruments: &instruments,
             weather: &ui.weather,
             boat: &ui.boat,
         }) else {
