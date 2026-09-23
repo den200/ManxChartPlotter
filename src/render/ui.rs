@@ -316,6 +316,9 @@ pub struct BoatView {
     pub beam_m: f64,
     pub draft_m: f64,
     pub air_draft_m: f64,
+    /// Engine cruising speed, knots. Zero: a sailing boat that does not
+    /// motor, and the planner never offers it.
+    pub motor_kt: f64,
     // Live state below.
     #[serde(skip)]
     pub open: bool,
@@ -340,6 +343,7 @@ impl Default for BoatView {
             beam_m: 0.0,
             draft_m: 0.0,
             air_draft_m: 0.0,
+            motor_kt: 0.0,
             open: false,
             search: String::new(),
             country: "DEN".into(),

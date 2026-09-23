@@ -95,6 +95,9 @@ impl TileGpuBuffers {
 }
 
 /// LRU cache for GPU tile buffers with byte budget
+/// How many known-empty tiles to remember before starting over.
+const MAX_EMPTY_TILES: usize = 100_000;
+
 pub struct TileGpuCache {
     tiles: HashMap<TileCacheKey, TileGpuBuffers>,
     lru_order: VecDeque<TileCacheKey>,
@@ -152,6 +155,12 @@ impl TileGpuCache {
 
     /// Mark a tile as known-empty without building it (e.g. no charts intersect)
     pub fn mark_empty(&mut self, key: &TileCacheKey) {
+        // A plotter left panning for days would otherwise remember every
+        // empty tile it ever saw. Forgetting them all costs one re-check of
+        // each, and only when the set has grown past any plausible screenful.
+        if self.empty_tiles.len() >= MAX_EMPTY_TILES {
+            self.empty_tiles.clear();
+        }
         if self.empty_tiles.insert(*key) {
             self.revision = self.revision.wrapping_add(1);
         }
@@ -197,9 +206,7 @@ impl TileGpuCache {
             && packet.pattern_vertices.is_empty()
         {
             log::debug!("  -> empty packet, marking as known-empty");
-            if self.empty_tiles.insert(key) {
-                self.revision = self.revision.wrapping_add(1);
-            }
+            self.mark_empty(&key);
             return;
         }
 

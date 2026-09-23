@@ -71,6 +71,22 @@ pub fn window(
                 field(ui, "draft", &mut boat.draft_m, 6.0);
                 field(ui, "air draft", &mut boat.air_draft_m, 60.0);
             });
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("engine").weak());
+                edited |= ui
+                    .add(
+                        egui::DragValue::new(&mut boat.motor_kt)
+                            .speed(0.1)
+                            .range(0.0..=30.0)
+                            .fixed_decimals(1)
+                            .suffix(" kn"),
+                    )
+                    .on_hover_text(
+                        "Cruising speed under engine. Sail plans motor where sailing \
+                         would crawl; zero means never.",
+                    )
+                    .changed();
+            });
             if edited {
                 // A boat's numbers are worth remembering the moment they are
                 // typed; nobody re-enters their draft twice happily.
