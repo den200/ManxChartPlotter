@@ -86,6 +86,8 @@ pub struct Uniforms {
 /// 2048 slots at a 256-byte stride is 512 KiB — small next to one tile's
 /// vertices, and several times the largest draw list a tilted view makes.
 pub const CAMERA_SLOTS: usize = 2048;
+/// Line styles one frame can draw: one uniform slot each.
+const LINE_STYLE_SLOTS: usize = 128;
 /// Slot for data still in global Mercator (the single-chart debug path).
 pub const SLOT_GLOBAL: usize = 0;
 /// Slot for the globally decluttered soundings and labels.
@@ -1005,10 +1007,9 @@ impl RenderState {
 
         let line_uniform_align = device.limits().min_uniform_buffer_offset_alignment;
         let slot_size = (line_uniform_align as usize).max(std::mem::size_of::<LineUniforms>());
-        let max_line_styles = 128;
         let line_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Line Uniform Buffer"),
-            size: (slot_size * max_line_styles) as u64,
+            size: (slot_size * LINE_STYLE_SLOTS) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2418,7 +2419,9 @@ impl RenderState {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.style_hash.hash(&mut hasher);
         self.tile_cache.revision().hash(&mut hasher);
-        self.visible_tiles_cache.hash(&mut hasher);
+        for (key, _) in &self.tile_draw_list {
+            key.hash(&mut hasher);
+        }
         hasher.finish()
     }
 
@@ -2444,11 +2447,14 @@ impl RenderState {
         self.effective_ppmm.max(1.0)
     }
 
+    /// Every line style the draw list will draw, one uniform slot each.
+    ///
+    /// From the draw list, not the visible tiles: a visible tile still loading
+    /// is drawn from a resident ancestor, whose styles need slots too.
     fn collect_visible_line_styles(&self) -> Vec<LineStyleKey> {
         let mut styles = Vec::new();
-        for tile_id in &self.visible_tiles_cache {
-            let key = TileCacheKey::new(*tile_id, self.style_hash);
-            if let Some(buffers) = self.tile_cache.get(&key) {
+        for (key, _) in &self.tile_draw_list {
+            if let Some(buffers) = self.tile_cache.get(key) {
                 for batch in &buffers.line_batches {
                     if batch.vertex_count > 0 {
                         styles.push(batch.key.style.clone());
@@ -2514,6 +2520,16 @@ impl RenderState {
             let styles_key = self.current_visible_line_styles_key();
             if self.cached_visible_line_styles_key != styles_key {
                 self.cached_visible_line_styles = self.collect_visible_line_styles();
+                // Past the buffer's slots a style goes undrawn rather than
+                // overrun the buffer.
+                if self.cached_visible_line_styles.len() > LINE_STYLE_SLOTS {
+                    log::warn!(
+                        "{} line styles in view, {} slots: the rest are not drawn",
+                        self.cached_visible_line_styles.len(),
+                        LINE_STYLE_SLOTS
+                    );
+                    self.cached_visible_line_styles.truncate(LINE_STYLE_SLOTS);
+                }
                 self.cached_visible_line_styles_key = styles_key;
             }
 
@@ -2670,7 +2686,9 @@ impl RenderState {
                 if let Some(start) = draw_start {
                     log::info!("profile.draw_tiles: {} ms", start.elapsed().as_millis());
                 }
-                self.draw_mariner_symbols(&mut render_pass);
+                if !super::debug_skip("mariner") {
+                    self.draw_mariner_symbols(&mut render_pass);
+                }
             } else {
                 // Single chart mode (existing code)
                 // 1. Render areas (land, depth)
@@ -3413,6 +3431,9 @@ impl RenderState {
         stroke: &'a wgpu::RenderPipeline,
         lc_bound: &mut Option<bool>,
     ) {
+        if super::debug_skip(if batch.index_buffer.is_some() { "stroke" } else { "lc" }) {
+            return;
+        }
         render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
         match &batch.index_buffer {
             Some(indices) => {
@@ -4047,7 +4068,7 @@ impl RenderState {
                     if let Some(ref bg_buf) = buffers.bg_area_buffer {
                         let start = buffers.bg_area_priority_offsets[p];
                         let end = buffers.bg_area_priority_offsets[p + 1];
-                        if end > start {
+                        if end > start && !super::debug_skip("bg") {
                             render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                             render_pass.set_vertex_buffer(0, bg_buf.slice(..));
                             render_pass.draw(start..end, 0..1);
@@ -4065,7 +4086,7 @@ impl RenderState {
                     self.apply_scissor(render_pass, *scissor);
                     let start = buffers.area_priority_offsets[p];
                     let end = buffers.area_priority_offsets[p + 1];
-                    if end > start {
+                    if end > start && !super::debug_skip("area") {
                         render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                         render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
                         render_pass.draw(start..end, 0..1);
@@ -4081,8 +4102,8 @@ impl RenderState {
             }
 
             // --- Patterns at this priority (bg then fg) ---
-            if let (Some(ref pattern_renderer), Some(ref pattern_bind_group)) =
-                (&self.pattern_renderer, &self.pattern_camera_bind_group)
+            if let (Some(ref pattern_renderer), Some(ref pattern_bind_group), false) =
+                (&self.pattern_renderer, &self.pattern_camera_bind_group, super::debug_skip("pattern"))
             {
                 let mut bg_pattern_state_set = false;
                 let mut fg_pattern_state_set = false;
@@ -4137,7 +4158,7 @@ impl RenderState {
             // --- Lines at this priority ---
             // Legacy draws are sorted by LineBatchKey which puts bg before fg.
             // Split the range into bg and fg sub-ranges.
-            let (l_start, l_end) = legacy_prio_ranges[p];
+            let (l_start, l_end) = if super::debug_skip("line") { (0, 0) } else { legacy_prio_ranges[p] };
 
             // Find the split point: bg batches (is_background=true) sort first
             let bg_end = legacy_draws[l_start..l_end]
@@ -4153,7 +4174,10 @@ impl RenderState {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
-                    let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    // No slot, no draw: another style's uniforms would draw it
+                    // wrong, and an ordinary stroke's through the LC shader
+                    // would divide by a zero advance.
+                    let Some(&offset) = line_style_offsets.get(style_key) else { continue };
                     self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
@@ -4172,7 +4196,10 @@ impl RenderState {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
-                    let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    // No slot, no draw: another style's uniforms would draw it
+                    // wrong, and an ordinary stroke's through the LC shader
+                    // would divide by a zero advance.
+                    let Some(&offset) = line_style_offsets.get(style_key) else { continue };
                     self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
@@ -4192,7 +4219,7 @@ impl RenderState {
                 let Some(ref buf) = buffers.sector_buffer else { continue };
                 let start = buffers.sector_priority_offsets[p];
                 let end = buffers.sector_priority_offsets[p + 1];
-                if end > start {
+                if end > start && !super::debug_skip("sector") {
                     if !sector_pipeline_set {
                         self.sector_renderer.set_pipeline(render_pass);
                         sector_pipeline_set = true;
@@ -4214,7 +4241,7 @@ impl RenderState {
                         self.camera_slot_offset(SLOT_GLOBAL),
                     );
                     symbol_draw_calls = 1;
-                } else if debug_mode != 3 {
+                } else if debug_mode != 3 && !super::debug_skip("symbol") {
                     let mut symbol_state_set = false;
                     for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
                         let Some(cam) = self.tile_cam(i) else { continue };
@@ -4276,7 +4303,7 @@ impl RenderState {
             (&self.text_renderer, &self.text_camera_bind_group)
         {
             if let Some(ref text_buffer) = self.global_text_buffer {
-                if self.global_text_count > 0 {
+                if self.global_text_count > 0 && !super::debug_skip("text") {
                     text_renderer.render_with_buffer(
                         render_pass,
                         text_bind_group,
@@ -4301,7 +4328,7 @@ impl RenderState {
             &self.symbol_camera_bind_group,
             &self.global_sounding_buffer,
         ) {
-            if self.global_sounding_count > 0 {
+            if self.global_sounding_count > 0 && !super::debug_skip("text") {
                 symbol_renderer.render_with_buffer(
                     render_pass,
                     symbol_bind_group,
@@ -4317,7 +4344,7 @@ impl RenderState {
             (&self.label_renderer, &self.label_camera_bind_group)
         {
             if let Some(ref label_buffer) = self.global_label_buffer {
-                if self.global_label_count > 0 {
+                if self.global_label_count > 0 && !super::debug_skip("label") {
                     label_renderer.render_with_buffer(
                         render_pass,
                         label_bind_group,

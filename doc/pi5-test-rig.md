@@ -94,8 +94,30 @@ WARN/ERROR grouped by message.
 Known from the first traces (2026-09-23): no fan on this Pi, so throttle flags
 `0xe0000` (soft temp limit and ARM cap *occurred*) show up; no under-voltage
 despite the "can't supply 5 A" popup (that's only PD negotiation with the
-Dell dock). NOAA California cells log ~1300 `Corrupt prim … huge=true`
-warnings at load. That's the lead for the V3D hang, not yet confirmed.
+Dell dock).
+
+### Reproducing a GPU hang
+
+navcore draws only when something changes, so a still view never hangs the GPU.
+Two env hooks make a hang reproducible without hands on the mouse:
+
+- `NAVCORE_STRESS=1` pans in a circle and zooms out ~64× and back, every frame.
+  `NAVCORE_STRESS=coast` follows the coast from San Diego Bay to LA harbour and
+  back at 0.3–8 m/px. Both redraw at 60 fps (~180 V3D jobs/s in `system.csv`).
+- `NAVCORE_SKIP=bg,area,pattern,line,sector,symbol,text,label,mariner,stroke,lc`
+  leaves those layers out, to bisect a hang by layer (`stroke` and `lc` split
+  `line` into plain strokes and LC() symbol lines).
+
+```sh
+ssh rpi5 'NAVCORE_STRESS=coast NAVCORE_VIEW=32.68,-117.235,1 bash ~/navcore/deploy/pi-run.sh'
+```
+
+The first V3D hang (2026-09-23) was the LC() fragment shader (`fs_lc`). An inner
+loop bounded by a uniform (`i < u.lc_count`) hung V3D within seconds under
+`NAVCORE_STRESS`. The same loop with a constant bound and a `break` doesn't.
+Keep shader loops constant-bounded on this GPU. The `Corrupt prim … huge=true`
+warnings seen at the time were a false alarm from a too-tight check in
+`senc/geometry.rs`.
 - Screenshot of the Pi's screen: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/s.png' && scp rpi5:/tmp/s.png .`
 - Check the outputs: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 wlr-randr'`
 - GPU: V3D through Mesa Vulkan (`vulkaninfo --summary`).

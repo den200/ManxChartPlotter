@@ -1803,6 +1803,8 @@ struct App {
     shot_path: Option<String>,
     shot_requested: bool,
     frame_count: u32,
+    /// NAVCORE_STRESS=coast: legs of the coastal tour done so far.
+    stress_leg: usize,
 }
 
 /// Where a wheel or trackpad zoom should hold still: under the pointer, or
@@ -1836,6 +1838,7 @@ impl App {
             pinch_centroid: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             frame_count: 0,
+            stress_leg: 0,
         }
     }
 
@@ -2018,6 +2021,50 @@ impl ApplicationHandler for App {
                 }
             }
             return;
+        }
+
+        // NAVCORE_STRESS=1: pan in a circle and zoom out ~64x and back, every
+        // frame, forever. NAVCORE_STRESS=coast: follow the southern California
+        // coast, San Diego Bay to LA harbour and back, zooming 0.3-8 m/px.
+        // A GPU soak test that needs no hands on the mouse.
+        let stress = std::env::var("NAVCORE_STRESS").unwrap_or_default();
+        if !stress.is_empty() && stress != "0" {
+            if let Some(state) = &mut self.state {
+                let t = self.frame_count as f32 / 60.0;
+                let (w, h) = (state.camera.viewport_width, state.camera.viewport_height);
+                if stress == "coast" {
+                    const COAST: [(f64, f64); 13] = [
+                        (32.680, -117.235), (32.700, -117.225), (32.715, -117.175),
+                        (32.680, -117.200), (32.680, -117.235), (32.765, -117.240),
+                        (32.850, -117.280), (32.960, -117.280), (33.207, -117.400),
+                        (33.460, -117.700), (33.600, -117.890), (33.750, -118.200),
+                        (33.720, -118.270),
+                    ];
+                    // Leg index runs out and back: 0..12, 12..0, ...
+                    let n = COAST.len();
+                    let leg = self.stress_leg % (2 * (n - 1));
+                    let i = if leg < n - 1 { leg + 1 } else { 2 * (n - 1) - leg - 1 };
+                    let (tx, ty) = navcore2::render::Projection::to_mercator(COAST[i].0, COAST[i].1);
+                    let d = glam::DVec2::new(tx, ty) - state.camera.position;
+                    let step = 30.0 * state.camera.zoom as f64;
+                    if d.length() <= step {
+                        state.camera.position = glam::DVec2::new(tx, ty);
+                        self.stress_leg += 1;
+                    } else {
+                        state.camera.position += d / d.length() * step;
+                    }
+                    let mpp = (0.3f32.ln() + (8.0f32.ln() - 0.3f32.ln()) * (0.5 - 0.5 * (0.4 * t).cos())).exp();
+                    state.camera.zoom = mpp.max(state.camera.min_zoom);
+                } else {
+                    state.camera.zoom_at((-0.0175 * (0.5 * t).sin()).exp(), w * 0.5, h * 0.5);
+                    state.camera.pan(w * 0.02 * (0.7 * t).cos(), h * 0.02 * (0.7 * t).sin());
+                }
+                state.window().request_redraw();
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    std::time::Instant::now() + std::time::Duration::from_millis(16),
+                ));
+                return;
+            }
         }
 
         if let Some(ref state) = self.state {

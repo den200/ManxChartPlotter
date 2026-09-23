@@ -96,6 +96,21 @@ use std::sync::OnceLock;
 
 static DEBUG_RENDER_MODE: OnceLock<u8> = OnceLock::new();
 
+static DEBUG_SKIP: OnceLock<Vec<String>> = OnceLock::new();
+
+/// NAVCORE_SKIP=bg,area,pattern,line,sector,symbol,text,label,mariner leaves
+/// those chart layers out of the frame. For bisecting a GPU hang by layer.
+pub fn debug_skip(kind: &str) -> bool {
+    DEBUG_SKIP
+        .get_or_init(|| {
+            std::env::var("NAVCORE_SKIP")
+                .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default()
+        })
+        .iter()
+        .any(|k| k == kind)
+}
+
 /// NAVCORE_DEBUG_RENDER:
 /// 1 = solid magenta symbols, 2 = no depth/cull for symbols, 3 = atlas debug quad.
 pub fn debug_render_mode() -> u8 {
