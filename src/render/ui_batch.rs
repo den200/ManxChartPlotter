@@ -59,14 +59,18 @@ impl Batch {
         self.mesh.reserve_triangles(shapes * 6);
     }
 
+    /// Nothing to draw: no triangles. Vertices alone are not something —
+    /// egui drops only a mesh with neither, and one with vertices but no
+    /// indices reaches egui-wgpu as an empty index range, which panics in
+    /// wgpu ("Buffer slices can not be empty") and takes navcore down.
     pub fn is_empty(&self) -> bool {
-        self.mesh.is_empty()
+        self.mesh.indices.is_empty()
     }
 
     /// Hand the batch to egui. Nothing is drawn for an empty one — an empty
-    /// mesh still costs a draw call.
+    /// mesh still costs a draw call, and one without triangles crashes.
     pub fn paint(self, painter: &Painter) {
-        if !self.mesh.is_empty() {
+        if !self.is_empty() {
             painter.add(Shape::Mesh(self.mesh));
         }
     }
@@ -86,7 +90,7 @@ impl Batch {
     /// painter — the clip rectangle comes from this call, not from the
     /// booking.
     pub fn paint_at(self, painter: &Painter, idx: ShapeIdx) {
-        if !self.mesh.is_empty() {
+        if !self.is_empty() {
             painter.set(idx, Shape::Mesh(self.mesh));
         }
     }
@@ -218,6 +222,7 @@ impl Batch {
             return;
         }
         let base = self.mesh.vertices.len() as u32;
+        let first_index = self.mesh.indices.len();
         self.mesh.reserve_vertices(cols * rows);
         self.mesh.reserve_triangles((cols - 1) * (rows - 1) * 2);
         for i in 0..cols * rows {
@@ -240,6 +245,12 @@ impl Batch {
                 }
                 self.quad_indices(at(c, r), at(c + 1, r), at(c + 1, r + 1), at(c, r + 1));
             }
+        }
+        // Not one cell with data on all four corners — panning past the edge
+        // of a forecast. Take the corners back: vertices with no triangles
+        // crashed navcore on the Pi (see is_empty).
+        if self.mesh.indices.len() == first_index {
+            self.mesh.vertices.truncate(base as usize);
         }
     }
 
@@ -363,6 +374,23 @@ mod tests {
         assert_eq!(v[1].color, Color32::RED);
         assert_eq!(v[2].color, Color32::RED);
         assert_eq!(v[3].color, Color32::TRANSPARENT);
+    }
+
+    /// A grid with no cell to draw leaves nothing behind — not a mesh of bare
+    /// corners, which egui-wgpu turns into an empty index buffer slice and a
+    /// panic. Seen panning past the edge of a wind forecast on the Pi.
+    #[test]
+    fn a_grid_with_no_whole_cell_leaves_no_vertices() {
+        let mut b = batch();
+        let at: Vec<[f32; 2]> = (0..6).map(|i| [(i % 3) as f32 * 10.0, (i / 3) as f32 * 10.0]).collect();
+        let red = Some(Color32::RED);
+        b.grid(&at, 3, 2, &[red, None, red, None, red, None]);
+        assert!(b.is_empty());
+        assert!(b.mesh.vertices.is_empty(), "{} corners left behind", b.mesh.vertices.len());
+        // And a later grid that does draw is indexed from the right base.
+        b.grid(&at, 3, 2, &[red; 6]);
+        assert_eq!(b.mesh.vertices.len(), 6);
+        assert!(b.mesh.indices.iter().all(|&i| (i as usize) < b.mesh.vertices.len()));
     }
 
     /// Degenerate input must produce nothing rather than NaN vertices, which

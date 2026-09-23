@@ -2155,12 +2155,14 @@ impl RenderState {
         self.env_plan_fired = true;
 
         // `NAVCORE_WIND=1` opens the weather sheet and fetches for what is on
-        // screen. Like the plan hook it has to wait for a view: at init_ui the
-        // camera is still looking at 0°N 0°E, and the fetch would ask for the
-        // wind over the Gulf of Guinea.
-        if std::env::var("NAVCORE_WIND").is_ok() {
+        // screen; `NAVCORE_WIND=fill` also turns on the colour wash. Like the
+        // plan hook it has to wait for a view: at init_ui the camera is still
+        // looking at 0°N 0°E, and the fetch would ask for the wind over the
+        // Gulf of Guinea.
+        if let Ok(wind) = std::env::var("NAVCORE_WIND") {
             if let Some(ref mut ui) = self.ui {
                 ui.wind.show = true;
+                ui.wind.fill |= wind == "fill";
                 ui.sheet.show = true;
             }
             self.spawn_wind_fetch();
