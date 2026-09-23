@@ -23,6 +23,14 @@ pub enum UiAction {
     DismissPick,
     /// The display settings changed: re-apply them and save.
     DisplayChanged,
+    /// Look up what is installed, and ask NOAA for sizes and dates.
+    FreeChartsRefresh,
+    /// Download (or update) a NOAA package.
+    FreeChartsDownload { code: String },
+    /// Stop the download in progress.
+    FreeChartsCancel,
+    /// Delete an installed NOAA package.
+    FreeChartsRemove { code: String },
     /// Abandon the passage plan being computed.
     PlanCancel,
     /// Keep the boat centred on the chart, or stop.
@@ -134,6 +142,42 @@ pub enum UiAction {
     WeatherRoute { route_id: uuid::Uuid },
 }
 
+/// The Charts window's three ways to get charts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChartsTab {
+    /// Buy o-charts cells.
+    #[default]
+    Shop,
+    /// Download free NOAA charts.
+    Free,
+    /// Point at a folder of charts already on disk.
+    Folder,
+}
+
+/// One NOAA package, as the Free charts tab lists it.
+#[derive(Debug, Clone)]
+pub struct FreeRow {
+    pub code: &'static str,
+    pub name: &'static str,
+    /// What NOAA offers now; `None` until asked (or if it did not answer).
+    pub remote: Option<crate::shop::noaa::Remote>,
+    pub installed: Option<crate::shop::noaa::Installed>,
+}
+
+/// The Free charts tab.
+#[derive(Debug, Clone, Default)]
+pub struct FreeChartsView {
+    pub rows: Vec<FreeRow>,
+    pub filter: String,
+    /// NOAA has been asked for sizes and dates this session.
+    pub probed: bool,
+    /// The package downloading now: code, bytes so far, total.
+    pub active: Option<(String, u64, u64)>,
+    /// A package whose removal is waiting for a second tap.
+    pub confirm_remove: Option<String>,
+    pub status: String,
+}
+
 /// The chart folder in use, and the browser for choosing another.
 ///
 /// Only the chosen folder is written to disk; where the user happened to be
@@ -145,9 +189,9 @@ pub enum UiAction {
 pub struct ChartFolderView {
     /// The folder the charts came from. Empty until one is chosen.
     pub chosen: String,
-    /// Browsing the disk rather than the shop.
+    /// Which tab of the Charts window is showing.
     #[serde(skip)]
-    pub browsing: bool,
+    pub tab: ChartsTab,
     /// The directory on show.
     #[serde(skip)]
     pub at: String,
@@ -744,6 +788,7 @@ pub struct Ui {
     /// other weather display on screen reads.
     pub sheet: super::ui_weather::SheetView,
     pub display: DisplayView,
+    pub free: FreeChartsView,
 }
 
 impl Ui {
@@ -783,6 +828,7 @@ impl Ui {
             wind: WindView::default(),
             sheet: Default::default(),
             display: crate::render::state::RenderState::load_display_settings(),
+            free: FreeChartsView::default(),
         }
     }
 
@@ -888,10 +934,11 @@ impl Ui {
         let wind = &mut self.wind;
         let sheet = &mut self.sheet;
         let display = &mut self.display;
+        let free = &mut self.free;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
                 ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
-                display, fleet, actions,
+                display, free, fleet, actions,
             );
         });
         self.state
