@@ -605,7 +605,16 @@ fn free_charts(
                             .small()
                             .weak(),
                         ),
-                        None => ui.label(RichText::new(size).small().weak()),
+                        None => match free.failed.as_ref().filter(|(c, _)| c == row.code) {
+                            Some((_, why)) => ui
+                                .label(
+                                    RichText::new("download failed")
+                                        .small()
+                                        .color(egui::Color32::from_rgb(200, 60, 60)),
+                                )
+                                .on_hover_text(why.as_str()),
+                            None => ui.label(RichText::new(size).small().weak()),
+                        },
                     };
                     ui.horizontal(|ui| {
                         let active = free.active.as_ref().filter(|(c, _, _)| c == row.code);
@@ -614,7 +623,10 @@ fn free_charts(
                             ui.add(
                                 egui::ProgressBar::new(f)
                                     .desired_width(150.0)
-                                    .text(if *total > 0 {
+                                    .text(if *total > 0 && done >= total {
+                                        // Unzipping a big state takes a while.
+                                        "installing…".to_string()
+                                    } else if *total > 0 {
                                         format!("{} of {}", mb(*done), mb(*total))
                                     } else {
                                         mb(*done)
@@ -650,7 +662,16 @@ fn free_charts(
                                 free.confirm_remove = Some(row.code.into());
                             }
                         } else if ui
-                            .add_enabled(!busy, egui::Button::new("Download"))
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(
+                                    if free.failed.as_ref().is_some_and(|(c, _)| c == row.code) {
+                                        "Try again"
+                                    } else {
+                                        "Download"
+                                    },
+                                ),
+                            )
                             .on_disabled_hover_text("one download at a time")
                             .clicked()
                         {
@@ -663,7 +684,16 @@ fn free_charts(
     });
     if !free.status.is_empty() {
         ui.add_space(4.0);
-        ui.label(RichText::new(&free.status).small());
+        let text = RichText::new(&free.status);
+        ui.label(if free.status.starts_with("Download failed") {
+            text.color(egui::Color32::from_rgb(200, 60, 60))
+        } else {
+            text
+        });
+    }
+    if !free.folder.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("Saved in {}", free.folder)).small().weak());
     }
     ui.add_space(4.0);
     ui.label(

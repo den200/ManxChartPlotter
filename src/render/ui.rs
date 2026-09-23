@@ -176,6 +176,11 @@ pub struct FreeChartsView {
     /// A package whose removal is waiting for a second tap.
     pub confirm_remove: Option<String>,
     pub status: String,
+    /// The last download that failed, and why — shown on its row, where
+    /// the eye is, not only in the line under the list.
+    pub failed: Option<(String, String)>,
+    /// Where packages are saved, for the line that says so.
+    pub folder: String,
 }
 
 /// The chart folder in use, and the browser for choosing another.

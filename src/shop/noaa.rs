@@ -78,16 +78,36 @@ pub struct Installed {
 
 const MARKER: &str = "navcore-noaa.json";
 
-fn agent(total_timeout: bool) -> ureq::Agent {
-    let b = ureq::Agent::config_builder();
-    // A HEAD is small; a package is up to a few hundred megabytes over a
-    // marina's wifi, so its timeout covers the wait for the response only.
-    let b = if total_timeout {
-        b.timeout_global(Some(std::time::Duration::from_secs(20)))
-    } else {
-        b.timeout_recv_response(Some(std::time::Duration::from_secs(30)))
-    };
-    b.build().into()
+/// A HEAD is small: 20 seconds for all of it.
+fn probe_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(20)))
+        .build()
+        .into()
+}
+
+/// How long one request of a download may run. ureq has no idle timeout,
+/// and its "receive response" limit keeps running through the body — a
+/// 30-second one cut every package off at 30 seconds, which on a slow link
+/// is a few megabytes in. So each request is given a minute and the
+/// download carries on from where it stopped with a Range request: a slow
+/// link finishes in several pieces, and a dead one is noticed within a
+/// minute rather than never.
+const DOWNLOAD_CALL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Requests in a row that may bring nothing before the download gives up.
+const MAX_STALLS: u32 = 3;
+
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(20)))
+        .timeout_per_call(Some(DOWNLOAD_CALL))
+        .build()
+        .into()
+}
+
+fn header(resp: &ureq::http::Response<ureq::Body>, name: &str) -> Option<String> {
+    resp.headers().get(name)?.to_str().ok().map(str::to_string)
 }
 
 /// The folder a package lives in.
@@ -97,7 +117,7 @@ pub fn region_dir(root: &Path, code: &str) -> PathBuf {
 
 /// Ask NOAA for a package's size and date.
 pub fn probe(code: &str) -> Result<Remote, String> {
-    let resp = agent(true)
+    let resp = probe_agent()
         .head(&zip_url(code))
         .call()
         .map_err(|e| e.to_string())?;
@@ -140,58 +160,13 @@ pub fn install(
     };
 
     // The package, to a file: some are hundreds of megabytes.
-    let mut resp = agent(false)
-        .get(&zip_url(code))
-        .call()
-        .map_err(|e| e.to_string())?;
-    let total: u64 = resp
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let last_modified = resp
-        .headers()
-        .get("last-modified")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    {
-        let mut out = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-        let mut reader = resp.body_mut().as_reader();
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut done = 0u64;
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                drop(out);
-                cleanup();
-                return Err("cancelled".into());
-            }
-            let n = match reader.read(&mut buf) {
-                Ok(n) => n,
-                Err(e) => {
-                    drop(out);
-                    cleanup();
-                    return Err(format!("download interrupted: {e}"));
-                }
-            };
-            if n == 0 {
-                break;
-            }
-            if let Err(e) = out.write_all(&buf[..n]) {
-                drop(out);
-                cleanup();
-                return Err(format!("cannot write the download: {e}"));
-            }
-            done += n as u64;
-            progress(done, total);
-        }
-        if total > 0 && done != total {
-            drop(out);
+    let last_modified = match fetch(code, &part, &mut progress, cancel) {
+        Ok(v) => v,
+        Err(e) => {
             cleanup();
-            return Err(format!("download ended early ({done} of {total} bytes)"));
+            return Err(e);
         }
-    }
+    };
 
     // Unpack beside the old copy.
     let _ = std::fs::remove_dir_all(&staging);
@@ -221,6 +196,96 @@ pub fn install(
     })?;
     let _ = std::fs::remove_file(&part);
     Ok(record)
+}
+
+/// Download a package to `part`, resuming after a request that ends early.
+/// Returns its Last-Modified.
+fn fetch(
+    code: &str,
+    part: &Path,
+    progress: &mut impl FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let agent = download_agent();
+    let mut out = std::fs::File::create(part).map_err(|e| e.to_string())?;
+    let mut done = 0u64;
+    let mut total = 0u64;
+    let mut last_modified = String::new();
+    let mut stalls = 0;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let mut req = agent.get(&zip_url(code));
+        if done > 0 {
+            req = req.header("Range", &format!("bytes={done}-"));
+            // A package republished meanwhile comes back whole (200), not
+            // as the rest of the old one.
+            if !last_modified.is_empty() {
+                req = req.header("If-Range", &last_modified);
+            }
+        }
+        let before = done;
+        let result = req.call();
+        let mut last_error = None;
+        match result {
+            Err(e) => last_error = Some(e.to_string()),
+            Ok(mut resp) => {
+                let resumed = resp.status() == 206;
+                if !resumed && done > 0 {
+                    // The server sent the whole file again: start over.
+                    out = std::fs::File::create(part).map_err(|e| e.to_string())?;
+                    done = 0;
+                }
+                if !resumed {
+                    total = header(&resp, "content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+                    last_modified = header(&resp, "last-modified").unwrap_or_default();
+                }
+                let mut reader = resp.body_mut().as_reader();
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("cancelled".into());
+                    }
+                    let n = match reader.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            last_error = Some(e.to_string());
+                            break;
+                        }
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    out.write_all(&buf[..n]).map_err(|e| format!("cannot write the download: {e}"))?;
+                    done += n as u64;
+                    progress(done, total);
+                }
+            }
+        }
+        if total > 0 && done >= total {
+            break;
+        }
+        if total == 0 && last_error.is_none() && done > 0 {
+            // No length given: the end of the body is the end.
+            break;
+        }
+        if done > before {
+            stalls = 0;
+        } else {
+            stalls += 1;
+            if stalls >= MAX_STALLS {
+                let why = last_error.unwrap_or_else(|| "no data".into());
+                return Err(format!("the connection to NOAA stalled ({why})"));
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        }
+        log::info!("NOAA {code}: resuming at {done} of {total} bytes");
+    }
+    if total > 0 && done != total {
+        return Err(format!("download ended early ({done} of {total} bytes)"));
+    }
+    Ok(last_modified)
 }
 
 /// Unzip a package, keeping only what sits under `ENC_ROOT/`.
