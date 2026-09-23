@@ -94,14 +94,17 @@ impl TriPrim {
             vertices.push([x, y]);
         }
 
-        // DEBUG: Check for corrupt data (NaN or extremely huge coordinates).
-        //
-        // Note: Many valid charts have SM coordinates tens/hundreds of km from the chart
-        // reference; treat only truly extreme values as suspicious.
+        // Check for corrupt data: NaN, or an offset no point on Earth can
+        // have. Vertices are metres from the cell's reference point, and a
+        // small-scale cell (US1PO02M, 1:10M) or the WORLD basemap really does
+        // reach thousands of km from it — a 5,000 km limit flagged ~1300
+        // sound primitives at every start. No valid offset exceeds one
+        // Mercator world width (2π × 6378137 m); twice that is the limit.
+        const MAX_OFFSET_M: f32 = 80_150_000.0;
         let has_nan = vertices.iter().any(|v| v[0].is_nan() || v[1].is_nan());
         let has_huge = vertices
             .iter()
-            .any(|v| v[0].abs() > 5_000_000.0 || v[1].abs() > 5_000_000.0);
+            .any(|v| v[0].abs() > MAX_OFFSET_M || v[1].abs() > MAX_OFFSET_M);
         if has_nan || has_huge {
             log::warn!("WARN: Corrupt prim[{}] type=0x{:02x} nvert={} nan={} huge={}",
                 prim_index, prim_type_byte, nvert, has_nan, has_huge);
