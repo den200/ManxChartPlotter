@@ -5570,7 +5570,7 @@ impl RenderState {
             }
             return;
         };
-        let (hours, polar_path, use_waves, use_currents) = self
+        let (hours, polar_path, use_waves, use_currents, motor_kt) = self
             .ui
             .as_ref()
             .map(|u| {
@@ -5579,9 +5579,16 @@ impl RenderState {
                     u.weather.polar_path.clone(),
                     u.weather.use_waves,
                     u.weather.use_currents,
+                    u.boat.motor_kt,
                 )
             })
-            .unwrap_or((48, String::new(), true, true));
+            .unwrap_or((48, String::new(), true, true, 0.0));
+        // The engine joins the plan where sailing crawls — only if the boat
+        // has one worth using.
+        let config = crate::nav::RoutingConfig {
+            motor_speed_kt: (motor_kt > 0.0).then_some(motor_kt),
+            ..Default::default()
+        };
         if let Some(ref mut ui) = self.ui {
             ui.weather.busy = true;
             ui.weather.status = "starting…".into();
@@ -5617,7 +5624,7 @@ impl RenderState {
                 &cache,
                 &polar_text,
                 &polar_name,
-                &crate::nav::RoutingConfig::default(),
+                &config,
                 &safety,
                 use_waves,
                 use_currents,
