@@ -36,5 +36,6 @@ not decrypt on the Pi.
 
 ## Updating
 
-After changes on the Mac: `deploy/deploy-to-pi.sh pi@<pi-name>.local`, then
-restart navcore on the Pi (or reboot it).
+After changes on the Mac: `deploy/deploy-to-pi.sh pi@<pi-name>.local`. It
+builds and restarts navcore on the Pi's screen (`NORUN=1` to only build).
+With no argument it deploys to the `rpi5` test rig (`doc/pi5-test-rig.md`).

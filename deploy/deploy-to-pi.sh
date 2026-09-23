@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Copy the source to the Pi and build it there. Run on the Mac:
+# Copy the source to the Pi, build it there and restart navcore on its screen.
+# Run on the Mac:
+#   deploy/deploy-to-pi.sh              # the rpi5 test rig (ssh alias)
 #   deploy/deploy-to-pi.sh pi@navcore.local
+#   NORUN=1 deploy/deploy-to-pi.sh      # build only, don't restart the app
 # The Pi keeps its own licence fingerprint (license/) and its own charts —
 # neither is copied: an o-charts licence belongs to one machine.
 set -euo pipefail
-HOST="${1:?usage: deploy/deploy-to-pi.sh user@host}"
+HOST="${1:-rpi5}"
 cd "$(dirname "$0")/.."
 
 rsync -az --delete \
@@ -14,11 +17,23 @@ rsync -az --delete \
     ./ "$HOST:navcore/"
 # The PNG exclusion above is for scratch captures; the assets need theirs.
 rsync -az assets/ "$HOST:navcore/assets/"
+# Which source this is — the trace sessions record it (pi-trace.sh).
+echo "$(git describe --always --dirty) $(git branch --show-current) deployed $(date -u -Iseconds)" |
+    ssh "$HOST" 'cat > ~/navcore/BUILD'
+# Double-click launcher on the Pi's desktop. quick_exec stops the file
+# manager asking "execute or open?" on every double-click.
+ssh "$HOST" 'mkdir -p ~/Desktop ~/.config/libfm &&
+    install -m 755 ~/navcore/deploy/navcore-test.desktop ~/Desktop/navcore-test.desktop &&
+    { [ -f ~/.config/libfm/libfm.conf ] || cp /etc/xdg/libfm/libfm.conf ~/.config/libfm/; } &&
+    { grep -q "^quick_exec=" ~/.config/libfm/libfm.conf || sed -i "/^\[config\]/a quick_exec=1" ~/.config/libfm/libfm.conf; }'
 
 # First time: the Pi has no Rust yet, so set it up (packages, Rust, autostart).
 if ! ssh "$HOST" 'test -x ~/.cargo/bin/cargo'; then
-    echo "First deployment: setting the Pi up (this asks for the Pi's sudo password)…"
+    echo "First deployment: setting the Pi up (this may ask for the Pi's sudo password)…"
     ssh -t "$HOST" 'bash ~/navcore/deploy/pi-setup.sh'
 fi
-ssh "$HOST" 'source ~/.cargo/env && cd ~/navcore && cargo build --release 2>&1 | tail -3'
-echo "Built. Start it on the Pi's screen, or reboot to autostart."
+ssh "$HOST" 'source ~/.cargo/env && cd ~/navcore &&
+    if out=$(cargo build --release 2>&1); then echo "$out" | tail -1; else echo "$out" | tail -40; exit 1; fi'
+if [ -z "${NORUN:-}" ]; then
+    ssh "$HOST" 'bash ~/navcore/deploy/pi-run.sh'
+fi

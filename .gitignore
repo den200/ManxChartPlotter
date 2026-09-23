@@ -54,3 +54,7 @@
 
 # Per-folder agent settings
 doc/.claude/
+
+# Trace sessions pulled from the Pi (deploy/pi-trace-pull.sh)
+/traces/
+__pycache__/
