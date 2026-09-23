@@ -1180,125 +1180,31 @@ fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::
 /// M5's surface: fetch real wind, plan a real sailing route, store it.
 fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) {
     use navcore2::geo::LatLon;
-    use navcore2::nav::autoroute::{self, SafetyConfig};
-    use navcore2::nav::{grib, polar::Polar, wxroute};
+    use navcore2::nav::autoroute::SafetyConfig;
+    use navcore2::nav::wxroute;
 
     let start = LatLon::new(a.0, a.1);
     let finish = LatLon::new(b.0, b.1);
-
-    // The forecast first: no point loading charts if the net is down.
     let cache = dirs::config_dir()
         .map(|d| d.join("navcore").join("grib"))
         .unwrap_or_else(|| PathBuf::from("grib-cache"));
-    let area = grib::GeoBox::around(&[start, finish], 1.0);
-    println!("Fetching {}…", grib::GribSource::NoaaGfs025.label());
-    let forecast = match grib::GribForecast::fetch(
-        grib::GribSource::NoaaGfs025,
-        area,
-        hours,
-        &cache,
-        |msg| println!("  {msg}"),
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
-    println!("Fetching waves…");
-    let waves = match grib::WaveForecast::fetch(
-        grib::GribSource::NoaaGfs025,
-        area,
-        hours,
-        &cache,
-        |msg| println!("  {msg}"),
-    ) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            println!("  waves unavailable, routing on wind alone: {e}");
-            None
-        }
-    };
-    println!("Fetching currents ({})…", navcore2::nav::currents::CURRENT_SOURCE_LABEL);
-    let currents = match navcore2::nav::currents::CurrentForecast::fetch(area, hours) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            println!("  currents unavailable, routing without: {e}");
-            None
-        }
-    };
-
-    // Charts, same loading as --auto-route.
-    let dir = PathBuf::from(dir_path);
-    let mut keys = navcore2::decrypt::KeyStore::new();
-    if let Err(e) = keys.load_keylists_in_dir(&dir) {
-        eprintln!("Warning: could not load keys: {e}");
-    }
-    let Ok(base) = ChartDecryptor::new("license") else {
-        eprintln!("Failed to create decryptor");
-        return;
-    };
-    let mut decryptor = CachedDecryptor::new(base);
-    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to build catalog: {e}");
-            return;
-        }
-    };
-    let (ax, ay) = navcore2::tiles::latlon_to_mercator(a.0, a.1);
-    let (bx, by) = navcore2::tiles::latlon_to_mercator(b.0, b.1);
-    let span = ((bx - ax).hypot(by - ay)).max(1_000.0);
-    let margin = (span * 0.35).max(15_000.0);
-    let (min_x, max_x) = ((ax.min(bx) - margin), (ax.max(bx) + margin));
-    let (min_y, max_y) = ((ay.min(by) - margin), (ay.max(by) + margin));
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
-    let decryptor = Mutex::new(decryptor);
-    let builder =
-        TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
-    let mut loaded = Vec::new();
-    for info in catalog.charts.iter().filter(|c| {
-        c.extent_mercator.min_x <= max_x
-            && c.extent_mercator.max_x >= min_x
-            && c.extent_mercator.min_y <= max_y
-            && c.extent_mercator.max_y >= min_y
-    }) {
-        match builder.load_chart(info) {
-            Ok(chart) => loaded.push((chart, info)),
-            Err(e) => eprintln!("  (skipping {}: {e})", info.name),
-        }
-    }
-    let sources: Vec<autoroute::ChartSource> = loaded
-        .iter()
-        .map(|(data, info)| autoroute::ChartSource { data, info })
-        .collect();
-
-    let polar = Polar::parse(wxroute::DEFAULT_POLAR).expect("built-in polar");
-    let config = navcore2::nav::RoutingConfig::default();
-    let safety = SafetyConfig::default();
     let depart = chrono::Utc::now();
-
-    println!(
-        "Weather-routing {:.1} nm across {} chart(s), departing now…",
-        navcore2::geo::distance_m(start, finish) / 1852.0,
-        sources.len()
-    );
-    let planned = match wxroute::plan(
-        &wxroute::WxJob {
-            sources: &sources,
-            start,
-            finish,
-            depart,
-            polar: &polar,
-            polar_name: "built-in cruiser",
-            forecast: &forecast,
-            waves: waves.as_ref(),
-            currents: currents.as_ref(),
-            config: &config,
-            safety: &safety,
-        },
+    // The same function the app's Sail button runs, so the command line
+    // reproduces exactly what a user saw.
+    let planned = match wxroute::plan_from_chart_dir(
+        std::path::Path::new(dir_path),
+        start,
+        finish,
+        hours,
+        &cache,
+        wxroute::DEFAULT_POLAR,
+        "built-in cruiser",
+        &navcore2::nav::RoutingConfig::default(),
+        &SafetyConfig::default(),
+        true,
+        true,
         &format!("Wx {:.2},{:.2} to {:.2},{:.2}", a.0, a.1, b.0, b.1),
+        |msg| println!("  {msg}"),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1332,97 +1238,30 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
             .unwrap_or_default()
         );
     }
-
-    let store_dir = std::env::var("NAVCORE_ROUTES")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(navcore2::nav::RouteStore::default_dir)
-        .unwrap_or_else(|| PathBuf::from("routes"));
-    if let Ok((mut store, _)) = navcore2::nav::RouteStore::open(store_dir) {
-        for wp in &planned.waypoints {
-            store.waypoints.insert(wp.clone());
-        }
-        match store.upsert_route(planned.route.clone()) {
-            Ok(()) => println!("saved to the route store"),
-            Err(e) => eprintln!("could not save: {e}"),
-        }
-    }
+    save_cli_route(&planned.route, &planned.waypoints);
 }
 
 fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f64>) {
     use navcore2::geo::LatLon;
-    use navcore2::nav::autoroute::{self, SafetyConfig};
-
-    let dir = PathBuf::from(dir_path);
-    let mut keys = navcore2::decrypt::KeyStore::new();
-    if let Err(e) = keys.load_keylists_in_dir(&dir) {
-        eprintln!("Warning: could not load keys: {e}");
-    }
-    let Ok(base) = ChartDecryptor::new("license") else {
-        eprintln!("Failed to create decryptor");
-        return;
-    };
-    let mut decryptor = CachedDecryptor::new(base);
-    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to build catalog: {e}");
-            return;
-        }
-    };
+    use navcore2::nav::autoroute::SafetyConfig;
 
     let mut safety = SafetyConfig::default();
     if let Some(d) = draft {
         safety.draft_m = d;
     }
-
-    // Charts whose extent meets the passage box, with margin to route round
-    // headlands near the ends.
-    let (ax, ay) = navcore2::tiles::latlon_to_mercator(a.0, a.1);
-    let (bx, by) = navcore2::tiles::latlon_to_mercator(b.0, b.1);
-    let span = ((bx - ax).hypot(by - ay)).max(1_000.0);
-    let margin = (span * 0.35).max(15_000.0);
-    let (min_x, max_x) = ((ax.min(bx) - margin), (ax.max(bx) + margin));
-    let (min_y, max_y) = ((ay.min(by) - margin), (ay.max(by) + margin));
-
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
-    let decryptor = Mutex::new(decryptor);
-    let builder =
-        TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
-
-    let mut loaded = Vec::new();
-    for info in catalog.charts.iter().filter(|c| {
-        c.extent_mercator.min_x <= max_x
-            && c.extent_mercator.max_x >= min_x
-            && c.extent_mercator.min_y <= max_y
-            && c.extent_mercator.max_y >= min_y
-    }) {
-        match builder.load_chart(info) {
-            Ok(chart) => loaded.push((chart, info)),
-            Err(e) => eprintln!("  (skipping {}: {e})", info.name),
-        }
-    }
+    let (start, finish) = (LatLon::new(a.0, a.1), LatLon::new(b.0, b.1));
     println!(
-        "Planning {:.1} nm passage across {} chart(s), draft {:.1} m…",
-        navcore2::geo::distance_m(
-            navcore2::geo::LatLon::new(a.0, a.1),
-            navcore2::geo::LatLon::new(b.0, b.1)
-        ) / 1852.0,
-        loaded.len(),
+        "Planning {:.1} nm passage, draft {:.1} m…",
+        navcore2::geo::distance_m(start, finish) / 1852.0,
         safety.draft_m
     );
-
-    let sources: Vec<autoroute::ChartSource> = loaded
-        .iter()
-        .map(|(data, info)| autoroute::ChartSource { data, info })
-        .collect();
-
-    let planned = match autoroute::plan(
-        &sources,
-        LatLon::new(a.0, a.1),
-        LatLon::new(b.0, b.1),
+    // The same function the app's Motor button runs.
+    let planned = match navcore2::nav::wxroute::motor_plan_from_chart_dir(
+        std::path::Path::new(dir_path),
+        start,
+        finish,
         &safety,
+        |msg| println!("  {msg}"),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1433,8 +1272,26 @@ fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f
     for w in &planned.warnings {
         println!("  note: {w}");
     }
+    println!(
+        "\n{}: {} waypoints, {:.1} nm",
+        planned.route.name,
+        planned.route.waypoints.len(),
+        planned.route.total_distance_nm()
+    );
+    for (i, leg) in planned.route.legs.iter().enumerate() {
+        println!(
+            "  leg {:>2}: {:>6.2} nm  {:>5.1}°",
+            i + 1,
+            leg.distance_nm,
+            leg.initial_bearing_deg
+        );
+    }
+    save_cli_route(&planned.route, &planned.waypoints);
+}
 
-    // Into the store, so the Routes window sees it immediately.
+/// Into the route store (`NAVCORE_ROUTES`, or the app's own), so the Routes
+/// window sees a command-line plan immediately.
+fn save_cli_route(route: &navcore2::nav::Route, waypoints: &[navcore2::nav::model::Waypoint]) {
     let store_dir = std::env::var("NAVCORE_ROUTES")
         .map(PathBuf::from)
         .ok()
@@ -1442,29 +1299,12 @@ fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f
         .unwrap_or_else(|| PathBuf::from("routes"));
     match navcore2::nav::RouteStore::open(store_dir) {
         Ok((mut store, _)) => {
-            let mut route = planned.route.clone();
-            for wp in &planned.waypoints {
+            for wp in waypoints {
                 store.waypoints.insert(wp.clone());
             }
-            route.recompute_legs(&store.waypoints);
-            println!(
-                "\n{}: {} waypoints, {:.1} nm",
-                route.name,
-                route.waypoints.len(),
-                route.total_distance_nm()
-            );
-            for (i, leg) in route.legs.iter().enumerate() {
-                println!(
-                    "  leg {:>2}: {:>6.2} nm  {:>5.1}°",
-                    i + 1,
-                    leg.distance_nm,
-                    leg.initial_bearing_deg
-                );
-            }
-            if let Err(e) = store.upsert_route(route) {
-                eprintln!("could not save the route: {e}");
-            } else {
-                println!("saved to the route store");
+            match store.upsert_route(route.clone()) {
+                Ok(()) => println!("saved to the route store"),
+                Err(e) => eprintln!("could not save: {e}"),
             }
         }
         Err(e) => eprintln!("route store unavailable: {e}"),

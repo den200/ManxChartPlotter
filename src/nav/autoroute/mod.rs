@@ -38,6 +38,12 @@ pub enum PlanError {
     OffGrid,
     /// An endpoint is buried in hazard further than the nudge will reach.
     EndpointBuried { which: &'static str },
+    /// An endpoint lies outside every chart loaded.
+    Uncharted { which: &'static str },
+    /// Both ends are in water, but neither is within a mile of water that
+    /// connects to the other — a closed bay, a lake, a basin behind a
+    /// fixed bridge. A wider search can still join them round the outside.
+    Disconnected,
     /// The sea between the endpoints is closed at this draft and offing.
     Unreachable,
     /// The user cancelled the plan.
@@ -49,9 +55,20 @@ impl std::fmt::Display for PlanError {
         match self {
             PlanError::NoCharts => write!(f, "no charts cover the passage"),
             PlanError::OffGrid => write!(f, "an endpoint lies outside the charted area"),
-            PlanError::EndpointBuried { which } => {
-                write!(f, "the {which} point is too far inside a hazard to nudge free")
-            }
+            PlanError::EndpointBuried { which } => write!(
+                f,
+                "the {which} is more than a mile from any water deep enough for the boat"
+            ),
+            PlanError::Disconnected => write!(
+                f,
+                "the start and finish are not in connected water: one of them is in a \
+                 closed bay, a lake or a basin behind a fixed bridge — pick a point in \
+                 open water or the channel"
+            ),
+            PlanError::Uncharted { which } => write!(
+                f,
+                "the {which} lies outside your charts — install the chart set that covers it"
+            ),
             PlanError::Cancelled => write!(f, "cancelled"),
             PlanError::Unreachable => {
                 write!(f, "no safe water connects the endpoints at this draft and offing")
@@ -69,19 +86,49 @@ pub struct Planned {
     pub warnings: Vec<String>,
 }
 
-/// Plan a safe route from `start` to `finish` across the given charts.
-pub fn plan(
+/// The safe corridor between two points: the hazard grid it was found on,
+/// and the path pulled taut through it.
+///
+/// Both routers start here. The motor router's answer *is* the corridor;
+/// the weather router sails the open stretches of it by isochrones and times
+/// the confined ones — so neither can produce a route this search would not,
+/// and both fail, when they fail, for the same honest reason.
+pub struct Corridor {
+    pub grid: Grid,
+    /// sec(latitude) at the middle of the passage: plane metres per ground
+    /// metre, one value for the whole job.
+    pub k: f64,
+    pub params: SearchParams,
+    /// Mercator, start to finish, every leg clear under `params`.
+    pub points: Vec<[f64; 2]>,
+    /// The ends as planned: the requested ones, or the nearest navigable
+    /// water when a requested end was on the hard.
+    pub start: LatLon,
+    pub finish: LatLon,
+    pub warnings: Vec<String>,
+}
+
+/// Said when a route crosses an area the chart asks care in.
+pub const CAUTION_AREA_NOTE: &str =
+    "the route crosses a caution, restricted or exercise area — check the chart for what applies there";
+
+/// How far an endpoint may be moved off the hard, and how far from each end
+/// the offing fades in. A mile: the length of a harbour and its approach.
+const ENDPOINT_REACH_NM: f64 = 1.0;
+
+/// Find the corridor. `margin_factor` sizes the search box as a fraction of
+/// the passage's span on every side; the callers try a small box first and
+/// widen it when the way round lies outside (a peninsula, an island group).
+pub fn corridor(
     sources: &[ChartSource<'_>],
     start: LatLon,
     finish: LatLon,
     safety: &SafetyConfig,
-) -> Result<Planned, PlanError> {
+    margin_factor: f64,
+) -> Result<Corridor, PlanError> {
     if sources.is_empty() {
         return Err(PlanError::NoCharts);
     }
-    let t0 = std::time::Instant::now();
-    let mut warnings = Vec::new();
-
     let a = merc(start);
     let b = merc(finish);
     // Mercator metres are not ground metres: at this latitude every distance
@@ -92,44 +139,82 @@ pub fn plan(
     // varies ~2 %, noise against a 2× error ignored.
     let mid_lat = ((start.lat + finish.lat) / 2.0).to_radians();
     let k = 1.0 / mid_lat.cos();
-    // Margin: room to route *around* things near the endpoints. A headland
-    // dodge can easily need a third of the passage span sideways.
-    let span = ((b[0] - a[0]).hypot(b[1] - a[1])).max(1_000.0);
-    let margin = (span * 0.35).max(15_000.0 * k);
-    let min = [a[0].min(b[0]) - margin, a[1].min(b[1]) - margin];
-    let max = [a[0].max(b[0]) + margin, a[1].max(b[1]) + margin];
-
+    let (min, max) = passage_box(a, b, k, margin_factor);
     let grid = build_hazard_grid(sources, min, max, safety, k);
+    // NAVCORE_ROUTE_DEBUG=<file.png>: the grid as the search sees it.
+    let debug_png = std::env::var("NAVCORE_ROUTE_DEBUG").ok();
+    if let Some(ref out) = debug_png {
+        grid.debug_png(&[a, b], std::path::Path::new(out), 1600);
+    }
 
-    let offing_min_m = safety.offing_min_nm * METRES_PER_NM * k;
-    let params = SearchParams {
-        offing_min_m,
-        offing_soft_m: safety.offing_soft_nm * METRES_PER_NM * k,
-    };
+    let nm = METRES_PER_NM * k;
+    let reach = ENDPOINT_REACH_NM * nm;
+    let mut warnings = Vec::new();
 
+    // An end on the hard — a pontoon, a quay, water the chart gives less
+    // depth than the boat needs — moves to the nearest water that is not.
+    // And that water must connect to the other end: the nearest water to a
+    // point on Refshaleøen is an inner basin behind fixed bridges, and a
+    // start snapped into it can never leave. So one end is freed first, its
+    // connected water found, and the other end freed into that.
+    let loose = SearchParams::fixed(0.0, 0.0);
     let start_cell = grid.cell_of(a).ok_or(PlanError::OffGrid)?;
     let goal_cell = grid.cell_of(b).ok_or(PlanError::OffGrid)?;
+    for (which, cell) in [("start", start_cell), ("finish", goal_cell)] {
+        if !grid.is_covered(cell.0, cell.1)
+            && grid::nudge(&grid, cell, &loose, reach)
+                .is_none_or(|c| !grid.is_covered(c.0, c.1))
+        {
+            return Err(PlanError::Uncharted { which });
+        }
+    }
+    let goal_plain =
+        grid::nudge(&grid, goal_cell, &loose, reach).ok_or(PlanError::EndpointBuried { which: "finish" })?;
+    let start_plain =
+        grid::nudge(&grid, start_cell, &loose, reach).ok_or(PlanError::EndpointBuried { which: "start" })?;
+    let (start_free, goal_free) = {
+        let goal_water = grid.component(goal_plain);
+        match grid::nudge_into(&grid, start_cell, &loose, reach, Some(&goal_water)) {
+            Some(s) => (s, goal_plain),
+            None => {
+                let start_water = grid.component(start_plain);
+                match grid::nudge_into(&grid, goal_cell, &loose, reach, Some(&start_water)) {
+                    Some(g) => (start_plain, g),
+                    // Neither end reaches the other's water within a mile:
+                    // a wider box may join them round the outside.
+                    None => return Err(PlanError::Disconnected),
+                }
+            }
+        }
+    };
+    for (which, from, to) in [("start", start_cell, start_free), ("finish", goal_cell, goal_free)] {
+        if from != to {
+            let why = if grid.is_blocked(from.0, from.1) {
+                "is on land or in water charted shallower than the boat needs"
+            } else {
+                "is in water that does not connect to the rest of the passage \
+                 (a fixed bridge, a lock or a closed basin)"
+            };
+            warnings.push(format!(
+                "the {which} {why}; the route {} the nearest water that does, {:.0} m away",
+                if which == "start" { "leaves from" } else { "ends at" },
+                cell_dist_nm(&grid, from, to) * METRES_PER_NM / k
+            ));
+        }
+    }
+    let a_free = if start_free == start_cell { a } else { grid.centre(start_free.0, start_free.1) };
+    let b_free = if goal_free == goal_cell { b } else { grid.centre(goal_free.0, goal_free.1) };
 
-    // §7.7: an endpoint closer to the hard than the offing — a berth, by
-    // definition — is nudged to the nearest safe water, with a warning,
-    // never an infinite loop.
-    let nudge_max = 2.0 * METRES_PER_NM * k;
-    let start_free = grid::nudge(&grid, start_cell, offing_min_m, nudge_max)
-        .ok_or(PlanError::EndpointBuried { which: "start" })?;
-    let goal_free = grid::nudge(&grid, goal_cell, offing_min_m, nudge_max)
-        .ok_or(PlanError::EndpointBuried { which: "finish" })?;
-    if start_free != start_cell {
-        warnings.push(format!(
-            "start moved {:.2} nm offshore to clear hazards and offing",
-            cell_dist_nm(&grid, start_cell, start_free) / k
-        ));
-    }
-    if goal_free != goal_cell {
-        warnings.push(format!(
-            "finish moved {:.2} nm offshore to clear hazards and offing",
-            cell_dist_nm(&grid, goal_cell, goal_free) / k
-        ));
-    }
+    let params = SearchParams {
+        // The least water between the hull and anything the chart calls
+        // unsafe, anywhere away from the ends. Not rounded up to the cell
+        // size: a sound two cells wide has only cells beside a hazard.
+        offing_hard_m: safety.offing_hard_nm * nm,
+        offing_min_m: safety.offing_min_nm * nm,
+        offing_soft_m: safety.offing_soft_nm * nm,
+        ends: vec![a_free, b_free],
+        taper_m: reach,
+    };
 
     let path = match grid::find_path(&grid, start_free, goal_free, &params) {
         Ok(p) => p,
@@ -138,37 +223,112 @@ pub fn plan(
         }
         Err(SearchError::Cancelled) => return Err(PlanError::Cancelled),
     };
-    let pulled = grid::string_pull(&grid, &path, offing_min_m);
+    let mut points = grid::string_pull(&grid, &path, &params);
+
+    // The ends the user actually asked for, where they are water: the cell
+    // centre is up to half a cell off, and a route should end on its mark.
+    // Only where the straight line from the exact point is itself clear.
+    if let (Some(first), Some(second)) = (points.first().copied(), points.get(1).copied()) {
+        let _ = first;
+        if start_free == start_cell && grid.segment_clear_by(a, second, &params) {
+            points[0] = a;
+        }
+    }
+    let n = points.len();
+    if n >= 2 && goal_free == goal_cell && grid.segment_clear_by(points[n - 2], b, &params) {
+        points[n - 1] = b;
+    }
 
     // Belt and braces: every emitted leg re-checked against the raster. The
-    // pull already guarantees this; the assert is the M3 DoD standing guard
-    // against a future refactor, cheap enough to keep on.
-    for w in pulled.windows(2) {
-        debug_assert!(grid.segment_clear(w[0], w[1], offing_min_m));
-        if !grid.segment_clear(w[0], w[1], offing_min_m) {
+    // pull already guarantees this; the check is the standing guard against
+    // a future refactor, cheap enough to keep on.
+    for w in points.windows(2) {
+        debug_assert!(grid.segment_clear_by(w[0], w[1], &params));
+        if !grid.segment_clear_by(w[0], w[1], &params) {
             return Err(PlanError::Unreachable);
         }
     }
 
-    // The endpoints the user actually asked for, restored where the nudge is
-    // the arrival circle's business rather than the route's.
-    let mut points: Vec<LatLon> = pulled
+    if let Some(ref out) = debug_png {
+        grid.debug_png(&points, std::path::Path::new(out), 1600);
+    }
+    if points.windows(2).any(|w| grid.segment_touches_soft(w[0], w[1])) {
+        warnings.push(CAUTION_AREA_NOTE.into());
+    }
+    let to_latlon = |p: [f64; 2]| {
+        let (lat, lon) = Projection::to_wgs84(p[0], p[1]);
+        LatLon::new(lat, lon)
+    };
+    let (start_at, finish_at) = (to_latlon(points[0]), to_latlon(points[points.len() - 1]));
+    Ok(Corridor {
+        grid,
+        k,
+        params,
+        points,
+        start: start_at,
+        finish: finish_at,
+        warnings,
+    })
+}
+
+/// The search box: the passage's bounding box grown by `margin_factor` of
+/// its span on every side, and never by less than 15 km of ground.
+pub fn passage_box(a: [f64; 2], b: [f64; 2], k: f64, margin_factor: f64) -> ([f64; 2], [f64; 2]) {
+    let span = ((b[0] - a[0]).hypot(b[1] - a[1])).max(1_000.0);
+    let margin = (span * margin_factor).max(15_000.0 * k);
+    (
+        [a[0].min(b[0]) - margin, a[1].min(b[1]) - margin],
+        [a[0].max(b[0]) + margin, a[1].max(b[1]) + margin],
+    )
+}
+
+/// The box sizes the planners try, smallest first: most passages need no
+/// more than the first; a route round Sjælland or up round Skagen needs the
+/// wider ones.
+pub const MARGIN_FACTORS: [f64; 3] = [0.35, 1.0, 2.5];
+
+/// Plan a safe route from `start` to `finish` across the given charts.
+pub fn plan(
+    sources: &[ChartSource<'_>],
+    start: LatLon,
+    finish: LatLon,
+    safety: &SafetyConfig,
+) -> Result<Planned, PlanError> {
+    plan_in_box(sources, start, finish, safety, MARGIN_FACTORS[0])
+}
+
+/// [`plan`] in a box of a given size; see [`MARGIN_FACTORS`].
+pub fn plan_in_box(
+    sources: &[ChartSource<'_>],
+    start: LatLon,
+    finish: LatLon,
+    safety: &SafetyConfig,
+    margin_factor: f64,
+) -> Result<Planned, PlanError> {
+    let t0 = std::time::Instant::now();
+    let corridor = corridor(sources, start, finish, safety, margin_factor)?;
+    let planned = route_from_corridor(&corridor, start, finish);
+    log::info!(
+        "auto-route: {} waypoints over {:.1} nm in {} ms",
+        planned.waypoints.len(),
+        crate::geo::distance_m(start, finish) / METRES_PER_NM,
+        t0.elapsed().as_millis()
+    );
+    Ok(planned)
+}
+
+/// The corridor as an ordinary route: its vertices as waypoints, named for
+/// what they are. `start` and `finish` are the requested ends, for the name.
+pub fn route_from_corridor(corridor: &Corridor, start: LatLon, finish: LatLon) -> Planned {
+    let warnings = corridor.warnings.clone();
+    let points: Vec<LatLon> = corridor
+        .points
         .iter()
         .map(|p| {
             let (lat, lon) = Projection::to_wgs84(p[0], p[1]);
             LatLon::new(lat, lon)
         })
         .collect();
-    if start_free == start_cell {
-        if let Some(first) = points.first_mut() {
-            *first = start;
-        }
-    }
-    if goal_free == goal_cell {
-        if let Some(last) = points.last_mut() {
-            *last = finish;
-        }
-    }
 
     let mut waypoints = Vec::new();
     // "to", not "→": the arrow is not in egui's default font and a route
@@ -200,17 +360,11 @@ pub fn plan(
         route.recompute_legs(&set);
     }
 
-    log::info!(
-        "auto-route: {} waypoints over {:.1} nm in {} ms",
-        points.len(),
-        crate::geo::distance_m(start, finish) / METRES_PER_NM,
-        t0.elapsed().as_millis()
-    );
-    Ok(Planned {
+    Planned {
         route,
         waypoints,
         warnings,
-    })
+    }
 }
 
 fn merc(p: LatLon) -> [f64; 2] {
@@ -238,6 +392,11 @@ pub fn build_hazard_grid(
     k: f64,
 ) -> Grid {
     let mut grid = Grid::new(min, max, safety.grid_res_m * k);
+    // Water no chart covers is not water anyone has vouched for. The grid
+    // starts closed and each chart opens only its own coverage — so a gap
+    // between surveys, or a chart that failed to load, is a wall, never a
+    // shortcut across unsurveyed ground.
+    grid.close_all();
     let mut ordered: Vec<&ChartSource> = sources.iter().collect();
     ordered.sort_by(|x, y| y.info.native_scale.cmp(&x.info.native_scale));
     for source in &ordered {
@@ -254,7 +413,9 @@ fn stamp_chart(grid: &mut Grid, source: &ChartSource<'_>, safety: &SafetyConfig)
     let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
 
     // The eraser pass: within this chart's stated coverage, this chart is
-    // the truth, so whatever a coarser chart said there is wiped.
+    // the truth, so whatever a coarser chart said there is wiped — and on a
+    // grid that starts closed, this is also what opens charted water.
+    let mut covered = false;
     for feature in &data.features {
         if !feature.is_coverage() || feature.attribute_int("CATCOV") != Some(1) {
             continue;
@@ -262,8 +423,22 @@ fn stamp_chart(grid: &mut Grid, source: &ChartSource<'_>, safety: &SafetyConfig)
         if let Some(geom) = &feature.area_geometry {
             geom.for_each_triangle_global(info.ref_lat, info.ref_lon, |tri| {
                 grid.clear_triangle(tri);
+                covered = true;
             });
         }
+    }
+    if !covered {
+        // A cell with no stated coverage: its extent is the best claim it
+        // makes. Its own land and shoals are stamped next either way.
+        let e = &info.extent_mercator;
+        let (sw, se, ne, nw) = (
+            [e.min_x, e.min_y],
+            [e.max_x, e.min_y],
+            [e.max_x, e.max_y],
+            [e.min_x, e.max_y],
+        );
+        grid.clear_triangle([sw, se, ne]);
+        grid.clear_triangle([sw, ne, nw]);
     }
 
     let contour = safety.safety_contour_m();

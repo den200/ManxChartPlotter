@@ -180,15 +180,15 @@ struct Node {
 
 /// One leg of an analytic final approach.
 #[derive(Debug, Clone)]
-struct ClosingLeg {
-    end_pos: [f64; 2],
-    heading: Bam,
-    twa_deg: f64,
-    tws_kt: f64,
-    stw_kt: f64,
-    tack: TackState,
-    end_time_ms: i64,
-    motoring: bool,
+pub(crate) struct ClosingLeg {
+    pub(crate) end_pos: [f64; 2],
+    pub(crate) heading: Bam,
+    pub(crate) twa_deg: f64,
+    pub(crate) tws_kt: f64,
+    pub(crate) stw_kt: f64,
+    pub(crate) tack: TackState,
+    pub(crate) end_time_ms: i64,
+    pub(crate) motoring: bool,
 }
 
 #[derive(Debug)]
@@ -443,8 +443,12 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
             // as a route that sailed the WRONG way first — so arrival must
             // never depend on out-surviving the frontier.
             let d_plane = dist2(parent.pos, finish_m).sqrt();
+            // A step and a half at a brisk 8 kn, never less than 3 NM. The
+            // closing legs sail on the weather of the node they start from,
+            // so a longer horizon freezes the forecast over more of the
+            // route — at three steps offshore that was 72 NM of it.
             let horizon = (3.0 * METRES_PER_NM * k)
-                .max(3.0 * 8.0 * dt_h * METRES_PER_NM * k);
+                .max(1.5 * 8.0 * dt_h * METRES_PER_NM * k);
             if d_plane <= horizon {
                 if let Some(legs) = closing_legs(
                     input, parent.pos, parent.time_ms, parent.tack, finish_m, k,
@@ -475,6 +479,14 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
                 -(vmg.run_twa_deg as f64),
             ] {
                 candidates.push((wind_from.wrapping_add(deg_to_bam(twa)), None));
+            }
+            // And a coarse ring behind the fan: the way out of a bay that
+            // opens away from the mark is a heading the fan never offers.
+            // Pruning drops them at once where they gain nothing.
+            let mut behind = cfg.max_diverted_deg as f64 + 20.0;
+            while behind <= 360.0 - cfg.max_diverted_deg as f64 - 20.0 {
+                candidates.push((bearing_fin.wrapping_add(deg_to_bam(behind)), None));
+                behind += 20.0;
             }
             if let Some(motor) = cfg.motor_speed_kt {
                 let sail_toward = input
@@ -723,7 +735,7 @@ pub fn best_departure(
 /// both wedge orders tried, and every implied segment checked against the
 /// chart and the tidal gates.
 #[allow(clippy::too_many_arguments)]
-fn closing_legs(
+pub(crate) fn closing_legs(
     input: &IsochroneInput<'_>,
     pos: [f64; 2],
     time_ms: i64,
@@ -821,6 +833,18 @@ fn closing_legs(
             let aim = [d_vec[0] - c_pl[0] * t, d_vec[1] - c_pl[1] * t];
             heading = deg_to_bam(aim[0].atan2(aim[1]).to_degrees());
         }
+        // The loop leaves `heading` one update past the speed it computed:
+        // check the final heading is sailable, at the speed it actually
+        // gives, and that the iteration settled — a heading that is still
+        // swinging, or one the current has pushed into the no-go zone, is
+        // not a leg.
+        let t_s = t_s.and_then(|t| {
+            let twa = signed_diff_deg(heading, wind_from);
+            let v = input.polar.speed_kt(twa.abs(), tws)? * wave_f;
+            let t2 = fixed_speed_time(kt_to_pl(v))?;
+            stw = v;
+            ((t2 - t).abs() <= 0.02 * t.max(1.0)).then_some(t2)
+        });
         if let Some(t) = t_s {
             let twa = signed_diff_deg(heading, wind_from);
             if stw > 0.05 && seg_ok(pos, finish_m, time_ms) {
@@ -989,7 +1013,28 @@ fn extract(
         douglas_peucker(&chain, w[0], w[1], tol_plane, &mut keep);
         keep.push(w[1]);
     }
+    keep.sort_unstable();
     keep.dedup();
+    // Simplifying moves legs sideways by up to the tolerance, and a leg is
+    // only known safe where the chart has checked it. Wherever a simplified
+    // leg is not clear, put back the dropped vertex that lay furthest off
+    // it; every original step was clear, so this ends, at worst, with the
+    // raw chain.
+    loop {
+        let bad = keep.windows(2).position(|w| {
+            w[1] > w[0] + 1 && !leg_clear(input, chain[w[0]].pos, chain[w[1]].pos)
+        });
+        let Some(i) = bad else { break };
+        let (a, b) = (keep[i], keep[i + 1]);
+        let (pa, pb) = (chain[a].pos, chain[b].pos);
+        let worst = (a + 1..b)
+            .max_by(|&x, &y| {
+                point_segment_dist(chain[x].pos, pa, pb)
+                    .total_cmp(&point_segment_dist(chain[y].pos, pa, pb))
+            })
+            .unwrap();
+        keep.insert(i + 1, worst);
+    }
 
     let mut points: Vec<PlannedPoint> = keep
         .iter()
@@ -1046,7 +1091,7 @@ fn extract(
         let brg_in = plane_bearing(merc(a.pos), merc(b.pos));
         let brg_out = plane_bearing(merc(b.pos), merc(c.pos));
         let straight = signed_diff_deg(brg_out, brg_in).abs() < 1.0;
-        if straight && b.tack == c.tack {
+        if straight && b.tack == c.tack && leg_clear(input, merc(a.pos), merc(c.pos)) {
             points.remove(i);
         } else {
             i += 1;
@@ -1060,6 +1105,26 @@ fn extract(
         raw_tack_changes,
         pruning_fallback: false, // overwritten by solve()
     }
+}
+
+/// Is a leg of the finished route clear of the chart, at the offing the
+/// solve used? Without a grid (open ocean, the analytic cases) it is.
+fn leg_clear(input: &IsochroneInput<'_>, a: [f64; 2], b: [f64; 2]) -> bool {
+    let Some(grid) = input.grid else { return true };
+    let (lat, _) = Projection::to_wgs84(a[0], a[1]);
+    let k = 1.0 / lat.to_radians().cos();
+    grid.segment_clear(a, b, input.offing_min_m * k)
+}
+
+fn point_segment_dist(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if len2 <= f64::EPSILON {
+        0.0
+    } else {
+        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / len2).clamp(0.0, 1.0)
+    };
+    dist2(p, [a[0] + ab[0] * t, a[1] + ab[1] * t]).sqrt()
 }
 
 /// Point of sail from an absolute TWA — for the plan's human-readable leg.

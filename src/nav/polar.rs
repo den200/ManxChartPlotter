@@ -156,9 +156,19 @@ impl Polar {
     fn build_vmg(&mut self) {
         self.vmg = (0..N_TWS)
             .map(|j| {
+                // Below the polar's lightest band the grid holds that band's
+                // speeds unscaled, and `speed_kt` scales them down at lookup.
+                // The VMG table must scale the same way, or a beat in 3 kn of
+                // wind is timed at the 6 kn band's speed — twice too fast.
+                let tws = j as f64 * TWS_STEP;
+                let low_scale = if tws < self.min_tws_kt && self.min_tws_kt > 0.0 {
+                    (tws / self.min_tws_kt) as f32
+                } else {
+                    1.0
+                };
                 let mut e = VmgEntry::default();
                 for twa in 0..N_TWA {
-                    let stw = self.grid[twa * N_TWS + j];
+                    let stw = self.grid[twa * N_TWS + j] * low_scale;
                     if !stw.is_finite() || stw <= 0.0 {
                         continue;
                     }

@@ -5668,14 +5668,17 @@ impl RenderState {
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
             let generation = crate::nav::isochrone::begin_cancellable();
-            let result = crate::nav::wxroute::with_chart_sources(&dir, a, b, |sources| {
-                crate::nav::autoroute::plan(sources, a, b, &safety)
+            let progress_tx = tx.clone();
+            let result = crate::nav::wxroute::motor_plan_from_chart_dir(&dir, a, b, &safety, |msg| {
+                if !crate::nav::isochrone::plan_cancelled(generation) {
+                    let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
+                }
             });
             if crate::nav::isochrone::plan_cancelled(generation) {
                 return;
             }
             let _ = tx.send(match result {
-                Ok(Ok(mut p)) => {
+                Ok(mut p) => {
                     p.route.name = name;
                     let nm: f64 = p.route.legs.iter().map(|l| l.distance_nm).sum();
                     RouteNetEvent::WxPlanned {
@@ -5690,7 +5693,6 @@ impl RenderState {
                         waypoints: p.waypoints,
                     }
                 }
-                Ok(Err(e)) => RouteNetEvent::WxFailed(e.to_string()),
                 Err(e) => RouteNetEvent::WxFailed(e),
             });
         });

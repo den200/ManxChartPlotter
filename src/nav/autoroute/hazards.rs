@@ -19,13 +19,19 @@ pub struct SafetyConfig {
     /// For bridges. `f64::INFINITY` would mean "never fits under anything";
     /// zero means a dinghy.
     pub air_draft_m: f64,
-    /// Inside this distance of a hazard is as forbidden as the hazard.
+    /// Never closer than this to unsafe water, away from the ends of the
+    /// passage. Small on purpose: a dredged channel is a few hundred metres
+    /// wide, and a floor any larger closes it.
+    pub offing_hard_nm: f64,
+    /// The offing the route keeps wherever the water allows: closer costs
+    /// steeply, so it is given up only where the water is narrower.
     pub offing_min_nm: f64,
-    /// Below this distance the route pays a rising cost — prefer sea room
-    /// when it is free.
+    /// Below this distance the route pays a gently rising cost — prefer sea
+    /// room when it is free.
     pub offing_soft_nm: f64,
-    /// Grid cell size. The spec says match the finest channel to transit;
-    /// 60 m resolves anything a sailing yacht calls a channel.
+    /// Grid cell size. The spec says match the finest channel to transit.
+    /// 30 m: at 60 m Svendborgsund was one or two cells wide and closed.
+    /// Long passages coarsen the grid themselves to fit its cell budget.
     pub grid_res_m: f64,
     /// Unsurveyed areas: unsafe by default (decision §10.4).
     pub unsare_navigable: bool,
@@ -44,9 +50,10 @@ impl Default for SafetyConfig {
             ukc_m: 0.5,
             squat_m: 0.0,
             air_draft_m: 20.0,
+            offing_hard_nm: 0.01,
             offing_min_nm: 0.2,
             offing_soft_nm: 0.5,
-            grid_res_m: 60.0,
+            grid_res_m: 30.0,
             unsare_navigable: false,
             tide_height_min_m: 0.0,
         }
@@ -87,6 +94,16 @@ fn entry_prohibited(feature: &Feature) -> bool {
         .map(|s| s.split(',').any(|v| v.trim() == "7"))
         .unwrap_or(false)
         || feature.attribute_int("RESTRN") == Some(7)
+}
+
+/// An opening bridge — opening, swing, lifting, bascule or draw (CATBRG
+/// 2, 3, 4, 5, 7).
+fn opening_bridge(feature: &Feature) -> bool {
+    let opens = |v: i32| matches!(v, 2 | 3 | 4 | 5 | 7);
+    feature.attribute_int("CATBRG").is_some_and(opens)
+        || feature
+            .attribute_str("CATBRG")
+            .is_some_and(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).any(opens))
 }
 
 /// Classify one feature against the boat. `None` means the router does not
@@ -137,11 +154,24 @@ pub fn classify(feature: &Feature, safety: &SafetyConfig) -> Option<Severity> {
         // M4 cost territory, not obstacles.
         "TSEZNE" => Some(Severity::Hard),
         "BRIDGE" => {
-            let verclr = feature.attribute_float("VERCLR");
-            let fits = verclr
+            // Fixed clearance, or the clearance of an opening bridge when
+            // closed — either lets the mast under without anyone's help.
+            let clearance = feature
+                .attribute_float("VERCLR")
+                .or_else(|| feature.attribute_float("VERCCL"));
+            let fits = clearance
                 .map(|c| safety.air_draft_m + 0.5 <= c)
                 .unwrap_or(false);
-            (!fits).then_some(Severity::Hard)
+            if fits {
+                None
+            } else if opening_bridge(feature) {
+                // It opens: passable, at a cost, because it opens on its own
+                // schedule. The Limfjord and a dozen Danish sounds are only
+                // reachable through one.
+                Some(Severity::Soft)
+            } else {
+                Some(Severity::Hard)
+            }
         }
         _ => None,
     }
@@ -256,6 +286,11 @@ mod tests {
         assert_eq!(classify(&high, &cfg()), None);
         // No clearance stated: do not sail under it.
         assert_eq!(classify(&feature("BRIDGE", &[]), &cfg()), Some(Severity::Hard));
+        // Unless it opens: then it is a wait, not a wall.
+        let bascule = feature("BRIDGE", &[("CATBRG", AttributeValue::Integer(5))]);
+        assert_eq!(classify(&bascule, &cfg()), Some(Severity::Soft));
+        let listed = feature("BRIDGE", &[("CATBRG", AttributeValue::String("1,3".into()))]);
+        assert_eq!(classify(&listed, &cfg()), Some(Severity::Soft));
 
         assert_eq!(classify(&feature("UNSARE", &[]), &cfg()), Some(Severity::Hard));
         let mut relaxed = cfg();
