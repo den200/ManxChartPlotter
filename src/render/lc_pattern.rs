@@ -106,6 +106,11 @@ pub fn lc_segments(pieces: &[(Vec<[f32; 2]>, f32)]) -> Vec<LcSegment> {
     out
 }
 
+/// The most segments one LC symbol may have. `fs_lc` loops over a symbol's
+/// segments with this as a constant bound (see line.wgsl for why it must not
+/// be the uniform count), so a symbol with more would lose the rest.
+pub const MAX_LC_SEGMENTS: u32 = 64;
+
 /// Where one symbol's segments sit in [`LcAtlas::segments`], and its size.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LcSymbolGpu {
@@ -160,6 +165,10 @@ impl LcAtlas {
             // code skipped it too.
             if advance_px >= 1.0 {
                 for seg in symbol.parse_hpgl().segments {
+                    if count == MAX_LC_SEGMENTS {
+                        log::warn!("LC symbol {name} has more than {MAX_LC_SEGMENTS} segments; the rest are not drawn");
+                        break;
+                    }
                     let stroke = super::s52_styles::style_for_key(
                         &LineStyleKey::new(LinePattern::Solid, seg.width.max(1), "CHBLK"),
                         ppmm,
@@ -309,6 +318,21 @@ mod tests {
         assert!((hi - 8.96).abs() < 0.01 && (lo + 11.04).abs() < 0.01, "{lo}..{hi}");
         // Every repeat's drawing lies within a couple of advances of its place.
         assert!(sym.x_range_px[0] > -sym.advance_px && sym.x_range_px[1] < 2.0 * sym.advance_px);
+    }
+
+    /// The shader's loop stops at MAX_LC_SEGMENTS, so no symbol of the
+    /// shared set may need more — at any display density.
+    #[test]
+    fn every_symbol_fits_the_shader_loop() {
+        let t = table();
+        let names = lc_symbol_names();
+        for ppmm in [2.0, 4.0, 8.0] {
+            for (name, sym) in names.iter().zip(LcAtlas::build(Some(&t), names, ppmm).symbols) {
+                let raw = t.get(name).map_or(0, |s| s.parse_hpgl().segments.len());
+                assert!(raw <= MAX_LC_SEGMENTS as usize, "{name} has {raw} segments");
+                assert!(sym.count <= MAX_LC_SEGMENTS);
+            }
+        }
     }
 
     /// Every symbol in the shared set gets a slot, so indices line up, and a
