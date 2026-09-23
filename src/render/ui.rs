@@ -208,6 +208,9 @@ pub struct ChartFolderView {
     /// extension, so this is exactly what would load.
     #[serde(skip)]
     pub cells: usize,
+    /// The count stopped early: this folder holds a lot besides charts.
+    #[serde(skip)]
+    pub cells_partial: bool,
     #[serde(skip)]
     pub status: String,
     /// A folder is being loaded in the background.
@@ -247,7 +250,13 @@ impl ChartFolderView {
                 // Free S-57 charts (NOAA's ENC_ROOT and the like) sit in a
                 // folder per cell, so count those below this one too — the
                 // same search the catalogue makes.
-                self.cells += crate::senc::find_s57_cells(std::path::Path::new(&self.at), 5).len();
+                // Bounded: this runs on the UI thread, and a home folder
+                // holds far more than charts. A few thousand entries answer
+                // for any chart folder in milliseconds.
+                let (found, more) =
+                    crate::senc::find_s57_cells_within(std::path::Path::new(&self.at), 5, 3_000);
+                self.cells += found.len();
+                self.cells_partial = more;
                 self.status.clear();
             }
             Err(e) => self.status = format!("cannot read this folder: {e}"),

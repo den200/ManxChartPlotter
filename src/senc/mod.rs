@@ -16,5 +16,5 @@ pub use records::{RecordType, SencHeader, CellExtent, ObjectClass, s57_code_to_a
 pub use geometry::{TriPrim, TriPrimType, AreaGeometry, LineGeometry, EdgeRef, EdgeTable, BBox, BBoxTileRelation};
 pub mod s57_names;
 pub use features::{s57_attribute_name, AttributeValue, Attributes, Feature, FeatureType, ChartData};
-pub use catalog::{find_s57_cells, ChartCatalog, ChartInfo, CatalogError};
+pub use catalog::{find_s57_cells, find_s57_cells_within, ChartCatalog, ChartInfo, CatalogError};
 pub use symbol_lookup::{features_to_instances, soundings_to_instances};

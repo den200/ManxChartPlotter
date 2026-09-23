@@ -265,20 +265,27 @@ pub fn sm_to_global(sm_x: f32, sm_y: f32, ref_lat: f64, ref_lon: f64) -> (f64, f
     (ref_mx + sm_x as f64, ref_my + sm_y as f64)
 }
 
-/// Compute tile zoom level from camera's meters-per-pixel
+/// The coarsest tile level drawn.
 ///
-/// Clamps to z >= 6 to prevent world-scale tiles that exceed GPU buffer limits.
-/// At z=0, all charts would be packed into one tile (~300MB+ vertices).
+/// This was 6: a coarser tile gathered every chart underneath it, and one
+/// world tile of detailed cells ran to hundreds of megabytes. Charts far too
+/// detailed for a tile are now left out of it (`charts_for_tile_scaled`), and
+/// the world basemap is always there to be the chart that remains, so a
+/// zoomed-out tile holds little more than the world's coastlines. Level 2 is
+/// the whole world in a 1200-pixel window.
+pub const MIN_TILE_Z: u8 = 2;
+
+/// Compute tile zoom level from camera's meters-per-pixel
 pub fn zoom_from_camera(meters_per_pixel: f32) -> u8 {
     let z = (WORLD_WIDTH / (256.0 * meters_per_pixel as f64)).log2();
-    z.round().clamp(6.0, 18.0) as u8  // Min z=6 to avoid buffer overflow
+    z.round().clamp(MIN_TILE_Z as f64, 18.0) as u8
 }
 
 /// Raw (fractional) zoom level from camera's meters-per-pixel.
 /// Used for hysteresis logic — callers compare against current_z.
 pub fn zoom_from_camera_raw(meters_per_pixel: f32) -> f64 {
     let z = (WORLD_WIDTH / (256.0 * meters_per_pixel as f64)).log2();
-    z.clamp(6.0, 18.0)
+    z.clamp(MIN_TILE_Z as f64, 18.0)
 }
 
 /// Meters per pixel at a given zoom level
@@ -443,10 +450,10 @@ mod tests {
     #[test]
     fn zoom_from_camera_at_world() {
         // At zoom 0, meters_per_pixel is WORLD_WIDTH / 256
-        // But we clamp to minimum z=6 to avoid buffer overflow
+        // But we clamp to the coarsest level drawn
         let mpp = WORLD_WIDTH as f32 / 256.0;
         let z = zoom_from_camera(mpp);
-        assert_eq!(z, 6);  // Clamped to minimum
+        assert_eq!(z, MIN_TILE_Z);
     }
 
     #[test]

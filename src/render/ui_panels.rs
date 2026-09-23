@@ -765,10 +765,12 @@ fn chart_folder_browser(
     // the twenty seconds it takes to find that out by decrypting.
     let ready = charts.cells > 0;
     ui.horizontal(|ui| {
-        ui.label(match charts.cells {
-            0 => RichText::new("no charts in this folder (o-charts .oesu or S-57 .000)").weak(),
-            1 => RichText::new("1 cell here").strong(),
-            n => RichText::new(format!("{n} cells here")).strong(),
+        ui.label(match (charts.cells, charts.cells_partial) {
+            (0, false) => RichText::new("no charts in this folder (o-charts .oesu or S-57 .000)").weak(),
+            (0, true) => RichText::new("no charts near the top of this folder — open the one that holds them").weak(),
+            (1, false) => RichText::new("1 cell here").strong(),
+            (n, false) => RichText::new(format!("{n} cells here")).strong(),
+            (n, true) => RichText::new(format!("{n}+ cells here")).strong(),
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
