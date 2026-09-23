@@ -20,9 +20,14 @@ use crate::render::projection::Projection;
 /// What to call the source wherever it is shown.
 pub const CURRENT_SOURCE_LABEL: &str = "Open-Meteo Marine (SMOC, tides included)";
 
-/// Points requested per axis. 12×12 over the passage box outresolves the
-/// 0.08° model on any coastal passage and stays one polite API call.
-const N_AXIS: usize = 12;
+/// The spacing asked for along each axis, degrees — close to the source
+/// model's own 0.08°, so a tidal stream round a headland is not smeared
+/// across a whole sound.
+const TARGET_STEP_DEG: f64 = 0.1;
+/// Points per axis, at least and at most. 16×16 = 256 points keeps the
+/// request one polite API call; a long passage gets coarser spacing.
+const MIN_AXIS: usize = 6;
+const MAX_AXIS: usize = 16;
 
 const KMH_TO_MS: f64 = 1000.0 / 3600.0;
 
@@ -261,8 +266,9 @@ impl CurrentField for CurrentForecast {
 fn grid_axes(area: GeoBox) -> (Vec<f64>, Vec<f64>) {
     let axis = |a: f64, b: f64| -> Vec<f64> {
         let (lo, hi) = (a.min(b), a.max(b));
-        let step = (hi - lo).max(1e-6) / (N_AXIS - 1) as f64;
-        (0..N_AXIS).map(|i| lo + i as f64 * step).collect()
+        let n = (((hi - lo) / TARGET_STEP_DEG).ceil() as usize + 1).clamp(MIN_AXIS, MAX_AXIS);
+        let step = (hi - lo).max(1e-6) / (n - 1) as f64;
+        (0..n).map(|i| lo + i as f64 * step).collect()
     };
     (axis(area.south, area.north), axis(area.west, area.east))
 }
@@ -428,9 +434,12 @@ mod tests {
     #[test]
     fn the_axes_cover_the_box_and_time_interpolates() {
         let (lats, lons) = grid_axes(GeoBox { south: 56.0, north: 57.0, west: 10.0, east: 12.0 });
-        assert_eq!(lats.len(), N_AXIS);
-        assert!((lats[0] - 56.0).abs() < 1e-9 && (lats[N_AXIS - 1] - 57.0).abs() < 1e-9);
-        assert!((lons[0] - 10.0).abs() < 1e-9 && (lons[N_AXIS - 1] - 12.0).abs() < 1e-9);
+        // A degree of latitude at ~0.1° is 11 points; two of longitude hit
+        // the cap. Both axes reach the edges exactly.
+        assert_eq!(lats.len(), 11);
+        assert_eq!(lons.len(), MAX_AXIS);
+        assert!((lats[0] - 56.0).abs() < 1e-9 && (lats[lats.len() - 1] - 57.0).abs() < 1e-9);
+        assert!((lons[0] - 10.0).abs() < 1e-9 && (lons[lons.len() - 1] - 12.0).abs() < 1e-9);
 
         let f = CurrentForecast::synthetic(
             vec![56.0, 57.0],

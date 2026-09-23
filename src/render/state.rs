@@ -413,6 +413,13 @@ pub struct RenderState {
     pub pattern_renderer: Option<PatternRenderer>,
     /// A chart folder loading on a worker thread.
     chart_load: Option<ChartLoad>,
+    /// Answers from the free-chart (NOAA) workers.
+    free_rx: std::sync::mpsc::Receiver<FreeEvent>,
+    free_tx: std::sync::mpsc::Sender<FreeEvent>,
+    /// Set to stop the NOAA download in progress.
+    free_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// NOAA workers still running.
+    free_jobs: usize,
     /// The colour table in use, so a re-apply does not re-upload it.
     palette_name: Option<String>,
     /// Bumped with every change of mariner settings; tiles built under an
@@ -817,6 +824,8 @@ impl RenderState {
             label: Some("Chart Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../../assets/shaders/chart.wgsl").into()),
         });
+
+        let (free_tx, free_rx) = std::sync::mpsc::channel();
 
         // Camera slots: one `Uniforms` per draw origin, at the device's
         // dynamic-offset alignment. Written every frame by write_camera_slots.
@@ -1348,6 +1357,10 @@ impl RenderState {
             pattern_renderer,
             clear_colour: OCEAN_BACKGROUND,
             chart_load: None,
+            free_rx,
+            free_tx,
+            free_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            free_jobs: 0,
             palette_name: None,
             settings_generation: 0,
             pattern_camera_bind_group,
@@ -1838,6 +1851,10 @@ impl RenderState {
     pub fn set_chart_root(&mut self, root: std::path::PathBuf) {
         if let Some(ref mut ui) = self.ui {
             ui.charts.chosen = root.display().to_string();
+            // What is installed depends on which folder is in use.
+            for row in ui.free.rows.iter_mut() {
+                row.installed = crate::shop::noaa::installed(&root, row.code);
+            }
         }
         self.chart_root = Some(root);
     }
@@ -1910,6 +1927,157 @@ impl RenderState {
                     ui.charts.loading = false;
                     ui.charts.status = e;
                 }
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Where free charts go: the chart folder in use, or — before there is
+    /// one — navcore's own, which then becomes the chart folder.
+    fn free_root(&self) -> std::path::PathBuf {
+        self.chart_root.clone().unwrap_or_else(|| {
+            dirs::data_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("navcore")
+                .join("charts")
+        })
+    }
+
+    /// List the packages with what is installed, and ask NOAA for sizes
+    /// and dates in the background.
+    fn free_refresh(&mut self) {
+        let root = self.free_root();
+        if let Some(ref mut ui) = self.ui {
+            ui.free.probed = true;
+            ui.free.rows = crate::shop::noaa::REGIONS
+                .iter()
+                .map(|r| crate::render::ui::FreeRow {
+                    code: r.code,
+                    name: r.name,
+                    remote: None,
+                    installed: crate::shop::noaa::installed(&root, r.code),
+                })
+                .collect();
+        }
+        let tx = self.free_tx.clone();
+        self.free_jobs += 1;
+        std::thread::spawn(move || {
+            for r in crate::shop::noaa::REGIONS {
+                let answer = crate::shop::noaa::probe(r.code);
+                if tx.send(FreeEvent::Probed(r.code, answer)).is_err() {
+                    return;
+                }
+            }
+            let _ = tx.send(FreeEvent::Done);
+        });
+    }
+
+    fn free_download(&mut self, code: String) {
+        if self.ui.as_ref().is_some_and(|u| u.free.active.is_some()) {
+            return;
+        }
+        let root = self.free_root();
+        let name = crate::shop::noaa::REGIONS
+            .iter()
+            .find(|r| r.code == code)
+            .map(|r| r.name)
+            .unwrap_or("charts");
+        if let Some(ref mut ui) = self.ui {
+            ui.free.active = Some((code.clone(), 0, 0));
+            ui.free.status = format!("Downloading {name}…");
+        }
+        self.free_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let cancel = Arc::clone(&self.free_cancel);
+        let tx = self.free_tx.clone();
+        self.free_jobs += 1;
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            let progress_tx = tx.clone();
+            let progress_code = code.clone();
+            let result = crate::shop::noaa::install(
+                &root,
+                &code,
+                |done, total| {
+                    // Four updates a second is plenty for a progress bar.
+                    if last.elapsed() >= std::time::Duration::from_millis(250) || done == total {
+                        last = std::time::Instant::now();
+                        let _ = progress_tx.send(FreeEvent::Progress(progress_code.clone(), done, total));
+                    }
+                },
+                &cancel,
+            );
+            let _ = tx.send(match result {
+                Ok(inst) => FreeEvent::Installed(code, root, inst),
+                Err(e) => FreeEvent::Failed(code, e),
+            });
+            let _ = tx.send(FreeEvent::Done);
+        });
+    }
+
+    fn free_remove(&mut self, code: &str) {
+        let root = self.free_root();
+        let result = crate::shop::noaa::remove(&root, code);
+        if let Some(ref mut ui) = self.ui {
+            match result {
+                Ok(()) => {
+                    if let Some(row) = ui.free.rows.iter_mut().find(|r| r.code == code) {
+                        row.installed = None;
+                    }
+                    ui.free.status = "Removed.".into();
+                }
+                Err(e) => ui.free.status = format!("Could not remove: {e}"),
+            }
+        }
+        // Take the removed cells off the map.
+        if self.chart_root.is_some() && self.chart_load.is_none() {
+            self.start_chart_folder_load(root, true);
+        }
+    }
+
+    /// Fold in what the NOAA workers have to say.
+    fn poll_free_charts(&mut self) {
+        let events: Vec<FreeEvent> = self.free_rx.try_iter().collect();
+        if events.is_empty() {
+            return;
+        }
+        let mut reload: Option<std::path::PathBuf> = None;
+        for event in events {
+            let Some(ref mut ui) = self.ui else { continue };
+            match event {
+                FreeEvent::Probed(code, answer) => {
+                    if let Some(row) = ui.free.rows.iter_mut().find(|r| r.code == code) {
+                        row.remote = answer.ok();
+                    }
+                }
+                FreeEvent::Progress(code, done, total) => {
+                    ui.free.active = Some((code, done, total));
+                }
+                FreeEvent::Installed(code, root, inst) => {
+                    let name = ui.free.rows.iter().find(|r| r.code == code).map(|r| r.name).unwrap_or("");
+                    ui.free.status = format!("{name} installed — loading the charts…");
+                    if let Some(row) = ui.free.rows.iter_mut().find(|r| r.code == code) {
+                        row.installed = Some(inst);
+                    }
+                    ui.free.active = None;
+                    reload = Some(root);
+                }
+                FreeEvent::Failed(_, e) => {
+                    ui.free.active = None;
+                    ui.free.status = if e == "cancelled" {
+                        "Download cancelled.".into()
+                    } else {
+                        format!("Download failed: {e}")
+                    };
+                }
+                FreeEvent::Done => self.free_jobs = self.free_jobs.saturating_sub(1),
+            }
+        }
+        if let Some(root) = reload {
+            // Keep the view where it is when adding to charts already on
+            // screen; frame the new ones when they are the first.
+            let keep_view = self.chart_root.is_some();
+            if self.chart_load.is_none() {
+                self.start_chart_folder_load(root, keep_view);
             }
         }
         self.needs_redraw = true;
@@ -2272,6 +2440,7 @@ impl RenderState {
         // the camera (follow) and the mariner symbols, and both must be
         // settled before the camera is clamped and the chart is drawn.
         self.poll_shop();
+        self.poll_free_charts();
         self.poll_chart_load();
         self.poll_signalk();
         self.update_route_following();
@@ -2686,6 +2855,12 @@ impl RenderState {
                     self.apply_display();
                     self.save_settings();
                 }
+                crate::render::ui::UiAction::FreeChartsRefresh => self.free_refresh(),
+                crate::render::ui::UiAction::FreeChartsDownload { code } => self.free_download(code),
+                crate::render::ui::UiAction::FreeChartsCancel => {
+                    self.free_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                crate::render::ui::UiAction::FreeChartsRemove { code } => self.free_remove(&code),
                 crate::render::ui::UiAction::DisplayChanged => {
                     self.apply_display();
                     self.save_settings();
@@ -4242,6 +4417,12 @@ impl RenderState {
                 if std::env::var("NAVCORE_SHOP").is_ok_and(|v| v != "0") {
                     ui.shop.open = true;
                     ui.shop.email = std::env::var("NAVCORE_SHOP_EMAIL").unwrap_or_default();
+                    // `NAVCORE_SHOP=free` or `=folder` opens that tab.
+                    ui.charts.tab = match std::env::var("NAVCORE_SHOP").as_deref() {
+                        Ok("free") => crate::render::ui::ChartsTab::Free,
+                        Ok("folder") => crate::render::ui::ChartsTab::Folder,
+                        _ => crate::render::ui::ChartsTab::Shop,
+                    };
                 }
                 // `NAVCORE_SIGNALK=<address>` overrides the saved server for
                 // this run only. It used to claim it did not touch settings
@@ -5889,7 +6070,7 @@ impl RenderState {
             }
             return;
         };
-        let (hours, polar_path, use_waves, use_currents) = self
+        let (hours, polar_path, use_waves, use_currents, motor_kt) = self
             .ui
             .as_ref()
             .map(|u| {
@@ -5898,9 +6079,16 @@ impl RenderState {
                     u.weather.polar_path.clone(),
                     u.weather.use_waves,
                     u.weather.use_currents,
+                    u.boat.motor_kt,
                 )
             })
-            .unwrap_or((48, String::new(), true, true));
+            .unwrap_or((48, String::new(), true, true, 0.0));
+        // The engine joins the plan where sailing crawls — only if the boat
+        // has one worth using.
+        let config = crate::nav::RoutingConfig {
+            motor_speed_kt: (motor_kt > 0.0).then_some(motor_kt),
+            ..Default::default()
+        };
         if let Some(ref mut ui) = self.ui {
             ui.weather.busy = true;
             ui.weather.status = "starting…".into();
@@ -5936,7 +6124,7 @@ impl RenderState {
                 &cache,
                 &polar_text,
                 &polar_name,
-                &crate::nav::RoutingConfig::default(),
+                &config,
                 &safety,
                 use_waves,
                 use_currents,
@@ -5987,14 +6175,17 @@ impl RenderState {
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
             let generation = crate::nav::isochrone::begin_cancellable();
-            let result = crate::nav::wxroute::with_chart_sources(&dir, a, b, |sources| {
-                crate::nav::autoroute::plan(sources, a, b, &safety)
+            let progress_tx = tx.clone();
+            let result = crate::nav::wxroute::motor_plan_from_chart_dir(&dir, a, b, &safety, |msg| {
+                if !crate::nav::isochrone::plan_cancelled(generation) {
+                    let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
+                }
             });
             if crate::nav::isochrone::plan_cancelled(generation) {
                 return;
             }
             let _ = tx.send(match result {
-                Ok(Ok(mut p)) => {
+                Ok(mut p) => {
                     p.route.name = name;
                     let nm: f64 = p.route.legs.iter().map(|l| l.distance_nm).sum();
                     RouteNetEvent::WxPlanned {
@@ -6009,7 +6200,6 @@ impl RenderState {
                         waypoints: p.waypoints,
                     }
                 }
-                Ok(Err(e)) => RouteNetEvent::WxFailed(e.to_string()),
                 Err(e) => RouteNetEvent::WxFailed(e),
             });
         });
@@ -6509,6 +6699,7 @@ impl RenderState {
     pub fn routing_busy(&self) -> bool {
         self.route_net_jobs > 0
             || self.chart_load.is_some()
+            || self.free_jobs > 0
             || self
                 .ui
                 .as_ref()
@@ -6964,9 +7155,7 @@ fn load_chart_folder(
         // another name, and the catalogue will say so cell by cell.
         log::warn!("chart folder {}: no key list read: {e}", dir.display());
     }
-    let base = crate::decrypt::ChartDecryptor::new("license")
-        .map_err(|e| format!("cannot start the chart decryptor: {e}"))?;
-    let mut decryptor = CachedDecryptor::new(base);
+    let mut decryptor = CachedDecryptor::open("license");
     let keys = Arc::new(keys);
     let catalog =
         ChartCatalog::from_directory(dir, &keys, &mut decryptor).map_err(|e| format!("{e}"))?;
@@ -7003,4 +7192,18 @@ fn match_installed(
         installed.len()
     );
     installed
+}
+
+/// What the free-chart (NOAA) workers report.
+enum FreeEvent {
+    /// NOAA's size and date for a package, or why it could not say.
+    Probed(&'static str, Result<crate::shop::noaa::Remote, String>),
+    /// Bytes so far and total, for the package downloading.
+    Progress(String, u64, u64),
+    /// A package is in place under this chart folder.
+    Installed(String, std::path::PathBuf, crate::shop::noaa::Installed),
+    /// A download failed or was cancelled ("cancelled").
+    Failed(String, String),
+    /// A worker has finished.
+    Done,
 }

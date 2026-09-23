@@ -19,13 +19,19 @@ pub struct SafetyConfig {
     /// For bridges. `f64::INFINITY` would mean "never fits under anything";
     /// zero means a dinghy.
     pub air_draft_m: f64,
-    /// Inside this distance of a hazard is as forbidden as the hazard.
+    /// Never closer than this to unsafe water, away from the ends of the
+    /// passage. Small on purpose: a dredged channel is a few hundred metres
+    /// wide, and a floor any larger closes it.
+    pub offing_hard_nm: f64,
+    /// The offing the route keeps wherever the water allows: closer costs
+    /// steeply, so it is given up only where the water is narrower.
     pub offing_min_nm: f64,
-    /// Below this distance the route pays a rising cost — prefer sea room
-    /// when it is free.
+    /// Below this distance the route pays a gently rising cost — prefer sea
+    /// room when it is free.
     pub offing_soft_nm: f64,
-    /// Grid cell size. The spec says match the finest channel to transit;
-    /// 60 m resolves anything a sailing yacht calls a channel.
+    /// Grid cell size. The spec says match the finest channel to transit.
+    /// 30 m: at 60 m Svendborgsund was one or two cells wide and closed.
+    /// Long passages coarsen the grid themselves to fit its cell budget.
     pub grid_res_m: f64,
     /// Unsurveyed areas: unsafe by default (decision §10.4).
     pub unsare_navigable: bool,
@@ -44,9 +50,10 @@ impl Default for SafetyConfig {
             ukc_m: 0.5,
             squat_m: 0.0,
             air_draft_m: 20.0,
+            offing_hard_nm: 0.01,
             offing_min_nm: 0.2,
             offing_soft_nm: 0.5,
-            grid_res_m: 60.0,
+            grid_res_m: 30.0,
             unsare_navigable: false,
             tide_height_min_m: 0.0,
         }
@@ -80,13 +87,38 @@ fn watlev_dangerous(watlev: Option<i32>) -> bool {
     matches!(watlev, Some(1) | Some(2) | Some(4) | Some(5))
 }
 
+/// The RESTRN codes on a feature.
+fn restrictions(feature: &Feature) -> Vec<i32> {
+    let mut v: Vec<i32> = feature
+        .attribute_str("RESTRN")
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    v.extend(feature.attribute_int("RESTRN"));
+    v
+}
+
 /// Does the RESTRN list prohibit entry? Value 7 is "entry prohibited".
 fn entry_prohibited(feature: &Feature) -> bool {
-    feature
-        .attribute_str("RESTRN")
-        .map(|s| s.split(',').any(|v| v.trim() == "7"))
-        .unwrap_or(false)
-        || feature.attribute_int("RESTRN") == Some(7)
+    restrictions(feature).contains(&7)
+}
+
+/// Does it restrict passage short of prohibiting it — "entry restricted"
+/// (8) or "area to be avoided" (14)? Anchoring, fishing, discharge,
+/// reporting and the rest regulate what a boat does there, not whether
+/// she may sail through, and a route should not pay for them: NOAA wraps
+/// whole bays in right-whale and no-discharge areas.
+fn passage_restricted(feature: &Feature) -> bool {
+    restrictions(feature).iter().any(|r| matches!(r, 8 | 14))
+}
+
+/// An opening bridge — opening, swing, lifting, bascule or draw (CATBRG
+/// 2, 3, 4, 5, 7).
+fn opening_bridge(feature: &Feature) -> bool {
+    let opens = |v: i32| matches!(v, 2 | 3 | 4 | 5 | 7);
+    feature.attribute_int("CATBRG").is_some_and(opens)
+        || feature
+            .attribute_str("CATBRG")
+            .is_some_and(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).any(opens))
 }
 
 /// Classify one feature against the boat. `None` means the router does not
@@ -127,21 +159,42 @@ pub fn classify(feature: &Feature, safety: &SafetyConfig) -> Option<Severity> {
         }
         "UNSARE" => (!safety.unsare_navigable).then_some(Severity::Hard),
         "MARCUL" => Some(Severity::Hard),
-        "RESARE" => Some(if entry_prohibited(feature) {
-            Severity::Hard
-        } else {
-            Severity::Soft
-        }),
-        "MIPARE" | "CTNARE" => Some(Severity::Soft),
+        "RESARE" => {
+            if entry_prohibited(feature) {
+                Some(Severity::Hard)
+            } else if passage_restricted(feature) {
+                Some(Severity::Soft)
+            } else {
+                None
+            }
+        }
+        // Military practice: firing, exercises — worth going round.
+        "MIPARE" => Some(Severity::Soft),
+        // A caution area is a note on the chart ("mandatory reporting",
+        // "see the Coast Pilot"), shown to the skipper, not a cost.
+        "CTNARE" => None,
         // Separation zones are for staying out of; the lanes themselves are
         // M4 cost territory, not obstacles.
         "TSEZNE" => Some(Severity::Hard),
         "BRIDGE" => {
-            let verclr = feature.attribute_float("VERCLR");
-            let fits = verclr
+            // Fixed clearance, or the clearance of an opening bridge when
+            // closed — either lets the mast under without anyone's help.
+            let clearance = feature
+                .attribute_float("VERCLR")
+                .or_else(|| feature.attribute_float("VERCCL"));
+            let fits = clearance
                 .map(|c| safety.air_draft_m + 0.5 <= c)
                 .unwrap_or(false);
-            (!fits).then_some(Severity::Hard)
+            if fits {
+                None
+            } else if opening_bridge(feature) {
+                // It opens: passable, at a cost, because it opens on its own
+                // schedule. The Limfjord and a dozen Danish sounds are only
+                // reachable through one.
+                Some(Severity::Soft)
+            } else {
+                Some(Severity::Hard)
+            }
         }
         _ => None,
     }
@@ -242,9 +295,16 @@ mod tests {
         assert_eq!(classify(&prohibited, &cfg()), Some(Severity::Hard));
         let listed = feature("RESARE", &[("RESTRN", AttributeValue::String("1,7,8".into()))]);
         assert_eq!(classify(&listed, &cfg()), Some(Severity::Hard));
+        // Anchoring banned, discharge banned: rules for being there, not
+        // for passing through.
         let anchoring_banned = feature("RESARE", &[("RESTRN", AttributeValue::String("1".into()))]);
-        assert_eq!(classify(&anchoring_banned, &cfg()), Some(Severity::Soft));
-        assert_eq!(classify(&feature("CTNARE", &[]), &cfg()), Some(Severity::Soft));
+        assert_eq!(classify(&anchoring_banned, &cfg()), None);
+        let no_discharge = feature("RESARE", &[("RESTRN", AttributeValue::String("16".into()))]);
+        assert_eq!(classify(&no_discharge, &cfg()), None);
+        let avoid = feature("RESARE", &[("RESTRN", AttributeValue::String("14".into()))]);
+        assert_eq!(classify(&avoid, &cfg()), Some(Severity::Soft));
+        assert_eq!(classify(&feature("CTNARE", &[]), &cfg()), None);
+        assert_eq!(classify(&feature("MIPARE", &[]), &cfg()), Some(Severity::Soft));
         assert_eq!(classify(&feature("MARCUL", &[]), &cfg()), Some(Severity::Hard));
     }
 
@@ -256,6 +316,11 @@ mod tests {
         assert_eq!(classify(&high, &cfg()), None);
         // No clearance stated: do not sail under it.
         assert_eq!(classify(&feature("BRIDGE", &[]), &cfg()), Some(Severity::Hard));
+        // Unless it opens: then it is a wait, not a wall.
+        let bascule = feature("BRIDGE", &[("CATBRG", AttributeValue::Integer(5))]);
+        assert_eq!(classify(&bascule, &cfg()), Some(Severity::Soft));
+        let listed = feature("BRIDGE", &[("CATBRG", AttributeValue::String("1,3".into()))]);
+        assert_eq!(classify(&listed, &cfg()), Some(Severity::Soft));
 
         assert_eq!(classify(&feature("UNSARE", &[]), &cfg()), Some(Severity::Hard));
         let mut relaxed = cfg();

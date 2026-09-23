@@ -152,6 +152,7 @@ pub fn sheet(
     ctx: &Context,
     view: &mut SheetView,
     field: &crate::render::ui::WindView,
+    units: &crate::signalk::UnitPrefs,
     actions: &mut Vec<UiAction>,
 ) {
     if !view.show {
@@ -199,7 +200,7 @@ pub fn sheet(
                 .as_ref()
                 .map(|d| d.at(view.cursor(now)))
                 .unwrap_or_default();
-            readout(ui, view, &sample, now);
+            readout(ui, view, &sample, now, units);
             if view.expanded {
                 if view.data.is_some() {
                     ui.add_space(4.0);
@@ -401,7 +402,21 @@ fn controls(
 /// The readings at the cursor: the line a helm reads without expanding
 /// anything. A dot in the lane's own spectrum colour ties each number to its
 /// lane below.
-fn readout(ui: &mut egui::Ui, view: &SheetView, s: &Sample, now: i64) {
+fn readout(
+    ui: &mut egui::Ui,
+    view: &SheetView,
+    s: &Sample,
+    now: i64,
+    units: &crate::signalk::UnitPrefs,
+) {
+    // In the speed unit the instruments use. The barbs and lanes stay in
+    // knots — a barb's feathers are knots by definition — and say so.
+    let speed = |kt: f32, decimals: usize| {
+        let kt = kt as f64;
+        let r = crate::signalk::Quantity::Speed.format(kt * crate::geo::METRES_PER_NM / 3600.0, units);
+        let v: f64 = r.value.parse().unwrap_or(kt);
+        format!("{v:.decimals$} {}", r.unit)
+    };
     ui.horizontal_wrapped(|ui| {
         let t = view.cursor(now);
         let ahead = (t - now) as f64 / 3_600_000.0;
@@ -430,12 +445,12 @@ fn readout(ui: &mut egui::Ui, view: &SheetView, s: &Sample, now: i64) {
             let gust = s
                 .gust_kt
                 .filter(|g| *g > kt + 1.0)
-                .map(|g| format!(" g{g:.0}"))
+                .map(|g| format!(" gusts {}", speed(g, 0)))
                 .unwrap_or_default();
             chip(
                 ui,
                 spectrum::WIND_KT.at(kt),
-                &format!("{kt:.0} kn{gust} {}", compass(from)),
+                &format!("{}{gust} {}", speed(kt, 0), compass(from)),
                 "Wind: mean, gust, and the point it blows from",
             );
         }
@@ -457,7 +472,7 @@ fn readout(ui: &mut egui::Ui, view: &SheetView, s: &Sample, now: i64) {
             chip(
                 ui,
                 spectrum::CURRENT_KT.at(kt),
-                &format!("{kt:.1} kn to {}", compass(to)),
+                &format!("{} to {}", speed(kt, 1), compass(to)),
                 "Set and drift: where the water is going, not where it comes from",
             );
         }
@@ -621,9 +636,9 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
             ink,
         );
     };
-    name(wind_l, "Wind kn");
+    name(wind_l, "Wind (kn)");
     name(wave_l, "Sea m");
-    name(cur_l, "Set kn");
+    name(cur_l, "Set (kn)");
     name(rain_l, "Rain mm");
     name(tide_l, "Tide m");
 

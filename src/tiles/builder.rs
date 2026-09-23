@@ -146,6 +146,8 @@ pub enum BuildError {
     Decrypt(crate::decrypt::DecryptError),
     Parse(SencError),
     NoKey(String),
+    /// An S-57 cell that could not be read or converted.
+    S57(String),
 }
 
 impl std::fmt::Display for BuildError {
@@ -154,6 +156,7 @@ impl std::fmt::Display for BuildError {
             BuildError::Decrypt(e) => write!(f, "Decrypt error: {}", e),
             BuildError::Parse(e) => write!(f, "Parse error: {:?}", e),
             BuildError::NoKey(name) => write!(f, "No key for chart: {}", name),
+            BuildError::S57(e) => write!(f, "S-57: {}", e),
         }
     }
 }
@@ -1396,6 +1399,19 @@ impl<'a> TileBuilder<'a> {
         let mut slot = slot.lock().unwrap();
         if let Some(chart) = slot.as_ref() {
             return Ok(Arc::clone(chart));
+        }
+
+        // A free S-57 cell: converted (or read from the cache), no key.
+        if ChartCatalog::is_s57(&info.path) {
+            let bytes = self
+                .decryptor
+                .lock()
+                .unwrap()
+                .s57_senc(&info.path)
+                .map_err(BuildError::S57)?;
+            let chart = Arc::new(ChartData::parse(bytes).map_err(BuildError::Parse)?);
+            *slot = Some(Arc::clone(&chart));
+            return Ok(chart);
         }
 
         // Get chart name for key lookup

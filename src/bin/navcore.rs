@@ -112,6 +112,36 @@ fn main() {
 
     // M3 auto-routing: a safe route between two points, from the charts.
     // navcore --auto-route <chart_dir> lat1,lon1 lat2,lon2 [draft_m]
+    // `--noaa-install <chart folder> <STATE>`: what the Free charts tab's
+    // Download button does, from the command line.
+    if args.len() >= 4 && args[1] == "--noaa-install" {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut last = 0;
+        match navcore2::shop::noaa::install(
+            std::path::Path::new(&args[2]),
+            &args[3].to_uppercase(),
+            |done, total| {
+                if done - last >= 1_000_000 || done == total {
+                    last = done;
+                    eprint!("\r  {} of {} MB", done / 1_000_000, total / 1_000_000);
+                }
+            },
+            &cancel,
+        ) {
+            Ok(i) => println!("\ninstalled ({} , package {})", i.downloaded, i.last_modified),
+            Err(e) => {
+                eprintln!("\n{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if args.len() >= 3 && args[1] == "--s57-dump" {
+        s57_dump_mode(&args[2]);
+        return;
+    }
+
     if args.len() >= 5 && args[1] == "--auto-route" {
         let parse_pos = |s: &str| -> Option<(f64, f64)> {
             let mut it = s.split(',').filter_map(|v| v.trim().parse::<f64>().ok());
@@ -1187,125 +1217,31 @@ fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::
 /// M5's surface: fetch real wind, plan a real sailing route, store it.
 fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) {
     use navcore2::geo::LatLon;
-    use navcore2::nav::autoroute::{self, SafetyConfig};
-    use navcore2::nav::{grib, polar::Polar, wxroute};
+    use navcore2::nav::autoroute::SafetyConfig;
+    use navcore2::nav::wxroute;
 
     let start = LatLon::new(a.0, a.1);
     let finish = LatLon::new(b.0, b.1);
-
-    // The forecast first: no point loading charts if the net is down.
     let cache = dirs::config_dir()
         .map(|d| d.join("navcore").join("grib"))
         .unwrap_or_else(|| PathBuf::from("grib-cache"));
-    let area = grib::GeoBox::around(&[start, finish], 1.0);
-    println!("Fetching {}…", grib::GribSource::NoaaGfs025.label());
-    let forecast = match grib::GribForecast::fetch(
-        grib::GribSource::NoaaGfs025,
-        area,
-        hours,
-        &cache,
-        |msg| println!("  {msg}"),
-    ) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    };
-    println!("Fetching waves…");
-    let waves = match grib::WaveForecast::fetch(
-        grib::GribSource::NoaaGfs025,
-        area,
-        hours,
-        &cache,
-        |msg| println!("  {msg}"),
-    ) {
-        Ok(w) => Some(w),
-        Err(e) => {
-            println!("  waves unavailable, routing on wind alone: {e}");
-            None
-        }
-    };
-    println!("Fetching currents ({})…", navcore2::nav::currents::CURRENT_SOURCE_LABEL);
-    let currents = match navcore2::nav::currents::CurrentForecast::fetch(area, hours) {
-        Ok(c) => Some(c),
-        Err(e) => {
-            println!("  currents unavailable, routing without: {e}");
-            None
-        }
-    };
-
-    // Charts, same loading as --auto-route.
-    let dir = PathBuf::from(dir_path);
-    let mut keys = navcore2::decrypt::KeyStore::new();
-    if let Err(e) = keys.load_keylists_in_dir(&dir) {
-        eprintln!("Warning: could not load keys: {e}");
-    }
-    let Ok(base) = ChartDecryptor::new("license") else {
-        eprintln!("Failed to create decryptor");
-        return;
-    };
-    let mut decryptor = CachedDecryptor::new(base);
-    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to build catalog: {e}");
-            return;
-        }
-    };
-    let (ax, ay) = navcore2::tiles::latlon_to_mercator(a.0, a.1);
-    let (bx, by) = navcore2::tiles::latlon_to_mercator(b.0, b.1);
-    let span = ((bx - ax).hypot(by - ay)).max(1_000.0);
-    let margin = (span * 0.35).max(15_000.0);
-    let (min_x, max_x) = ((ax.min(bx) - margin), (ax.max(bx) + margin));
-    let (min_y, max_y) = ((ay.min(by) - margin), (ay.max(by) + margin));
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
-    let decryptor = Mutex::new(decryptor);
-    let builder =
-        TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
-    let mut loaded = Vec::new();
-    for info in catalog.charts.iter().filter(|c| {
-        c.extent_mercator.min_x <= max_x
-            && c.extent_mercator.max_x >= min_x
-            && c.extent_mercator.min_y <= max_y
-            && c.extent_mercator.max_y >= min_y
-    }) {
-        match builder.load_chart(info) {
-            Ok(chart) => loaded.push((chart, info)),
-            Err(e) => eprintln!("  (skipping {}: {e})", info.name),
-        }
-    }
-    let sources: Vec<autoroute::ChartSource> = loaded
-        .iter()
-        .map(|(data, info)| autoroute::ChartSource { data, info })
-        .collect();
-
-    let polar = Polar::parse(wxroute::DEFAULT_POLAR).expect("built-in polar");
-    let config = navcore2::nav::RoutingConfig::default();
-    let safety = SafetyConfig::default();
     let depart = chrono::Utc::now();
-
-    println!(
-        "Weather-routing {:.1} nm across {} chart(s), departing now…",
-        navcore2::geo::distance_m(start, finish) / 1852.0,
-        sources.len()
-    );
-    let planned = match wxroute::plan(
-        &wxroute::WxJob {
-            sources: &sources,
-            start,
-            finish,
-            depart,
-            polar: &polar,
-            polar_name: "built-in cruiser",
-            forecast: &forecast,
-            waves: waves.as_ref(),
-            currents: currents.as_ref(),
-            config: &config,
-            safety: &safety,
-        },
+    // The same function the app's Sail button runs, so the command line
+    // reproduces exactly what a user saw.
+    let planned = match wxroute::plan_from_chart_dir(
+        std::path::Path::new(dir_path),
+        start,
+        finish,
+        hours,
+        &cache,
+        wxroute::DEFAULT_POLAR,
+        "built-in cruiser",
+        &navcore2::nav::RoutingConfig::default(),
+        &SafetyConfig::default(),
+        true,
+        true,
         &format!("Wx {:.2},{:.2} to {:.2},{:.2}", a.0, a.1, b.0, b.1),
+        |msg| println!("  {msg}"),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1339,97 +1275,30 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
             .unwrap_or_default()
         );
     }
-
-    let store_dir = std::env::var("NAVCORE_ROUTES")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(navcore2::nav::RouteStore::default_dir)
-        .unwrap_or_else(|| PathBuf::from("routes"));
-    if let Ok((mut store, _)) = navcore2::nav::RouteStore::open(store_dir) {
-        for wp in &planned.waypoints {
-            store.waypoints.insert(wp.clone());
-        }
-        match store.upsert_route(planned.route.clone()) {
-            Ok(()) => println!("saved to the route store"),
-            Err(e) => eprintln!("could not save: {e}"),
-        }
-    }
+    save_cli_route(&planned.route, &planned.waypoints);
 }
 
 fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f64>) {
     use navcore2::geo::LatLon;
-    use navcore2::nav::autoroute::{self, SafetyConfig};
-
-    let dir = PathBuf::from(dir_path);
-    let mut keys = navcore2::decrypt::KeyStore::new();
-    if let Err(e) = keys.load_keylists_in_dir(&dir) {
-        eprintln!("Warning: could not load keys: {e}");
-    }
-    let Ok(base) = ChartDecryptor::new("license") else {
-        eprintln!("Failed to create decryptor");
-        return;
-    };
-    let mut decryptor = CachedDecryptor::new(base);
-    let catalog = match ChartCatalog::from_directory(&dir, &keys, &mut decryptor) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to build catalog: {e}");
-            return;
-        }
-    };
+    use navcore2::nav::autoroute::SafetyConfig;
 
     let mut safety = SafetyConfig::default();
     if let Some(d) = draft {
         safety.draft_m = d;
     }
-
-    // Charts whose extent meets the passage box, with margin to route round
-    // headlands near the ends.
-    let (ax, ay) = navcore2::tiles::latlon_to_mercator(a.0, a.1);
-    let (bx, by) = navcore2::tiles::latlon_to_mercator(b.0, b.1);
-    let span = ((bx - ax).hypot(by - ay)).max(1_000.0);
-    let margin = (span * 0.35).max(15_000.0);
-    let (min_x, max_x) = ((ax.min(bx) - margin), (ax.max(bx) + margin));
-    let (min_y, max_y) = ((ay.min(by) - margin), (ay.max(by) + margin));
-
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
-    let decryptor = Mutex::new(decryptor);
-    let builder =
-        TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
-
-    let mut loaded = Vec::new();
-    for info in catalog.charts.iter().filter(|c| {
-        c.extent_mercator.min_x <= max_x
-            && c.extent_mercator.max_x >= min_x
-            && c.extent_mercator.min_y <= max_y
-            && c.extent_mercator.max_y >= min_y
-    }) {
-        match builder.load_chart(info) {
-            Ok(chart) => loaded.push((chart, info)),
-            Err(e) => eprintln!("  (skipping {}: {e})", info.name),
-        }
-    }
+    let (start, finish) = (LatLon::new(a.0, a.1), LatLon::new(b.0, b.1));
     println!(
-        "Planning {:.1} nm passage across {} chart(s), draft {:.1} m…",
-        navcore2::geo::distance_m(
-            navcore2::geo::LatLon::new(a.0, a.1),
-            navcore2::geo::LatLon::new(b.0, b.1)
-        ) / 1852.0,
-        loaded.len(),
+        "Planning {:.1} nm passage, draft {:.1} m…",
+        navcore2::geo::distance_m(start, finish) / 1852.0,
         safety.draft_m
     );
-
-    let sources: Vec<autoroute::ChartSource> = loaded
-        .iter()
-        .map(|(data, info)| autoroute::ChartSource { data, info })
-        .collect();
-
-    let planned = match autoroute::plan(
-        &sources,
-        LatLon::new(a.0, a.1),
-        LatLon::new(b.0, b.1),
+    // The same function the app's Motor button runs.
+    let planned = match navcore2::nav::wxroute::motor_plan_from_chart_dir(
+        std::path::Path::new(dir_path),
+        start,
+        finish,
         &safety,
+        |msg| println!("  {msg}"),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1440,8 +1309,26 @@ fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f
     for w in &planned.warnings {
         println!("  note: {w}");
     }
+    println!(
+        "\n{}: {} waypoints, {:.1} nm",
+        planned.route.name,
+        planned.route.waypoints.len(),
+        planned.route.total_distance_nm()
+    );
+    for (i, leg) in planned.route.legs.iter().enumerate() {
+        println!(
+            "  leg {:>2}: {:>6.2} nm  {:>5.1}°",
+            i + 1,
+            leg.distance_nm,
+            leg.initial_bearing_deg
+        );
+    }
+    save_cli_route(&planned.route, &planned.waypoints);
+}
 
-    // Into the store, so the Routes window sees it immediately.
+/// Into the route store (`NAVCORE_ROUTES`, or the app's own), so the Routes
+/// window sees a command-line plan immediately.
+fn save_cli_route(route: &navcore2::nav::Route, waypoints: &[navcore2::nav::model::Waypoint]) {
     let store_dir = std::env::var("NAVCORE_ROUTES")
         .map(PathBuf::from)
         .ok()
@@ -1449,32 +1336,106 @@ fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f
         .unwrap_or_else(|| PathBuf::from("routes"));
     match navcore2::nav::RouteStore::open(store_dir) {
         Ok((mut store, _)) => {
-            let mut route = planned.route.clone();
-            for wp in &planned.waypoints {
+            for wp in waypoints {
                 store.waypoints.insert(wp.clone());
             }
-            route.recompute_legs(&store.waypoints);
-            println!(
-                "\n{}: {} waypoints, {:.1} nm",
-                route.name,
-                route.waypoints.len(),
-                route.total_distance_nm()
-            );
-            for (i, leg) in route.legs.iter().enumerate() {
-                println!(
-                    "  leg {:>2}: {:>6.2} nm  {:>5.1}°",
-                    i + 1,
-                    leg.distance_nm,
-                    leg.initial_bearing_deg
-                );
-            }
-            if let Err(e) = store.upsert_route(route) {
-                eprintln!("could not save the route: {e}");
-            } else {
-                println!("saved to the route store");
+            match store.upsert_route(route.clone()) {
+                Ok(()) => println!("saved to the route store"),
+                Err(e) => eprintln!("could not save: {e}"),
             }
         }
         Err(e) => eprintln!("route store unavailable: {e}"),
+    }
+}
+
+/// `--s57-dump <cell.000>`: the cell through navcore's whole S-57 path —
+/// read, updates applied, encoded as SENC, parsed back — one JSON object per
+/// feature, in the shape tools/s57oracle prints, for tools/s57diff.py.
+fn s57_dump_mode(path: &str) {
+    use navcore2::senc::{AttributeValue, ChartData, FeatureType};
+    let cell = match navcore2::s57::cell::Cell::open(std::path::Path::new(path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let (bytes, ids) = navcore2::s57::senc_encode::encode_with_ids(&cell);
+    let chart = match ChartData::parse(bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SENC parse: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (rlat, rlon) = (chart.header.ref_lat, chart.header.ref_lon);
+    let (rx, ry) = navcore2::tiles::latlon_to_mercator(rlat, rlon);
+    let ll = |x: f64, y: f64| {
+        let (lat, lon) = navcore2::tiles::mercator_to_latlon(x, y);
+        serde_json::json!([(lon * 1e7).round() / 1e7, (lat * 1e7).round() / 1e7])
+    };
+    println!(
+        "{}",
+        serde_json::json!({"dsid": {"dsnm": cell.dataset.dsnm, "updn": cell.dataset.update,
+            "cscl": cell.dataset.cscl, "updates_applied": cell.updates_applied,
+            "features": chart.features.len()}})
+    );
+    for (f, rcid) in chart.features.iter().zip(ids) {
+        let mut attrs = serde_json::Map::new();
+        for (code, v) in f.attributes.iter_codes() {
+            let name = navcore2::senc::s57_attribute_name(code)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{code}"));
+            let s = match v {
+                AttributeValue::Integer(i) => i.to_string(),
+                AttributeValue::Float(x) => x.to_string(),
+                AttributeValue::String(s) => s.clone(),
+            };
+            attrs.insert(name, serde_json::Value::String(s));
+        }
+        let geom = match f.feature_type {
+            FeatureType::Point => f.point_geometry.as_ref().map(|p| {
+                serde_json::json!({"type": "Point", "c": [p.y, p.x]})
+            }),
+            FeatureType::Multipoint => f.multipoint_geometry.as_ref().map(|m| {
+                let c: Vec<_> = m
+                    .points
+                    .iter()
+                    .map(|p| {
+                        let mut v = ll(rx + p[0] as f64, ry + p[1] as f64);
+                        v.as_array_mut().unwrap().push(serde_json::json!(p[2]));
+                        v
+                    })
+                    .collect();
+                serde_json::json!({"type": "MultiPoint", "c": c})
+            }),
+            FeatureType::Line => f.line_geometry.as_ref().map(|g| {
+                let parts = g.resolve_global(&chart.edge_table, rlat, rlon);
+                let len: f64 = parts
+                    .iter()
+                    .flat_map(|p| p.windows(2))
+                    .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+                    .sum();
+                serde_json::json!({"type": "Lines", "parts": parts.len(), "len": len})
+            }),
+            FeatureType::Area => f.area_geometry.as_ref().map(|g| {
+                let mut area = 0.0;
+                g.for_each_triangle_global(rlat, rlon, |t| {
+                    area += ((t[1][0] - t[0][0]) * (t[2][1] - t[0][1])
+                        - (t[2][0] - t[0][0]) * (t[1][1] - t[0][1]))
+                        .abs()
+                        / 2.0;
+                });
+                let rings = g.resolve_closed_rings(&chart.edge_table).len();
+                serde_json::json!({"type": "Area", "area": area, "rings": rings})
+            }),
+        };
+        println!(
+            "{}",
+            serde_json::json!({"rcid": rcid, "objl": f.type_code,
+                "acronym": navcore2::senc::s57_code_to_acronym(f.type_code),
+                "attrs": attrs, "geom": geom})
+        );
     }
 }
 
@@ -1906,15 +1867,9 @@ impl App {
         }
         println!("Loaded {} chart keys", keys.len());
 
-        // Create decryptor with disk cache (will be moved to RenderState)
-        let base_decryptor = match ChartDecryptor::new("license") {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Failed to create decryptor: {}", e);
-                return;
-            }
-        };
-        let mut decryptor = CachedDecryptor::new(base_decryptor);
+        // Create decryptor with disk cache (will be moved to RenderState).
+        // The o-charts helper if it starts; S-57 cells load either way.
+        let mut decryptor = CachedDecryptor::open("license");
 
         // Build catalog (needs mutable decryptor for header parsing)
         let catalog = match ChartCatalog::from_directory(&dir, &self.keys, &mut decryptor) {
