@@ -31,24 +31,33 @@ ssh rpi5            # alias in ~/.ssh/config → den@rpi5.local, key ~/.ssh/id_e
   `video=HDMI-A-1:1920x1080@60D` in `/boot/firmware/cmdline.txt`. The original
   is saved as `cmdline.txt.orig`. Without that line the desktop comes up with
   no outputs at all.
+- **Input:** Logitech MX Anywhere 3S and MX Keys S over Bluetooth, paired and
+  trusted, so they reconnect on boot. Keyboard layout is Danish (`dk`) in
+  `/etc/default/keyboard` and `~/.config/labwc/environment`. To pair from SSH,
+  use `bluetoothctl --agent NoInputNoOutput`. The default agent asks for a PIN
+  that nobody can type in time.
 
 ## Deploy / build / run
 
 ```sh
-deploy/deploy-to-pi.sh rpi5      # rsync source → ~/navcore on the Pi, cargo build --release there
+deploy/deploy-to-pi.sh           # rsync → ~/navcore on the Pi, cargo build --release there, restart navcore on its screen
+NORUN=1 deploy/deploy-to-pi.sh   # build only
 ```
 
-- Builds **on the Pi** (aarch64). Never cross-copy a Mac binary.
-- `pi-setup.sh` has already run: apt deps, rustup in `~/.cargo`, and XDG
-  autostart in `~/.config/autostart/navcore.desktop`, so navcore starts with
-  the desktop.
-- The Wayland session belongs to user `den`. To start or restart the app on the
-  Pi's screen from SSH:
+This is the everyday loop: edit on the Mac, run it, look at the Dell.
 
-  ```sh
-  ssh rpi5 'pkill -x navcore; cd ~/navcore && WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 nohup target/release/navcore >/tmp/navcore.log 2>&1 &'
-  ssh rpi5 'tail -f /tmp/navcore.log'
-  ```
+- Builds **on the Pi** (aarch64). Never cross-copy a Mac binary. The first
+  build took 10 min; incremental ones take a minute or two.
+- Don't run a deploy while a build is still going on the Pi. The rsync would
+  change sources under the running cargo.
+- `pi-setup.sh` has already run: apt deps, rustup in `~/.cargo`, and XDG
+  autostart in `~/.config/autostart/navcore.desktop`. Autostart isn't needed
+  for testing; delete that file if the app starting at boot gets in the way.
+- `deploy/pi-run.sh` (on the Pi) kills any running navcore and starts it on the
+  desktop's Wayland session (`wayland-0`, `/run/user/1000`) with
+  `RUST_LOG=info`, logging to `~/navcore.log`. Restart the app without
+  rebuilding: `ssh rpi5 'bash ~/navcore/deploy/pi-run.sh'`. Follow the log:
+  `ssh rpi5 'tail -f ~/navcore.log'`.
 - Screenshot of the Pi's screen: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/s.png' && scp rpi5:/tmp/s.png .`
 - Check the outputs: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 wlr-randr'`
 - GPU: V3D through Mesa Vulkan (`vulkaninfo --summary`).
