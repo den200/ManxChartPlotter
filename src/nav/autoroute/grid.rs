@@ -29,12 +29,16 @@ pub struct Grid {
     soft: Vec<u8>,
     /// Metres to the nearest blocked cell, after [`Grid::finalize`].
     dist: Vec<f32>,
+    /// Some chart's coverage reaches this cell. Outside every chart the
+    /// grid is closed, and saying *why* an end cannot be reached ("outside
+    /// your charts") needs to tell that apart from land.
+    covered: Vec<bool>,
 }
 
 /// Cap on total cells: past this the grid coarsens itself rather than eating
-/// gigabytes. 16M cells ≈ 80 MB of working state, seconds to fill — fine for
-/// a one-shot background job on a button press.
-const MAX_CELLS: usize = 16_000_000;
+/// gigabytes. 12M cells is about 200 MB with the search's own arrays —
+/// within a Raspberry Pi 5's means, and seconds to fill.
+const MAX_CELLS: usize = 12_000_000;
 
 impl Grid {
     /// A grid covering `min..max` (Mercator metres) at `res`, coarsened if the
@@ -59,10 +63,17 @@ impl Grid {
                     blocked: vec![0; w * h],
                     soft: vec![0; w * h],
                     dist: Vec::new(),
+                    covered: vec![false; w * h],
                 };
             }
             res *= 1.5;
         }
+    }
+
+    /// Mark every cell as an obstacle: the start state of a grid on which
+    /// only charted coverage is water.
+    pub fn close_all(&mut self) {
+        self.blocked.fill(1);
     }
 
     #[inline]
@@ -120,6 +131,91 @@ impl Grid {
         let i = self.idx(x as usize, y as usize);
         self.blocked[i] = 0;
         self.soft[i] = 0;
+        self.covered[i] = true;
+    }
+
+    /// Draw the grid as a PNG, for seeing why a route goes where it goes:
+    /// grey uncharted, black unsafe, orange soft cost, blue deepening with
+    /// distance from hazards, and `path` (Mercator) in red. Downsampled to
+    /// at most `max_px` on the long side.
+    pub fn debug_png(&self, path: &[[f64; 2]], out: &std::path::Path, max_px: usize) {
+        let step = (self.w.max(self.h) / max_px.max(1)).max(1);
+        let (iw, ih) = (self.w / step, self.h / step);
+        let mut img = image::RgbImage::new(iw as u32, ih as u32);
+        for py in 0..ih {
+            for px in 0..iw {
+                let (x, y) = (px * step, self.h - 1 - py * step);
+                let i = self.idx(x, y);
+                let c = if !self.covered[i] && self.blocked[i] != 0 {
+                    [110, 110, 110]
+                } else if self.blocked[i] != 0 {
+                    [20, 20, 20]
+                } else if self.soft[i] != 0 {
+                    [240, 160, 60]
+                } else {
+                    let d = self.dist.get(i).copied().unwrap_or(0.0) as f64;
+                    let f = (d / 2_000.0).min(1.0);
+                    [(230.0 - 150.0 * f) as u8, (240.0 - 110.0 * f) as u8, 255]
+                };
+                img.put_pixel(px as u32, py as u32, image::Rgb(c));
+            }
+        }
+        for w in path.windows(2) {
+            let n = 400;
+            for i in 0..=n {
+                let t = i as f64 / n as f64;
+                let p = [w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t];
+                if let Some((x, y)) = self.cell_of(p) {
+                    let (px, py) = (x / step, (self.h - 1 - y) / step);
+                    if px < iw && py < ih {
+                        img.put_pixel(px as u32, py as u32, image::Rgb([230, 30, 30]));
+                    }
+                }
+            }
+        }
+        if let Err(e) = img.save(out) {
+            log::warn!("could not write {}: {e}", out.display());
+        }
+    }
+
+    /// Does any chart's coverage reach this cell?
+    pub fn is_covered(&self, x: usize, y: usize) -> bool {
+        self.covered[self.idx(x, y)]
+    }
+
+    /// Every cell reachable from `from` through water that is not blocked,
+    /// 8-connected without cutting blocked corners — the same moves the
+    /// search makes, with no offing at all. A marina basin shut in by fixed
+    /// bridges is its own component, and an end snapped into it can never
+    /// be reached from outside.
+    pub fn component(&self, from: (usize, usize)) -> Vec<bool> {
+        let mut seen = vec![false; self.w * self.h];
+        if self.is_blocked(from.0, from.1) {
+            return seen;
+        }
+        let mut stack = vec![from];
+        seen[self.idx(from.0, from.1)] = true;
+        while let Some((x, y)) = stack.pop() {
+            for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
+                let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                if nx < 0 || ny < 0 || nx as usize >= self.w || ny as usize >= self.h {
+                    continue;
+                }
+                let (nx, ny) = (nx as usize, ny as usize);
+                let i = self.idx(nx, ny);
+                if seen[i] || self.is_blocked(nx, ny) {
+                    continue;
+                }
+                if dx != 0 && dy != 0
+                    && (self.is_blocked(nx, y) || self.is_blocked(x, ny))
+                {
+                    continue;
+                }
+                seen[i] = true;
+                stack.push((nx, ny));
+            }
+        }
+        seen
     }
 
     /// Stamp a filled triangle (Mercator metres): interior by cell centre,
@@ -144,10 +240,17 @@ impl Grid {
         let max_x = t.iter().map(|p| p[0]).fold(f64::MIN, f64::max);
         let min_y = t.iter().map(|p| p[1]).fold(f64::MAX, f64::min);
         let max_y = t.iter().map(|p| p[1]).fold(f64::MIN, f64::max);
-        let x0 = ((min_x - self.origin[0]) / self.res).floor() as i64;
-        let x1 = ((max_x - self.origin[0]) / self.res).ceil() as i64;
-        let y0 = ((min_y - self.origin[1]) / self.res).floor() as i64;
-        let y1 = ((max_y - self.origin[1]) / self.res).ceil() as i64;
+        // Clamped to the grid: an overview chart's land triangle can be
+        // hundreds of kilometres across, and walking its whole bounding box
+        // cell by cell — almost all of it off the grid — took longer than
+        // everything else in the plan put together.
+        let x0 = (((min_x - self.origin[0]) / self.res).floor() as i64).max(0);
+        let x1 = (((max_x - self.origin[0]) / self.res).ceil() as i64).min(self.w as i64 - 1);
+        let y0 = (((min_y - self.origin[1]) / self.res).floor() as i64).max(0);
+        let y1 = (((max_y - self.origin[1]) / self.res).ceil() as i64).min(self.h as i64 - 1);
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let c = [
@@ -179,6 +282,16 @@ impl Grid {
         b: [f64; 2],
         mut f: impl FnMut(&mut Self, i64, i64),
     ) {
+        // Only the part on the grid (plus a cell) is walked: an overview
+        // chart's coastline edge can be a hundred kilometres long.
+        let lo = [self.origin[0] - self.res, self.origin[1] - self.res];
+        let hi = [
+            self.origin[0] + (self.w as f64 + 1.0) * self.res,
+            self.origin[1] + (self.h as f64 + 1.0) * self.res,
+        ];
+        let Some((a, b)) = clip_segment(a, b, lo, hi) else {
+            return;
+        };
         let steps = ((b[0] - a[0]).hypot(b[1] - a[1]) / (self.res * 0.45)).ceil() as usize;
         let steps = steps.max(1);
         let mut last: Option<(i64, i64)> = None;
@@ -270,10 +383,38 @@ impl Grid {
         !self.is_blocked(x, y) && self.hazard_distance(x, y) >= offing_min_m
     }
 
+    /// Is this cell somewhere a boat may be, under a search's rules — the
+    /// hard offing, faded near the endpoints?
+    pub fn passable_by(&self, x: usize, y: usize, params: &SearchParams) -> bool {
+        !self.is_blocked(x, y)
+            && self.hazard_distance(x, y) >= params.floor_at(self.centre(x, y))
+    }
+
+    /// [`segment_clear`](Self::segment_clear) under a search's rules.
+    pub fn segment_clear_by(&self, a: [f64; 2], b: [f64; 2], params: &SearchParams) -> bool {
+        self.segment_clear_with(a, b, |g, x, y| g.passable_by(x, y, params))
+    }
+
+    /// Does the segment pass through a soft area — a caution area, a
+    /// restricted area short of prohibition, an exercise area? The route may,
+    /// but the skipper should be told.
+    pub fn segment_touches_soft(&self, a: [f64; 2], b: [f64; 2]) -> bool {
+        !self.segment_clear_with(a, b, |g, x, y| g.soft[g.idx(x, y)] == 0)
+    }
+
     /// Is the straight segment between two Mercator points clear, offing
     /// included? The same supercover the rasterizer used, so the answer
     /// cannot disagree with the stamping.
     pub fn segment_clear(&self, a: [f64; 2], b: [f64; 2], offing_min_m: f64) -> bool {
+        self.segment_clear_with(a, b, |g, x, y| g.passable(x, y, offing_min_m))
+    }
+
+    fn segment_clear_with(
+        &self,
+        a: [f64; 2],
+        b: [f64; 2],
+        ok: impl Fn(&Self, usize, usize) -> bool,
+    ) -> bool {
         let mut clear = true;
         // Walk on a clone-free path: reimplement the walk read-only.
         let steps = ((b[0] - a[0]).hypot(b[1] - a[1]) / (self.res * 0.45)).ceil() as usize;
@@ -292,7 +433,7 @@ impl Grid {
                     clear = false;
                     return;
                 }
-                if !self.passable(cx as usize, cy as usize, offing_min_m) {
+                if !ok(self, cx as usize, cy as usize) {
                     clear = false;
                 }
             };
@@ -309,6 +450,39 @@ impl Grid {
         }
         true
     }
+}
+
+/// Liang–Barsky: the part of segment `a`–`b` inside the box, if any.
+fn clip_segment(
+    a: [f64; 2],
+    b: [f64; 2],
+    lo: [f64; 2],
+    hi: [f64; 2],
+) -> Option<([f64; 2], [f64; 2])> {
+    let d = [b[0] - a[0], b[1] - a[1]];
+    let (mut t0, mut t1) = (0.0f64, 1.0f64);
+    for axis in 0..2 {
+        for (p, q) in [(-d[axis], a[axis] - lo[axis]), (d[axis], hi[axis] - a[axis])] {
+            if p == 0.0 {
+                if q < 0.0 {
+                    return None;
+                }
+            } else {
+                let r = q / p;
+                if p < 0.0 {
+                    t0 = t0.max(r);
+                } else {
+                    t1 = t1.min(r);
+                }
+            }
+        }
+    }
+    (t0 <= t1).then(|| {
+        (
+            [a[0] + d[0] * t0, a[1] + d[1] * t0],
+            [a[0] + d[0] * t1, a[1] + d[1] * t1],
+        )
+    })
 }
 
 fn point_in_triangle(p: [f64; 2], t: [[f64; 2]; 3]) -> bool {
@@ -334,12 +508,71 @@ pub enum SearchError {
     Cancelled,
 }
 
-/// How the search weighs comfort against distance.
+/// How the search weighs comfort against distance — and where it may go.
+///
+/// Three distances from unsafe water, all Mercator-plane metres:
+/// - `offing_hard_m`: never closer. Small — a cell or so — so a dredged
+///   channel or a sound a few hundred metres wide stays open;
+/// - `offing_min_m`: the offing a skipper wants. Closer costs steeply (up
+///   to four times the distance), so the route keeps it wherever the chart
+///   allows and gives it up only where the water itself is narrower;
+/// - `offing_soft_m`: sea room is cheap; below this the cost rises gently.
+///
+/// A berth is inside every offing by definition. Within `taper_m` of an
+/// endpoint the floor and the penalties fade to nothing, so the route can
+/// leave a harbour through its own entrance instead of failing, or being
+/// teleported to open water it does not connect to.
 pub struct SearchParams {
+    pub offing_hard_m: f64,
     pub offing_min_m: f64,
-    /// Below this distance from hazards the cost rises linearly, up to
-    /// double at the minimum offing. Sea room is cheap; use it.
     pub offing_soft_m: f64,
+    /// The start and finish, Mercator.
+    pub ends: Vec<[f64; 2]>,
+    pub taper_m: f64,
+}
+
+impl SearchParams {
+    /// One fixed offing, no fading: the old behaviour, and the analytic
+    /// tests'.
+    pub fn fixed(offing_min_m: f64, offing_soft_m: f64) -> Self {
+        Self {
+            offing_hard_m: offing_min_m,
+            offing_min_m,
+            offing_soft_m,
+            ends: Vec::new(),
+            taper_m: 0.0,
+        }
+    }
+
+    /// 0 at an endpoint, rising to 1 at `taper_m` from it.
+    pub fn fade(&self, p: [f64; 2]) -> f64 {
+        if self.taper_m <= 0.0 {
+            return 1.0;
+        }
+        self.ends
+            .iter()
+            .map(|e| ((p[0] - e[0]).hypot(p[1] - e[1]) / self.taper_m).min(1.0))
+            .fold(1.0, f64::min)
+    }
+
+    /// The hard offing at a place.
+    pub fn floor_at(&self, p: [f64; 2]) -> f64 {
+        self.offing_hard_m * self.fade(p)
+    }
+
+    /// The cost of a metre of water `d` from the nearest hazard, as a
+    /// multiplier ≥ 1 (so Euclidean distance stays an admissible heuristic).
+    fn multiplier(&self, d: f64, fade: f64) -> f64 {
+        let pen = if d < self.offing_min_m && self.offing_min_m > self.offing_hard_m {
+            1.0 + 3.0 * ((self.offing_min_m - d) / (self.offing_min_m - self.offing_hard_m))
+                .clamp(0.0, 1.0)
+        } else if d < self.offing_soft_m && self.offing_soft_m > self.offing_min_m {
+            ((self.offing_soft_m - d) / (self.offing_soft_m - self.offing_min_m)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        1.0 + pen * fade
+    }
 }
 
 /// A* over the grid, 8-connected.
@@ -386,7 +619,7 @@ pub fn find_path(
     ];
 
     let mut popped = 0u32;
-    while let Some(Reverse((_, current))) = heap.pop() {
+    while let Some(Reverse((f_key, current))) = heap.pop() {
         // A cancelled plan stops here too, rather than finishing a search
         // nobody will read. Checked now and then: it is a thread-local read.
         popped = popped.wrapping_add(1);
@@ -394,6 +627,11 @@ pub fn find_path(
             return Err(SearchError::Cancelled);
         }
         let c = (current as usize % w, current as usize / w);
+        // A node is pushed again each time a cheaper way to it is found; the
+        // older entries are stale and would only re-expand it.
+        if f_key != key(g_score[current as usize] + hcost(c)) {
+            continue;
+        }
         if c == goal {
             // Walk parents back.
             let mut path = vec![c];
@@ -413,16 +651,14 @@ pub fn find_path(
                 continue;
             }
             let n = (nx as usize, ny as usize);
-            if !grid.passable(n.0, n.1, params.offing_min_m) {
+            if !grid.passable_by(n.0, n.1, params) {
                 continue;
             }
             // Diagonal moves must not cut a blocked corner.
             if dx != 0 && dy != 0 {
                 let a = ((c.0 as i64 + dx) as usize, c.1);
                 let b = (c.0, (c.1 as i64 + dy) as usize);
-                if !grid.passable(a.0, a.1, params.offing_min_m)
-                    || !grid.passable(b.0, b.1, params.offing_min_m)
-                {
+                if !grid.passable_by(a.0, a.1, params) || !grid.passable_by(b.0, b.1, params) {
                     continue;
                 }
             }
@@ -432,12 +668,8 @@ pub fn find_path(
                 grid.res
             };
             let d = grid.hazard_distance(n.0, n.1);
-            let offing_pen = if d < params.offing_soft_m && params.offing_soft_m > params.offing_min_m {
-                1.0 - (d - params.offing_min_m) / (params.offing_soft_m - params.offing_min_m)
-            } else {
-                0.0
-            };
-            let mult = 1.0 + offing_pen.clamp(0.0, 1.0) + grid.soft_cost(n.0, n.1);
+            let fade = params.fade(grid.centre(n.0, n.1));
+            let mult = params.multiplier(d, fade) + grid.soft_cost(n.0, n.1);
             let tentative = g_here + (step * mult) as f32;
             let ni = index(n);
             if tentative < g_score[ni] {
@@ -451,15 +683,30 @@ pub fn find_path(
 }
 
 /// The nearest passable cell to a point, spiralling outward — §7.7's nudge
-/// for an endpoint inside the offing or on the hard. `None` within `max_m`
-/// means the endpoint is truly buried.
+/// for an endpoint on the hard (a pontoon, a quay, a charted shoal). With
+/// the endpoint fading in `params`, any water off the hard will do. `None`
+/// within `max_m` means the endpoint is truly buried.
 pub fn nudge(
     grid: &Grid,
     from: (usize, usize),
-    offing_min_m: f64,
+    params: &SearchParams,
     max_m: f64,
 ) -> Option<(usize, usize)> {
-    if grid.passable(from.0, from.1, offing_min_m) {
+    nudge_into(grid, from, params, max_m, None)
+}
+
+/// [`nudge`], but only to a cell inside `component` when one is given.
+pub fn nudge_into(
+    grid: &Grid,
+    from: (usize, usize),
+    params: &SearchParams,
+    max_m: f64,
+    component: Option<&[bool]>,
+) -> Option<(usize, usize)> {
+    let ok = |x: usize, y: usize| {
+        grid.passable_by(x, y, params) && component.is_none_or(|c| c[y * grid.w + x])
+    };
+    if ok(from.0, from.1) {
         return Some(from);
     }
     let max_r = (max_m / grid.res).ceil() as i64;
@@ -475,7 +722,7 @@ pub fn nudge(
                 if x < 0 || y < 0 || x as usize >= grid.w || y as usize >= grid.h {
                     continue;
                 }
-                if grid.passable(x as usize, y as usize, offing_min_m) {
+                if ok(x as usize, y as usize) {
                     let d2 = dx * dx + dy * dy;
                     if best.map(|(_, b)| d2 < b).unwrap_or(true) {
                         best = Some(((x as usize, y as usize), d2));
@@ -492,7 +739,7 @@ pub fn nudge(
 
 /// Pull the cell path taut: keep only the corners that matter, each surviving
 /// leg verified clear by the same supercover the rasterizer used.
-pub fn string_pull(grid: &Grid, path: &[(usize, usize)], offing_min_m: f64) -> Vec<[f64; 2]> {
+pub fn string_pull(grid: &Grid, path: &[(usize, usize)], params: &SearchParams) -> Vec<[f64; 2]> {
     if path.is_empty() {
         return Vec::new();
     }
@@ -502,7 +749,7 @@ pub fn string_pull(grid: &Grid, path: &[(usize, usize)], offing_min_m: f64) -> V
     while i + 1 < pts.len() {
         // Furthest j visible from i.
         let mut j = pts.len() - 1;
-        while j > i + 1 && !grid.segment_clear(pts[i], pts[j], offing_min_m) {
+        while j > i + 1 && !grid.segment_clear_by(pts[i], pts[j], params) {
             j -= 1;
         }
         out.push(pts[j]);
@@ -521,10 +768,7 @@ mod tests {
     }
 
     fn params() -> SearchParams {
-        SearchParams {
-            offing_min_m: 150.0,
-            offing_soft_m: 400.0,
-        }
+        SearchParams::fixed(150.0, 400.0)
     }
 
     /// A square island in the middle, as two triangles.
@@ -553,7 +797,7 @@ mod tests {
             assert!(grid.passable(x, y, params().offing_min_m), "cell ({x},{y})");
         }
         // And the pulled legs hold the same guarantee.
-        let pulled = string_pull(&grid, &path, params().offing_min_m);
+        let pulled = string_pull(&grid, &path, &params());
         assert!(pulled.len() >= 3, "must dodge: {} points", pulled.len());
         for w in pulled.windows(2) {
             assert!(grid.segment_clear(w[0], w[1], params().offing_min_m));
@@ -571,7 +815,7 @@ mod tests {
         let start = grid.cell_of([500.0, 500.0]).unwrap();
         let goal = grid.cell_of([9_500.0, 8_500.0]).unwrap();
         let path = find_path(&grid, start, goal, &params()).unwrap();
-        let pulled = string_pull(&grid, &path, params().offing_min_m);
+        let pulled = string_pull(&grid, &path, &params());
         assert_eq!(pulled.len(), 2, "no obstacles, no corners: {pulled:?}");
     }
 
@@ -600,10 +844,7 @@ mod tests {
         // slipping.
         let start = grid.cell_of([900.0, 100.0]).unwrap();
         let goal = grid.cell_of([100.0, 900.0]).unwrap();
-        let p = SearchParams {
-            offing_min_m: 0.0,
-            offing_soft_m: 0.0,
-        };
+        let p = SearchParams::fixed(0.0, 0.0);
         assert_eq!(find_path(&grid, start, goal, &p), Err(SearchError::Unreachable));
     }
 
@@ -642,10 +883,7 @@ mod tests {
         let start = grid.cell_of([1_000.0, 5_000.0]).unwrap();
         let goal = grid.cell_of([9_000.0, 5_000.0]).unwrap();
         // Through the channel with a modest offing.
-        let p = SearchParams {
-            offing_min_m: 100.0,
-            offing_soft_m: 200.0,
-        };
+        let p = SearchParams::fixed(100.0, 200.0);
         let path = find_path(&grid, start, goal, &p).expect("the fine chart's channel is open");
         for &(x, y) in &path {
             assert!(grid.passable(x, y, p.offing_min_m));
@@ -658,11 +896,129 @@ mod tests {
         island(&mut grid);
         // A start inside the island.
         let buried = grid.cell_of([5_000.0, 5_000.0]).unwrap();
-        let freed = nudge(&grid, buried, params().offing_min_m, 3_000.0)
+        let freed = nudge(&grid, buried, &params(), 3_000.0)
             .expect("open water within 3 km");
         assert!(grid.passable(freed.0, freed.1, params().offing_min_m));
         // And a hopeless case gives None, not a spin.
-        assert!(nudge(&grid, buried, params().offing_min_m, 200.0).is_none());
+        assert!(nudge(&grid, buried, &params(), 200.0).is_none());
+    }
+
+    /// Land as an axis-aligned block.
+    fn block(grid: &mut Grid, x0: f64, y0: f64, x1: f64, y1: f64) {
+        grid.stamp_triangle([[x0, y0], [x1, y0], [x1, y1]], true);
+        grid.stamp_triangle([[x0, y0], [x1, y1], [x0, y1]], true);
+    }
+
+    /// The harbour the old router could not leave: a basin with a 150 m
+    /// entrance, well inside any sensible offing. Tapered at the ends, the
+    /// route leaves through the entrance; far from the ends the offing is
+    /// still kept.
+    #[test]
+    fn a_marina_with_a_narrow_entrance_can_be_left() {
+        let mut grid = Grid::new([0.0, 0.0], [10_000.0, 10_000.0], 25.0);
+        // Basin walls round (1000..3000, 1000..3000), entrance on the east
+        // side at y 1925..2075.
+        block(&mut grid, 800.0, 800.0, 3200.0, 1000.0);
+        block(&mut grid, 800.0, 3000.0, 3200.0, 3200.0);
+        block(&mut grid, 800.0, 800.0, 1000.0, 3200.0);
+        block(&mut grid, 3000.0, 800.0, 3200.0, 1925.0);
+        block(&mut grid, 3000.0, 2075.0, 3200.0, 3200.0);
+        grid.finalize();
+        let (a, b) = ([2000.0, 2000.0], [9000.0, 9000.0]);
+        let start = grid.cell_of(a).unwrap();
+        let goal = grid.cell_of(b).unwrap();
+
+        // A fixed 370 m offing: the entrance is closed and the berth with it.
+        assert!(find_path(&grid, start, goal, &SearchParams::fixed(370.0, 900.0)).is_err());
+
+        let params = SearchParams {
+            offing_hard_m: 20.0,
+            offing_min_m: 370.0,
+            offing_soft_m: 900.0,
+            ends: vec![a, b],
+            taper_m: 1_850.0,
+        };
+        let path = find_path(&grid, start, goal, &params).expect("out through the entrance");
+        let pulled = string_pull(&grid, &path, &params);
+        for w in pulled.windows(2) {
+            assert!(grid.segment_clear_by(w[0], w[1], &params));
+        }
+        // Away from the ends the preferred offing is kept where the water
+        // allows it.
+        for &(x, y) in &path {
+            let p = grid.centre(x, y);
+            if params.fade(p) >= 1.0 {
+                assert!(grid.hazard_distance(x, y) >= 370.0, "cell ({x},{y}) hugs the shore");
+            }
+        }
+    }
+
+    /// Where the only water is a channel narrower than the preferred offing,
+    /// the route uses it rather than calling the passage impossible.
+    #[test]
+    fn a_narrow_channel_is_used_when_it_is_the_only_way() {
+        let mut grid = Grid::new([0.0, 0.0], [20_000.0, 10_000.0], 25.0);
+        // A wall across the middle with a 200 m channel through it.
+        block(&mut grid, 9_000.0, -100.0, 11_000.0, 4_900.0);
+        block(&mut grid, 9_000.0, 5_100.0, 11_000.0, 10_100.0);
+        grid.finalize();
+        let (a, b) = ([2_000.0, 5_000.0], [18_000.0, 5_000.0]);
+        let params = SearchParams {
+            offing_hard_m: 20.0,
+            offing_min_m: 370.0,
+            offing_soft_m: 900.0,
+            ends: vec![a, b],
+            taper_m: 1_850.0,
+        };
+        let path = find_path(&grid, grid.cell_of(a).unwrap(), grid.cell_of(b).unwrap(), &params)
+            .expect("through the channel");
+        assert!(path.iter().all(|&(x, y)| !grid.is_blocked(x, y)));
+    }
+
+    /// A basin shut by a fixed bridge is its own water: an end snapped into
+    /// it could never be reached, so the snap must look for connected water.
+    #[test]
+    fn an_end_snaps_to_water_that_connects() {
+        let mut grid = Grid::new([0.0, 0.0], [10_000.0, 10_000.0], 25.0);
+        // A closed basin (1000..2000)² next to the start point on land.
+        block(&mut grid, 800.0, 800.0, 2200.0, 1000.0);
+        block(&mut grid, 800.0, 2000.0, 2200.0, 2200.0);
+        block(&mut grid, 800.0, 800.0, 1000.0, 2200.0);
+        block(&mut grid, 2000.0, 800.0, 2200.0, 2200.0);
+        // Land between the basin and the open sea, the start on it.
+        block(&mut grid, 2200.0, 800.0, 2700.0, 2200.0);
+        grid.finalize();
+        let on_land = grid.cell_of([2150.0, 1500.0]).unwrap();
+        let loose = SearchParams::fixed(0.0, 0.0);
+        let sea = grid.component(grid.cell_of([9_000.0, 9_000.0]).unwrap());
+        let snapped = nudge_into(&grid, on_land, &loose, 1_000.0, Some(&sea)).expect("the sea");
+        assert!(sea[snapped.1 * grid.w + snapped.0]);
+        // The plain nearest water is the closed basin — the old answer.
+        let nearest = nudge(&grid, on_land, &loose, 1_000.0).unwrap();
+        assert!(!sea[nearest.1 * grid.w + nearest.0]);
+    }
+
+    /// On a grid that starts closed, only charted coverage is water, and
+    /// the grid can say which closed cells are merely uncharted.
+    #[test]
+    fn uncharted_water_is_closed_and_known_as_uncharted() {
+        let mut grid = open();
+        grid.close_all();
+        grid.clear_triangle([[0.0, 0.0], [5_000.0, 0.0], [5_000.0, 10_000.0]]);
+        grid.clear_triangle([[0.0, 0.0], [5_000.0, 10_000.0], [0.0, 10_000.0]]);
+        grid.finalize();
+        let (x, y) = grid.cell_of([8_000.0, 5_000.0]).unwrap();
+        assert!(grid.is_blocked(x, y) && !grid.is_covered(x, y));
+        let (x, y) = grid.cell_of([2_000.0, 5_000.0]).unwrap();
+        assert!(!grid.is_blocked(x, y) && grid.is_covered(x, y));
+    }
+
+    #[test]
+    fn segments_are_clipped_to_the_grid_before_they_are_walked() {
+        let (lo, hi) = ([0.0, 0.0], [10.0, 10.0]);
+        let (a, b) = clip_segment([-10.0, 5.0], [20.0, 5.0], lo, hi).unwrap();
+        assert_eq!((a, b), ([0.0, 5.0], [10.0, 5.0]));
+        assert!(clip_segment([-10.0, -10.0], [-5.0, 20.0], lo, hi).is_none());
     }
 
     #[test]
