@@ -418,6 +418,9 @@ pub struct RenderState {
     free_tx: std::sync::mpsc::Sender<FreeEvent>,
     /// Set to stop the NOAA download in progress.
     free_cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// A download worker is running — true until it has let go of its
+    /// files, which after a Cancel can be a while after the row went back.
+    free_installing: Arc<std::sync::atomic::AtomicBool>,
     /// NOAA workers still running.
     free_jobs: usize,
     /// The colour table in use, so a re-apply does not re-upload it.
@@ -1360,6 +1363,7 @@ impl RenderState {
             free_rx,
             free_tx,
             free_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            free_installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             free_jobs: 0,
             palette_name: None,
             settings_generation: 0,
@@ -1949,6 +1953,7 @@ impl RenderState {
         let root = self.free_root();
         if let Some(ref mut ui) = self.ui {
             ui.free.probed = true;
+            ui.free.folder = root.join("noaa").display().to_string();
             ui.free.rows = crate::shop::noaa::REGIONS
                 .iter()
                 .map(|r| crate::render::ui::FreeRow {
@@ -1976,6 +1981,12 @@ impl RenderState {
         if self.ui.as_ref().is_some_and(|u| u.free.active.is_some()) {
             return;
         }
+        if self.free_installing.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(ref mut ui) = self.ui {
+                ui.free.status = "Still stopping the last download — try again in a moment.".into();
+            }
+            return;
+        }
         let root = self.free_root();
         let name = crate::shop::noaa::REGIONS
             .iter()
@@ -1984,10 +1995,14 @@ impl RenderState {
             .unwrap_or("charts");
         if let Some(ref mut ui) = self.ui {
             ui.free.active = Some((code.clone(), 0, 0));
+            ui.free.failed = None;
+            ui.free.folder = root.join("noaa").display().to_string();
             ui.free.status = format!("Downloading {name}…");
         }
         self.free_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         let cancel = Arc::clone(&self.free_cancel);
+        let installing = Arc::clone(&self.free_installing);
+        installing.store(true, std::sync::atomic::Ordering::Relaxed);
         let tx = self.free_tx.clone();
         self.free_jobs += 1;
         std::thread::spawn(move || {
@@ -2010,6 +2025,7 @@ impl RenderState {
                 Ok(inst) => FreeEvent::Installed(code, root, inst),
                 Err(e) => FreeEvent::Failed(code, e),
             });
+            installing.store(false, std::sync::atomic::Ordering::Relaxed);
             let _ = tx.send(FreeEvent::Done);
         });
     }
@@ -2050,7 +2066,11 @@ impl RenderState {
                     }
                 }
                 FreeEvent::Progress(code, done, total) => {
-                    ui.free.active = Some((code, done, total));
+                    // A cancelled download may still report a chunk that
+                    // was on its way; the row has already gone back.
+                    if !self.free_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        ui.free.active = Some((code, done, total));
+                    }
                 }
                 FreeEvent::Installed(code, root, inst) => {
                     let name = ui.free.rows.iter().find(|r| r.code == code).map(|r| r.name).unwrap_or("");
@@ -2061,13 +2081,14 @@ impl RenderState {
                     ui.free.active = None;
                     reload = Some(root);
                 }
-                FreeEvent::Failed(_, e) => {
+                FreeEvent::Failed(code, e) => {
                     ui.free.active = None;
-                    ui.free.status = if e == "cancelled" {
-                        "Download cancelled.".into()
+                    if e == "cancelled" {
+                        ui.free.status = "Download cancelled.".into();
                     } else {
-                        format!("Download failed: {e}")
-                    };
+                        ui.free.status = format!("Download failed: {e}");
+                        ui.free.failed = Some((code, e));
+                    }
                 }
                 FreeEvent::Done => self.free_jobs = self.free_jobs.saturating_sub(1),
             }
@@ -2862,6 +2883,12 @@ impl RenderState {
                 crate::render::ui::UiAction::FreeChartsDownload { code } => self.free_download(code),
                 crate::render::ui::UiAction::FreeChartsCancel => {
                     self.free_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // The worker may be waiting on the network for up to a
+                    // minute before it sees the flag; the window need not.
+                    if let Some(ref mut ui) = self.ui {
+                        ui.free.active = None;
+                        ui.free.status = "Download cancelled.".into();
+                    }
                 }
                 crate::render::ui::UiAction::FreeChartsRemove { code } => self.free_remove(&code),
                 crate::render::ui::UiAction::DisplayChanged => {

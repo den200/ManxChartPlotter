@@ -439,6 +439,21 @@ impl TileBuilder<'_> {
         a < self.min_triangle_area_m2() as f64
     }
 
+    /// Whether a chart's declared coverage reaches into `bounds`. A chart
+    /// that declares none, or cannot be read here, is given the benefit of
+    /// the doubt — it is dropped later if it fails to load.
+    fn has_coverage_in(&self, info: &ChartInfo, bounds: &TileBounds) -> bool {
+        let Ok(chart) = self.load_chart(info) else { return true };
+        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
+        let coverage = self.coverage_for(info.id, &chart, ref_mx, ref_my);
+        coverage.is_empty()
+            || coverage.iter().any(|t| {
+                let (min_x, max_x) = (t[0][0].min(t[1][0]).min(t[2][0]), t[0][0].max(t[1][0]).max(t[2][0]));
+                let (min_y, max_y) = (t[0][1].min(t[1][1]).min(t[2][1]), t[0][1].max(t[1][1]).max(t[2][1]));
+                min_x <= bounds.max_x && max_x >= bounds.min_x && min_y <= bounds.max_y && max_y >= bounds.min_y
+            })
+    }
+
     /// The chart's coverage tessellation, computed once per chart.
     fn coverage_for(
         &self,
@@ -939,7 +954,9 @@ impl<'a> TileBuilder<'a> {
         // chart (see ChartCatalog::charts_for_tile_scaled).
         let tile_scale_denom =
             super::meters_per_pixel(tile_id.z) * (self.view_ppmm as f64) * 1000.0;
-        let charts = self.catalog.charts_for_tile_scaled(&bounds, tile_scale_denom);
+        let charts = self.catalog.charts_for_tile_where(&bounds, tile_scale_denom, &|info| {
+            self.has_coverage_in(info, &bounds)
+        });
 
         if log::log_enabled!(log::Level::Debug) {
             log::debug!("=== TILE {:?} ===", tile_id);
@@ -1041,7 +1058,12 @@ impl<'a> TileBuilder<'a> {
         for (chart_index, ctx) in loaded_charts.iter().enumerate() {
             let detailed_coverages = collect_more_detailed_coverages(&loaded_charts, chart_index);
 
+            // Never the world basemap: a chart's coverage says where it has
+            // data, not that anything of it is drawn at this zoom — NOAA
+            // cells hide their land behind SCAMIN when zoomed out, and
+            // skipping the basemap under them left the land blank.
             if chart_index + 1 < loaded_charts.len()
+                && !crate::s57::basemap::is_basemap(&ctx.info.path)
                 && tile_region_fully_covered(bounds, &detailed_coverages)
             {
                 continue;

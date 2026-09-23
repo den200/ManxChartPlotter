@@ -351,6 +351,24 @@ impl ChartCatalog {
         tile: &TileBounds,
         tile_scale_denom: f64,
     ) -> Vec<&ChartInfo> {
+        self.charts_for_tile_where(tile, tile_scale_denom, &|_| true)
+    }
+
+    /// [`charts_for_tile_scaled`](Self::charts_for_tile_scaled), leaving
+    /// out charts for which `has_data` says no.
+    ///
+    /// Selection works on extent rectangles, and a rectangle is a poor
+    /// stand-in for a cell's coverage: a NOAA cell charting one inlet has
+    /// an extent reaching over miles of the coast beside it, and there it
+    /// shut out every coarser chart while drawing nothing itself — blank
+    /// blocks the size of a tile. The tile builder knows each cell's real
+    /// coverage and passes it in here.
+    pub fn charts_for_tile_where(
+        &self,
+        tile: &TileBounds,
+        tile_scale_denom: f64,
+        has_data: &dyn Fn(&ChartInfo) -> bool,
+    ) -> Vec<&ChartInfo> {
         // A chart overzoomed out by more than this factor relative to the tile
         // scale is dropped (its detail is wasted and bloats the tile). This was
         // 16, to keep some land and water on screen when zoomed out past the
@@ -359,7 +377,8 @@ impl ChartCatalog {
         // as one black knot over a view of all of Europe.
         const MAX_OVERZOOM_OUT: f64 = 4.0;
 
-        let intersecting: Vec<&ChartInfo> = self.charts.iter().filter(|c| c.intersects(tile)).collect();
+        let intersecting: Vec<&ChartInfo> =
+            self.charts.iter().filter(|c| c.intersects(tile) && has_data(c)).collect();
         if intersecting.len() <= 1 {
             return intersecting;
         }
@@ -409,6 +428,22 @@ impl ChartCatalog {
             }
             if uncovered.is_empty() {
                 break;
+            }
+        }
+
+        // The world basemap stays under every tile it touches. A chart's
+        // extent is a rectangle, and "covered" above only means inside that
+        // rectangle: a NOAA cell that charts a strip of coast still claims
+        // the land and sea around it, and with the basemap dropped there
+        // the screen was blank in rectangular blocks. The basemap is a
+        // handful of polygons, drawn first, so the charts still win.
+        if let Some(world) = intersecting
+            .iter()
+            .copied()
+            .find(|c| crate::s57::basemap::is_basemap(&c.path))
+        {
+            if !selected.iter().any(|c| std::ptr::eq(*c, world)) {
+                selected.push(world);
             }
         }
 
