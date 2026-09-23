@@ -47,6 +47,13 @@ pub enum TileRequest {
         tolerance_m: f64,
         seq: u64,
     },
+    /// New mariner settings (safety depth, display category, text…).
+    /// Builds after this use them; `generation` is echoed in every response
+    /// built under them, so tiles already on the way can be told apart.
+    Settings {
+        settings: crate::s52::MarinerSettings,
+        generation: u64,
+    },
     /// Shut down the worker thread
     Shutdown,
 }
@@ -68,6 +75,8 @@ pub struct TileResponse {
     /// line-symbol spacing are baked in at it, so a tile built before the
     /// window moved to another display is the wrong size on this one.
     pub ppmm: f32,
+    /// The [`TileRequest::Settings`] generation it was built under.
+    pub settings_generation: u64,
 }
 
 /// Handle for communicating with the background tile worker
@@ -126,6 +135,11 @@ impl TileWorkerHandle {
         results
     }
 
+    /// Change the mariner settings the worker builds with.
+    pub fn set_settings(&self, settings: crate::s52::MarinerSettings, generation: u64) {
+        let _ = self.request_tx.send(TileRequest::Settings { settings, generation });
+    }
+
     /// Shut down the worker thread
     pub fn shutdown(self) {
         let _ = self.request_tx.send(TileRequest::Shutdown);
@@ -181,7 +195,7 @@ fn worker_loop(
     catalog: Arc<ChartCatalog>,
     keys: Arc<KeyStore>,
     decryptor: CachedDecryptor,
-    s52_engine: Option<S52Engine>,
+    mut s52_engine: Option<S52Engine>,
     request_rx: mpsc::Receiver<TileRequest>,
     response_tx: mpsc::Sender<TileResponse>,
     pick_tx: mpsc::Sender<PickResponse>,
@@ -193,6 +207,7 @@ fn worker_loop(
     // is the same wherever it is used.
     let coverage_cache: crate::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor: Mutex<CachedDecryptor> = Mutex::new(decryptor);
+    let mut settings_generation = 0u64;
 
     loop {
         // Block until next request
@@ -306,6 +321,7 @@ fn worker_loop(
                                 tile_id,
                                 result,
                                 ppmm: view_params.ppmm,
+                                settings_generation,
                             });
                     });
 
@@ -319,6 +335,15 @@ fn worker_loop(
                 }
 
 
+            }
+            TileRequest::Settings {
+                settings,
+                generation,
+            } => {
+                if let Some(ref mut engine) = s52_engine {
+                    engine.set_settings(settings);
+                }
+                settings_generation = generation;
             }
             TileRequest::Pick {
                 mercator,

@@ -330,6 +330,8 @@ pub enum SearchError {
     Unreachable,
     /// An endpoint was off the grid entirely.
     OffGrid,
+    /// The user cancelled the plan.
+    Cancelled,
 }
 
 /// How the search weighs comfort against distance.
@@ -383,7 +385,14 @@ pub fn find_path(
         (-1, -1),
     ];
 
+    let mut popped = 0u32;
     while let Some(Reverse((_, current))) = heap.pop() {
+        // A cancelled plan stops here too, rather than finishing a search
+        // nobody will read. Checked now and then: it is a thread-local read.
+        popped = popped.wrapping_add(1);
+        if popped % 65_536 == 0 && crate::nav::isochrone::this_plan_cancelled() {
+            return Err(SearchError::Cancelled);
+        }
         let c = (current as usize % w, current as usize / w);
         if c == goal {
             // Walk parents back.

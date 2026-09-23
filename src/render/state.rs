@@ -350,6 +350,11 @@ pub struct RenderState {
     pub pattern_renderer: Option<PatternRenderer>,
     /// A chart folder loading on a worker thread.
     chart_load: Option<ChartLoad>,
+    /// The colour table in use, so a re-apply does not re-upload it.
+    palette_name: Option<String>,
+    /// Bumped with every change of mariner settings; tiles built under an
+    /// older one are discarded on arrival.
+    settings_generation: u64,
     /// What the frame is cleared to: deep water in the active palette, so
     /// the sea beyond the charts (and a tile still loading) dims with the
     /// rest of the chart at night instead of flashing day blue.
@@ -1196,6 +1201,8 @@ impl RenderState {
             pattern_renderer,
             clear_colour: OCEAN_BACKGROUND,
             chart_load: None,
+            palette_name: None,
+            settings_generation: 0,
             pattern_camera_bind_group,
             text_renderer,
             text_camera_bind_group,
@@ -1629,6 +1636,7 @@ impl RenderState {
 
     /// Switch the active palette (Day/Dusk/Night) — zero tile rebuilds.
     pub fn switch_palette(&mut self, palette_name: &str) {
+        self.palette_name = Some(palette_name.to_string());
         if let Some(ref mut ui) = self.ui {
             ui.set_dark(matches!(palette_name, "DUSK" | "NIGHT"));
         }
@@ -1960,6 +1968,10 @@ impl RenderState {
             worker_engine,
         );
         self.tile_worker = Some(worker);
+        // The saved Display choices — palette, safety depth from the draft —
+        // now that there is an engine and a worker to give them to.
+        self.settings_generation = 0;
+        self.apply_display();
         self.pending_tiles.clear();
         self.deferred_tile_results.clear();
         log::debug!("Background tile worker spawned");
@@ -2501,7 +2513,15 @@ impl RenderState {
                     }
                     self.needs_redraw = true;
                 }
-                crate::render::ui::UiAction::SettingsChanged => self.save_settings(),
+                crate::render::ui::UiAction::SettingsChanged => {
+                    // The boat's draft feeds the chart's safety depth.
+                    self.apply_display();
+                    self.save_settings();
+                }
+                crate::render::ui::UiAction::DisplayChanged => {
+                    self.apply_display();
+                    self.save_settings();
+                }
                 crate::render::ui::UiAction::RoutesOpen => {
                     self.ensure_route_store();
                     self.refresh_route_rows();
@@ -2680,13 +2700,45 @@ impl RenderState {
                     index,
                     waypoint,
                 } => {
+                    let mut removed_at = None;
                     self.edit_route(route_id, |route| {
                         let Some(at) = resolve_waypoint(route, index, waypoint) else {
                             return false;
                         };
                         route.waypoints.remove(at);
+                        removed_at = Some(at);
                         true
                     });
+                    if let Some(at) = removed_at {
+                        let name = self
+                            .route_store
+                            .as_ref()
+                            .and_then(|s| s.waypoints.get(waypoint))
+                            .map(|w| w.name.clone())
+                            .unwrap_or_default();
+                        if let Some(ref mut ui) = self.ui {
+                            ui.routes.undo = Some((route_id, at, waypoint, name));
+                        }
+                    }
+                }
+                crate::render::ui::UiAction::RouteWaypointUndo => {
+                    let undo = self.ui.as_mut().and_then(|u| u.routes.undo.take());
+                    if let Some((route_id, at, waypoint, _)) = undo {
+                        // The mark itself was never deleted — a route
+                        // dropping a waypoint does not unmake the place —
+                        // so putting it back is only a matter of order.
+                        let exists = self
+                            .route_store
+                            .as_ref()
+                            .is_some_and(|s| s.waypoints.get(waypoint).is_some());
+                        if exists {
+                            self.edit_route(route_id, |route| {
+                                let at = at.min(route.waypoints.len());
+                                route.waypoints.insert(at, waypoint);
+                                true
+                            });
+                        }
+                    }
                 }
                 crate::render::ui::UiAction::RouteWaypointMove {
                     route_id,
@@ -3027,8 +3079,10 @@ impl RenderState {
         const MAX_UPLOADS_PER_FRAME: usize = 64;
         let deferred = std::mem::take(&mut self.deferred_tile_results);
         for response in deferred {
-            if response.ppmm != self.effective_ppmm {
-                continue; // built for the display the window has left
+            if response.ppmm != self.effective_ppmm
+                || response.settings_generation != self.settings_generation
+            {
+                continue; // built for a display or settings since changed
             }
             if uploads_this_frame >= MAX_UPLOADS_PER_FRAME {
                 self.deferred_tile_results.push(response);
@@ -3054,8 +3108,10 @@ impl RenderState {
             let results = worker.poll_results();
             for response in results {
                 self.pending_tiles.remove(&response.tile_id);
-                if response.ppmm != self.effective_ppmm {
-                    continue; // built for the display the window has left
+                if response.ppmm != self.effective_ppmm
+                    || response.settings_generation != self.settings_generation
+                {
+                    continue; // built for a display or settings since changed
                 }
                 if uploads_this_frame >= MAX_UPLOADS_PER_FRAME {
                     // Defer excess results to next frame (avoid re-building)
@@ -3947,8 +4003,8 @@ impl RenderState {
     }
 
     /// Esc: back out of whatever is most in the way — the info bubble, then
-    /// an armed planner pin, then route editing. Answers whether it did
-    /// anything.
+    /// an armed planner pin, then route editing, then an open window.
+    /// Answers whether it did anything.
     pub fn escape(&mut self) -> bool {
         if self.pick_active() {
             self.dismiss_pick();
@@ -3963,6 +4019,24 @@ impl RenderState {
         if self.ui.as_ref().and_then(|u| u.routes.editing).is_some() {
             self.finish_route_edit();
             return true;
+        }
+        // Then the windows, one per press, the last-opened kind first as far
+        // as a fixed order can guess it: the object-level ones before the
+        // settings-level ones.
+        if let Some(ref mut ui) = self.ui {
+            for open in [
+                &mut ui.display.open,
+                &mut ui.boat.open,
+                &mut ui.routes.open,
+                &mut ui.instruments.open,
+                &mut ui.shop.open,
+            ] {
+                if *open {
+                    *open = false;
+                    self.needs_redraw = true;
+                    return true;
+                }
+            }
         }
         false
     }
@@ -4099,6 +4173,7 @@ impl RenderState {
             weather: &'a crate::render::ui::WeatherView,
             boat: &'a crate::render::ui::BoatView,
             charts: &'a crate::render::ui::ChartFolderView,
+            display: &'a crate::render::ui::DisplayView,
         }
         // An env override is for this run; the file keeps what the user set.
         let mut instruments = ui.instruments.clone();
@@ -4110,13 +4185,17 @@ impl RenderState {
             weather: &ui.weather,
             boat: &ui.boat,
             charts: &ui.charts,
+            display: &ui.display,
         }) else {
             return;
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(&path, json) {
+        // Written aside and renamed into place: power on a boat goes when it
+        // goes, and a settings file cut off mid-write would lose everything.
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, &path)) {
             // Not fatal: the session works, it just will not be remembered.
             log::warn!("could not save settings to {}: {e}", path.display());
         }
@@ -4160,6 +4239,55 @@ impl RenderState {
         serde_json::from_str::<Persisted>(&text)
             .map(|p| p.weather)
             .unwrap_or_default()
+    }
+
+    pub(crate) fn load_display_settings() -> crate::render::ui::DisplayView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            display: crate::render::ui::DisplayView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.display)
+            .unwrap_or_default()
+    }
+
+    /// Put the Display window's choices into effect: the palette at once,
+    /// and the mariner's settings in both engines, starting the tiles over
+    /// when they changed. Safe to call often — nothing happens when nothing
+    /// changed.
+    pub fn apply_display(&mut self) {
+        let Some(ref ui) = self.ui else { return };
+        let display = ui.display.clone();
+        let draft = ui.boat.draft_m;
+        if std::env::var("NAVCORE_PALETTE").is_err()
+            && self.palette_name.as_deref() != Some(display.palette.table())
+        {
+            self.switch_palette(display.palette.table());
+        }
+        let Some(ref engine) = self.s52_engine else { return };
+        let base = crate::s52::MarinerSettings::from_env();
+        let settings = display.apply(&base, draft);
+        if engine.settings == settings {
+            return;
+        }
+        if let Some(ref mut engine) = self.s52_engine {
+            engine.set_settings(settings.clone());
+        }
+        self.settings_generation += 1;
+        if let Some(ref worker) = self.tile_worker {
+            worker.set_settings(settings, self.settings_generation);
+        }
+        self.tile_cache.clear();
+        self.pending_tiles.clear();
+        self.deferred_tile_results.clear();
+        self.needs_redraw = true;
     }
 
     pub(crate) fn load_boat_settings() -> crate::render::ui::BoatView {
@@ -4906,6 +5034,9 @@ impl RenderState {
     /// is discarded — pressing New route and changing your mind should not
     /// leave "Route 3 · 0 legs" behind to be cleaned up by hand.
     fn finish_route_edit(&mut self) {
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.undo = None;
+        }
         let Some(id) = self.ui.as_mut().and_then(|u| u.routes.editing.take()) else {
             return;
         };

@@ -21,6 +21,8 @@ use egui_wgpu::ScreenDescriptor;
 pub enum UiAction {
     /// Close the object-query bubble.
     DismissPick,
+    /// The display settings changed: re-apply them and save.
+    DisplayChanged,
     /// Abandon the passage plan being computed.
     PlanCancel,
     /// Keep the boat centred on the chart, or stop.
@@ -85,6 +87,8 @@ pub enum UiAction {
         index: usize,
         waypoint: uuid::Uuid,
     },
+    /// Put back the waypoint removed last.
+    RouteWaypointUndo,
     /// Move a waypoint one place earlier (`-1`) or later (`+1`).
     RouteWaypointMove {
         route_id: uuid::Uuid,
@@ -414,6 +418,9 @@ pub struct RoutesView {
     /// The route open in the editor. While one is open its waypoints are
     /// listed and a chart tap appends to it.
     pub editing: Option<uuid::Uuid>,
+    /// The waypoint removed last, so a mistaken Del can be taken back:
+    /// (route, where it was, the mark, its name).
+    pub undo: Option<(uuid::Uuid, usize, uuid::Uuid, String)>,
     /// A publish or fetch is on the wire. Their buttons wait for it rather
     /// than inviting a second click that would send the same PUT twice.
     pub net_busy: bool,
@@ -435,6 +442,126 @@ pub enum BarPosition {
     #[default]
     Bottom,
     Hidden,
+}
+
+/// Day, dusk or night: the S-52 colour tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Palette {
+    #[default]
+    Day,
+    Dusk,
+    Night,
+}
+
+impl Palette {
+    /// The colour table's name in chartsymbols.xml.
+    pub fn table(self) -> &'static str {
+        match self {
+            Palette::Day => "DAY_BRIGHT",
+            Palette::Dusk => "DUSK",
+            Palette::Night => "NIGHT",
+        }
+    }
+}
+
+/// How much of the chart to show, as ECDIS names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ChartDetail {
+    /// Display base: coastline, dangers, the safety contour. Never less.
+    Base,
+    Standard,
+    /// Everything the chart carries.
+    #[default]
+    All,
+}
+
+/// How the chart itself is drawn: the palette, and the mariner's settings
+/// that decide which water reads as safe.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DisplayView {
+    #[serde(skip)]
+    pub open: bool,
+    pub palette: Palette,
+    pub detail: ChartDetail,
+    /// Safety depth = the boat's draft + `clearance_m`, and the safety
+    /// contour follows it. Off, the two manual values below are used.
+    pub depth_from_draft: bool,
+    pub clearance_m: f32,
+    pub safety_depth_m: f32,
+    pub safety_contour_m: f32,
+    pub shallow_contour_m: f32,
+    pub deep_contour_m: f32,
+    pub show_text: bool,
+    pub show_soundings: bool,
+}
+
+impl Default for DisplayView {
+    fn default() -> Self {
+        let m = crate::s52::MarinerSettings::default();
+        Self {
+            open: false,
+            palette: Palette::Day,
+            detail: ChartDetail::All,
+            depth_from_draft: true,
+            // Half a metre under the keel: a common minimum for coastal
+            // pilotage. Raise it for a swell.
+            clearance_m: 0.5,
+            safety_depth_m: m.safety_depth,
+            safety_contour_m: m.safety_contour,
+            shallow_contour_m: m.shallow_contour,
+            deep_contour_m: m.deep_contour,
+            show_text: m.show_text,
+            show_soundings: m.show_soundings,
+        }
+    }
+}
+
+impl DisplayView {
+    /// Apply these choices to `base`. A setting pinned by a `NAVCORE_*`
+    /// variable is left alone, so a capture or a conformance run stays
+    /// reproducible whatever the user last chose. `draft_m` is the boat's;
+    /// zero means unknown, and then the manual depths are used.
+    pub fn apply(&self, base: &crate::s52::MarinerSettings, draft_m: f64) -> crate::s52::MarinerSettings {
+        let pinned = |k: &str| std::env::var(k).is_ok();
+        let mut s = base.clone();
+        if !pinned("NAVCORE_DISPLAY_CAT") {
+            (s.show_standard, s.show_other) = match self.detail {
+                ChartDetail::Base => (false, false),
+                ChartDetail::Standard => (true, false),
+                ChartDetail::All => (true, true),
+            };
+        }
+        let (depth, contour) = if self.depth_from_draft && draft_m > 0.0 {
+            // The chart then selects the next contour it actually has at or
+            // below this depth as the safety contour.
+            let d = draft_m as f32 + self.clearance_m.max(0.0);
+            (d, d)
+        } else {
+            (self.safety_depth_m, self.safety_contour_m)
+        };
+        if !pinned("NAVCORE_SAFETY_DEPTH") {
+            s.safety_depth = depth;
+        }
+        if !pinned("NAVCORE_SAFETY_CONTOUR") {
+            s.safety_contour = contour;
+        }
+        if !pinned("NAVCORE_SHALLOW_CONTOUR") {
+            s.shallow_contour = self.shallow_contour_m;
+        }
+        if !pinned("NAVCORE_DEEP_CONTOUR") {
+            s.deep_contour = self.deep_contour_m;
+        }
+        // S-52's order: shallow <= safety <= deep, and a safety contour no
+        // shallower than the safety depth — or the shading calls water safe
+        // that the soundings call dangerous.
+        s.safety_contour = s.safety_contour.max(s.safety_depth);
+        s.shallow_contour = s.shallow_contour.min(s.safety_contour);
+        s.deep_contour = s.deep_contour.max(s.safety_contour);
+        s.show_text = self.show_text;
+        s.show_soundings = self.show_soundings;
+        s
+    }
 }
 
 /// The instrument strip and the connection behind it.
@@ -608,6 +735,7 @@ pub struct Ui {
     /// The weather sheet: the time axis, the lanes, and the cursor that every
     /// other weather display on screen reads.
     pub sheet: super::ui_weather::SheetView,
+    pub display: DisplayView,
 }
 
 impl Ui {
@@ -646,6 +774,7 @@ impl Ui {
             boat: crate::render::state::RenderState::load_boat_settings(),
             wind: WindView::default(),
             sheet: Default::default(),
+            display: crate::render::state::RenderState::load_display_settings(),
         }
     }
 
@@ -750,10 +879,11 @@ impl Ui {
         let boat = &mut self.boat;
         let wind = &mut self.wind;
         let sheet = &mut self.sheet;
+        let display = &mut self.display;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
                 ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
-                fleet, actions,
+                display, fleet, actions,
             );
         });
         self.state
@@ -829,4 +959,36 @@ fn style(ctx: &egui::Context, dark: bool) {
     style.spacing.interact_size.y = 32.0;
     style.visuals.window_rounding = egui::Rounding::same(6.0);
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// Safety depth follows the draft, and the S-52 ordering holds whatever
+    /// was typed: shallow <= safety contour <= deep, contour >= depth.
+    #[test]
+    fn display_choices_become_consistent_mariner_settings() {
+        let base = crate::s52::MarinerSettings::default();
+        let d = DisplayView {
+            clearance_m: 0.5,
+            shallow_contour_m: 9.0,
+            deep_contour_m: 1.0,
+            detail: ChartDetail::Standard,
+            show_text: false,
+            ..DisplayView::default()
+        };
+        let s = d.apply(&base, 2.1);
+        assert!((s.safety_depth - 2.6).abs() < 1e-6);
+        assert!(s.safety_contour >= s.safety_depth);
+        assert!(s.shallow_contour <= s.safety_contour);
+        assert!(s.deep_contour >= s.safety_contour);
+        assert!(s.show_standard && !s.show_other && s.show_displaybase);
+        assert!(!s.show_text);
+
+        // Unknown draft: the manual values are used instead.
+        let manual = DisplayView { safety_depth_m: 4.0, safety_contour_m: 5.0, ..d };
+        let s = manual.apply(&base, 0.0);
+        assert_eq!((s.safety_depth, s.safety_contour), (4.0, 5.0));
+    }
 }

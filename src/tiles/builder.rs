@@ -1415,7 +1415,10 @@ impl<'a> TileBuilder<'a> {
 
         // Two-phase label decluttering: cheap AABB pre-check then full glyph layout (C4a).
         // Only ~20% of labels survive decluttering, so we save ~80% of layout_text() calls.
-        packet.label_candidates = label_candidates;
+        // The mariner's "text" switch: names, light descriptions and other
+        // TX/TE labels go; soundings have their own switch.
+        let show_text = self.s52_engine.is_none_or(|e| e.settings.show_text);
+        packet.label_candidates = if show_text { label_candidates } else { Vec::new() };
         // Text layout and decluttering deferred to global pass
 
         let fin_ms = fin_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);

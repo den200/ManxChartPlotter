@@ -195,6 +195,9 @@ impl GribForecast {
         let step = source.step_hours();
         let mut fh = step;
         while fh <= hours_ahead {
+            if crate::nav::isochrone::this_plan_cancelled() {
+                return Err(GribError::Download("cancelled".into()));
+            }
             progress(format!("forecast +{fh:03}h"));
             let bytes = fetch_step(&agent, source, run, fh, area, cache_dir)?;
             forecast.absorb(&bytes)?;
@@ -445,6 +448,9 @@ impl WaveForecast {
         let step = source.step_hours();
         let mut fh = step;
         while fh <= hours_ahead {
+            if crate::nav::isochrone::this_plan_cancelled() {
+                return Err(GribError::Download("cancelled".into()));
+            }
             progress(format!("waves +{fh:03}h"));
             let bytes = fetch_wave_step(&agent, source, run, fh, area, cache_dir)?;
             forecast.absorb(&bytes)?;

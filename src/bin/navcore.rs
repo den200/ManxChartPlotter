@@ -46,6 +46,34 @@ enum ChartSource {
     Directory(PathBuf),
 }
 
+/// Run from the directory that holds `assets/`.
+///
+/// The symbology, fonts, the decryption helper and the licence are all found
+/// by paths relative to it. Started by hand from the project that is always
+/// so; started by the system at boot (a systemd service on the plotter) the
+/// working directory is `/`, and the chart would come up with no S-52
+/// symbology at all. So when `assets/` is not here, look beside the
+/// executable and up from it — `target/release/navcore` sits two levels
+/// below the project — and move there.
+fn find_install_dir() {
+    let marker = std::path::Path::new("assets/s52/chartsymbols.xml");
+    if marker.exists() {
+        return;
+    }
+    let Ok(exe) = env::current_exe().and_then(|p| p.canonicalize()) else {
+        return;
+    };
+    for dir in exe.ancestors().skip(1) {
+        if dir.join(marker).exists() {
+            if env::set_current_dir(dir).is_ok() {
+                log::info!("working directory set to {}", dir.display());
+            }
+            return;
+        }
+    }
+    log::warn!("assets/ not found beside {}; S-52 symbology will be missing", exe.display());
+}
+
 fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
@@ -54,7 +82,15 @@ fn main() {
     .filter_module("wgpu_hal", log::LevelFilter::Warn)
     .init();
 
-    let args: Vec<String> = env::args().collect();
+    // Paths on the command line mean what they meant where the command was
+    // typed; fix them before the working directory can move.
+    let args: Vec<String> = env::args()
+        .map(|a| match std::path::Path::new(&a).canonicalize() {
+            Ok(abs) if !a.starts_with('-') => abs.display().to_string(),
+            _ => a,
+        })
+        .collect();
+    find_install_dir();
 
     // Handle --info mode
     if args.len() >= 3 && args[1] == "--info" {

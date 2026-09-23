@@ -312,7 +312,10 @@ pub fn plan_cancelled(generation: u64) -> bool {
     PLAN_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation
 }
 
-fn this_plan_cancelled() -> bool {
+/// Whether the plan running on this thread has been cancelled. Checked by
+/// the slow steps before the solve too — the forecast download, the grid
+/// search — so Cancel frees the machine, not just the interface.
+pub fn this_plan_cancelled() -> bool {
     STARTED_UNDER.with(|c| c.get()).is_some_and(plan_cancelled)
 }
 

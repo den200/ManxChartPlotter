@@ -205,7 +205,24 @@ fn name_field(
 
 /// The waypoint list of the route being edited: rename, reorder, remove,
 /// and the standing invitation to tap the chart for one more.
-fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction>) {
+fn waypoint_editor(
+    ui: &mut egui::Ui,
+    row: &RouteRow,
+    undo: Option<&(Uuid, usize, Uuid, String)>,
+    actions: &mut Vec<UiAction>,
+) {
+    // Del is one tap on a small button among others; the way back is one tap
+    // too, rather than a question before every removal.
+    if let Some((route_id, _, _, name)) = undo {
+        if *route_id == row.id {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("Removed {name}")).small());
+                if ui.small_button("Undo").clicked() {
+                    actions.push(UiAction::RouteWaypointUndo);
+                }
+            });
+        }
+    }
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("tap the chart to add a waypoint")
@@ -485,7 +502,7 @@ pub fn window(
                         ui.label(RichText::new(p).small().weak());
                     }
                     if view.editing == Some(row.id) {
-                        waypoint_editor(ui, &row, actions);
+                        waypoint_editor(ui, &row, view.undo.as_ref(), actions);
                     }
                     ui.separator();
                 }

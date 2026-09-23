@@ -23,6 +23,7 @@ pub fn build(
     boat: &mut crate::render::ui::BoatView,
     wind: &mut crate::render::ui::WindView,
     sheet: &mut crate::render::ui_weather::SheetView,
+    display: &mut crate::render::ui::DisplayView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -61,7 +62,7 @@ pub fn build(
         super::ui_ownship::draw(ctx, ship);
     }
 
-    menu_bar(ctx, shop, instruments, routes, plan, boat, sheet, weather, actions);
+    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, actions);
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
@@ -91,11 +92,131 @@ pub fn build(
     if boat.open {
         super::ui_boat::window(ctx, boat, weather, instruments.units.depth, actions);
     }
+    if display.open {
+        display_window(ctx, display, boat.draft_m, actions);
+    }
     // Last, over the chart area the panels have left: what a chart tap will
     // do right now, and the way back to following the boat.
     tap_mode_chip(ctx, plan);
     if state.own_ship.is_some() {
         follow_button(ctx, instruments, actions);
+    }
+}
+
+/// How the chart is drawn: palette, safety depth, detail.
+///
+/// The palette is the one a helm reaches for at dusk, so it comes first and
+/// takes effect on the tap. The depths are the mariner's settings S-52 is
+/// built around: water shallower than the safety contour is drawn as
+/// danger, and soundings shallower than the safety depth print bold.
+fn display_window(
+    ctx: &Context,
+    display: &mut crate::render::ui::DisplayView,
+    draft_m: f64,
+    actions: &mut Vec<UiAction>,
+) {
+    use crate::render::ui::{ChartDetail, Palette};
+    let before = display.clone();
+    let mut open = display.open;
+    Window::new("Display")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .constrain_to(ctx.available_rect())
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Colours").strong());
+                ui.selectable_value(&mut display.palette, Palette::Day, "Day");
+                ui.selectable_value(&mut display.palette, Palette::Dusk, "Dusk");
+                ui.selectable_value(&mut display.palette, Palette::Night, "Night");
+            });
+            ui.label(
+                RichText::new("Night keeps your eyes adjusted to the dark; use it after sunset.")
+                    .small()
+                    .weak(),
+            );
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Safe water").strong());
+            let known_draft = draft_m > 0.0;
+            ui.add_enabled_ui(known_draft, |ui| {
+                ui.checkbox(
+                    &mut display.depth_from_draft,
+                    "Work it out from the boat's draft",
+                )
+                .on_disabled_hover_text("Enter the draft in the Boat window first");
+            });
+            let auto = display.depth_from_draft && known_draft;
+            let metres = |ui: &mut egui::Ui, v: &mut f32, max: f32| {
+                ui.add(
+                    egui::DragValue::new(v)
+                        .speed(0.1)
+                        .range(0.0..=max)
+                        .fixed_decimals(1)
+                        .suffix(" m"),
+                );
+            };
+            if auto {
+                ui.horizontal(|ui| {
+                    ui.label(format!("Draft {draft_m:.1} m + clearance"));
+                    metres(ui, &mut display.clearance_m, 10.0);
+                    ui.label(format!(
+                        "= safety depth {:.1} m",
+                        draft_m as f32 + display.clearance_m
+                    ));
+                });
+                ui.label(
+                    RichText::new(
+                        "The chart shades water shallower than the next depth contour \
+                         at or below this as unsafe, and draws that contour bold.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            } else {
+                egui::Grid::new("display-depths").num_columns(2).show(ui, |ui| {
+                    ui.label("Safety depth");
+                    metres(ui, &mut display.safety_depth_m, 50.0);
+                    ui.end_row();
+                    ui.label("Safety contour");
+                    metres(ui, &mut display.safety_contour_m, 50.0);
+                    ui.end_row();
+                });
+            }
+            egui::Grid::new("display-contours").num_columns(2).show(ui, |ui| {
+                ui.label("Shallow contour");
+                metres(ui, &mut display.shallow_contour_m, 50.0);
+                ui.end_row();
+                ui.label("Deep contour");
+                metres(ui, &mut display.deep_contour_m, 100.0);
+                ui.end_row();
+            });
+            ui.add_space(8.0);
+
+            ui.label(RichText::new("Chart detail").strong());
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut display.detail, ChartDetail::Base, "Base")
+                    .on_hover_text("Coastline, dangers and the safety contour only");
+                ui.selectable_value(&mut display.detail, ChartDetail::Standard, "Standard")
+                    .on_hover_text("What an ECDIS shows by default");
+                ui.selectable_value(&mut display.detail, ChartDetail::All, "All")
+                    .on_hover_text("Everything the chart carries");
+            });
+            ui.checkbox(&mut display.show_text, "Names and light descriptions");
+            ui.checkbox(&mut display.show_soundings, "Soundings");
+        });
+    display.open = open;
+    // Applied as they change, but a drag emits a change per frame, and each
+    // one restarts the tiles: wait for the drag to finish.
+    let dragging = ctx.input(|i| i.pointer.any_down());
+    if *display != before && !dragging {
+        actions.push(UiAction::DisplayChanged);
+    } else if *display != before {
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new("display-dirty"), true));
+    } else if !dragging
+        && ctx.data_mut(|d| d.remove_temp::<bool>(egui::Id::new("display-dirty"))).is_some()
+    {
+        actions.push(UiAction::DisplayChanged);
     }
 }
 
@@ -217,6 +338,7 @@ fn menu_bar(
     routes: &crate::render::ui::RoutesView,
     plan: &mut crate::render::ui::PlanView,
     boat: &mut crate::render::ui::BoatView,
+    display: &mut crate::render::ui::DisplayView,
     sheet: &crate::render::ui_weather::SheetView,
     weather: &mut crate::render::ui::WeatherView,
     actions: &mut Vec<UiAction>,
@@ -253,6 +375,13 @@ fn menu_bar(
             }
             if ui.selectable_label(boat.open, "Boat").clicked() {
                 boat.open = !boat.open;
+            }
+            if ui
+                .selectable_label(display.open, "Display")
+                .on_hover_text("Day, dusk or night; safety depth; how much of the chart to show")
+                .clicked()
+            {
+                display.open = !display.open;
             }
             if ui
                 .selectable_label(sheet.show, "Weather")
