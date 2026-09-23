@@ -112,6 +112,31 @@ fn main() {
 
     // M3 auto-routing: a safe route between two points, from the charts.
     // navcore --auto-route <chart_dir> lat1,lon1 lat2,lon2 [draft_m]
+    // `--noaa-install <chart folder> <STATE>`: what the Free charts tab's
+    // Download button does, from the command line.
+    if args.len() >= 4 && args[1] == "--noaa-install" {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut last = 0;
+        match navcore2::shop::noaa::install(
+            std::path::Path::new(&args[2]),
+            &args[3].to_uppercase(),
+            |done, total| {
+                if done - last >= 1_000_000 || done == total {
+                    last = done;
+                    eprint!("\r  {} of {} MB", done / 1_000_000, total / 1_000_000);
+                }
+            },
+            &cancel,
+        ) {
+            Ok(i) => println!("\ninstalled ({} , package {})", i.downloaded, i.last_modified),
+            Err(e) => {
+                eprintln!("\n{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.len() >= 3 && args[1] == "--s57-dump" {
         s57_dump_mode(&args[2]);
         return;

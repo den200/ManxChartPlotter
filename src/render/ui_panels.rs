@@ -24,6 +24,7 @@ pub fn build(
     wind: &mut crate::render::ui::WindView,
     sheet: &mut crate::render::ui_weather::SheetView,
     display: &mut crate::render::ui::DisplayView,
+    free: &mut crate::render::ui::FreeChartsView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -81,7 +82,7 @@ pub fn build(
         object_query(ctx, objects, state.pick_anchor, state.pick_id, actions);
     }
     if shop.open {
-        chart_shop(ctx, shop, charts, actions);
+        chart_shop(ctx, shop, charts, free, actions);
     }
     if instruments.open {
         super::ui_instruments::settings(ctx, instruments, &fleet.own, actions);
@@ -518,6 +519,160 @@ fn menu_bar(
     });
 }
 
+/// Free charts: NOAA's packages, one row per state.
+///
+/// Each row says everything about its state at a glance — size, whether it
+/// is installed and when, whether NOAA has a newer one — and offers the one
+/// thing to do next. A download shows its progress in its own row, so there
+/// is nothing to go and look for.
+fn free_charts(
+    ui: &mut egui::Ui,
+    free: &mut crate::render::ui::FreeChartsView,
+    actions: &mut Vec<UiAction>,
+) {
+    if !free.probed {
+        actions.push(UiAction::FreeChartsRefresh);
+    }
+    ui.label(RichText::new("Free charts from NOAA").strong());
+    ui.label(
+        RichText::new(
+            "Official charts of US waters, free to use and updated every week. \
+             They are kept with your other charts and appear on the map as soon \
+             as they are downloaded.",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(4.0);
+    ui.add(
+        egui::TextEdit::singleline(&mut free.filter)
+            .hint_text("Find a state…")
+            .desired_width(220.0),
+    );
+    ui.add_space(4.0);
+
+    let mb = |b: u64| {
+        if b >= 10_000_000 {
+            format!("{} MB", b / 1_000_000)
+        } else {
+            format!("{:.1} MB", b as f64 / 1e6)
+        }
+    };
+    let day = |ymd: &str| {
+        chrono::NaiveDate::parse_from_str(ymd, "%Y-%m-%d")
+            .map(|d| d.format("%-d %b").to_string())
+            .unwrap_or_else(|_| ymd.to_string())
+    };
+    let needle = free.filter.trim().to_lowercase();
+    let busy = free.active.is_some();
+
+    ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+        egui::Grid::new("free-charts")
+            .num_columns(3)
+            .striped(true)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                // Yours first, then the rest: what is on the plotter is what
+                // gets updated and removed, and should not need finding.
+                let mut rows = free.rows.clone();
+                rows.sort_by_key(|r| (r.installed.is_none(), r.name));
+                for row in rows {
+                    if !needle.is_empty()
+                        && !row.name.to_lowercase().contains(&needle)
+                        && !row.code.eq_ignore_ascii_case(&needle)
+                    {
+                        continue;
+                    }
+                    ui.label(row.name);
+                    // What there is to know, in one short line.
+                    let size = row.remote.as_ref().map(|r| mb(r.size)).unwrap_or_else(|| "…".into());
+                    let newer = match (&row.installed, &row.remote) {
+                        (Some(i), Some(r)) => crate::shop::noaa::update_available(i, r),
+                        _ => false,
+                    };
+                    match &row.installed {
+                        Some(i) if newer => ui.label(
+                            RichText::new(format!("installed {} · update available", day(&i.downloaded)))
+                                .small()
+                                .color(egui::Color32::from_rgb(40, 130, 200)),
+                        ),
+                        Some(i) => ui.label(
+                            RichText::new(if row.remote.is_some() {
+                                format!("installed {} · up to date", day(&i.downloaded))
+                            } else {
+                                format!("installed {}", day(&i.downloaded))
+                            })
+                            .small()
+                            .weak(),
+                        ),
+                        None => ui.label(RichText::new(size).small().weak()),
+                    };
+                    ui.horizontal(|ui| {
+                        let active = free.active.as_ref().filter(|(c, _, _)| c == row.code);
+                        if let Some((_, done, total)) = active {
+                            let f = if *total > 0 { *done as f32 / *total as f32 } else { 0.0 };
+                            ui.add(
+                                egui::ProgressBar::new(f)
+                                    .desired_width(150.0)
+                                    .text(if *total > 0 {
+                                        format!("{} of {}", mb(*done), mb(*total))
+                                    } else {
+                                        mb(*done)
+                                    }),
+                            );
+                            if ui.button("Cancel").clicked() {
+                                actions.push(UiAction::FreeChartsCancel);
+                            }
+                        } else if free.confirm_remove.as_deref() == Some(row.code) {
+                            ui.label(RichText::new("Remove these charts?").small());
+                            if ui
+                                .button(RichText::new("Remove").color(egui::Color32::from_rgb(200, 60, 60)))
+                                .clicked()
+                            {
+                                free.confirm_remove = None;
+                                actions.push(UiAction::FreeChartsRemove { code: row.code.into() });
+                            }
+                            if ui.button("Keep").clicked() {
+                                free.confirm_remove = None;
+                            }
+                        } else if row.installed.is_some() {
+                            // Update only when there is one: a greyed button
+                            // reads as something broken, not as "up to date".
+                            if newer
+                                && ui
+                                    .add_enabled(!busy, egui::Button::new("Update"))
+                                    .on_disabled_hover_text("one download at a time")
+                                    .clicked()
+                            {
+                                actions.push(UiAction::FreeChartsDownload { code: row.code.into() });
+                            }
+                            if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
+                                free.confirm_remove = Some(row.code.into());
+                            }
+                        } else if ui
+                            .add_enabled(!busy, egui::Button::new("Download"))
+                            .on_disabled_hover_text("one download at a time")
+                            .clicked()
+                        {
+                            actions.push(UiAction::FreeChartsDownload { code: row.code.into() });
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+    });
+    if !free.status.is_empty() {
+        ui.add_space(4.0);
+        ui.label(RichText::new(&free.status).small());
+    }
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Source: NOAA Office of Coast Survey, charts.noaa.gov")
+            .small()
+            .weak(),
+    );
+}
+
 /// Walk the disk for a folder of charts.
 ///
 /// A list of folders with big rows rather than a native file dialog: the
@@ -648,8 +803,10 @@ fn chart_shop(
     ctx: &Context,
     shop: &mut ShopView,
     charts: &mut crate::render::ui::ChartFolderView,
+    free: &mut crate::render::ui::FreeChartsView,
     actions: &mut Vec<UiAction>,
 ) {
+    use crate::render::ui::ChartsTab;
     let mut open = shop.open;
     Window::new("Charts")
         // No title-bar collapse: on a touchscreen it is an easy accidental
@@ -673,11 +830,22 @@ fn chart_shop(
             // on the command line, which is no use on a plotter with no
             // keyboard.
             ui.horizontal(|ui| {
-                if ui.selectable_label(!charts.browsing, "Shop").clicked() {
-                    charts.browsing = false;
+                if ui
+                    .selectable_label(charts.tab == ChartsTab::Shop, "o-charts shop")
+                    .on_hover_text("Buy and install licensed charts")
+                    .clicked()
+                {
+                    charts.tab = ChartsTab::Shop;
                 }
-                if ui.selectable_label(charts.browsing, "Open a folder").clicked() {
-                    charts.browsing = true;
+                if ui
+                    .selectable_label(charts.tab == ChartsTab::Free, "Free charts")
+                    .on_hover_text("Official US charts from NOAA, free to download")
+                    .clicked()
+                {
+                    charts.tab = ChartsTab::Free;
+                }
+                if ui.selectable_label(charts.tab == ChartsTab::Folder, "Open a folder").clicked() {
+                    charts.tab = ChartsTab::Folder;
                     if charts.at.is_empty() {
                         // Start where the charts already are, else where the
                         // user is: both beat starting at the root of the disk.
@@ -692,7 +860,11 @@ fn chart_shop(
                 }
             });
             ui.separator();
-            if charts.browsing {
+            if charts.tab == ChartsTab::Free {
+                free_charts(ui, free, actions);
+                return;
+            }
+            if charts.tab == ChartsTab::Folder {
                 chart_folder_browser(ui, charts, actions);
                 return;
             }
