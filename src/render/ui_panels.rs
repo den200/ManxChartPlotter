@@ -1353,7 +1353,9 @@ fn object_query(
     // Beside the tap, and never more than half the screen, so the chart stays
     // visible while the panel is up.
     let max_h = (screen.height() * 0.6).max(160.0);
-    let max_w = (screen.width() * 0.45).clamp(260.0, 460.0);
+    // The 260 floor is for readability, but never wider than the window
+    // itself: a narrow window got a bubble running off its edge.
+    let max_w = (screen.width() * 0.45).clamp(260.0, 460.0).min(screen.width() - 16.0);
 
     // `default_pos` only applies to a window egui has not seen before; one
     // id per query is what lets each bubble open beside its own tap.
@@ -1499,7 +1501,10 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
             .show(ui, |ui| {
                 for (k, v) in o.attributes.iter().filter(|(k, _)| crate::pick::is_worth_showing(k)) {
                     ui.label(RichText::new(k).monospace().weak());
-                    ui.label(v);
+                    // Labels in a grid do not wrap by default: one long value
+                    // (a SORIND, an INFORM sentence) widened the whole bubble
+                    // past its max_width and off the window.
+                    ui.add(egui::Label::new(v).wrap());
                     ui.end_row();
                 }
             });
