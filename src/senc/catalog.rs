@@ -163,8 +163,42 @@ impl ChartCatalog {
             })
             .collect();
 
-        if entries.is_empty() {
+        // Unencrypted S-57 cells, wherever they sit below the folder: NOAA
+        // and most hydrographic offices ship `ENC_ROOT/<cell>/<cell>.000`.
+        let s57_cells = find_s57_cells(dir, 5);
+
+        if entries.is_empty() && s57_cells.is_empty() {
             return Err(CatalogError::EmptyDirectory);
+        }
+
+        // Converting a cell is the slow step the first time (it is cached
+        // after), and each cell is independent: do them side by side.
+        let s57_infos: Vec<ChartInfo> = {
+            use rayon::prelude::*;
+            let shared: &CachedDecryptor = decryptor;
+            s57_cells
+                .par_iter()
+                .filter_map(|path| {
+                    let bytes = match shared.s57_senc(path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            log::warn!("S-57 {}: {e}", path.display());
+                            return None;
+                        }
+                    };
+                    let header = SencReader::parse_header_only(&bytes)
+                        .map_err(|e| log::warn!("S-57 {}: {e:?}", path.display()))
+                        .ok()?;
+                    ChartInfo::from_header(header, path.clone())
+                })
+                .collect()
+        };
+        for info in s57_infos {
+            combined = Some(match combined {
+                Some(c) => c.union(&info.extent_mercator),
+                None => info.extent_mercator,
+            });
+            charts.push(info);
         }
 
         for entry in entries {
@@ -268,6 +302,11 @@ impl ChartCatalog {
             charts,
             combined_extent,
         })
+    }
+
+    /// Whether a chart is an unencrypted S-57 cell rather than an o-charts one.
+    pub fn is_s57(path: &Path) -> bool {
+        path.extension().is_some_and(|e| e == "000")
     }
 
     /// Get charts relevant to a tile, sorted by scale (small scale first = background).
@@ -607,4 +646,30 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "DETAIL");
     }
+}
+
+/// Every `*.000` below `dir`, to `depth` levels, hidden folders skipped.
+/// Sorted, so a catalog lists the same cells in the same order every run.
+pub fn find_s57_cells(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for e in entries.filter_map(Result::ok) {
+        let p = e.path();
+        let hidden = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'));
+        if hidden {
+            continue;
+        }
+        if p.is_dir() {
+            if depth > 0 {
+                out.extend(find_s57_cells(&p, depth - 1));
+            }
+        } else if p.extension().is_some_and(|x| x == "000") {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
 }

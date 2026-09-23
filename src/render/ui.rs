@@ -200,6 +200,10 @@ impl ChartFolderView {
                     }
                 }
                 self.entries.sort_by_key(|n| n.to_lowercase());
+                // Free S-57 charts (NOAA's ENC_ROOT and the like) sit in a
+                // folder per cell, so count those below this one too — the
+                // same search the catalogue makes.
+                self.cells += crate::senc::find_s57_cells(std::path::Path::new(&self.at), 5).len();
                 self.status.clear();
             }
             Err(e) => self.status = format!("cannot read this folder: {e}"),

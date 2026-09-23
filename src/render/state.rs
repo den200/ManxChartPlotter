@@ -6654,9 +6654,7 @@ fn load_chart_folder(
         // another name, and the catalogue will say so cell by cell.
         log::warn!("chart folder {}: no key list read: {e}", dir.display());
     }
-    let base = crate::decrypt::ChartDecryptor::new("license")
-        .map_err(|e| format!("cannot start the chart decryptor: {e}"))?;
-    let mut decryptor = CachedDecryptor::new(base);
+    let mut decryptor = CachedDecryptor::open("license");
     let keys = Arc::new(keys);
     let catalog =
         ChartCatalog::from_directory(dir, &keys, &mut decryptor).map_err(|e| format!("{e}"))?;

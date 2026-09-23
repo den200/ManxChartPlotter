@@ -112,6 +112,11 @@ fn main() {
 
     // M3 auto-routing: a safe route between two points, from the charts.
     // navcore --auto-route <chart_dir> lat1,lon1 lat2,lon2 [draft_m]
+    if args.len() >= 3 && args[1] == "--s57-dump" {
+        s57_dump_mode(&args[2]);
+        return;
+    }
+
     if args.len() >= 5 && args[1] == "--auto-route" {
         let parse_pos = |s: &str| -> Option<(f64, f64)> {
             let mut it = s.split(',').filter_map(|v| v.trim().parse::<f64>().ok());
@@ -1311,6 +1316,97 @@ fn save_cli_route(route: &navcore2::nav::Route, waypoints: &[navcore2::nav::mode
     }
 }
 
+/// `--s57-dump <cell.000>`: the cell through navcore's whole S-57 path —
+/// read, updates applied, encoded as SENC, parsed back — one JSON object per
+/// feature, in the shape tools/s57oracle prints, for tools/s57diff.py.
+fn s57_dump_mode(path: &str) {
+    use navcore2::senc::{AttributeValue, ChartData, FeatureType};
+    let cell = match navcore2::s57::cell::Cell::open(std::path::Path::new(path)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let (bytes, ids) = navcore2::s57::senc_encode::encode_with_ids(&cell);
+    let chart = match ChartData::parse(bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("SENC parse: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (rlat, rlon) = (chart.header.ref_lat, chart.header.ref_lon);
+    let (rx, ry) = navcore2::tiles::latlon_to_mercator(rlat, rlon);
+    let ll = |x: f64, y: f64| {
+        let (lat, lon) = navcore2::tiles::mercator_to_latlon(x, y);
+        serde_json::json!([(lon * 1e7).round() / 1e7, (lat * 1e7).round() / 1e7])
+    };
+    println!(
+        "{}",
+        serde_json::json!({"dsid": {"dsnm": cell.dataset.dsnm, "updn": cell.dataset.update,
+            "cscl": cell.dataset.cscl, "updates_applied": cell.updates_applied,
+            "features": chart.features.len()}})
+    );
+    for (f, rcid) in chart.features.iter().zip(ids) {
+        let mut attrs = serde_json::Map::new();
+        for (code, v) in f.attributes.iter_codes() {
+            let name = navcore2::senc::s57_attribute_name(code)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{code}"));
+            let s = match v {
+                AttributeValue::Integer(i) => i.to_string(),
+                AttributeValue::Float(x) => x.to_string(),
+                AttributeValue::String(s) => s.clone(),
+            };
+            attrs.insert(name, serde_json::Value::String(s));
+        }
+        let geom = match f.feature_type {
+            FeatureType::Point => f.point_geometry.as_ref().map(|p| {
+                serde_json::json!({"type": "Point", "c": [p.y, p.x]})
+            }),
+            FeatureType::Multipoint => f.multipoint_geometry.as_ref().map(|m| {
+                let c: Vec<_> = m
+                    .points
+                    .iter()
+                    .map(|p| {
+                        let mut v = ll(rx + p[0] as f64, ry + p[1] as f64);
+                        v.as_array_mut().unwrap().push(serde_json::json!(p[2]));
+                        v
+                    })
+                    .collect();
+                serde_json::json!({"type": "MultiPoint", "c": c})
+            }),
+            FeatureType::Line => f.line_geometry.as_ref().map(|g| {
+                let parts = g.resolve_global(&chart.edge_table, rlat, rlon);
+                let len: f64 = parts
+                    .iter()
+                    .flat_map(|p| p.windows(2))
+                    .map(|w| (w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]))
+                    .sum();
+                serde_json::json!({"type": "Lines", "parts": parts.len(), "len": len})
+            }),
+            FeatureType::Area => f.area_geometry.as_ref().map(|g| {
+                let mut area = 0.0;
+                g.for_each_triangle_global(rlat, rlon, |t| {
+                    area += ((t[1][0] - t[0][0]) * (t[2][1] - t[0][1])
+                        - (t[2][0] - t[0][0]) * (t[1][1] - t[0][1]))
+                        .abs()
+                        / 2.0;
+                });
+                let rings = g.resolve_closed_rings(&chart.edge_table).len();
+                serde_json::json!({"type": "Area", "area": area, "rings": rings})
+            }),
+        };
+        println!(
+            "{}",
+            serde_json::json!({"rcid": rcid, "objl": f.type_code,
+                "acronym": navcore2::senc::s57_code_to_acronym(f.type_code),
+                "attrs": attrs, "geom": geom})
+        );
+    }
+}
+
 fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
     let dir = PathBuf::from(dir_path);
     let mut keys = KeyStore::new();
@@ -1739,15 +1835,9 @@ impl App {
         }
         println!("Loaded {} chart keys", keys.len());
 
-        // Create decryptor with disk cache (will be moved to RenderState)
-        let base_decryptor = match ChartDecryptor::new("license") {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("Failed to create decryptor: {}", e);
-                return;
-            }
-        };
-        let mut decryptor = CachedDecryptor::new(base_decryptor);
+        // Create decryptor with disk cache (will be moved to RenderState).
+        // The o-charts helper if it starts; S-57 cells load either way.
+        let mut decryptor = CachedDecryptor::open("license");
 
         // Build catalog (needs mutable decryptor for header parsing)
         let catalog = match ChartCatalog::from_directory(&dir, &self.keys, &mut decryptor) {

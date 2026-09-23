@@ -59,10 +59,14 @@ impl SencCache {
 
     /// Write SENC data to cache
     pub fn write_cache(&self, chart_name: &str, data: &[u8]) -> io::Result<()> {
+        // Written aside and renamed into place: several cells are converted
+        // in parallel, and a reader must never see half a file.
         let path = self.cache_path(chart_name);
-        let mut file = fs::File::create(&path)?;
+        let tmp = path.with_extension(format!("senc.tmp{}", std::process::id()));
+        let mut file = fs::File::create(&tmp)?;
         file.write_all(data)?;
-        Ok(())
+        drop(file);
+        fs::rename(&tmp, &path)
     }
 
     /// Clear all cached files
