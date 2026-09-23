@@ -372,7 +372,9 @@ mod tests {
         let other = Motion { speed: 4.0, ..other };
         let c = cpa(own, other).expect("relative motion exists");
         assert!((to_nm(c.distance_m) - 0.5).abs() < 0.01, "{}", to_nm(c.distance_m));
-        assert_eq!(c.seconds, 0.0);
+        // "Now", to within floating-point noise: the geodesic arithmetic
+        // lands on 7e-10 s on Linux and exactly 0 on macOS.
+        assert!(c.seconds.abs() < 1e-6, "{}", c.seconds);
     }
 
     #[test]
