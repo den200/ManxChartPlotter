@@ -4,12 +4,16 @@
 // pixels, as S-52 states pattern spacing in millimetres on the display.
 
 struct CameraUniform {
+    // Maps positions relative to this draw's origin (a tile centre) to clip.
     view_proj: mat4x4<f32>,
     view_size: vec2<f32>,
     pixels_per_meter: f32,
     // Physical pixels per logical point: 2 on the Retina display the sizes
     // here were calibrated on, 1 on a standard screen such as the Pi's.
     px_per_point: f32,
+    // This draw's origin minus the frame's pattern anchor, in metres.
+    anchor_offset: vec2<f32>,
+    _pad: vec2<f32>,
 }
 
 // Per-pattern metadata
@@ -27,10 +31,13 @@ struct PatternMeta {
 @group(1) @binding(0) var t_atlas: texture_2d<f32>;
 @group(1) @binding(1) var s_atlas: sampler;
 @group(1) @binding(2) var<storage, read> pattern_meta: array<PatternMeta>;
+// Per pattern: where the frame's anchor falls on the pattern grid, as
+// [fraction of a cell in x, rows modulo 2 in y] (see pattern_grid_phase).
+@group(1) @binding(3) var<storage, read> pattern_phase: array<vec4<f32>>;
 
 // Per-instance data
 struct VertexInput {
-    @location(0) position: vec2<f32>,      // World position (SM meters)
+    @location(0) position: vec2<f32>,      // Metres from the tile centre
     @location(1) pattern_id: u32,           // Index into pattern_meta
     @location(2) offset: vec2<f32>,         // Pattern offset from object position
     @location(3) disp_prio: u32,            // Display priority for depth sorting
@@ -38,7 +45,8 @@ struct VertexInput {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) world_pos: vec2<f32>,
+    // Metres from the frame's pattern anchor (small, so f32 is exact enough)
+    @location(0) anchor_pos: vec2<f32>,
     @location(1) @interpolate(flat) pattern_id: u32,
     @location(2) @interpolate(flat) offset: vec2<f32>,
 }
@@ -53,7 +61,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.clip_position.z = (1.0 - f32(in.disp_prio) / 10.0) * out.clip_position.w;
 
     // Pass through data to fragment shader
-    out.world_pos = in.position;
+    out.anchor_pos = camera.anchor_offset + in.position;
     out.pattern_id = in.pattern_id;
     out.offset = in.offset;
 
@@ -85,17 +93,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // is in, and using the world origin as the anchor makes neighbouring tiles
     // agree on the grid, so a pattern crosses a tile boundary without a seam.
     // Screen y runs down and world y runs north, hence the negation.
-    let grid = vec2<f32>(in.world_pos.x, -in.world_pos.y) * camera.pixels_per_meter;
-    let frag_x = grid.x;
-    let frag_y = grid.y;
+    //
+    // World metres times pixels-per-metre is ~1e8 px here, which f32 cannot
+    // hold to a pixel, so the grid is split: `pattern_phase` is where the
+    // frame's anchor sits on this pattern's grid (worked out in f64 on the
+    // CPU), and only the short distance from the anchor is done here.
+    let grid = vec2<f32>(in.anchor_pos.x, -in.anchor_pos.y) * camera.pixels_per_meter;
+    let phase = pattern_phase[in.pattern_id].xy;
 
     // Apply object offset for seamless tiling across features
     let offset_x = in.offset.x + pat_info.offset_info.x * density;
     let offset_y = in.offset.y + pat_info.offset_info.y * density;
 
+    // Grid coordinates in cells: x modulo one cell, y modulo two rows.
+    let gx = phase.x + (grid.x - offset_x) / tile_w;
+    let gy = phase.y + (grid.y + offset_y) / tile_h;
+
     // Calculate which row we're in for stagger
-    // yOffM is the un-modded y offset (same as offset_y here)
-    let row = floor((frag_y + offset_y) / tile_h);
+    let row = floor(gy);
 
     // Apply stagger for odd rows (brick pattern)
     var stagger_offset = 0.0;
@@ -104,8 +119,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Position within the tile, in pixels.
-    let u_local = fract((frag_x - offset_x) / tile_w + stagger_offset);
-    let v_local = fract((frag_y + offset_y) / tile_h);
+    let u_local = fract(gx + stagger_offset);
+    let v_local = fract(gy);
     let in_tile = vec2<f32>(u_local * tile_w, v_local * tile_h);
 
     // The glyph occupies only its own size; the rest of the tile is the S-52

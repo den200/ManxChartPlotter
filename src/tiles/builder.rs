@@ -185,6 +185,7 @@ impl std::error::Error for BuildError {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct AreaVertex {
+    /// Metres from the tile centre (see [`tile_relative`]).
     pub position: [f32; 2],
     pub color_index: u32,
     pub disp_prio: u32,
@@ -1200,7 +1201,9 @@ impl<'a> TileBuilder<'a> {
                     (get_line_style_table(), get_lc_pattern_table())
                 {
                     let dpi = self.view_ppmm * 25.4;
-                    let config = LcRenderConfig::new(dpi, self.view_meters_per_pixel);
+                    let mut config = LcRenderConfig::new(dpi, self.view_meters_per_pixel);
+                    let (ox, oy) = bounds.center();
+                    config.origin = [ox, oy];
 
                     for (
                         symbol_name,
@@ -1365,15 +1368,16 @@ impl<'a> TileBuilder<'a> {
             // ground the features did, the reorder mis-sliced.
             if let Some(log) = &self.scene_log {
                 let mut bboxes = Vec::new();
+                let (ox, oy) = bounds.center();
                 for p in 0..10usize {
                     let (s0, e0) = (fg_area_offsets[p] as usize, fg_area_offsets[p + 1] as usize);
                     if e0 > s0 {
                         let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
                         for v in &packet.area_vertices[s0..e0] {
-                            b[0] = b[0].min(v.position[0] as f64);
-                            b[1] = b[1].min(v.position[1] as f64);
-                            b[2] = b[2].max(v.position[0] as f64);
-                            b[3] = b[3].max(v.position[1] as f64);
+                            b[0] = b[0].min(v.position[0] as f64 + ox);
+                            b[1] = b[1].min(v.position[1] as f64 + oy);
+                            b[2] = b[2].max(v.position[0] as f64 + ox);
+                            b[3] = b[3].max(v.position[1] as f64 + oy);
                         }
                         bboxes.push((p as u8, (e0 - s0) as u32, b));
                     }
@@ -1746,7 +1750,8 @@ impl<'a> TileBuilder<'a> {
                         // No clipping, no f64 conversion, no heap allocations
                         // (the quilt is resolved by draw order, not by masking)
                         stats.fast_path_features += 1;
-                        geom.for_each_triangle_direct(ref_mx as f32, ref_my as f32, |tri| {
+                        let (ox, oy) = bounds.center();
+                        geom.for_each_triangle_direct(ref_mx - ox, ref_my - oy, |tri| {
                             if self.below_min_triangle_area(&tri) {
                                 stats.subpixel_triangles += 1;
                                 return;
@@ -1922,18 +1927,14 @@ impl<'a> TileBuilder<'a> {
                             geom.extent.max_y,
                             geom.extent.max_x,
                         );
-                        // Vertices are already global Mercator (global_to_vertex
-                        // is the identity), pushed as a flat triangle list.
+                        // Vertices are tile-relative (see global_to_vertex);
+                        // the log is in global Mercator, so add the origin back.
+                        let (ox, oy) = bounds.center();
+                        let g = |p: [f32; 2]| [p[0] as f64 + ox, p[1] as f64 + oy];
                         let tris: Vec<[[f64; 2]; 3]> = packet.area_vertices
                             [vert_start..packet.area_vertices.len()]
                             .chunks_exact(3)
-                            .map(|t| {
-                                [
-                                    [t[0].position[0] as f64, t[0].position[1] as f64],
-                                    [t[1].position[0] as f64, t[1].position[1] as f64],
-                                    [t[2].position[0] as f64, t[2].position[1] as f64],
-                                ]
-                            })
+                            .map(|t| [g(t[0].position), g(t[1].position), g(t[2].position)])
                             .collect();
                         let mut log = log.lock().unwrap();
                         log.begin_feature(
@@ -2048,10 +2049,11 @@ impl<'a> TileBuilder<'a> {
                         );
                     }
                     let rings = if draw_chart_outline {
-                        let min_x = info.extent_mercator.min_x as f32;
-                        let min_y = info.extent_mercator.min_y as f32;
-                        let max_x = info.extent_mercator.max_x as f32;
-                        let max_y = info.extent_mercator.max_y as f32;
+                        // Rings are chart-local (relative to the chart's
+                        // reference point), like `resolve_rings` returns.
+                        let e = &info.extent_mercator;
+                        let (min_x, min_y) = ((e.min_x - ref_mx) as f32, (e.min_y - ref_my) as f32);
+                        let (max_x, max_y) = ((e.max_x - ref_mx) as f32, (e.max_y - ref_my) as f32);
                         vec![vec![
                             [min_x, min_y],
                             [max_x, min_y],
@@ -2202,7 +2204,7 @@ impl<'a> TileBuilder<'a> {
 	                                let color_index =
 	                                    engine.get_color_index(color_token).unwrap_or(0) as u32;
 	                                label_candidates.push(TextParams {
-	                                    position: [cx as f32, cy as f32],
+	                                    position: self.global_to_vertex([cx, cy], bounds),
 	                                    text,
 	                                    color,
 	                                    color_index,
@@ -2720,7 +2722,7 @@ impl<'a> TileBuilder<'a> {
                                         continue;
                                     }
                                     label_candidates.push(TextParams {
-                                        position: [cx as f32, cy as f32],
+                                        position: self.global_to_vertex([cx, cy], bounds),
 	                                        text: text.clone(),
 	                                        color,
 	                                        color_index,
@@ -3109,7 +3111,7 @@ impl<'a> TileBuilder<'a> {
                     .unwrap_or(0.0);
                 let sym_idx = packet.symbol_instances.len();
                 packet.symbol_instances.push(SymbolInstance {
-                    position: [mx as f32, my as f32],
+                    position: self.global_to_vertex([mx, my], bounds),
                     symbol_id,
                     rotation,
                     disp_prio: sym_priority as u32,
@@ -3128,7 +3130,7 @@ impl<'a> TileBuilder<'a> {
                 if let Some(ref sector) = light_sector {
                     self.add_light_sector_lines(
                         packet,
-                        [mx as f32, my as f32],
+                        self.global_to_vertex([mx, my], bounds),
                         sector,
                         resolved.priority,
                     );
@@ -3172,7 +3174,7 @@ impl<'a> TileBuilder<'a> {
 	                            .and_then(|e| e.get_color_index("CHBLK"))
 	                            .unwrap_or(0) as u32;
 	                            label_candidates.push(TextParams {
-	                                position: [mx as f32, my as f32],
+	                                position: self.global_to_vertex([mx, my], bounds),
 	                                text: desc,
 	                                color,
 	                                color_index,
@@ -3197,7 +3199,7 @@ impl<'a> TileBuilder<'a> {
 	                            .and_then(|e| e.get_color_index("CHBLK"))
 	                            .unwrap_or(0) as u32;
 	                        label_candidates.push(TextParams {
-	                            position: [mx as f32, my as f32],
+	                            position: self.global_to_vertex([mx, my], bounds),
 	                            text,
 	                            color,
 	                            color_index,
@@ -3252,7 +3254,7 @@ impl<'a> TileBuilder<'a> {
                                 let color_index =
                                     engine.get_color_index(info.color_token()).unwrap_or(0) as u32;
                                 packet.text_instances.push(SoundingInstance {
-                                    position: [mx as f32, my as f32],
+                                    position: self.global_to_vertex([mx, my], bounds),
                                     depth: info.whole_part as f32,
                                     flags: info.to_flags(),
                                     scale: 1.8,
@@ -3270,7 +3272,7 @@ impl<'a> TileBuilder<'a> {
 	                            let color_index =
 	                                engine.get_color_index(color_token).unwrap_or(0) as u32;
 	                            label_candidates.push(TextParams {
-	                                position: [mx as f32, my as f32],
+	                                position: self.global_to_vertex([mx, my], bounds),
 	                                text,
 	                                color,
 	                                color_index,
@@ -3404,7 +3406,7 @@ impl<'a> TileBuilder<'a> {
                     .and_then(|engine| engine.get_color_index(render_info.color_token()))
                     .unwrap_or(0) as u32;
                 packet.text_instances.push(SoundingInstance {
-                    position: [x as f32, y as f32],
+                    position: self.global_to_vertex([x, y], bounds),
                     depth: render_info.whole_part as f32,
                     flags: render_info.to_flags(),
                     scale: scamin_scale * 1.8,
@@ -3539,11 +3541,16 @@ impl<'a> TileBuilder<'a> {
         }
     }
 
-    /// Convert global Mercator coordinates to f32 for GPU
-    /// Keeps coordinates in global Mercator meters - camera view-projection handles transform
-    fn global_to_vertex(&self, global: [f64; 2], _bounds: &TileBounds) -> [f32; 2] {
-        // Keep in global Mercator - camera view-projection matrix does the transform
-        [global[0] as f32, global[1] as f32]
+    /// Convert global Mercator coordinates to a tile vertex position.
+    ///
+    /// Every position in a tile packet is in metres *relative to the tile's
+    /// centre* (`TileBounds::center`), taken in f64 before the cast. Global
+    /// Mercator is 7.5–8.4e6 m here, where an f32 cannot resolve better than
+    /// 0.5–1 m; relative to the centre of even the largest tile the error is
+    /// a fraction of a millimetre. The renderer draws each tile with the
+    /// camera matrix re-based on the same centre (`Camera::view_projection_relative`).
+    fn global_to_vertex(&self, global: [f64; 2], bounds: &TileBounds) -> [f32; 2] {
+        tile_relative(global, bounds)
     }
 
     /// Get area color index for a feature using S-52 palette.
@@ -4051,6 +4058,13 @@ fn format_s52_text(fmt: &str, value: f64) -> String {
     }
 }
 
+/// A global Mercator point relative to a tile's centre, the frame every
+/// position in a [`TilePacket`] is stored in.
+pub fn tile_relative(global: [f64; 2], bounds: &TileBounds) -> [f32; 2] {
+    let (ox, oy) = bounds.center();
+    [(global[0] - ox) as f32, (global[1] - oy) as f32]
+}
+
 fn light_sector_arc_points(
     center: [f32; 2],
     radius_m: f64,
@@ -4300,6 +4314,22 @@ mod tests {
         // @location(3) shade: f32
         assert_eq!(std::mem::size_of::<AreaVertex>(), 20);
         assert_eq!(std::mem::align_of::<AreaVertex>(), 4);
+    }
+
+    /// Packet positions are metres from the tile centre, and the renderer
+    /// re-bases each tile on `TileId::origin`. The two must agree exactly, and
+    /// the offset must survive f32 at Danish latitudes to well under a
+    /// millimetre — global Mercator in f32 would be 0.5 m out here.
+    #[test]
+    fn tile_relative_positions_keep_millimetres() {
+        let (mx, my) = crate::tiles::latlon_to_mercator(55.70333, 12.61457);
+        let tile = TileId::from_mercator(mx, my, 18);
+        let origin = tile.origin();
+        let p = [mx + 0.0123, my - 0.0456];
+        let rel = tile_relative(p, &tile.bounds());
+        let back = [origin.x + rel[0] as f64, origin.y + rel[1] as f64];
+        assert!((back[0] - p[0]).abs() < 1e-5 && (back[1] - p[1]).abs() < 1e-5, "{back:?} vs {p:?}");
+        assert!(((p[1] as f32) as f64 - p[1]).abs() > 0.01, "global f32 was expected to be coarse here");
     }
 
     #[test]

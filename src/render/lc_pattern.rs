@@ -29,6 +29,9 @@ pub struct LcRenderConfig {
     pub ppmm: f32,
     /// Meters per pixel at current zoom
     pub meters_per_pixel: f32,
+    /// Global Mercator position the polylines are measured from (a tile's
+    /// centre), so the stamp phase can still be taken on the global grid.
+    pub origin: [f64; 2],
 }
 
 impl LcRenderConfig {
@@ -37,6 +40,7 @@ impl LcRenderConfig {
         Self {
             ppmm: dpi / 25.4,
             meters_per_pixel,
+            origin: [0.0, 0.0],
         }
     }
 
@@ -181,7 +185,8 @@ pub fn generate_stamps_along_polyline_with_phase(
     // by projecting it onto the line's direction from the origin
     // This gives us the "global arc position" of where this polyline segment starts
     // Compute dot in f64 to reduce drift at large Mercator coordinates.
-    let global_start_pos = (first_pt[0] as f64) * (dir_x as f64) + (first_pt[1] as f64) * (dir_y as f64);
+    let global_start_pos = (first_pt[0] as f64 + config.origin[0]) * (dir_x as f64)
+        + (first_pt[1] as f64 + config.origin[1]) * (dir_y as f64);
     let global_start_pos = global_start_pos as f32;
 
     // Compute the global base phase (where stamp 0 would be for an infinite line through origin)

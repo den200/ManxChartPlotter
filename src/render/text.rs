@@ -9,7 +9,9 @@
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SoundingInstance {
-    /// World position in SM (Simple Mercator) meters
+    /// Position in metres from the draw's origin: the tile centre in a tile
+    /// packet (see `tiles::builder::tile_relative`), else the origin of the
+    /// camera slot it is drawn with.
     pub position: [f32; 2],
     /// Whole-part depth value in display units (used for digit extraction)
     pub depth: f32,
@@ -69,16 +71,7 @@ impl TextRenderer {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("text_camera_layout"),
                 entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    super::state::camera_layout_entry(0),
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -194,7 +187,7 @@ impl TextRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
+                    resource: super::state::camera_binding(camera_buffer),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -209,13 +202,14 @@ impl TextRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
     ) {
         if self.instance_count == 0 {
             return;
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
 
         // Each sounding renders as a small quad with up to 4 digits
@@ -228,6 +222,7 @@ impl TextRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
         instance_buffer: &'a wgpu::Buffer,
         instance_count: u32,
     ) {
@@ -236,7 +231,7 @@ impl TextRenderer {
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
         render_pass.draw(0..6, 0..instance_count);
     }

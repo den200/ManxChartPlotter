@@ -90,10 +90,13 @@ fn ais_symbol(
     }
 }
 
-/// Turn lat/lon into the world metres the symbol shader expects.
-fn world(lat: f64, lon: f64) -> [f32; 2] {
+/// Turn lat/lon into the metres from `origin` the symbol shader expects.
+///
+/// Relative, not global: global Mercator in f32 is only good to 0.5–1 m here,
+/// which at close zoom is several pixels of boat jumping about in her berth.
+fn world(lat: f64, lon: f64, origin: [f64; 2]) -> [f32; 2] {
     let (x, y) = crate::render::projection::Projection::to_mercator(lat, lon);
-    [x as f32, y as f32]
+    [(x - origin[0]) as f32, (y - origin[1]) as f32]
 }
 
 /// Build one frame's worth of mariner symbols.
@@ -101,7 +104,15 @@ fn world(lat: f64, lon: f64) -> [f32; 2] {
 /// `stale_own` suppresses our own ship: a boat symbol sitting confidently on a
 /// chart while the fix is dead is the worst thing a plotter can draw, and the
 /// interface layer marks the gap in words instead.
-pub fn instances(fleet: &Fleet, symbols: &MarinerSymbols, stale_own: bool) -> Vec<SymbolInstance> {
+///
+/// Positions are metres from `origin` (global Mercator); the renderer draws
+/// them through a camera slot re-based on the same point.
+pub fn instances(
+    fleet: &Fleet,
+    symbols: &MarinerSymbols,
+    stale_own: bool,
+    origin: [f64; 2],
+) -> Vec<SymbolInstance> {
     let mut out = Vec::new();
 
     if !stale_own {
@@ -112,7 +123,7 @@ pub fn instances(fleet: &Fleet, symbols: &MarinerSymbols, stale_own: bool) -> Ve
                 .or_else(|| fleet.own.number("navigation.courseOverGroundTrue"))
                 .unwrap_or(0.0);
             out.push(SymbolInstance {
-                position: world(lat, lon),
+                position: world(lat, lon, origin),
                 symbol_id: symbols.own_ship,
                 rotation: heading as f32,
                 disp_prio: MARINER_PRIO,
@@ -130,7 +141,7 @@ pub fn instances(fleet: &Fleet, symbols: &MarinerSymbols, stale_own: bool) -> Ve
         // A lost target keeps its symbol and is crossed through by the overlay;
         // swapping the glyph would lose the heading it was last showing.
         out.push(SymbolInstance {
-            position: world(lat, lon),
+            position: world(lat, lon, origin),
             symbol_id: ais_symbol(symbols, heading, course, target.under_way() && !target.is_lost()),
             rotation: heading.or(course).unwrap_or(0.0) as f32,
             disp_prio: MARINER_PRIO,
@@ -163,7 +174,7 @@ pub fn instances(fleet: &Fleet, symbols: &MarinerSymbols, stale_own: bool) -> Ve
                 speed * seconds,
             );
             out.push(SymbolInstance {
-                position: world(at.lat, at.lon),
+                position: world(at.lat, at.lon, origin),
                 symbol_id: symbol,
                 // The marks are drawn across the vector, so they turn with it.
                 rotation: course as f32,
@@ -229,15 +240,15 @@ mod tests {
                 {"path":"navigation.headingTrue","value":1.5}]}]}"#,
         );
         let s = symbols();
-        let out = instances(&fleet, &s, false);
+        let out = instances(&fleet, &s, false, [0.0, 0.0]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].symbol_id, s.own_ship);
         assert_eq!(out[0].rotation, 1.5);
         assert_eq!(out[0].disp_prio, MARINER_PRIO);
-        assert_eq!(out[0].position, world(56.5, 11.6));
+        assert_eq!(out[0].position, world(56.5, 11.6, [0.0, 0.0]));
 
         // A dead fix draws no boat at all.
-        assert!(instances(&fleet, &s, true).is_empty());
+        assert!(instances(&fleet, &s, true, [0.0, 0.0]).is_empty());
     }
 
     #[test]
@@ -249,7 +260,7 @@ mod tests {
                 {"path":"navigation.speedOverGround","value":5.0}]}]}"#,
         );
         let s = symbols();
-        let out = instances(&fleet, &s, false);
+        let out = instances(&fleet, &s, false, [0.0, 0.0]);
         assert_eq!(out.len(), 3, "the target and its one- and six-minute marks");
         assert_eq!(out[0].symbol_id, s.active);
         assert_eq!(out[1].symbol_id, s.one_minute);
@@ -275,7 +286,7 @@ mod tests {
                 {"path":"navigation.state","value":"moored"}]}]}"#,
         );
         let s = symbols();
-        let out = instances(&fleet, &s, false);
+        let out = instances(&fleet, &s, false, [0.0, 0.0]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].symbol_id, s.sleeping);
     }
@@ -288,6 +299,6 @@ mod tests {
             r#"{"context":"vessels.urn:mrn:imo:mmsi:3","updates":[{"values":[
                 {"path":"name","value":"NORDLYS"}]}]}"#,
         );
-        assert!(instances(&fleet, &symbols(), false).is_empty());
+        assert!(instances(&fleet, &symbols(), false, [0.0, 0.0]).is_empty());
     }
 }

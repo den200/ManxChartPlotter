@@ -4,22 +4,32 @@
 // miter/bevel joins in the vertex shader. Width is in screen pixels, not world units.
 // Dash patterns are computed in the fragment shader using arc-length.
 
-struct LineUniforms {
-    view_proj: mat4x4<f32>,      // SM -> clip space (64 bytes)
-    viewport_size: vec2<f32>,    // window size in pixels (8 bytes)
-    line_width_px: f32,          // stroke width in pixels, e.g., 2.0 (4 bytes)
-    join_limit: f32,             // miter limit, e.g., 4.0 (4 bytes)
-    color_index: u32,            // index into palette (4 bytes)
-    dash_on_px: f32,             // dash on length in screen pixels (4 bytes)
-    dash_off_px: f32,            // dash off (gap) length in screen pixels (4 bytes)
-    px_per_meter: f32,           // pixels per meter at current zoom (4 bytes)
-    disp_prio: f32,              // display priority for depth sorting (4 bytes)
-    dot_on_px: f32,              // dot length in gap for DASD pattern (4 bytes)
-    _pad2: u32,
-    _pad3: u32,
-    // Total: 112 bytes, 16-byte aligned
+// The camera, per draw: positions are metres from the draw's origin (a tile
+// centre) and view_proj already has that origin folded in, in f64 on the CPU.
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    view_size: vec2<f32>,
+    pixels_per_meter: f32,
+    px_per_point: f32,
+    anchor_offset: vec2<f32>,
+    _pad: vec2<f32>,
 }
 
+// The style, per line batch. Nothing here depends on the camera, so it is
+// only rewritten when the set of visible styles or the display changes.
+struct LineUniforms {
+    line_width_px: f32,          // stroke width in pixels, e.g., 2.0
+    join_limit: f32,             // miter limit, e.g., 4.0
+    color_index: u32,            // index into palette
+    dash_on_px: f32,             // dash on length in screen pixels
+    dash_off_px: f32,            // dash off (gap) length in screen pixels
+    disp_prio: f32,              // display priority for depth sorting
+    dot_on_px: f32,              // dot length in gap for DASD pattern
+    _pad: u32,
+    // Total: 32 bytes
+}
+
+@group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1)
 var<storage, read> palette: array<vec4<f32>>;
 
@@ -41,9 +51,9 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     // Project all points to clip space
-    let clip_prev = u.view_proj * vec4(in.prev, 0.0, 1.0);
-    let clip_curr = u.view_proj * vec4(in.curr, 0.0, 1.0);
-    let clip_next = u.view_proj * vec4(in.next, 0.0, 1.0);
+    let clip_prev = camera.view_proj * vec4(in.prev, 0.0, 1.0);
+    let clip_curr = camera.view_proj * vec4(in.curr, 0.0, 1.0);
+    let clip_next = camera.view_proj * vec4(in.next, 0.0, 1.0);
 
     // Convert to NDC
     let ndc_prev = clip_prev.xy / clip_prev.w;
@@ -101,7 +111,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     }
 
     // Convert pixel width to NDC offset
-    let px_to_ndc = 2.0 / u.viewport_size;
+    let px_to_ndc = 2.0 / camera.view_size;
     let offset = miter * in.side * u.line_width_px * 0.5 * miter_scale * px_to_ndc;
 
     let final_pos = ndc_curr + offset;
@@ -123,7 +133,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Convert arc_len (meters) to screen pixels
-    let arc_px = in.arc_len * u.px_per_meter;
+    let arc_px = in.arc_len * camera.pixels_per_meter;
     let pattern_len = u.dash_on_px + u.dash_off_px;
 
     // Apply dash pattern: discard pixels in the "off" (gap) portion

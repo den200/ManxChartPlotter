@@ -13,7 +13,7 @@ struct CameraUniform {
 @group(0) @binding(1) var<storage, read> palette: array<vec4<f32>>;
 
 struct InstanceInput {
-    @location(0) position: vec2<f32>,  // World position (SM meters)
+    @location(0) position: vec2<f32>,  // Metres from this draw's origin (tile centre)
     @location(1) depth: f32,           // Whole-part depth in display units
     @location(2) flags: u32,           // SNDFRM02 flags
     @location(3) scale: f32,           // Soft-SCAMIN scale
