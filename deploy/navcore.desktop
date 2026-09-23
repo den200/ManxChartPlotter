@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=navcore
+Comment=Chart plotter
+# The binary finds assets/, the chart helper and the licence beside itself,
+# so it can be started from anywhere.
+Exec=@HOME@/navcore/target/release/navcore
+Terminal=false
+X-GNOME-Autostart-enabled=true

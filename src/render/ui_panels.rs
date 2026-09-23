@@ -76,7 +76,7 @@ pub fn build(
     // Last of the bottom panels, so it sits *above* the instrument strip and
     // the guidance line rather than pushing them off the screen edge — the
     // same ordering rule the strip and the bar already rely on.
-    super::ui_weather::sheet(ctx, sheet, wind, actions);
+    super::ui_weather::sheet(ctx, sheet, wind, &instruments.units, actions);
     if let Some(objects) = state.picked {
         object_query(ctx, objects, state.pick_anchor, state.pick_id, actions);
     }
