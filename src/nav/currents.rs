@@ -12,7 +12,6 @@
 //! §8.5 holds here too: direction and speed are converted to U/V components
 //! once, at fetch; everything after interpolates components.
 
-use chrono::NaiveDateTime;
 
 use super::grib::GeoBox;
 use super::isochrone::CurrentField;
@@ -62,9 +61,15 @@ impl CurrentForecast {
         // forecast_days counts calendar days from TODAY 00:00, so an
         // afternoon departure needs a day of padding to cover its horizon.
         let days = ((hours_ahead as usize).div_ceil(24) + 1).clamp(1, 8);
+        // `timeformat=unixtime` is not a detail. The answer repeats the whole
+        // hour axis once per point, so 144 points over three days is 10 000
+        // timestamps; as ISO strings that is megabytes to move, allocate and
+        // parse, and on a Pi it is the most expensive thing about a current
+        // fetch. As integers it is a fraction of that.
         let url = format!(
             "https://marine-api.open-meteo.com/v1/marine?latitude={lat_list}&longitude={lon_list}\
-             &hourly=ocean_current_velocity,ocean_current_direction&forecast_days={days}"
+             &hourly=ocean_current_velocity,ocean_current_direction&forecast_days={days}\
+             &timeformat=unixtime&timezone=UTC"
         );
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(std::time::Duration::from_secs(60)))
@@ -102,20 +107,21 @@ impl CurrentForecast {
                 lons.len()
             ));
         }
-        let hourly = |p: &serde_json::Value, key: &str| -> Option<Vec<serde_json::Value>> {
-            Some(p.get("hourly")?.get(key)?.as_array()?.clone())
-        };
+        // Borrowed, never cloned: the series are the bulk of the answer and
+        // there are two of them per point.
+        fn hourly<'j>(
+            p: &'j serde_json::Value,
+            key: &str,
+        ) -> Option<&'j Vec<serde_json::Value>> {
+            p.get("hourly")?.get(key)?.as_array()
+        }
         let first = &points[0];
-        let time_strs = hourly(first, "time").ok_or("current answer lacks hourly.time")?;
-        let times: Vec<i64> = time_strs
-            .iter()
-            .filter_map(|t| {
-                let s = t.as_str()?;
-                let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok()?;
-                Some(naive.and_utc().timestamp_millis())
-            })
-            .collect();
-        if times.len() != time_strs.len() || times.is_empty() {
+        let stamps = hourly(first, "time").ok_or("current answer lacks hourly.time")?;
+        // Seconds from `timeformat=unixtime`. An answer that came back in some
+        // other shape is refused rather than half-read: a current field
+        // silently shifted an hour is worse than none.
+        let times: Vec<i64> = stamps.iter().filter_map(|t| Some(t.as_i64()? * 1000)).collect();
+        if times.len() != stamps.len() || times.is_empty() {
             return Err("current answer has unreadable times".into());
         }
 
@@ -149,11 +155,52 @@ impl CurrentForecast {
         Ok(Self { lats, lons, times, u, v, max_ms })
     }
 
+    /// The hours the field covers, ascending — what a time cursor moves over.
+    pub fn steps(&self) -> &[i64] {
+        &self.times
+    }
+
+    /// Is this position inside the fetched box?
+    ///
+    /// The sampler clamps at the edges, which is right for a passage fetched
+    /// *for* those endpoints and quite wrong for a display: clamping would
+    /// paint the edge's set across the whole ocean beyond it. Same reasoning,
+    /// and same shape, as the wind field's `covers`.
+    pub fn covers(&self, lat: f64, lon: f64) -> bool {
+        let within = |axis: &[f64], x: f64| match (axis.first(), axis.last()) {
+            (Some(&lo), Some(&hi)) => x >= lo && x <= hi,
+            _ => false,
+        };
+        within(&self.lats, lat) && within(&self.lons, lon)
+    }
+
+    /// Current at a position and time for display: `(set towards °T, knots)`.
+    ///
+    /// `None` outside the box, and `None` where the model has no sea — the
+    /// two cases a router may treat as still water and a display may not. An
+    /// arrow drawn over dry land is a bug the reader cannot see through.
+    pub fn sample(&self, lat: f64, lon: f64, time_ms: i64) -> Option<(f64, f64)> {
+        if !self.covers(lat, lon) {
+            return None;
+        }
+        let (u, v) = self.uv_opt(lat, lon, time_ms)?;
+        let kt = (u * u + v * v).sqrt() * 3600.0 / 1852.0;
+        // Set is quoted the way the water goes, so no negation here — the
+        // opposite of the wind's convention, deliberately kept apart.
+        let to_deg = u.atan2(v).to_degrees().rem_euclid(360.0);
+        Some((to_deg, kt))
+    }
+
     /// U/V in m/s — bilinear over the grid with NaN cells dropped and the
     /// weights renormalized, linear in time, clamped at the edges. A point
     /// with no data at all answers still water: the honest default when the
-    /// model is silent.
+    /// model is silent, and what the router needs.
     fn uv(&self, lat: f64, lon: f64, time_ms: i64) -> (f64, f64) {
+        self.uv_opt(lat, lon, time_ms).unwrap_or((0.0, 0.0))
+    }
+
+    /// The same lookup, but saying so when the model had nothing to say.
+    fn uv_opt(&self, lat: f64, lon: f64, time_ms: i64) -> Option<(f64, f64)> {
         let (i0, i1, fy) = bracket(&self.lats, lat);
         let (j0, j1, fx) = bracket(&self.lons, lon);
         let (t0, t1, ft) = bracket_i64(&self.times, time_ms);
@@ -180,10 +227,10 @@ impl CurrentForecast {
         };
         match (sample_t(t0), sample_t(t1)) {
             (Some((u0, v0)), Some((u1, v1))) => {
-                (u0 + (u1 - u0) * ft, v0 + (v1 - v0) * ft)
+                Some((u0 + (u1 - u0) * ft, v0 + (v1 - v0) * ft))
             }
-            (Some(a), None) | (None, Some(a)) => a,
-            (None, None) => (0.0, 0.0),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
         }
     }
 
@@ -272,7 +319,7 @@ mod tests {
         let point = |vel: f64, dir: f64| {
             format!(
                 r#"{{"latitude":56.0,"longitude":11.0,"hourly":{{
-                    "time":["2026-08-01T00:00","2026-08-01T01:00"],
+                    "time":[1785801600,1785805200],
                     "ocean_current_velocity":[{vel},{vel}],
                     "ocean_current_direction":[{dir},{dir}]}}}}"#
             )
@@ -300,6 +347,47 @@ mod tests {
         // Cell 2 (56.5, 11.0): south.
         assert!((f.v[0][2] as f64 + kmh).abs() < 1e-6);
         assert!((f.max_ms - kmh).abs() < 1e-9);
+    }
+
+    /// The display sampler must refuse what the router is happy to clamp.
+    /// A field fetched for a passage across the Sound says nothing about the
+    /// Atlantic, and an arrow there would be an invention.
+    #[test]
+    fn the_display_sampler_stops_at_the_edge_of_the_box() {
+        let f = CurrentForecast::synthetic(
+            vec![56.0, 57.0],
+            vec![11.0, 12.0],
+            vec![0],
+            // 1 knot toward the east everywhere.
+            vec![vec![0.514444; 4]],
+            vec![vec![0.0; 4]],
+            0.514444,
+        );
+        assert!(f.covers(56.5, 11.5));
+        assert!(!f.covers(56.5, 20.0));
+        assert!(!f.covers(40.0, 11.5));
+        let (to, kt) = f.sample(56.5, 11.5, 0).expect("inside the box");
+        assert!((to - 90.0).abs() < 1e-3, "set east, got {to}");
+        assert!((kt - 1.0).abs() < 1e-3, "one knot, got {kt}");
+        assert_eq!(f.sample(56.5, 20.0, 0), None);
+    }
+
+    /// Land answers nothing rather than answering slack water: a field of
+    /// still-water arrows over a headland reads as a fact about the tide.
+    #[test]
+    fn the_display_sampler_reports_nothing_where_the_model_has_no_sea() {
+        let f = CurrentForecast::synthetic(
+            vec![56.0, 57.0],
+            vec![11.0, 12.0],
+            vec![0],
+            vec![vec![f32::NAN; 4]],
+            vec![vec![f32::NAN; 4]],
+            0.0,
+        );
+        assert_eq!(f.sample(56.5, 11.5, 0), None);
+        // …while the router still gets its still water.
+        let (x, y) = Projection::to_mercator(56.5, 11.5);
+        assert_eq!(f.current([x, y], 0), (0.0, 0.0));
     }
 
     /// Nulls — the model's land — drop out of the sample, and a spot with

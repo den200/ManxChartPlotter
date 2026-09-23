@@ -42,6 +42,30 @@ const APLRT: Color32 = Color32::from_rgb(235, 125, 54);
 /// Routes on the chart. Dashed in PLRTE as S-52 draws a planned route; the
 /// active route in APLRT with its current leg solid and heavier; legs already
 /// sailed fall back to quiet.
+/// Might this leg put ink on the screen?
+///
+/// Asked of the leg, not of its ends. Testing whether either end lands on the
+/// screen throws away exactly the legs that matter most: a long one — the
+/// weather router happily produces a fifteen-mile leg — has both ends far
+/// outside the view while crossing the middle of it, and the route then
+/// appeared to stop dead at the edge of the screen. Comparing the leg's own
+/// bounding box against the view keeps it. The test is generous, so a
+/// diagonal that misses the corner is still drawn; that costs one line and is
+/// cheaper than being exact.
+fn leg_may_show(screen: egui::Rect, a: egui::Pos2, b: egui::Pos2) -> bool {
+    if !(a.x.is_finite() && a.y.is_finite() && b.x.is_finite() && b.y.is_finite()) {
+        return false;
+    }
+    let lo_x = a.x.min(b.x);
+    let hi_x = a.x.max(b.x);
+    let lo_y = a.y.min(b.y);
+    let hi_y = a.y.max(b.y);
+    lo_x <= screen.right()
+        && hi_x >= screen.left()
+        && lo_y <= screen.bottom()
+        && hi_y >= screen.top()
+}
+
 pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
     if routes.is_empty() {
         return;
@@ -54,16 +78,16 @@ pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
         for (i, w) in route.points.windows(2).enumerate() {
             let a = egui::pos2(w[0].screen[0], w[0].screen[1]);
             let b = egui::pos2(w[1].screen[0], w[1].screen[1]);
-            if !screen.contains(a) && !screen.contains(b) {
+            if !leg_may_show(screen, a, b) {
                 continue;
             }
             let sailed = route.active_leg.map(|l| i < l).unwrap_or(false);
             let current = route.active_leg == Some(i);
             if current {
-                painter.line_segment([a, b], egui::Stroke::new(3.0, colour));
+                painter.line_segment([a, b], egui::Stroke::new(3.0_f32, colour));
             } else {
                 let stroke = egui::Stroke::new(
-                    2.0,
+                    2.0_f32,
                     if sailed { colour.gamma_multiply(0.4) } else { colour },
                 );
                 painter.add(egui::Shape::dashed_line(&[a, b], stroke, 8.0, 6.0));
@@ -78,12 +102,12 @@ pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
                 pos,
                 4.0,
                 Color32::TRANSPARENT,
-                egui::Stroke::new(1.8, colour),
+                egui::Stroke::new(1.8_f32, colour),
             );
             if let Some(r) = p.arrival_radius_px {
                 painter.add(egui::Shape::dashed_line(
                     &circle_points(pos, r),
-                    egui::Stroke::new(1.0, colour),
+                    egui::Stroke::new(1.0_f32, colour),
                     4.0,
                     4.0,
                 ));
@@ -150,6 +174,35 @@ pub struct RouteRow {
     pub waypoints: Vec<RouteWaypointRow>,
 }
 
+/// A name being edited. The text lives in egui's memory while the field has
+/// focus and is handed back once, when the user leaves it or presses Enter —
+/// not per keystroke, which rewrote the route file for every letter and let
+/// a half-typed or empty name reach the disk. An empty name is refused and
+/// the old one comes back.
+fn name_field(
+    ui: &mut egui::Ui,
+    key: impl std::hash::Hash,
+    current: &str,
+    width: f32,
+) -> Option<String> {
+    let id = egui::Id::new(key);
+    let mut text = ui
+        .data(|d| d.get_temp::<String>(id))
+        .unwrap_or_else(|| current.to_string());
+    let edit = ui.add(egui::TextEdit::singleline(&mut text).desired_width(width));
+    if edit.changed() {
+        ui.data_mut(|d| d.insert_temp(id, text.clone()));
+    }
+    if edit.lost_focus() {
+        ui.data_mut(|d| d.remove::<String>(id));
+        let name = text.trim();
+        if !name.is_empty() && name != current {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 /// The waypoint list of the route being edited: rename, reorder, remove,
 /// and the standing invitation to tap the chart for one more.
 fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction>) {
@@ -160,12 +213,30 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
                 .color(APLRT),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
+            // Two taps, the second on a different word: a planned passage is
+            // an evening's work, and "Delete route" sits right beside
+            // "Reverse". The pending question lives in egui's memory, so it
+            // goes away with the editor.
+            let confirm_id = egui::Id::new(("confirm-delete-route", row.id));
+            let asking = ui.data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
+            if asking {
+                if ui.small_button("Keep").clicked() {
+                    ui.data_mut(|d| d.remove::<bool>(confirm_id));
+                }
+                if ui
+                    .small_button(RichText::new("Delete it").color(egui::Color32::from_rgb(200, 60, 60)))
+                    .clicked()
+                {
+                    ui.data_mut(|d| d.remove::<bool>(confirm_id));
+                    actions.push(UiAction::RouteDelete { route_id: row.id });
+                }
+                ui.label(RichText::new("Delete this route?").small());
+            } else if ui
                 .small_button("Delete route")
                 .on_hover_text("Remove this route. Its waypoints stay in the store.")
                 .clicked()
             {
-                actions.push(UiAction::RouteDelete { route_id: row.id });
+                ui.data_mut(|d| d.insert_temp(confirm_id, true));
             }
             if ui
                 .add_enabled(
@@ -191,11 +262,7 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
     for (i, wp) in row.waypoints.iter().enumerate() {
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{:>2}.", i + 1)).small().weak());
-            let mut name = wp.name.clone();
-            if ui
-                .add(egui::TextEdit::singleline(&mut name).desired_width(110.0))
-                .changed()
-            {
+            if let Some(name) = name_field(ui, ("wp-name", wp.id), &wp.name, 110.0) {
                 actions.push(UiAction::RouteWaypointRename {
                     route_id: row.id,
                     index: i,
@@ -204,13 +271,13 @@ fn waypoint_editor(ui: &mut egui::Ui, row: &RouteRow, actions: &mut Vec<UiAction
                 });
             }
             ui.label(
-                RichText::new(format!("{:.4}, {:.4}", wp.lat, wp.lon))
+                RichText::new(crate::geo::format_latlon(wp.lat, wp.lon))
                     .small()
                     .weak(),
             );
             if let Some((nm, brg)) = wp.leg {
                 ui.label(
-                    RichText::new(format!("{nm:.2} nm {brg:03.0}°"))
+                    RichText::new(format!("{nm:.2} NM {}", crate::geo::format_bearing(brg)))
                         .small()
                         .weak(),
                 );
@@ -270,7 +337,9 @@ pub fn window(
         // Wide enough that a row of buttons and the editor's waypoint lines
         // fit without the labels being squeezed into wraps.
         .default_size([620.0, 380.0])
-        .constrain(true)
+        // Inside the space the menu bar and instrument strip leave: a window
+        // over the menu bar hides the very button that closes it.
+        .constrain_to(ctx.available_rect())
         .collapsible(false)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -281,7 +350,7 @@ pub fn window(
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
-                        .button("Fetch from Signal K")
+                        .add_enabled(!view.net_busy, egui::Button::new("Fetch from Signal K"))
                         .on_hover_text(
                             "Read the routes the Signal K server holds and add them here",
                         )
@@ -298,6 +367,16 @@ pub fn window(
                     }
                 });
             });
+            // Right under the buttons that cause it, not below the weather
+            // settings where a publish result used to land out of sight.
+            if view.net_busy || !view.status.is_empty() {
+                ui.horizontal(|ui| {
+                    if view.net_busy {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(&view.status).small());
+                });
+            }
             ui.separator();
 
             if view.rows.is_empty() {
@@ -311,9 +390,13 @@ pub fn window(
                 for row in view.rows.clone() {
                     ui.horizontal(|ui| {
                         let mut shown = row.visible;
+                        // The route being followed is always drawn; a box
+                        // that could be clicked but never cleared read as
+                        // broken, so it is shown ticked and greyed instead.
                         if ui
-                            .checkbox(&mut shown, "")
+                            .add_enabled(!row.active, egui::Checkbox::new(&mut shown, ""))
                             .on_hover_text("Show this route on the chart")
+                            .on_disabled_hover_text("The route being followed is always shown")
                             .changed()
                         {
                             if shown {
@@ -324,11 +407,9 @@ pub fn window(
                         }
                         let editing = view.editing == Some(row.id);
                         if editing {
-                            let mut name = row.name.clone();
-                            let edit = ui.add(
-                                egui::TextEdit::singleline(&mut name).desired_width(150.0),
-                            );
-                            if edit.changed() {
+                            if let Some(name) =
+                                name_field(ui, ("route-name", row.id), &row.name, 150.0)
+                            {
                                 actions.push(UiAction::RouteRename {
                                     route_id: row.id,
                                     name,
@@ -348,7 +429,7 @@ pub fn window(
                         ui.add(
                             egui::Label::new(
                                 RichText::new(format!(
-                                    "{} legs · {:.1} nm",
+                                    "{} legs · {:.1} NM",
                                     row.legs, row.distance_nm
                                 ))
                                 .small()
@@ -380,17 +461,18 @@ pub fn window(
                                     actions.push(UiAction::RouteActivate { route_id: row.id });
                                 }
                                 if ui
-                                    .small_button("Publish")
+                                    .add_enabled(!view.net_busy, egui::Button::new("Publish"))
                                     .on_hover_text("Publish this route to the Signal K server")
                                     .clicked()
                                 {
                                     actions.push(UiAction::RoutePublish { route_id: row.id });
                                 }
                                 if ui
-                                    .add_enabled(!weather.busy, egui::Button::new("Wx").small())
+                                    .add_enabled(!weather.busy, egui::Button::new("Sail"))
                                     .on_hover_text(
-                                        "Weather-route between this route's endpoints, on the \
-                                         latest forecast and the polar below",
+                                        "Plan a sailing passage between this route's ends, on \
+                                         the latest forecast and the polar below — the same \
+                                         as Sail in the menu bar",
                                     )
                                     .clicked()
                                 {
@@ -420,28 +502,37 @@ pub fn window(
                 ui.label("NOAA GFS 0.25° (NOMADS)");
                 ui.add_space(10.0);
                 ui.label(RichText::new("hours:").weak());
-                ui.add(
+                let r = ui.add(
                     egui::DragValue::new(&mut weather.hours)
                         .speed(3)
                         .range(12..=120),
                 );
+                if r.drag_stopped() || r.lost_focus() {
+                    actions.push(UiAction::SettingsChanged);
+                }
             });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Polar:").weak());
-                ui.add(
-                    egui::TextEdit::singleline(&mut weather.polar_path)
-                        .hint_text("built-in ~10 m cruiser — set a .pol path for your boat")
-                        .desired_width(280.0),
-                );
+                if ui
+                    .add(
+                        egui::TextEdit::singleline(&mut weather.polar_path)
+                            .hint_text("built-in ~10 m cruiser — set a .pol path for your boat")
+                            .desired_width(280.0),
+                    )
+                    .lost_focus()
+                {
+                    actions.push(UiAction::SettingsChanged);
+                }
             });
-            ui.checkbox(&mut weather.use_waves, "Waves (GFS Hs: slows the boat, blocks over the limit)")
+            let waves = ui
+                .checkbox(&mut weather.use_waves, "Waves (GFS Hs: slows the boat, blocks over the limit)")
                 .on_hover_text(
                     "Fetches significant wave height alongside the wind. Speed is \
                      reduced by 1/(1 + 0.03·Hs²) and seas over the configured \
                      maximum are treated as impassable. If the wave file is not \
                      yet published the route falls back to wind alone.",
                 );
-            ui.checkbox(
+            let currents = ui.checkbox(
                 &mut weather.use_currents,
                 format!("Currents ({})", crate::nav::currents::CURRENT_SOURCE_LABEL),
             )
@@ -451,6 +542,9 @@ pub fn window(
                  this includes are often worth more than the wind detail. \
                  If the fetch fails the route plans in still water.",
             );
+            if waves.changed() || currents.changed() {
+                actions.push(UiAction::SettingsChanged);
+            }
             if weather.busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -460,16 +554,29 @@ pub fn window(
                 ui.label(RichText::new(&weather.status).small());
             }
 
-            if !view.status.is_empty() {
-                ui.separator();
-                ui.label(RichText::new(&view.status).small());
-            }
         });
+    // Closing the window ends editing too. Left on, every later chart tap
+    // would keep adding waypoints to a route the user can no longer see.
+    if view.open && !open && view.editing.is_some() {
+        actions.push(UiAction::RouteEdit { route_id: None });
+    }
     view.open = open;
 }
 
 /// The strip above the instrument bar while a route is active.
-pub fn guidance_strip(ctx: &Context, g: &Guidance) {
+/// The strip, while a route is followed but cannot be steered yet.
+pub fn waiting_strip(ctx: &Context, why: &str) {
+    egui::TopBottomPanel::bottom("guidance-strip")
+        .exact_height(34.0)
+        .show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(why).weak());
+            });
+        });
+}
+
+pub fn guidance_strip(ctx: &Context, g: &Guidance, units: &crate::signalk::UnitPrefs) {
     egui::TopBottomPanel::bottom("guidance-strip")
         .exact_height(34.0)
         .show(ctx, |ui| {
@@ -495,7 +602,7 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance) {
                 } else {
                     ("▶", "steer stbd")
                 };
-                let xte_text = format!("XTE {:.2} nm {arrow}", g.xte_nm.abs());
+                let xte_text = format!("XTE {:.2} NM {arrow}", g.xte_nm.abs());
                 let xte = if g.xte_nm.abs() > 0.1 {
                     RichText::new(xte_text).strong()
                 } else {
@@ -503,12 +610,15 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance) {
                 };
                 ui.label(xte).on_hover_text(side);
                 ui.separator();
-                ui.label(format!("DTW {:.2} nm", g.dtw_nm));
+                ui.label(format!("DTW {:.2} NM", g.dtw_nm));
                 ui.separator();
-                ui.label(format!("BRG {:03.0}°", g.btw_deg));
+                ui.label(format!("BRG {}", crate::geo::format_bearing(g.btw_deg)));
                 if let Some(vmg) = g.vmg_kt {
                     ui.separator();
-                    ui.label(format!("VMG {vmg:.1} kn"));
+                    // In the speed unit the instruments use.
+                    let r = crate::signalk::Quantity::Speed
+                        .format(vmg * crate::geo::METRES_PER_NM / 3600.0, units);
+                    ui.label(format!("VMG {} {}", r.value, r.unit));
                     // Time to go, from closing speed — only when actually
                     // closing; an ETA from a negative VMG is an insult.
                     if vmg > 0.2 {
@@ -519,4 +629,60 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance) {
                 }
             });
         });
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+    use egui::{pos2, Rect};
+
+    fn view() -> Rect {
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 700.0))
+    }
+
+    /// The bug: a leg long enough that both its ends lie outside the view was
+    /// dropped, and the route stopped at the edge of the screen. A fifteen
+    /// mile leg zoomed in on is exactly that leg.
+    #[test]
+    fn a_leg_crossing_the_view_is_drawn_even_though_neither_end_is_in_it() {
+        // Straight through, left to right.
+        assert!(leg_may_show(view(), pos2(-5000.0, 350.0), pos2(6000.0, 350.0)));
+        // Straight through, top to bottom.
+        assert!(leg_may_show(view(), pos2(500.0, -4000.0), pos2(500.0, 4000.0)));
+        // Corner to corner.
+        assert!(leg_may_show(
+            view(),
+            pos2(-3000.0, -3000.0),
+            pos2(4000.0, 4000.0)
+        ));
+    }
+
+    /// Legs that cannot touch the view are still skipped — the point of the
+    /// test is to save work, and a route may run off the far side of the world.
+    #[test]
+    fn a_leg_that_cannot_touch_the_view_is_skipped() {
+        assert!(!leg_may_show(view(), pos2(-900.0, 350.0), pos2(-100.0, 350.0)));
+        assert!(!leg_may_show(view(), pos2(1100.0, 0.0), pos2(4000.0, 700.0)));
+        assert!(!leg_may_show(view(), pos2(0.0, -900.0), pos2(1000.0, -50.0)));
+        assert!(!leg_may_show(view(), pos2(0.0, 800.0), pos2(1000.0, 5000.0)));
+    }
+
+    /// A leg with an end inside is always drawn, which is what the old test
+    /// got right and must not be lost.
+    #[test]
+    fn a_leg_with_an_end_in_the_view_is_drawn() {
+        assert!(leg_may_show(view(), pos2(500.0, 350.0), pos2(9000.0, 350.0)));
+        assert!(leg_may_show(view(), pos2(-9000.0, 350.0), pos2(10.0, 10.0)));
+    }
+
+    /// A waypoint that failed to project must not take the draw call with it.
+    #[test]
+    fn a_leg_that_is_not_a_number_is_refused() {
+        assert!(!leg_may_show(view(), pos2(f32::NAN, 350.0), pos2(500.0, 350.0)));
+        assert!(!leg_may_show(
+            view(),
+            pos2(500.0, 350.0),
+            pos2(500.0, f32::INFINITY)
+        ));
+    }
 }

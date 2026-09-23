@@ -64,6 +64,10 @@ pub struct PickResponse {
 pub struct TileResponse {
     pub tile_id: TileId,
     pub result: Result<TilePacket, String>,
+    /// The screen density the tile was built for. Text sizes, light arcs and
+    /// line-symbol spacing are baked in at it, so a tile built before the
+    /// window moved to another display is the wrong size on this one.
+    pub ppmm: f32,
 }
 
 /// Handle for communicating with the background tile worker
@@ -298,7 +302,11 @@ fn worker_loop(
                         let _ = sender
                             .lock()
                             .unwrap()
-                            .send(TileResponse { tile_id, result });
+                            .send(TileResponse {
+                                tile_id,
+                                result,
+                                ppmm: view_params.ppmm,
+                            });
                     });
 
                 if let Some(start) = batch_start {

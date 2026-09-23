@@ -63,8 +63,11 @@ pub struct Uniforms {
     pub view_size: [f32; 2],
     /// Pixels per meter at current zoom
     pub pixels_per_meter: f32,
-    /// Padding for alignment
-    pub _pad: f32,
+    /// Physical pixels per logical point (the display's scale factor).
+    /// Symbols and area patterns are sized in pixels, so without it they
+    /// were twice their S-52 size on a standard-density screen relative to
+    /// the lines and text, which already scale with the display.
+    pub px_per_point: f32,
 }
 
 /// Line vertex with adjacency data for shader-based polyline rendering.
@@ -282,6 +285,12 @@ pub(crate) enum RouteNetEvent {
     WindLoaded(Box<crate::nav::grib::GribForecast>),
     WindFailed(String),
     WindProgress(String),
+    /// A surface-current field for the overlay arrived.
+    CurrentLoaded(Box<crate::nav::currents::CurrentForecast>),
+    CurrentFailed(String),
+    /// The point forecast behind the weather sheet arrived.
+    PointLoaded(Box<crate::nav::pointfx::PointForecast>),
+    PointFailed(String),
     /// A worker thread has ended, however it ended. Sent by a drop guard, so
     /// it arrives even if the worker panicked — which is what keeps a busy
     /// flag from sticking on for the rest of the session.
@@ -339,6 +348,12 @@ pub struct RenderState {
 
     // Pattern fill rendering (area patterns)
     pub pattern_renderer: Option<PatternRenderer>,
+    /// A chart folder loading on a worker thread.
+    chart_load: Option<ChartLoad>,
+    /// What the frame is cleared to: deep water in the active palette, so
+    /// the sea beyond the charts (and a tile still loading) dims with the
+    /// rest of the chart at night instead of flashing day blue.
+    clear_colour: Color,
     pub pattern_camera_bind_group: Option<wgpu::BindGroup>,
 
     // Text/sounding rendering
@@ -384,6 +399,11 @@ pub struct RenderState {
     signalk_override_saved: Option<String>,
     /// The wind field the overlay draws, when one is loaded.
     wind_forecast: Option<crate::nav::grib::GribForecast>,
+    /// The surface current the overlay draws, likewise. Fetched separately
+    /// from the wind — it is a different service and a much smaller answer,
+    /// and waiting for the GRIB to arrive before showing the tide's set would
+    /// be the tail wagging the dog.
+    current_forecast: Option<crate::nav::currents::CurrentForecast>,
     /// Worker threads reporting to the route-network channel that have not
     /// yet ended. The event loop keeps polling while any are outstanding —
     /// nothing else would wake it to collect their results.
@@ -392,6 +412,8 @@ pub struct RenderState {
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f32; 2]>,
     pick_objects: Vec<crate::pick::PickedObject>,
+    /// The query the open bubble is answering.
+    pick_shown: u64,
     /// Sequence number of a query the worker has not answered yet.
     ///
     /// Until it comes back there is nothing to show, and the event loop has to
@@ -504,6 +526,138 @@ fn profile_enabled() -> bool {
     })
 }
 
+/// A lattice of sample points that belongs to the sea rather than to the
+/// screen.
+///
+/// The weather overlays used to step across the window from its own corner and
+/// sample whatever water happened to lie under each point. That pins the
+/// pattern to the glass: pan, and the chart slides beneath a field that does
+/// not move; zoom, and it stays exactly as coarse as it was. A wind field has
+/// to belong to the water, so the lattice is laid out in Mercator and then
+/// projected, and every barb keeps its place on the sea as the chart moves.
+///
+/// The spacing is quantised to octaves of world distance. Derived straight
+/// from the zoom it would be re-cut on every wheel click and the whole field
+/// would crawl; rounded to the nearest power of two it holds still through a
+/// factor of two of zoom and then doubles cleanly.
+struct SampleGrid {
+    /// Where each point landed on screen, logical points, row-major.
+    screen: Vec<[f32; 2]>,
+    /// Where each point is on the earth, in the same order.
+    geo: Vec<(f64, f64)>,
+    cols: usize,
+    rows: usize,
+}
+
+impl SampleGrid {
+    fn is_empty(&self) -> bool {
+        self.cols == 0 || self.rows == 0
+    }
+}
+
+impl RenderState {
+    /// Lay a world-anchored lattice over `area`, about `spacing` points apart.
+    fn sample_grid(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
+        sample_grid_for(&self.camera, self.scale_factor, spacing, area)
+    }
+}
+
+/// The lattice, as arithmetic on a camera alone.
+///
+/// Split out from the renderer so it can be tested without a GPU — and the
+/// thing worth testing is precisely the bug this replaced: pan the camera and
+/// every sample must travel with the chart.
+///
+/// `area` is in logical points. The lattice is generous by one cell on every
+/// side so a wash reaches the edges of the chart rather than stopping short of
+/// them, and so a barb whose feathers cross the edge is still drawn.
+fn sample_grid_for(
+    camera: &Camera,
+    scale_factor: f32,
+    spacing: f32,
+    area: egui::Rect,
+) -> SampleGrid {
+    {
+        let empty = SampleGrid {
+            screen: Vec::new(),
+            geo: Vec::new(),
+            cols: 0,
+            rows: 0,
+        };
+        let ppp = scale_factor.max(0.01);
+        if area.width() <= 0.0 || area.height() <= 0.0 {
+            return empty;
+        }
+        // World units per logical point, and from that the world distance the
+        // caller asked for, rounded to the nearest octave.
+        let per_point = camera.zoom * ppp;
+        let wanted = spacing * per_point;
+        if !wanted.is_finite() || wanted <= 0.0 {
+            return empty;
+        }
+        let step = 2f32.powf(wanted.log2().round());
+        if !step.is_finite() || step <= 0.0 {
+            return empty;
+        }
+
+        // The world rectangle the visible area covers. Taken from the four
+        // corners because a tilted camera does not map a screen rectangle to a
+        // world one, and the bounding box of the corners is the honest
+        // conservative answer.
+        let (mut lo_x, mut lo_y) = (f32::INFINITY, f32::INFINITY);
+        let (mut hi_x, mut hi_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for (x, y) in [
+            (area.left(), area.top()),
+            (area.right(), area.top()),
+            (area.left(), area.bottom()),
+            (area.right(), area.bottom()),
+        ] {
+            let w = camera.screen_to_world(x * ppp, y * ppp);
+            lo_x = lo_x.min(w.x);
+            hi_x = hi_x.max(w.x);
+            lo_y = lo_y.min(w.y);
+            hi_y = hi_y.max(w.y);
+        }
+        if !(lo_x.is_finite() && lo_y.is_finite() && hi_x.is_finite() && hi_y.is_finite()) {
+            return empty;
+        }
+
+        let i0 = (lo_x / step).floor() as i64 - 1;
+        let i1 = (hi_x / step).ceil() as i64 + 1;
+        let j0 = (lo_y / step).floor() as i64 - 1;
+        let j1 = (hi_y / step).ceil() as i64 + 1;
+        let cols = (i1 - i0 + 1).max(0) as usize;
+        let rows = (j1 - j0 + 1).max(0) as usize;
+        // A camera looking at the whole earth through a tilted lens can ask
+        // for a lattice with no end to it. Refusing is better than freezing.
+        const MOST: usize = 20_000;
+        if cols < 2 || rows < 2 || cols.saturating_mul(rows) > MOST {
+            return empty;
+        }
+
+        let mut screen = Vec::with_capacity(cols * rows);
+        let mut geo = Vec::with_capacity(cols * rows);
+        // Rows run north to south so the lattice comes out in reading order on
+        // screen, which is what the fill's mesh expects.
+        for j in (j0..=j1).rev() {
+            for i in i0..=i1 {
+                let (wx, wy) = (i as f32 * step, j as f32 * step);
+                let s = camera.world_to_screen(wx, wy);
+                screen.push([s.x / ppp, s.y / ppp]);
+                let (lat, lon) =
+                    crate::render::projection::Projection::to_wgs84(wx as f64, wy as f64);
+                geo.push((lat, lon));
+            }
+        }
+        SampleGrid {
+            screen,
+            geo,
+            cols,
+            rows,
+        }
+    }
+}
+
 impl RenderState {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
@@ -592,7 +746,7 @@ impl RenderState {
                 view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
                 view_size: [size.width as f32, size.height as f32],
                 pixels_per_meter: 1.0,
-                _pad: 0.0,
+                px_per_point: scale_factor.max(0.5),
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
@@ -1040,6 +1194,8 @@ impl RenderState {
             symbol_renderer,
             symbol_camera_bind_group,
             pattern_renderer,
+            clear_colour: OCEAN_BACKGROUND,
+            chart_load: None,
             pattern_camera_bind_group,
             text_renderer,
             text_camera_bind_group,
@@ -1060,9 +1216,11 @@ impl RenderState {
             env_plan_fired: false,
             signalk_override_saved: None,
             wind_forecast: None,
+            current_forecast: None,
             route_net_jobs: 0,
             pick_anchor: None,
             pick_objects: Vec::new(),
+            pick_shown: 0,
             pick_pending: None,
 
             label_camera_bind_group,
@@ -1483,6 +1641,22 @@ impl RenderState {
                     0,
                     bytemuck::cast_slice(&palette_data),
                 );
+                if let Some(c) = engine.get_color("DEPDW") {
+                    self.clear_colour = c;
+                }
+                if let Some(ref patterns) = self.pattern_renderer {
+                    let tables = &engine.tables;
+                    let colour_of = |token: &str| {
+                        tables
+                            .get_color_f32(token)
+                            .map(|c| [0, 1, 2].map(|i| (c[i].clamp(0.0, 1.0) * 255.0).round() as u8))
+                    };
+                    let day = matches!(palette_name, "DAY" | "DAY_BRIGHT");
+                    patterns.switch_palette(
+                        &self.queue,
+                        (!day).then_some(&colour_of as &dyn Fn(&str) -> Option<[u8; 3]>),
+                    );
+                }
                 if let Some(ref mut symbol_renderer) = self.symbol_renderer {
                     if let Err(err) = symbol_renderer.switch_palette(&self.queue, palette_name) {
                         log::warn!(
@@ -1499,9 +1673,120 @@ impl RenderState {
 
     /// Load chart catalog for tile-based multi-chart rendering.
     /// Takes ownership of decryptor (not Clone) and wraps catalog in Arc.
-    /// Remember where chart sets live, so a download lands beside them.
+    /// Remember where chart sets live, so a download lands beside them —
+    /// and so the next session opens the same charts without an argument.
     pub fn set_chart_root(&mut self, root: std::path::PathBuf) {
+        if let Some(ref mut ui) = self.ui {
+            ui.charts.chosen = root.display().to_string();
+        }
         self.chart_root = Some(root);
+    }
+
+    /// Load a folder of charts now, replacing whatever is on screen.
+    ///
+    /// The startup path in `main` does the same three steps but is allowed to
+    /// take `Arc::get_mut` on a key store nothing else holds yet. By the time
+    /// the menu can call this, that store is shared with the tile worker, so
+    /// the keys are built fresh here rather than mutated in place — the
+    /// alternative is a panic the first time somebody changes folder.
+    ///
+    /// Returns how many cells the catalogue found, or a sentence fit for the
+    /// window: a folder of holiday photographs is a thing a user will pick by
+    /// accident, and it must say so rather than empty the chart.
+    /// Start loading a folder of charts on a worker thread.
+    ///
+    /// Building the catalogue decrypts every cell's header, which takes the
+    /// better part of twenty seconds on a real set — done on the UI thread,
+    /// the window froze with no spinner and no way to tell it was working.
+    /// `keep_view` holds the camera where it is (a reload after an install);
+    /// otherwise the view frames the new charts.
+    pub fn start_chart_folder_load(&mut self, dir: std::path::PathBuf, keep_view: bool) {
+        if let Some(ref mut ui) = self.ui {
+            ui.charts.loading = true;
+            ui.charts.status = "Loading charts…".into();
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(load_chart_folder(&worker_dir));
+        });
+        self.chart_load = Some(ChartLoad { dir, keep_view, rx });
+        self.needs_redraw = true;
+    }
+
+    /// Take a finished chart load, if one has arrived.
+    fn poll_chart_load(&mut self) {
+        let Some(ref load) = self.chart_load else { return };
+        let result = match load.rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("the chart loader stopped unexpectedly".into())
+            }
+        };
+        let ChartLoad { dir, keep_view, .. } = self.chart_load.take().unwrap();
+        match result {
+            Ok((catalog, keys, decryptor)) => {
+                let found = catalog.charts.len();
+                log::info!("chart folder {}: {found} cells", dir.display());
+                let view = keep_view.then(|| self.camera.clone());
+                self.set_chart_root(dir.clone());
+                self.load_catalog(catalog, keys, decryptor);
+                if let Some(camera) = view {
+                    self.camera = camera;
+                }
+                if let Some(ref mut ui) = self.ui {
+                    ui.charts.loading = false;
+                    ui.charts.chosen = dir.display().to_string();
+                    ui.charts.status = format!("{found} cells loaded");
+                }
+                self.refresh_installed();
+                // Only a folder that actually loaded is worth coming back to
+                // next time.
+                self.save_settings();
+            }
+            Err(e) => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.charts.loading = false;
+                    ui.charts.status = e;
+                }
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Whether charts are being loaded in the background.
+    pub fn chart_load_pending(&self) -> bool {
+        self.chart_load.is_some()
+    }
+
+    /// Re-key the shop's listing to what is on disk now. After an install
+    /// the table must stop saying "Not installed" about what it just put there.
+    fn refresh_installed(&mut self) {
+        let root = self.chart_root.clone().unwrap_or_else(|| "charts".into());
+        let Some(ref mut ui) = self.ui else { return };
+        if ui.shop.charts.is_empty() {
+            return;
+        }
+        ui.shop.installed = match_installed(&ui.shop.charts, &root);
+    }
+
+    /// The folder the last session was using, if it is still there.
+    ///
+    /// Read straight from the settings file rather than through the UI, because
+    /// `main` needs it before there is a window to hold a UI at all.
+    pub fn remembered_chart_folder() -> Option<std::path::PathBuf> {
+        let path = Self::settings_path()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            charts: crate::render::ui::ChartFolderView,
+        }
+        let p: Persisted = serde_json::from_str(&text).ok()?;
+        let dir = std::path::PathBuf::from(p.charts.chosen.trim());
+        // A folder on a memory stick that is no longer plugged in must not
+        // stop the plotter starting.
+        dir.is_dir().then_some(dir)
     }
 
     /// `NAVCORE_PLAN="from;to[;motor]"` types the passage planner's fields
@@ -1515,16 +1800,17 @@ impl RenderState {
         }
         self.env_plan_fired = true;
 
-        // `NAVCORE_WIND=1` turns the wind overlay on (and `NAVCORE_WIND=<n>`
-        // picks the forecast hour). Like the plan hook it has to wait for a
-        // view: at init_ui the camera is still looking at 0°N 0°E, and the
-        // fetch would ask for the wind over the Gulf of Guinea.
-        if let Ok(spec) = std::env::var("NAVCORE_WIND") {
+        // `NAVCORE_WIND=1` opens the weather sheet and fetches for what is on
+        // screen. Like the plan hook it has to wait for a view: at init_ui the
+        // camera is still looking at 0°N 0°E, and the fetch would ask for the
+        // wind over the Gulf of Guinea.
+        if std::env::var("NAVCORE_WIND").is_ok() {
             if let Some(ref mut ui) = self.ui {
                 ui.wind.show = true;
-                ui.wind.step = spec.trim().parse().unwrap_or(0);
+                ui.sheet.show = true;
             }
             self.spawn_wind_fetch();
+            self.spawn_point_fetch();
         }
 
         let Ok(spec) = std::env::var("NAVCORE_PLAN") else { return };
@@ -1739,8 +2025,20 @@ impl RenderState {
 
     /// Update scale factor for HiDPI display changes
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        let ppmm = 4.0 * scale_factor; // 96 DPI base = 4.0 ppmm
+        let changed = ppmm != self.effective_ppmm;
         self.scale_factor = scale_factor;
-        self.effective_ppmm = 4.0 * scale_factor; // 96 DPI base = 4.0 ppmm
+        self.effective_ppmm = ppmm;
+        // Tiles carry sizes baked at the old density — labels, light arcs,
+        // line-symbol spacing, even which charts were chosen for the scale —
+        // and the known-empty set was worked out with it too. Moving the
+        // window to a display of another density starts them over.
+        if changed && self.tile_mode {
+            self.tile_cache.clear();
+            self.pending_tiles.clear();
+            self.deferred_tile_results.clear();
+            self.needs_redraw = true;
+        }
     }
 
     fn current_text_layout_key(&self) -> u64 {
@@ -1813,6 +2111,7 @@ impl RenderState {
         // the camera (follow) and the mariner symbols, and both must be
         // settled before the camera is clamped and the chart is drawn.
         self.poll_shop();
+        self.poll_chart_load();
         self.poll_signalk();
         self.update_route_following();
         self.drain_route_net();
@@ -1830,7 +2129,7 @@ impl RenderState {
             view_proj: self.camera.view_projection_matrix().to_cols_array_2d(),
             view_size: [self.size.width as f32, self.size.height as f32],
             pixels_per_meter: 1.0 / self.camera.zoom, // Convert zoom (m/px) to px/m
-            _pad: 0.0,
+            px_per_point: self.scale_factor.max(0.5),
         };
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
@@ -1961,9 +2260,9 @@ impl RenderState {
                     resolve_target: multisampled.then_some(&view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: OCEAN_BACKGROUND[0] as f64,
-                            g: OCEAN_BACKGROUND[1] as f64,
-                            b: OCEAN_BACKGROUND[2] as f64,
+                            r: self.clear_colour[0] as f64,
+                            g: self.clear_colour[1] as f64,
+                            b: self.clear_colour[2] as f64,
                             a: 1.0,
                         }),
                         store: if multisampled {
@@ -2069,11 +2368,15 @@ impl RenderState {
         // self.ui is temporarily None and the pins would silently vanish.
         let routes_display = self.routes_display();
         let plan_pins = self.plan_pins();
-        // The step slider is the window's own state, so the label that says
-        // which hour is on screen is restated here rather than at the click.
-        self.refresh_wind_label();
         let wind_barbs = self.wind_barbs();
-        self.refresh_wind_coverage(wind_barbs.len());
+        // Projected before the take, like the routes and the pins: inside the
+        // block self.ui is None and both would silently vanish.
+        let current_arrows = self.current_arrows();
+        let wind_fill = self.wind_fill();
+        // Either layer drawing something means the field reaches the view.
+        let fill_drawn = wind_fill.kt.iter().filter(|k| k.is_some()).count();
+        self.refresh_wind_coverage(wind_barbs.len() + fill_drawn);
+        let weather_anchor = self.weather_anchor_screen();
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
@@ -2093,12 +2396,16 @@ impl RenderState {
                 crate::render::ui::UiState {
                     picked: self.pick_anchor.map(|_| self.pick_objects.as_slice()),
                     pick_anchor: anchor,
+                    pick_id: self.pick_shown,
                     own_ship,
                     ais,
                     mpp,
                     routes: routes_display,
                     plan_pins,
                     wind: wind_barbs,
+                    wind_fill,
+                    current: current_arrows,
+                    weather_anchor,
                 },
                 &self.fleet,
             );
@@ -2172,6 +2479,9 @@ impl RenderState {
                         self.signalk
                             .get_or_insert_with(crate::signalk::SignalKService::new)
                             .connect(stream);
+                        if let Some(ref mut ui) = self.ui {
+                            ui.instruments.active = true;
+                        }
                         self.save_settings();
                     }
                     self.needs_redraw = true;
@@ -2185,6 +2495,8 @@ impl RenderState {
                     self.fleet.clear();
                     if let Some(ref mut ui) = self.ui {
                         ui.instruments.connected = false;
+                        ui.instruments.active = false;
+                        ui.instruments.status = "Not connected".into();
                         ui.instruments.available.clear();
                     }
                     self.needs_redraw = true;
@@ -2195,6 +2507,9 @@ impl RenderState {
                     self.refresh_route_rows();
                     if let Some(ref mut ui) = self.ui {
                         ui.routes.open = !ui.routes.open;
+                    }
+                    if !self.ui.as_ref().is_some_and(|u| u.routes.open) {
+                        self.finish_route_edit();
                     }
                 }
                 crate::render::ui::UiAction::RouteActivate { route_id } => {
@@ -2218,6 +2533,10 @@ impl RenderState {
                     });
                     match (base, job) {
                         (Some(base), Some((route, set))) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.routes.net_busy = true;
+                                ui.routes.status = format!("Publishing \"{}\"…", route.name);
+                            }
                             let tx = self.route_net_sender();
                             std::thread::spawn(move || {
                                 let _done = JobGuard(tx.clone());
@@ -2259,7 +2578,21 @@ impl RenderState {
                 crate::render::ui::UiAction::PlanRoute { from, to, sail } => {
                     self.plan_passage(&from, &to, sail);
                 }
+                crate::render::ui::UiAction::PlanCancel => {
+                    // The workers notice at their next ring (or simply stay
+                    // quiet when they finish); the UI is free at once.
+                    crate::nav::isochrone::cancel_plans();
+                    if let Some(ref mut ui) = self.ui {
+                        ui.weather.busy = false;
+                        ui.weather.status = "planning cancelled".into();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::FollowSet { on } => {
+                    self.set_follow(on);
+                }
                 crate::render::ui::UiAction::RouteCreate => {
+                    self.finish_route_edit();
                     self.ensure_route_store();
                     let route = crate::nav::Route::new(unique_route_name(
                         self.route_store.as_ref(),
@@ -2321,7 +2654,15 @@ impl RenderState {
                         true
                     });
                 }
+                crate::render::ui::UiAction::RouteEdit { route_id: None } => {
+                    self.finish_route_edit();
+                }
                 crate::render::ui::UiAction::RouteEdit { route_id } => {
+                    // Switching straight from one route to another still
+                    // finishes the first, so an empty one does not linger.
+                    if self.ui.as_ref().and_then(|u| u.routes.editing).is_some() {
+                        self.finish_route_edit();
+                    }
                     if let Some(ref mut ui) = self.ui {
                         ui.routes.editing = route_id;
                         ui.routes.status = match route_id {
@@ -2416,7 +2757,72 @@ impl RenderState {
                     }
                     self.needs_redraw = true;
                 }
-                crate::render::ui::UiAction::WindRefresh => self.spawn_wind_fetch(),
+                crate::render::ui::UiAction::ChartFolderOpen { path } => {
+                    if self.chart_load.is_none() {
+                        self.start_chart_folder_load(std::path::PathBuf::from(&path), false);
+                    }
+                }
+                crate::render::ui::UiAction::WeatherSheetToggle => {
+                    let (showing, empty) = match self.ui.as_mut() {
+                        Some(u) => {
+                            u.sheet.show = !u.sheet.show;
+                            (u.sheet.show, u.sheet.data.is_none())
+                        }
+                        None => (false, true),
+                    };
+                    // Opening it with nothing in it fetches for where the
+                    // chart is looking — one click, not two, same as the
+                    // barbs have always done.
+                    if showing && empty {
+                        self.spawn_point_fetch();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::WeatherRefreshHere => {
+                    self.spawn_point_fetch();
+                    let (barbs, set) = self
+                        .ui
+                        .as_ref()
+                        .map(|u| (u.wind.show || u.wind.fill, u.sheet.current_field))
+                        .unwrap_or((false, false));
+                    if barbs {
+                        self.spawn_wind_fetch();
+                    }
+                    if set {
+                        self.spawn_current_fetch();
+                    }
+                }
+                crate::render::ui::UiAction::WindFillToggle => {
+                    let showing = self
+                        .ui
+                        .as_mut()
+                        .map(|u| {
+                            u.wind.fill = !u.wind.fill;
+                            u.wind.fill
+                        })
+                        .unwrap_or(false);
+                    // The wash and the barbs read the same field, so turning
+                    // it on with nothing loaded fetches once, exactly as the
+                    // barbs do.
+                    if showing && self.wind_forecast.is_none() {
+                        self.spawn_wind_fetch();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::CurrentFieldToggle => {
+                    let showing = self
+                        .ui
+                        .as_mut()
+                        .map(|u| {
+                            u.sheet.current_field = !u.sheet.current_field;
+                            u.sheet.current_field
+                        })
+                        .unwrap_or(false);
+                    if showing && self.current_forecast.is_none() {
+                        self.spawn_current_fetch();
+                    }
+                    self.needs_redraw = true;
+                }
                 crate::render::ui::UiAction::BoatSearch { query, country } => {
                     self.spawn_orc_search(query, country);
                 }
@@ -2432,6 +2838,10 @@ impl RenderState {
                         .and_then(|u| crate::signalk::resources::http_base(&u.instruments.url))
                     {
                         Some(base) => {
+                            if let Some(ref mut ui) = self.ui {
+                                ui.routes.net_busy = true;
+                                ui.routes.status = "Fetching routes from Signal K…".into();
+                            }
                             let tx = self.route_net_sender();
                             std::thread::spawn(move || {
                                 let _done = JobGuard(tx.clone());
@@ -2447,11 +2857,7 @@ impl RenderState {
                                                 )
                                             })
                                             .collect();
-                                        let n = routes.len();
                                         let _ = tx.send(RouteNetEvent::Fetched(routes));
-                                        let _ = tx.send(RouteNetEvent::Status(format!(
-                                            "Fetched {n} route(s) from Signal K"
-                                        )));
                                     }
                                     Err(e) => {
                                         let _ = tx.send(RouteNetEvent::Status(format!(
@@ -2505,40 +2911,29 @@ impl RenderState {
         let max_y = (extent.max_y as f32) - half_h;
 
         // If the extent is smaller than the viewport at the current zoom there
-        // is no meaningful range to clamp into, and the view is centred on the
-        // charts instead.
-        //
-        // Except while following the boat. That case is not hypothetical: at
-        // the zoom navcore opens at, a single chart set fits on screen whole,
-        // so this branch ran every frame and snapped the camera back a moment
-        // after the boat moved it — follow appeared to do nothing at all.
-        // Following still stays inside the charts, it simply is not dragged to
-        // their middle.
-        let centre_x = ((extent.min_x + extent.max_x) / 2.0) as f32;
-        let centre_y = ((extent.min_y + extent.max_y) / 2.0) as f32;
-
+        // is no range that keeps the screen full of chart. The centre of the
+        // screen is then only kept over the charts, not pinned to their
+        // middle: pinning it — as this once did, every frame — undid every
+        // pan and every zoom-at-the-cursor at the zoom navcore opens at, and
+        // snapped the boat away from the middle while following her.
         if min_x.is_finite() && max_x.is_finite() && min_x <= max_x {
             self.camera.position.x = self.camera.position.x.clamp(min_x, max_x);
-        } else if self.following {
+        } else {
             self.camera.position.x = self
                 .camera
                 .position
                 .x
                 .clamp(extent.min_x as f32, extent.max_x as f32);
-        } else {
-            self.camera.position.x = centre_x;
         }
 
         if min_y.is_finite() && max_y.is_finite() && min_y <= max_y {
             self.camera.position.y = self.camera.position.y.clamp(min_y, max_y);
-        } else if self.following {
+        } else {
             self.camera.position.y = self
                 .camera
                 .position
                 .y
                 .clamp(extent.min_y as f32, extent.max_y as f32);
-        } else {
-            self.camera.position.y = centre_y;
         }
     }
 
@@ -2632,6 +3027,9 @@ impl RenderState {
         const MAX_UPLOADS_PER_FRAME: usize = 64;
         let deferred = std::mem::take(&mut self.deferred_tile_results);
         for response in deferred {
+            if response.ppmm != self.effective_ppmm {
+                continue; // built for the display the window has left
+            }
             if uploads_this_frame >= MAX_UPLOADS_PER_FRAME {
                 self.deferred_tile_results.push(response);
                 continue;
@@ -2656,6 +3054,9 @@ impl RenderState {
             let results = worker.poll_results();
             for response in results {
                 self.pending_tiles.remove(&response.tile_id);
+                if response.ppmm != self.effective_ppmm {
+                    continue; // built for the display the window has left
+                }
                 if uploads_this_frame >= MAX_UPLOADS_PER_FRAME {
                     // Defer excess results to next frame (avoid re-building)
                     self.deferred_tile_results.push(response);
@@ -2685,6 +3086,7 @@ impl RenderState {
                 // answer to one the user has already dismissed is discarded.
                 if self.pick_pending == Some(answer.seq) {
                     self.pick_pending = None;
+                    self.pick_shown = answer.seq;
                     self.pick_anchor =
                         Some([answer.position[0] as f32, answer.position[1] as f32]);
                     self.pick_objects = answer.objects;
@@ -3369,6 +3771,16 @@ impl RenderState {
                 &self.window,
                 self.config.format,
             ));
+            // Seed the remembered folder before anything can save over it.
+            // A session started on the test triangle, or on a folder named
+            // once on the command line, still saves its settings when the
+            // user moves an instrument — and an empty field written then
+            // would quietly forget the boat's own charts.
+            if let (Some(ref mut ui), Some(dir)) =
+                (self.ui.as_mut(), Self::remembered_chart_folder())
+            {
+                ui.charts.chosen = dir.display().to_string();
+            }
             // `NAVCORE_ROUTE_NEW="lat,lon;lat,lon;…"` builds a route by the
             // same path a tap takes, so the editor can be captured without
             // a pointer.
@@ -3493,6 +3905,9 @@ impl RenderState {
                 self.signalk
                     .get_or_insert_with(crate::signalk::SignalKService::new)
                     .connect(stream);
+                if let Some(ref mut ui) = self.ui {
+                    ui.instruments.active = true;
+                }
             }
         }
     }
@@ -3523,6 +3938,54 @@ impl RenderState {
     /// Is the pointer over the interface rather than the chart?
     pub fn ui_pointer_over(&self) -> bool {
         self.ui.as_ref().is_some_and(|u| u.pointer_over_ui())
+    }
+
+    /// Is this physical-pixel position covered by the interface? For touch,
+    /// where there is no hovering pointer to ask about.
+    pub fn ui_covers(&self, x: f32, y: f32) -> bool {
+        self.ui.as_ref().is_some_and(|u| u.covers(x, y))
+    }
+
+    /// Esc: back out of whatever is most in the way — the info bubble, then
+    /// an armed planner pin, then route editing. Answers whether it did
+    /// anything.
+    pub fn escape(&mut self) -> bool {
+        if self.pick_active() {
+            self.dismiss_pick();
+            return true;
+        }
+        if let Some(ref mut ui) = self.ui {
+            if ui.plan.picking.take().is_some() {
+                self.needs_redraw = true;
+                return true;
+            }
+        }
+        if self.ui.as_ref().and_then(|u| u.routes.editing).is_some() {
+            self.finish_route_edit();
+            return true;
+        }
+        false
+    }
+
+    /// A tap on the chart, from mouse or finger.
+    ///
+    /// An armed planner pin or an open route editor takes the tap even while
+    /// the info bubble is up — the user asked for that tap deliberately, and
+    /// losing it to "close the bubble" left the pin armed and the waypoint
+    /// unplaced. Otherwise a tap with the bubble open closes it, the usual
+    /// tap-away of a popover, and a tap with nothing open asks what is there.
+    pub fn tap_at_screen(&mut self, x: f32, y: f32) {
+        let world = self.camera.screen_to_world(x, y);
+        let (wx, wy) = (world.x as f64, world.y as f64);
+        if self.plan_pick_fill(wx, wy) || self.route_edit_append(wx, wy) {
+            self.dismiss_pick();
+            return;
+        }
+        if self.pick_active() {
+            self.dismiss_pick();
+        } else {
+            self.pick_at_world(world.x, world.y);
+        }
     }
 
     /// Ask what chart objects are under a screen position, for the info bubble.
@@ -3568,7 +4031,7 @@ impl RenderState {
         let Some(ref mut ui) = self.ui else { return false };
         let Some(target) = ui.plan.picking.take() else { return false };
         let (lat, lon) = crate::render::projection::Projection::to_wgs84(x, y);
-        let text = format!("{lat:.4},{lon:.4}");
+        let text = crate::geo::format_latlon(lat, lon);
         match target {
             crate::render::ui::PlanPickTarget::From => ui.plan.from = text,
             crate::render::ui::PlanPickTarget::To => ui.plan.to = text,
@@ -3635,6 +4098,7 @@ impl RenderState {
             instruments: &'a crate::render::ui::InstrumentView,
             weather: &'a crate::render::ui::WeatherView,
             boat: &'a crate::render::ui::BoatView,
+            charts: &'a crate::render::ui::ChartFolderView,
         }
         // An env override is for this run; the file keeps what the user set.
         let mut instruments = ui.instruments.clone();
@@ -3645,6 +4109,7 @@ impl RenderState {
             instruments: &instruments,
             weather: &ui.weather,
             boat: &ui.boat,
+            charts: &ui.charts,
         }) else {
             return;
         };
@@ -3779,20 +4244,7 @@ impl RenderState {
             return Vec::new();
         }
 
-        let own = self.fleet.own.position().map(|(lat, lon)| Motion {
-            at: LatLon::new(lat, lon),
-            course: self
-                .fleet
-                .own
-                .number("navigation.courseOverGroundTrue")
-                .or_else(|| self.fleet.own.heading_true())
-                .unwrap_or(0.0),
-            speed: self
-                .fleet
-                .own
-                .number("navigation.speedOverGround")
-                .unwrap_or(0.0),
-        });
+        let own = self.own_motion();
 
         let mut out = Vec::new();
         for target in self.fleet.targets() {
@@ -3830,7 +4282,7 @@ impl RenderState {
             if let Some(own) = own {
                 let (range, bearing) = crate::geo::range_bearing(own.at, there);
                 push("Range", format!("{:.2} NM", to_nm(range)));
-                push("Bearing", format!("{:03.0}°", bearing.to_degrees()));
+                push("Bearing", crate::geo::format_bearing(bearing.to_degrees()));
 
                 if let (Some(course), Some(speed)) = (target.course(), target.speed()) {
                     if let Some(c) = cpa(own, Motion { at: there, course, speed }) {
@@ -3956,7 +4408,12 @@ impl RenderState {
                             .then(|| r.legs.get(i - 1))
                             .flatten()
                             .and_then(|l| l.plan.as_ref())
-                            .map(|p| p.eta.format("%H:%M").to_string());
+                            .map(|p| {
+                                // Local, like the weather sheet's clock: the
+                                // same instant must not read 12:00 beside the
+                                // barbs and 14:00 on the sheet.
+                                p.eta.with_timezone(&chrono::Local).format("%H:%M").to_string()
+                            });
                         let arrival_radius_px = (to_wp == Some(*id)).then(|| {
                             let k = 1.0 / wp.position.lat.to_radians().cos();
                             let radius_nm = wp.arrival_radius_nm.unwrap_or(0.1);
@@ -3986,12 +4443,21 @@ impl RenderState {
     /// north a Mercator northing is stretched by nearly a factor of two, so a
     /// range measured there would be wrong in exactly the situation the number
     /// exists for.
-    fn ais_targets(&self) -> Vec<crate::render::ui_ais::AisTarget> {
-        use crate::geo::{cpa, LatLon, Motion};
-
-        let ppp = self.scale_factor.max(0.01);
-        let own = self.fleet.own.position().map(|(lat, lon)| Motion {
-            at: LatLon::new(lat, lon),
+    /// Own ship's position and motion, for CPA and range/bearing — `None`
+    /// while the fix is stale. A CPA worked from where the boat was a minute
+    /// ago is a confident wrong answer, the worst kind for collision work.
+    fn own_motion(&self) -> Option<crate::geo::Motion> {
+        let fresh = self
+            .fleet
+            .own
+            .get("navigation.position")
+            .is_some_and(|r| !r.is_stale());
+        if !fresh {
+            return None;
+        }
+        let (lat, lon) = self.fleet.own.position()?;
+        Some(crate::geo::Motion {
+            at: crate::geo::LatLon::new(lat, lon),
             course: self
                 .fleet
                 .own
@@ -4003,7 +4469,14 @@ impl RenderState {
                 .own
                 .number("navigation.speedOverGround")
                 .unwrap_or(0.0),
-        });
+        })
+    }
+
+    fn ais_targets(&self) -> Vec<crate::render::ui_ais::AisTarget> {
+        use crate::geo::{cpa, LatLon, Motion};
+
+        let ppp = self.scale_factor.max(0.01);
+        let own = self.own_motion();
 
         self.fleet
             .targets()
@@ -4048,6 +4521,8 @@ impl RenderState {
                 crate::signalk::service::Event::Status(s) => {
                     if let Some(ref mut ui) = self.ui {
                         ui.instruments.connected = s.is_connected();
+                        ui.instruments.active =
+                            !matches!(s, crate::signalk::service::Status::Disconnected);
                         ui.instruments.status = s.summary();
                     }
                 }
@@ -4074,25 +4549,46 @@ impl RenderState {
         }
 
         self.following = false;
-        // Keep the boat centred, if asked. Only while the fix is fresh: a
-        // chart that keeps recentring on a dead position is worse than one
-        // that stays put and lets the stale marker drift off.
         if follow {
-            if let Some((lat, lon)) = self.fleet.own.position() {
-                let fresh = self
-                    .fleet
-                    .own
-                    .get("navigation.position")
-                    .is_some_and(|r| !r.is_stale());
-                if fresh {
-                    let (x, y) =
-                        crate::render::projection::Projection::to_mercator(lat, lon);
-                    self.camera.position = glam::Vec2::new(x as f32, y as f32);
-                    self.following = true;
-                }
-            }
+            self.recentre_on_boat();
         }
         self.needs_redraw = true;
+    }
+
+    /// Put the boat in the middle of the chart. Only while the fix is fresh:
+    /// a chart that keeps recentring on a dead position is worse than one
+    /// that stays put and lets the stale marker drift off.
+    fn recentre_on_boat(&mut self) {
+        let Some((lat, lon)) = self.fleet.own.position() else { return };
+        let fresh = self
+            .fleet
+            .own
+            .get("navigation.position")
+            .is_some_and(|r| !r.is_stale());
+        if fresh {
+            let (x, y) = crate::render::projection::Projection::to_mercator(lat, lon);
+            self.camera.position = glam::Vec2::new(x as f32, y as f32);
+            self.following = true;
+        }
+    }
+
+    /// Turn following on or off, from the button on the chart or the `C` key.
+    /// On means now, not at the next position report.
+    pub fn set_follow(&mut self, on: bool) {
+        if let Some(ref mut ui) = self.ui {
+            ui.instruments.follow = on;
+        }
+        self.following = false;
+        if on {
+            self.recentre_on_boat();
+        }
+        self.save_settings();
+        self.needs_redraw = true;
+    }
+
+    /// Whether the chart is keeping the boat centred.
+    pub fn follow_on(&self) -> bool {
+        self.ui.as_ref().is_some_and(|u| u.instruments.follow)
     }
 
     fn shop_send(&mut self, request: crate::shop::service::Request) {
@@ -4119,6 +4615,24 @@ impl RenderState {
         let Some(chart) = ui.shop.charts.iter().find(|c| c.id == chart_id) else {
             return;
         };
+
+        // A live subscription this machine holds no slot for: the download
+        // spends one, for good. Said before, not discovered after.
+        if !chart.expired {
+            let machine = ui.shop.system_name.clone().unwrap_or_default();
+            ui.shop.pending = Some(crate::render::ui::PendingDownload {
+                chart_id: chart_id.to_string(),
+                chart_name: chart.name.clone(),
+                edition: None,
+                because: format!(
+                    "This assigns one of the {} free slot(s) on this licence to \"{machine}\". \
+                     o-charts cannot move or cancel an assignment once a chart is requested.",
+                    chart.free_slots()
+                ),
+                new_slot: true,
+            });
+            return;
+        }
 
         let from_slot = ui
             .shop
@@ -4164,6 +4678,7 @@ impl RenderState {
             chart_name: chart.name.clone(),
             edition,
             because,
+            new_slot: false,
         });
     }
 
@@ -4311,10 +4826,17 @@ impl RenderState {
     /// on screen says the fix behind them is minutes old. The same reasoning
     /// as the instrument bar clearing itself when Signal K drops.
     fn clear_guidance(&mut self) {
+        self.guidance_waiting(None);
+    }
+
+    /// No guidance this frame. `why`, when a route is still being followed,
+    /// is what the strip says instead.
+    fn guidance_waiting(&mut self, why: Option<String>) {
         if let Some(ref mut ui) = self.ui {
-            if ui.routes.guidance.take().is_some() {
+            if ui.routes.guidance.take().is_some() || ui.routes.guidance_waiting != why {
                 self.needs_redraw = true;
             }
+            ui.routes.guidance_waiting = why;
         }
     }
 
@@ -4324,6 +4846,7 @@ impl RenderState {
         if let Some(ref mut ui) = self.ui {
             ui.routes.active = None;
             ui.routes.guidance = None;
+            ui.routes.guidance_waiting = None;
         }
         self.refresh_route_rows();
         self.needs_redraw = true;
@@ -4345,7 +4868,7 @@ impl RenderState {
             .route_follow
             .as_ref()
             .filter(|f| f.route_id == id)
-            .and_then(|f| f.target(self.route_store.as_ref()?.route(id)?));
+            .and_then(|f| Some(f.marks_ahead(self.route_store.as_ref()?.route(id)?)));
 
         let Some(store) = self.route_store.as_mut() else { return };
         let Some(mut route) = store.route(id).cloned() else { return };
@@ -4364,7 +4887,7 @@ impl RenderState {
         if let Some(target) = steering_to {
             let route = self.route_store.as_ref().and_then(|s| s.route(id)).cloned();
             if let (Some(follow), Some(route)) = (self.route_follow.as_mut(), route) {
-                follow.retarget(&route, target);
+                follow.retarget(&route, &target);
             }
         }
         // A route the user is editing is a route they want to watch.
@@ -4378,6 +4901,38 @@ impl RenderState {
 
     /// Append a waypoint at a tapped position to the route being edited.
     /// Answers whether the tap was claimed.
+    /// Leave route editing, however the user got out: Done, closing the
+    /// window, or starting on another route. A route left with no waypoints
+    /// is discarded — pressing New route and changing your mind should not
+    /// leave "Route 3 · 0 legs" behind to be cleaned up by hand.
+    fn finish_route_edit(&mut self) {
+        let Some(id) = self.ui.as_mut().and_then(|u| u.routes.editing.take()) else {
+            return;
+        };
+        let empty = self
+            .route_store
+            .as_ref()
+            .and_then(|s| s.route(id))
+            .is_some_and(|r| r.waypoints.is_empty());
+        let mut status = String::new();
+        if empty {
+            if self.ui.as_ref().and_then(|u| u.routes.active) == Some(id) {
+                self.deactivate_route();
+            }
+            if let Some(Ok(_)) = self.route_store.as_mut().map(|s| s.delete_route(id)) {
+                status = "empty route discarded".into();
+            }
+            if let Some(ref mut ui) = self.ui {
+                ui.routes.visible.remove(&id);
+            }
+        }
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.status = status;
+        }
+        self.refresh_route_rows();
+        self.needs_redraw = true;
+    }
+
     fn route_edit_append(&mut self, x: f64, y: f64) -> bool {
         let Some(id) = self.ui.as_ref().and_then(|u| u.routes.editing) else {
             return false;
@@ -4393,7 +4948,20 @@ impl RenderState {
             }
             return false;
         }
-        let n = store.route(id).map(|r| r.waypoints.len()).unwrap_or(0);
+        // One past the highest "WP n" already on the route, not the count:
+        // after a deletion the count would hand out a name already in use.
+        let n = store
+            .route(id)
+            .map(|r| {
+                r.waypoints
+                    .iter()
+                    .filter_map(|w| store.waypoints.get(*w))
+                    .filter_map(|w| w.name.strip_prefix("WP ")?.parse::<usize>().ok())
+                    .max()
+                    .unwrap_or(0)
+                    .max(r.waypoints.len())
+            })
+            .unwrap_or(0);
         let wp = crate::nav::model::Waypoint::new(format!("WP {}", n + 1), lat, lon);
         let wp_id = wp.id;
         store.waypoints.insert(wp);
@@ -4457,26 +5025,31 @@ impl RenderState {
         });
     }
 
-    /// Restate which hour the overlay is showing, in local terms a crew can
-    /// use: the valid time and how far ahead of now it is.
-    fn refresh_wind_label(&mut self) {
-        let Some(ref mut ui) = self.ui else { return };
-        let Some(&t) = ui.wind.steps.get(ui.wind.step) else {
-            ui.wind.valid_label.clear();
-            return;
-        };
-        use chrono::TimeZone as _;
-        let valid = chrono::Utc
-            .timestamp_millis_opt(t)
-            .single()
-            .unwrap_or_else(chrono::Utc::now);
-        let ahead = (t - chrono::Utc::now().timestamp_millis()) as f64 / 3_600_000.0;
-        ui.wind.valid_label = format!(
-            "valid {} ({}{:.0} h)",
-            valid.format("%d %b %H:%M UTC"),
-            if ahead < -0.05 { "−" } else { "+" },
-            ahead.abs()
-        );
+    /// The instant every weather display on screen is showing.
+    ///
+    /// One reading of one cursor, used by the barbs, the current arrows and
+    /// the sheet alike. Before there was a sheet each display carried its own
+    /// step index, and it was possible — easy, in fact — to have the barbs on
+    /// one hour and the numbers on another.
+    fn weather_cursor_ms(&self) -> i64 {
+        let now = chrono::Utc::now().timestamp_millis();
+        match self.ui.as_ref() {
+            // A closed sheet has no visible cursor, so nothing on screen says
+            // which hour the overlays show — they must then show the present,
+            // not the +30 h someone scrubbed to before closing it.
+            Some(ui) if ui.sheet.show => ui.sheet.cursor(now),
+            _ => now,
+        }
+    }
+
+    /// The cursor, held inside a field's own span — or `None` when it lies
+    /// well outside it. Clamping a little is honest (the steps are hours
+    /// apart); clamping +72 h to a field that ends at +48 h would draw
+    /// Tuesday's wind labelled as Thursday's.
+    fn field_time_ms(&self, first: i64, last: i64) -> Option<i64> {
+        const SLACK_MS: i64 = 3 * 3_600_000;
+        let t = self.weather_cursor_ms();
+        (t >= first - SLACK_MS && t <= last + SLACK_MS).then(|| t.clamp(first, last))
     }
 
     /// The wind field projected onto a screen grid, for the overlay.
@@ -4491,53 +5064,241 @@ impl RenderState {
         if !ui.wind.show || ui.wind.steps.is_empty() {
             return Vec::new();
         }
-        let time_ms = ui.wind.steps[ui.wind.step.min(ui.wind.steps.len() - 1)];
-        let ppp = self.scale_factor.max(0.01);
-        let (w, h) = (
-            self.config.width as f32 / ppp,
-            self.config.height as f32 / ppp,
-        );
+        // The sheet's cursor, held inside what this field actually covers.
+        // The two need not span the same hours — the GRIB reaches 48 h and
+        // the point forecast further — and clamping is honest here, because
+        // the barbs then simply stop moving at the edge of their own data.
+        let Some((first, last)) = forecast.valid_span() else {
+            return Vec::new();
+        };
+        let Some(time_ms) = self.field_time_ms(first, last) else {
+            return Vec::new();
+        };
         // One barb every ~64 points: dense enough to show a shift across the
-        // screen, sparse enough that the feathers never collide.
-        const SPACING: f32 = 64.0;
+        // screen, sparse enough that the feathers never collide. Anchored to
+        // the water, so the field travels with the chart under a pan.
+        let area = ui.chart_area();
+        let grid = self.sample_grid(64.0, area);
         let mut barbs = Vec::new();
-        let mut y = SPACING * 0.75;
-        while y < h {
-            let mut x = SPACING * 0.75;
-            while x < w {
-                let world = self.camera.screen_to_world(x * ppp, y * ppp);
-                let (lat, lon) = crate::render::projection::Projection::to_wgs84(
-                    world.x as f64,
-                    world.y as f64,
-                );
-                if let Some((from_deg, kt)) = forecast.sample(lat, lon, time_ms) {
-                    barbs.push(crate::render::ui_wind::WindBarb {
-                        screen: [x, y],
-                        from_deg: from_deg as f32,
-                        kt: kt as f32,
-                    });
-                }
-                x += SPACING;
+        for (screen, &(lat, lon)) in grid.screen.iter().zip(grid.geo.iter()) {
+            // A barb whose centre is under a panel is a barb nobody sees.
+            if !area.contains(egui::pos2(screen[0], screen[1])) {
+                continue;
             }
-            y += SPACING;
+            if let Some((from_deg, kt)) = forecast.sample(lat, lon, time_ms) {
+                barbs.push(crate::render::ui_wind::WindBarb {
+                    screen: *screen,
+                    from_deg: from_deg as f32,
+                    kt: kt as f32,
+                });
+            }
         }
         barbs
+    }
+
+    /// The wind field as a screen-space grid of speeds, for the colour wash.
+    ///
+    /// Coarser than a pixel and finer than the model: 26 points is close
+    /// enough that the eye reads a smooth gradient once the GPU has
+    /// interpolated between the corners, and sparse enough that a 1080p
+    /// window costs about 3 000 samples rather than two million. The grid is
+    /// anchored to the window like the barbs, so it does not crawl when a
+    /// panel opens.
+    fn wind_fill(&self) -> crate::render::ui_wind::WindFill {
+        let empty = crate::render::ui_wind::WindFill::default();
+        let (Some(ui), Some(forecast)) = (self.ui.as_ref(), self.wind_forecast.as_ref()) else {
+            return empty;
+        };
+        if !ui.wind.fill || ui.wind.steps.is_empty() {
+            return empty;
+        }
+        let Some((first, last)) = forecast.valid_span() else {
+            return empty;
+        };
+        let Some(time_ms) = self.field_time_ms(first, last) else {
+            return empty;
+        };
+        // Finer than the barbs because the GPU draws the gradient between the
+        // corners, and anchored to the water for the same reason they are:
+        // a wash that stands still under a pan reads as a smear on the glass.
+        let grid = self.sample_grid(32.0, ui.chart_area());
+        if grid.is_empty() {
+            return empty;
+        }
+        let kt = grid
+            .geo
+            .iter()
+            .map(|&(lat, lon)| forecast.sample(lat, lon, time_ms).map(|(_, kt)| kt as f32))
+            .collect();
+        crate::render::ui_wind::WindFill {
+            screen: grid.screen,
+            cols: grid.cols,
+            rows: grid.rows,
+            kt,
+        }
     }
 
     /// Say so when the loaded field has nothing to show here, rather than
     /// drawing an empty sea and letting it read as calm.
     fn refresh_wind_coverage(&mut self, drawn: usize) {
         let loaded = self.wind_forecast.is_some();
+        // Past the field's last step the overlay draws nothing on purpose;
+        // say when it ends rather than blame the view.
+        let ends = self
+            .wind_forecast
+            .as_ref()
+            .and_then(|f| f.valid_span())
+            .filter(|&(first, last)| self.field_time_ms(first, last).is_none())
+            .map(|(_, last)| last);
         let Some(ref mut ui) = self.ui else { return };
-        if !ui.wind.show || ui.wind.busy || !loaded {
+        if !(ui.wind.show || ui.wind.fill) || ui.wind.busy || !loaded {
             return;
         }
-        let uncovered = "the loaded wind does not reach this view — press Refresh here";
-        if drawn == 0 && !ui.wind.steps.is_empty() {
+        let uncovered = "the wind field does not reach this view — press Here";
+        let past_end = "the wind field ends at";
+        if let Some(last) = ends {
+            let at = chrono::DateTime::from_timestamp_millis(last)
+                .map(|t| t.with_timezone(&chrono::Local).format("%a %H:%M").to_string())
+                .unwrap_or_default();
+            ui.wind.status = format!("{past_end} {at} — nothing to draw for the cursor's hour");
+        } else if drawn == 0 && !ui.wind.steps.is_empty() {
             ui.wind.status = uncovered.into();
-        } else if ui.wind.status == uncovered {
+        } else if ui.wind.status == uncovered || ui.wind.status.starts_with(past_end) {
             ui.wind.status.clear();
         }
+    }
+
+    /// Where the point forecast should be taken: the middle of the chart.
+    ///
+    /// The same place "Here" fetches the wind and current fields for, so
+    /// the lanes and the barbs always describe the same water. It used to be
+    /// the boat whenever there was a fix, which meant panning to tomorrow's
+    /// destination and pressing Here moved the barbs but left the lanes at
+    /// the berth. While following, the boat *is* the middle of the chart.
+    fn weather_anchor_latlon(&self) -> crate::geo::LatLon {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
+        let world = self.camera.screen_to_world(w / 2.0, h / 2.0);
+        let (lat, lon) =
+            crate::render::projection::Projection::to_wgs84(world.x as f64, world.y as f64);
+        crate::geo::LatLon::new(lat.clamp(-89.0, 89.0), lon)
+    }
+
+    /// Fetch the point forecast behind the sheet on a worker thread.
+    fn spawn_point_fetch(&mut self) {
+        let at = self.weather_anchor_latlon();
+        let days = self
+            .ui
+            .as_ref()
+            // At least the sheet's widest span (3 days), or a third of it
+            // would be blank.
+            .map(|u| u.weather.hours.div_ceil(24).clamp(3, 8))
+            .unwrap_or(3);
+        if let Some(ref mut ui) = self.ui {
+            ui.sheet.busy = true;
+            ui.sheet.status = "fetching…".into();
+            // The place moves only when its forecast arrives: moved now, a
+            // failed fetch would leave the old lanes under the new name.
+            if ui.sheet.data.is_none() {
+                ui.sheet.anchor = Some([at.lat, at.lon]);
+                ui.sheet.place = crate::nav::pointfx::place_label(at.lat, at.lon);
+                ui.sheet.source = crate::nav::pointfx::POINT_SOURCE_LABEL.into();
+            }
+            ui.sheet.show = true;
+        }
+        let tx = self.route_net_sender();
+        std::thread::spawn(move || {
+            let _done = JobGuard(tx.clone());
+            let _ = tx.send(
+                match crate::nav::pointfx::PointForecast::fetch(at.lat, at.lon, days) {
+                    Ok(f) => RouteNetEvent::PointLoaded(Box::new(f)),
+                    Err(e) => RouteNetEvent::PointFailed(e),
+                },
+            );
+        });
+    }
+
+    /// Fetch the surface current for the visible area on a worker thread.
+    fn spawn_current_fetch(&mut self) {
+        let area = self.visible_geo_box();
+        let hours = self
+            .ui
+            .as_ref()
+            .map(|u| u.weather.hours.min(72))
+            .unwrap_or(48);
+        if let Some(ref mut ui) = self.ui {
+            ui.sheet.status = "fetching the set…".into();
+        }
+        let tx = self.route_net_sender();
+        std::thread::spawn(move || {
+            let _done = JobGuard(tx.clone());
+            let _ = tx.send(
+                match crate::nav::currents::CurrentForecast::fetch(area, hours) {
+                    Ok(f) => RouteNetEvent::CurrentLoaded(Box::new(f)),
+                    Err(e) => RouteNetEvent::CurrentFailed(e),
+                },
+            );
+        });
+    }
+
+    /// The current field projected onto a screen grid, for the overlay.
+    ///
+    /// Coarser than the barbs on purpose. Two fields of arrows at the same
+    /// spacing would interleave into a thicket, and the current is the slower
+    /// story of the two: a grid every ~96 points reads as a pattern the eye
+    /// can follow round a headland.
+    fn current_arrows(&self) -> Vec<crate::render::ui_weather::CurrentArrow> {
+        let (Some(ui), Some(field)) = (self.ui.as_ref(), self.current_forecast.as_ref()) else {
+            return Vec::new();
+        };
+        if !ui.sheet.current_field {
+            return Vec::new();
+        }
+        let steps = field.steps();
+        let (Some(&first), Some(&last)) = (steps.first(), steps.last()) else {
+            return Vec::new();
+        };
+        let Some(time_ms) = self.field_time_ms(first, last) else {
+            return Vec::new();
+        };
+        // Only over the chart the reader can see, and anchored to the water
+        // like the barbs: an arrow that stands still while the tide it
+        // describes slides past is worse than no arrow.
+        let area = ui.chart_area();
+        let grid = self.sample_grid(96.0, area);
+        let mut out = Vec::new();
+        for (screen, &(lat, lon)) in grid.screen.iter().zip(grid.geo.iter()) {
+            if !area.contains(egui::pos2(screen[0], screen[1])) {
+                continue;
+            }
+            if let Some((to_deg, kt)) = field.sample(lat, lon, time_ms) {
+                out.push(crate::render::ui_weather::CurrentArrow {
+                    screen: *screen,
+                    to_deg: to_deg as f32,
+                    kt: kt as f32,
+                });
+            }
+        }
+        out
+    }
+
+    /// Where the sheet's point forecast was taken, in logical points.
+    /// `None` when there is none, or when it has panned off the screen —
+    /// a marker clamped to the edge would claim the forecast was taken there.
+    fn weather_anchor_screen(&self) -> Option<[f32; 2]> {
+        let ui = self.ui.as_ref()?;
+        if !ui.sheet.show {
+            return None;
+        }
+        let [lat, lon] = ui.sheet.anchor?;
+        let (mx, my) = crate::render::projection::Projection::to_mercator(lat, lon);
+        let s = self.camera.world_to_screen(mx as f32, my as f32);
+        let ppp = self.scale_factor.max(0.01);
+        let (x, y) = (s.x / ppp, s.y / ppp);
+        let (w, h) = (
+            self.config.width as f32 / ppp,
+            self.config.height as f32 / ppp,
+        );
+        (x >= -20.0 && y >= -20.0 && x <= w + 20.0 && y <= h + 20.0).then_some([x, y])
     }
 
     /// Search ORC certificates on a worker thread; results drain back into
@@ -4637,9 +5398,10 @@ impl RenderState {
         match (start, finish) {
             (Some(a), Some(b)) => {
                 let name = format!(
-                    "{} {:.3},{:.3} to {:.3},{:.3}",
+                    "{} {} to {}",
                     if sail { "Sail" } else { "Motor" },
-                    a.lat, a.lon, b.lat, b.lon
+                    crate::nav::pointfx::place_label(a.lat, a.lon),
+                    crate::nav::pointfx::place_label(b.lat, b.lon),
                 );
                 if sail {
                     self.spawn_wx_plan(a, b, name);
@@ -4648,10 +5410,21 @@ impl RenderState {
                 }
             }
             (None, _) if from.trim().is_empty() => {
-                status(self, "no boat position yet — type a start as lat, lon");
+                status(self, "no boat position yet — tap 📍 by \"from\" and tap the chart, \
+                              or type a start");
             }
-            (None, _) => status(self, "start must be lat, lon in decimal degrees"),
-            (_, None) => status(self, "destination must be lat, lon in decimal degrees"),
+            (None, _) => status(
+                self,
+                "can't read the start — try 56°24.6'N 10°58.8'E or 56.41, 10.98",
+            ),
+            (_, None) if to.trim().is_empty() => status(
+                self,
+                "where to? Tap 📍 by \"to\" and tap the chart, or type a position",
+            ),
+            (_, None) => status(
+                self,
+                "can't read the destination — try 56°24.6'N 10°58.8'E or 56.41, 10.98",
+            ),
         }
     }
 
@@ -4662,7 +5435,7 @@ impl RenderState {
         self.save_settings();
         let Some(dir) = self.chart_root.clone() else {
             if let Some(ref mut ui) = self.ui {
-                ui.weather.status = "no chart directory loaded".into();
+                ui.weather.status = "no chart folder loaded — choose one under Charts".into();
             }
             return;
         };
@@ -4689,6 +5462,7 @@ impl RenderState {
             let cache = dirs::config_dir()
                 .map(|d| d.join("navcore").join("grib"))
                 .unwrap_or_else(|| "grib-cache".into());
+            let generation = crate::nav::isochrone::begin_cancellable();
             let (polar_text, polar_name) = if polar_path.trim().is_empty() {
                 (crate::nav::wxroute::DEFAULT_POLAR.to_string(),
                  "built-in cruiser".to_string())
@@ -4718,16 +5492,23 @@ impl RenderState {
                 use_currents,
                 &name,
                 move |msg| {
-                    let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
+                    if !crate::nav::isochrone::plan_cancelled(generation) {
+                        let _ = progress_tx.send(RouteNetEvent::WxProgress(msg));
+                    }
                 },
             );
+            // A cancelled plan says nothing more: the UI has moved on, and
+            // may already be waiting on the next one.
+            if crate::nav::isochrone::plan_cancelled(generation) {
+                return;
+            }
             let _ = tx.send(match result {
                 Ok(p) => RouteNetEvent::WxPlanned {
                     summary: format!(
-                        "{}: arrival {} ({} warnings)",
+                        "{}: arrival {}{}",
                         p.route.name,
-                        p.arrival.format("%d %b %H:%M UTC"),
-                        p.warnings.len()
+                        p.arrival.with_timezone(&chrono::Local).format("%a %d %b %H:%M"),
+                        warnings_suffix(&p.warnings)
                     ),
                     route: p.route,
                     waypoints: p.waypoints,
@@ -4743,7 +5524,7 @@ impl RenderState {
         self.ensure_route_store();
         let Some(dir) = self.chart_root.clone() else {
             if let Some(ref mut ui) = self.ui {
-                ui.weather.status = "no chart directory loaded".into();
+                ui.weather.status = "no chart folder loaded — choose one under Charts".into();
             }
             return;
         };
@@ -4755,20 +5536,24 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
+            let generation = crate::nav::isochrone::begin_cancellable();
             let result = crate::nav::wxroute::with_chart_sources(&dir, a, b, |sources| {
                 crate::nav::autoroute::plan(sources, a, b, &safety)
             });
+            if crate::nav::isochrone::plan_cancelled(generation) {
+                return;
+            }
             let _ = tx.send(match result {
                 Ok(Ok(mut p)) => {
                     p.route.name = name;
                     let nm: f64 = p.route.legs.iter().map(|l| l.distance_nm).sum();
                     RouteNetEvent::WxPlanned {
                         summary: format!(
-                            "{}: {:.1} nm, {} waypoints ({} warnings)",
+                            "{}: {:.1} NM, {} waypoints{}",
                             p.route.name,
                             nm,
                             p.route.waypoints.len(),
-                            p.warnings.len()
+                            warnings_suffix(&p.warnings)
                         ),
                         route: p.route,
                         waypoints: p.waypoints,
@@ -4795,6 +5580,7 @@ impl RenderState {
                 RouteNetEvent::Status(msg) => {
                     if let Some(ref mut ui) = self.ui {
                         ui.routes.status = msg;
+                        ui.routes.net_busy = false;
                     }
                 }
                 RouteNetEvent::WxProgress(msg) => {
@@ -4821,15 +5607,59 @@ impl RenderState {
                     if let Some(ref mut ui) = self.ui {
                         ui.wind.busy = false;
                         ui.wind.source = source;
-                        // Keep the hour the user was looking at if it still
-                        // exists; otherwise start at the top of the run.
-                        ui.wind.step = ui.wind.step.min(steps.len().saturating_sub(1));
                         ui.wind.steps = steps;
                         ui.wind.status =
                             format!("run {}", run.format("%d %b %HZ"));
-                        ui.wind.show = true;
+                        // Show what was fetched, but in the layer asked for:
+                        // someone who wanted only the colour wash should not
+                        // get barbs switched on over it.
+                        if !ui.wind.fill {
+                            ui.wind.show = true;
+                        }
                     }
-                    self.refresh_wind_label();
+                    self.needs_redraw = true;
+                }
+                RouteNetEvent::CurrentFailed(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.sheet.status = msg;
+                    }
+                }
+                RouteNetEvent::CurrentLoaded(field) => {
+                    self.current_forecast = Some(*field);
+                    if let Some(ref mut ui) = self.ui {
+                        ui.sheet.current_field = true;
+                        if ui.sheet.status == "fetching the set…" {
+                            ui.sheet.status.clear();
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+                RouteNetEvent::PointFailed(msg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.sheet.busy = false;
+                        ui.sheet.status = msg;
+                    }
+                }
+                RouteNetEvent::PointLoaded(point) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.sheet.busy = false;
+                        ui.sheet.anchor = Some([point.lat, point.lon]);
+                        ui.sheet.place =
+                            crate::nav::pointfx::place_label(point.lat, point.lon);
+                        ui.sheet.source = crate::nav::pointfx::POINT_SOURCE_LABEL.into();
+                        ui.sheet.status = if point.has_sea {
+                            String::new()
+                        } else {
+                            "no sea data here — waves, set and tide are ashore".into()
+                        };
+                        // A new place is a new picture: hand the cursor back
+                        // to the present rather than leaving it parked on an
+                        // hour the reader chose for somewhere else.
+                        ui.sheet.cursor_ms = None;
+                        ui.sheet.window_start_ms = None;
+                        ui.sheet.data = Some(point);
+                        ui.sheet.show = true;
+                    }
                     self.needs_redraw = true;
                 }
                 RouteNetEvent::OrcProgress(msg) => {
@@ -4845,6 +5675,8 @@ impl RenderState {
                     // for the rest of the session.
                     if self.route_net_jobs == 0 {
                         if let Some(ref mut ui) = self.ui {
+                            ui.routes.net_busy = false;
+                            ui.wind.busy = false;
                             if ui.weather.busy {
                                 ui.weather.busy = false;
                                 ui.weather.status = "the planner stopped unexpectedly".into();
@@ -4852,6 +5684,11 @@ impl RenderState {
                             if ui.boat.busy {
                                 ui.boat.busy = false;
                                 ui.boat.status = "the search stopped unexpectedly".into();
+                            }
+                            if ui.sheet.busy {
+                                ui.sheet.busy = false;
+                                ui.sheet.status =
+                                    "the forecast stopped unexpectedly".into();
                             }
                         }
                     }
@@ -4911,10 +5748,63 @@ impl RenderState {
                     // manual edit: hold on to the mark, not the index.
                     let steering_to = self.route_follow.as_ref().and_then(|f| {
                         let route = self.route_store.as_ref()?.route(f.route_id)?;
-                        f.target(route).map(|t| (f.route_id, t))
+                        Some((f.route_id, f.marks_ahead(route)))
                     });
+                    let count = routes.len();
+                    let mut kept_local: Vec<String> = Vec::new();
                     if let Some(store) = self.route_store.as_mut() {
-                        for (route, wps) in routes {
+                        for (mut route, mut wps) in routes {
+                            // Publish and fetch round-trip the same id, so a
+                            // route edited here since it was published would
+                            // be silently replaced by the server's older copy.
+                            // When the two differ, keep the local one and
+                            // bring the server's in beside it.
+                            type Mark<'a> = (crate::geo::LatLon, &'a str);
+                            let fetched: Vec<Mark> = route
+                                .waypoints
+                                .iter()
+                                .filter_map(|id| wps.iter().find(|w| w.id == *id))
+                                .map(|w| (w.position, w.name.as_str()))
+                                .collect();
+                            if let Some(local) = store.route(route.id) {
+                                let mine: Vec<Mark> = local
+                                    .waypoints
+                                    .iter()
+                                    .filter_map(|id| store.waypoints.get(*id))
+                                    .map(|w| (w.position, w.name.as_str()))
+                                    .collect();
+                                let same = local.name == route.name
+                                    && mine.len() == fetched.len()
+                                    && mine.iter().zip(&fetched).all(|((a, an), (b, bn))| {
+                                        (a.lat - b.lat).abs() < 1e-7
+                                            && (a.lon - b.lon).abs() < 1e-7
+                                            && an == bn
+                                    });
+                                if !same {
+                                    kept_local.push(local.name.clone());
+                                    let copy = format!("{} (Signal K)", route.name);
+                                    // A later fetch refreshes the same copy
+                                    // rather than stacking up new ones.
+                                    route.id = store
+                                        .routes()
+                                        .find(|r| r.name == copy)
+                                        .map(|r| r.id)
+                                        .unwrap_or_else(uuid::Uuid::new_v4);
+                                    route.name = copy;
+                                    // Its marks come back under the local
+                                    // marks' ids; inserted as they are they
+                                    // would move the kept route's waypoints.
+                                    for wp in wps.iter_mut() {
+                                        let fresh = uuid::Uuid::new_v4();
+                                        for id in route.waypoints.iter_mut() {
+                                            if *id == wp.id {
+                                                *id = fresh;
+                                            }
+                                        }
+                                        wp.id = fresh;
+                                    }
+                                }
+                            }
                             for wp in wps {
                                 store.waypoints.insert(wp);
                             }
@@ -4925,13 +5815,25 @@ impl RenderState {
                             }
                         }
                     }
-                    if let Some((id, target)) = steering_to {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.net_busy = false;
+                        ui.routes.status = if kept_local.is_empty() {
+                            format!("Fetched {count} route(s) from Signal K")
+                        } else {
+                            format!(
+                                "Fetched {count} route(s). Kept your changes to {}; \
+                                 the server's version is beside it as \"… (Signal K)\".",
+                                kept_local.join(", ")
+                            )
+                        };
+                    }
+                    if let Some((id, ahead)) = steering_to {
                         let route =
                             self.route_store.as_ref().and_then(|s| s.route(id)).cloned();
                         if let (Some(follow), Some(route)) =
                             (self.route_follow.as_mut(), route)
                         {
-                            follow.retarget(&route, target);
+                            follow.retarget(&route, &ahead);
                         }
                     }
                 }
@@ -4955,6 +5857,13 @@ impl RenderState {
                 self.clear_guidance();
                 return;
             };
+            let name = route.name.clone();
+            if route.legs.is_empty() {
+                self.guidance_waiting(Some(format!(
+                    "Following {name} — it needs at least two waypoints"
+                )));
+                return;
+            }
             let fresh = self
                 .fleet
                 .own
@@ -4963,7 +5872,9 @@ impl RenderState {
             let Some((lat, lon)) = self.fleet.own.position().filter(|_| fresh) else {
                 // No fix, or a fix gone stale: the last guidance is not
                 // guidance any more, it is a photograph of one.
-                self.clear_guidance();
+                self.guidance_waiting(Some(format!(
+                    "Following {name} — waiting for a position fix"
+                )));
                 return;
             };
             // Signal K is SI: m/s and radians. Guidance speaks knots/degrees.
@@ -4997,6 +5908,7 @@ impl RenderState {
                 self.needs_redraw = true;
             }
             ui.routes.guidance = Some(guidance);
+            ui.routes.guidance_waiting = None;
         }
     }
 
@@ -5010,13 +5922,14 @@ impl RenderState {
     /// charts are usable here rather than merely owned.
     fn shop_sign_in(&mut self, email: String, password: String) {
         let fingerprint = Self::machine_fingerprint();
-        if fingerprint.is_none() {
-            if let Some(ref mut ui) = self.ui {
-                ui.shop.status =
-                    "No chart licence found on this machine; charts can be listed but not \
-                     assigned here."
-                        .into();
-            }
+        if let Some(ref mut ui) = self.ui {
+            ui.shop.warning = if fingerprint.is_none() {
+                "No chart licence found on this machine; charts can be listed but not \
+                 assigned here."
+                    .into()
+            } else {
+                String::new()
+            };
         }
         self.shop_send(crate::shop::service::Request::SignIn {
             email,
@@ -5027,6 +5940,21 @@ impl RenderState {
 
     /// Drain the shop worker into the panel.
     fn poll_shop(&mut self) {
+        let mut reload_after_install = false;
+        self.poll_shop_events(&mut reload_after_install);
+        // The new cells are drawn now, not after a restart; the view stays
+        // where the user left it.
+        if reload_after_install {
+            self.refresh_installed();
+            if let Some(dir) = self.chart_root.clone() {
+                if self.chart_load.is_none() {
+                    self.start_chart_folder_load(dir, true);
+                }
+            }
+        }
+    }
+
+    fn poll_shop_events(&mut self, reload_after_install: &mut bool) {
         use crate::shop::service::Event;
         let (Some(shop), Some(ui)) = (self.shop.as_ref(), self.ui.as_mut()) else {
             return;
@@ -5045,29 +5973,7 @@ impl RenderState {
                     // subscription has nothing to ask the shop for except the
                     // current edition — which is the one it will not grant.
                     let root = self.chart_root.clone().unwrap_or_else(|| "charts".into());
-                    let on_disk = crate::shop::installed::scan(&root);
-                    let mut installed: std::collections::HashMap<_, _> = charts
-                        .iter()
-                        .filter_map(|c| {
-                            let stem = c.set_stem()?;
-                            let edition =
-                                crate::shop::installed::newest_for(&on_disk, &stem)?;
-                            Some((c.id.clone(), edition))
-                        })
-                        .collect();
-                    // The stem comes from the shop's ChartList links, and not
-                    // every reply carries them. One chart set owned and one
-                    // installed is unambiguous without any key at all — and
-                    // it is much the commonest case, one region per boat.
-                    if installed.is_empty() && charts.len() == 1 && on_disk.len() == 1 {
-                        installed.insert(charts[0].id.clone(), on_disk[0].edition);
-                    }
-                    log::info!(
-                        "chart shop: {} set(s) on disk, {} matched to the listing",
-                        on_disk.len(),
-                        installed.len()
-                    );
-                    ui.shop.installed = installed;
+                    ui.shop.installed = match_installed(&charts, &root);
                     ui.shop.charts = charts;
                     ui.shop.systems = systems;
                     ui.shop.busy = false;
@@ -5097,8 +6003,8 @@ impl RenderState {
                 Event::Installed { chart_id, summary } => {
                     ui.shop.grants.insert(chart_id, format!("installed: {summary}"));
                     ui.shop.busy = false;
-                    ui.shop.status =
-                        "Installed. Restart navcore to draw the new charts.".into();
+                    ui.shop.status = "Installed — loading the new charts…".into();
+                    *reload_after_install = true;
                 }
                 Event::Grant { chart_id, summary } => {
                     ui.shop.grants.insert(chart_id, summary);
@@ -5142,8 +6048,17 @@ impl RenderState {
     /// else would wake the app to collect a worker's answer, so without it a
     /// fetched route can sit in the channel until the user happens to move
     /// the mouse.
+    /// A Signal K stream is wanted. Its deltas are only read during a frame,
+    /// so while one is open something has to keep frames coming even when
+    /// nobody touches the screen — otherwise an unattended plotter shows the
+    /// boat, the traffic and the instruments as they were when last touched.
+    pub fn signalk_live(&self) -> bool {
+        self.signalk.is_some() && self.ui.as_ref().is_some_and(|u| u.instruments.active)
+    }
+
     pub fn routing_busy(&self) -> bool {
         self.route_net_jobs > 0
+            || self.chart_load.is_some()
             || self
                 .ui
                 .as_ref()
@@ -5434,4 +6349,208 @@ mod fallback_tests {
         // that one is missing.
         assert_eq!(nearest_resident_ancestor(tile, |t| t == tile), None);
     }
+}
+
+#[cfg(test)]
+mod sample_grid_tests {
+    use super::*;
+
+    fn camera_at(cx: f32, cy: f32, zoom: f32) -> Camera {
+        Camera::new(cx, cy, zoom, 1400.0, 900.0)
+    }
+
+    fn area() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 40.0), egui::pos2(1400.0, 800.0))
+    }
+
+    /// The bug this replaced: the samples used to step from the window's own
+    /// corner, so the whole field stood still while the chart slid under it.
+    /// Pan the camera and every sample must travel with the chart, by exactly
+    /// the distance the chart moved.
+    #[test]
+    fn the_field_travels_with_the_chart_under_a_pan() {
+        let zoom = 50.0;
+        let a = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
+        // Shift the camera by a whole number of world units.
+        let shift_world = 500.0f32;
+        let b = sample_grid_for(
+            &camera_at(1_380_000.0 + shift_world, 7_540_000.0, zoom),
+            1.0,
+            64.0,
+            area(),
+        );
+        assert!(!a.is_empty() && !b.is_empty());
+        // Moving the camera east moves the chart west on screen, and the
+        // lattice with it.
+        let expected = -shift_world / zoom;
+
+        // Find a sample in `b` that is the same point of the earth as a
+        // sample in `a`, and check where it landed.
+        let (i, j) = a
+            .geo
+            .iter()
+            .enumerate()
+            .find_map(|(i, ga)| {
+                b.geo
+                    .iter()
+                    .position(|gb| (gb.0 - ga.0).abs() < 1e-9 && (gb.1 - ga.1).abs() < 1e-9)
+                    .map(|j| (i, j))
+            })
+            .expect("the two lattices share no point of the earth");
+        let moved = b.screen[j][0] - a.screen[i][0];
+        assert!(
+            (moved - expected).abs() < 0.01,
+            "the same point of sea moved {moved} points, expected {expected}"
+        );
+        assert!(
+            (b.screen[j][1] - a.screen[i][1]).abs() < 0.01,
+            "a pure east-west pan moved the field vertically"
+        );
+    }
+
+    /// Zoom must not re-cut the lattice on every wheel click: the spacing is
+    /// quantised to octaves, so a small change of zoom keeps the same points
+    /// of sea and only the gaps between them grow.
+    #[test]
+    fn the_lattice_holds_its_ground_through_a_small_zoom() {
+        let here = (1_380_000.0, 7_540_000.0);
+        let a = sample_grid_for(&camera_at(here.0, here.1, 50.0), 1.0, 64.0, area());
+        let b = sample_grid_for(&camera_at(here.0, here.1, 55.0), 1.0, 64.0, area());
+        // The same latitudes are sampled, because the world step did not change.
+        let shared = a
+            .geo
+            .iter()
+            .filter(|ga| {
+                b.geo
+                    .iter()
+                    .any(|gb| (gb.0 - ga.0).abs() < 1e-9 && (gb.1 - ga.1).abs() < 1e-9)
+            })
+            .count();
+        assert!(
+            shared > a.geo.len() / 2,
+            "only {shared} of {} points survived a 10% zoom",
+            a.geo.len()
+        );
+    }
+
+    /// Spacing is honoured to within the octave rounding, so the barbs stay
+    /// far enough apart for their feathers not to collide.
+    #[test]
+    fn the_samples_land_about_as_far_apart_as_asked() {
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area());
+        let gap = (g.screen[1][0] - g.screen[0][0]).abs();
+        assert!(
+            (45.0..=91.0).contains(&gap),
+            "asked for 64 points between samples, got {gap}"
+        );
+    }
+
+    /// The lattice's size tracks the window, not the zoom: the step is
+    /// derived from the same zoom that sets the extent, so the two cancel and
+    /// the count stays near `area / spacing` at every scale. Worth pinning,
+    /// because it is the reason this can be rebuilt every frame at all.
+    #[test]
+    fn the_cost_does_not_run_away_with_the_zoom() {
+        for zoom in [0.05f32, 5.0, 500.0, 50_000.0, 5_000_000.0] {
+            let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
+            assert!(!g.is_empty(), "no lattice at {zoom} m/px");
+            let n = g.cols * g.rows;
+            assert!(n < 2_000, "{n} samples at {zoom} m/px");
+        }
+    }
+
+    /// A camera that cannot answer must produce nothing rather than a lattice
+    /// of NaNs, which would take the whole draw call down with it.
+    #[test]
+    fn a_broken_camera_is_refused_rather_than_drawn() {
+        // A viewport of no size, before the first resize has arrived.
+        let g = sample_grid_for(
+            &camera_at(0.0, 0.0, 50.0),
+            1.0,
+            64.0,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.0, 0.0)),
+        );
+        assert!(g.is_empty());
+        // A zoom of nothing, and a zoom that is not a number.
+        assert!(sample_grid_for(&camera_at(0.0, 0.0, 0.0), 1.0, 64.0, area()).is_empty());
+        assert!(sample_grid_for(&camera_at(0.0, 0.0, f32::NAN), 1.0, 64.0, area()).is_empty());
+        // Every point of a good lattice is a real number.
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area());
+        assert!(g
+            .screen
+            .iter()
+            .all(|p| p[0].is_finite() && p[1].is_finite()));
+        assert!(g.geo.iter().all(|(la, lo)| la.is_finite() && lo.is_finite()));
+    }
+}
+
+/// The planner's warnings, spelled out after its summary. "(2 warnings)" on
+/// its own hid the ones that matter most — a passage that outruns the
+/// forecast looks exactly as trustworthy as one that does not.
+fn warnings_suffix(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        String::new()
+    } else {
+        format!(" — warning: {}", warnings.join("; "))
+    }
+}
+
+/// A chart folder being loaded off the UI thread.
+struct ChartLoad {
+    dir: std::path::PathBuf,
+    keep_view: bool,
+    rx: std::sync::mpsc::Receiver<Result<(ChartCatalog, Arc<KeyStore>, CachedDecryptor), String>>,
+}
+
+/// Read a folder's key lists and build its catalogue. The slow part of
+/// opening charts, run on a worker thread by
+/// [`RenderState::start_chart_folder_load`].
+fn load_chart_folder(
+    dir: &std::path::Path,
+) -> Result<(ChartCatalog, Arc<KeyStore>, CachedDecryptor), String> {
+    let mut keys = KeyStore::new();
+    if let Err(e) = keys.load_keylists_in_dir(dir) {
+        // Not fatal on its own: the keys may sit beside the cells under
+        // another name, and the catalogue will say so cell by cell.
+        log::warn!("chart folder {}: no key list read: {e}", dir.display());
+    }
+    let base = crate::decrypt::ChartDecryptor::new("license")
+        .map_err(|e| format!("cannot start the chart decryptor: {e}"))?;
+    let mut decryptor = CachedDecryptor::new(base);
+    let keys = Arc::new(keys);
+    let catalog =
+        ChartCatalog::from_directory(dir, &keys, &mut decryptor).map_err(|e| format!("{e}"))?;
+    Ok((catalog, keys, decryptor))
+}
+
+/// Key each listed chart to the edition on disk under `root`. Without this
+/// the panel cannot say which edition is held, and a lapsed subscription has
+/// nothing to ask the shop for except the current edition — which is the
+/// one it will not grant.
+fn match_installed(
+    charts: &[crate::shop::types::Chart],
+    root: &std::path::Path,
+) -> HashMap<String, crate::shop::types::Edition> {
+    let on_disk = crate::shop::installed::scan(root);
+    let mut installed: HashMap<_, _> = charts
+        .iter()
+        .filter_map(|c| {
+            let stem = c.set_stem()?;
+            let edition = crate::shop::installed::newest_for(&on_disk, &stem)?;
+            Some((c.id.clone(), edition))
+        })
+        .collect();
+    // The stem comes from the shop's ChartList links, and not every reply
+    // carries them. One chart set owned and one installed is unambiguous
+    // without any key at all — and it is much the commonest case, one
+    // region per boat.
+    if installed.is_empty() && charts.len() == 1 && on_disk.len() == 1 {
+        installed.insert(charts[0].id.clone(), on_disk[0].edition);
+    }
+    log::info!(
+        "chart shop: {} set(s) on disk, {} matched to the listing",
+        on_disk.len(),
+        installed.len()
+    );
+    installed
 }

@@ -7,7 +7,9 @@ struct CameraUniform {
     view_proj: mat4x4<f32>,
     view_size: vec2<f32>,
     pixels_per_meter: f32,
-    _pad: f32,
+    // Physical pixels per logical point: 2 on the Retina display the sizes
+    // here were calibrated on, 1 on a standard screen such as the Pi's.
+    px_per_point: f32,
 }
 
 // Per-pattern metadata
@@ -62,9 +64,11 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let pat_info = pattern_meta[in.pattern_id];
 
-    // Pattern tile size in pixels
-    let tile_w = pat_info.tile_info.x;
-    let tile_h = pat_info.tile_info.y;
+    // Pattern tile size in pixels, fitted on a 2x display and following the
+    // display's density from there, like the symbols.
+    let density = camera.px_per_point * 0.5;
+    let tile_w = pat_info.tile_info.x * density;
+    let tile_h = pat_info.tile_info.y * density;
     let stagger = pat_info.tile_info.z;  // 0.0 for linear, 0.5 for staggered
 
     // Where this fragment sits on the pattern grid, in pixels.
@@ -86,8 +90,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let frag_y = grid.y;
 
     // Apply object offset for seamless tiling across features
-    let offset_x = in.offset.x + pat_info.offset_info.x;
-    let offset_y = in.offset.y + pat_info.offset_info.y;
+    let offset_x = in.offset.x + pat_info.offset_info.x * density;
+    let offset_y = in.offset.y + pat_info.offset_info.y * density;
 
     // Calculate which row we're in for stagger
     // yOffM is the un-modded y offset (same as offset_y here)
@@ -106,7 +110,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // The glyph occupies only its own size; the rest of the tile is the S-52
     // minimum distance between symbols and must stay clear.
-    let sym = pat_info.offset_info.zw;
+    let sym = pat_info.offset_info.zw * density;
     if (in_tile.x >= sym.x || in_tile.y >= sym.y) {
         discard;
     }

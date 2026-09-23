@@ -17,7 +17,7 @@ mod parser;
 pub mod patterns;
 mod settings;
 
-pub use cs::{depare02, depare02_color_token, depcnt02, depcnt02_params, is_safety_contour, execute_cs, DepthColorToken, DepthContourStyle};
+pub use cs::{depare02, depare02_color_token, depcnt02, depcnt02_params, depcnt02_selected, is_safety_contour, select_safety_contour, execute_cs, DepthColorToken, DepthContourStyle};
 pub use cs::{light_render_info, light_sector_info, lights06_symbol, litdsn01, LightRenderInfo, LightSectorInfo, LightSymbol};
 pub use cs::{sndfrm02, sounding_color, sounding_color_rgb, SoundingRenderInfo};
 pub use cs::{CsContext, DepthAreaIndex};

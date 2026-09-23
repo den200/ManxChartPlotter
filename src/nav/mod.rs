@@ -27,6 +27,7 @@ pub mod gpx;
 pub mod grib;
 pub mod isochrone;
 pub mod orc;
+pub mod pointfx;
 pub mod polar;
 pub mod wxroute;
 pub mod model;

@@ -77,8 +77,32 @@ impl DepthContourStyle {
 /// # Returns
 /// Style enum with pattern, width, and color information
 pub fn depcnt02(feature: &Feature, settings: &MarinerSettings) -> DepthContourStyle {
+    depcnt02_selected(feature, settings, None)
+}
+
+/// The chart's safety contour, per s52cnsy.cpp's chart context: the
+/// shallowest contour the chart has that is at least as deep as the mariner's
+/// setting. A chart whose contours run 2, 5, 10 m has a 5 m safety contour
+/// for a 3 m setting — an exact-match test would highlight nothing at all.
+///
+/// `None` when every contour is shallower than the setting: the chart then
+/// has no line that separates safe water, and none is highlighted.
+pub fn select_safety_contour(depths: impl IntoIterator<Item = f64>, setting: f64) -> Option<f64> {
+    depths
+        .into_iter()
+        .filter(|d| d.is_finite() && *d >= setting - 0.01)
+        .min_by(|a, b| a.total_cmp(b))
+}
+
+/// [`depcnt02`] against the chart's selected safety contour
+/// ([`select_safety_contour`]). `None` uses the mariner's setting as-is.
+pub fn depcnt02_selected(
+    feature: &Feature,
+    settings: &MarinerSettings,
+    selected: Option<f64>,
+) -> DepthContourStyle {
     let valdco = feature.valdco().unwrap_or(0.0) as f32;
-    let safety = settings.safety_contour;
+    let safety = selected.map(|s| s as f32).unwrap_or(settings.safety_contour);
     let quapos = feature.attribute_int("QUAPOS").unwrap_or(1);
     // Per S52-RENDERING-SPEC.md Appendix M.2: quapos > 1 && quapos < 10 = uncertain
     // QUAPOS values 2-9 indicate position uncertainty
@@ -105,15 +129,20 @@ pub fn depcnt02(feature: &Feature, settings: &MarinerSettings) -> DepthContourSt
 pub fn depcnt02_params(
     feature: &Feature,
     settings: &MarinerSettings,
+    selected: Option<f64>,
 ) -> (LinePattern, u8, &'static str) {
-    let style = depcnt02(feature, settings);
+    let style = depcnt02_selected(feature, settings, selected);
     (style.pattern(), style.width(), style.color_token())
 }
 
 /// Check if a depth contour is the safety contour (regardless of accuracy)
-pub fn is_safety_contour(feature: &Feature, settings: &MarinerSettings) -> bool {
+pub fn is_safety_contour(
+    feature: &Feature,
+    settings: &MarinerSettings,
+    selected: Option<f64>,
+) -> bool {
     matches!(
-        depcnt02(feature, settings),
+        depcnt02_selected(feature, settings, selected),
         DepthContourStyle::SafetyContour | DepthContourStyle::SafetyContourLowAccuracy
     )
 }
@@ -151,21 +180,39 @@ mod tests {
     fn safety_contour_is_promoted_and_follows_the_setting() {
         let mut settings = test_contours();
         settings.safety_contour = 5.0;
-        assert!(is_safety_contour(&make_depcnt(5.0), &settings));
-        assert!(!is_safety_contour(&make_depcnt(2.0), &settings));
-        assert!(!is_safety_contour(&make_depcnt(10.0), &settings));
+        assert!(is_safety_contour(&make_depcnt(5.0), &settings, None));
+        assert!(!is_safety_contour(&make_depcnt(2.0), &settings, None));
+        assert!(!is_safety_contour(&make_depcnt(10.0), &settings, None));
 
         // Change the mariner's setting and a different contour is promoted.
         settings.safety_contour = 2.0;
-        assert!(is_safety_contour(&make_depcnt(2.0), &settings));
-        assert!(!is_safety_contour(&make_depcnt(5.0), &settings));
+        assert!(is_safety_contour(&make_depcnt(2.0), &settings, None));
+        assert!(!is_safety_contour(&make_depcnt(5.0), &settings, None));
 
         // Low positional accuracy changes the style, not the promotion: a
         // dashed safety contour is still the safety contour.
         assert!(is_safety_contour(
             &make_depcnt_with_quapos(2.0, Some(4)),
-            &settings
+            &settings,
+            None
         ));
+    }
+
+    /// A chart with 2, 5 and 10 m contours and a 3 m setting has a 5 m
+    /// safety contour. The exact-match test this replaced highlighted nothing.
+    #[test]
+    fn safety_contour_is_the_next_deeper_contour_the_chart_has() {
+        assert_eq!(select_safety_contour([2.0, 5.0, 10.0], 3.0), Some(5.0));
+        assert_eq!(select_safety_contour([10.0, 2.0, 5.0], 5.0), Some(5.0));
+        assert_eq!(select_safety_contour([2.0, 5.0], 20.0), None);
+
+        let settings = MarinerSettings {
+            safety_contour: 3.0,
+            ..test_contours()
+        };
+        assert!(!is_safety_contour(&make_depcnt(5.0), &settings, None));
+        assert!(is_safety_contour(&make_depcnt(5.0), &settings, Some(5.0)));
+        assert!(!is_safety_contour(&make_depcnt(10.0), &settings, Some(5.0)));
     }
 
     fn make_depcnt_with_quapos(valdco: f64, quapos: Option<i32>) -> Feature {
@@ -223,7 +270,7 @@ mod tests {
         let feature = make_depcnt(5.0);
         let mut settings = test_contours();
         settings.safety_contour = 5.0;
-        assert!(is_safety_contour(&feature, &settings));
+        assert!(is_safety_contour(&feature, &settings, None));
     }
 
     #[test]
@@ -231,7 +278,7 @@ mod tests {
         // VALDCO = 10.05 should still match safety_contour = 10.0
         let feature = make_depcnt(10.05);
         let settings = test_contours();
-        assert!(is_safety_contour(&feature, &settings));
+        assert!(is_safety_contour(&feature, &settings, None));
     }
 
     // QUAPOS low-accuracy tests
@@ -305,14 +352,14 @@ mod tests {
         // is_safety_contour should return true even for low-accuracy safety contours
         let feature = make_depcnt_with_quapos(10.0, Some(4));
         let settings = test_contours();
-        assert!(is_safety_contour(&feature, &settings));
+        assert!(is_safety_contour(&feature, &settings, None));
     }
 
     #[test]
     fn test_depcnt02_params_returns_tuple() {
         let feature = make_depcnt_with_quapos(10.0, Some(4));
         let settings = test_contours();
-        let (pattern, width, color) = depcnt02_params(&feature, &settings);
+        let (pattern, width, color) = depcnt02_params(&feature, &settings, None);
         assert_eq!(pattern, LinePattern::Dashed);
         assert_eq!(width, 2);
         assert_eq!(color, "DEPSC");

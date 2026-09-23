@@ -595,6 +595,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![10.0],
             line_drval2: vec![],
+            ..Default::default()
         };
         let result = obstrn04(&feature, &settings, &ctx);
         assert_eq!(result.symbol, ObstrnSymbol::Isodgr51);
@@ -611,6 +612,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![0.0],
             line_drval2: vec![],
+            ..Default::default()
         };
         let result = obstrn04(&feature, &settings, &ctx);
         assert_ne!(result.symbol, ObstrnSymbol::Isodgr51);

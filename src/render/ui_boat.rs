@@ -14,14 +14,20 @@ pub fn window(
     ctx: &Context,
     boat: &mut BoatView,
     weather: &WeatherView,
+    depth_unit: crate::signalk::units::DepthUnit,
     actions: &mut Vec<UiAction>,
 ) {
     let mut open = boat.open;
     Window::new("Boat")
+        // No title-bar collapse: on a touchscreen it is an easy accidental
+        // tap that leaves an empty title bar and no obvious way back.
+        .collapsible(false)
         .open(&mut open)
         .default_size([520.0, 420.0])
         .default_pos([120.0, 60.0])
-        .constrain(true)
+        // Inside the space the menu bar and instrument strip leave: a window
+        // over the menu bar hides the very button that closes it.
+        .constrain_to(ctx.available_rect())
         .show(ctx, |ui| {
             let mut edited = false;
             ui.horizontal(|ui| {
@@ -39,16 +45,26 @@ pub fn window(
                     .lost_focus();
             });
             ui.horizontal(|ui| {
+                // Stored in metres, shown in the depth unit the instruments
+                // use — a boat whose sounder reads feet has her draft in feet.
+                let k = depth_unit.from_metres(1.0);
+                let suffix = format!(" {}", depth_unit.label());
                 let mut field = |ui: &mut egui::Ui, label: &str, v: &mut f64, max: f64| {
                     ui.label(RichText::new(label).weak());
-                    edited |= ui
+                    let mut shown = *v * k;
+                    if ui
                         .add(
-                            egui::DragValue::new(v)
+                            egui::DragValue::new(&mut shown)
                                 .speed(0.05)
-                                .range(0.0..=max)
-                                .suffix(" m"),
+                                .range(0.0..=max * k)
+                                .fixed_decimals(2)
+                                .suffix(suffix.as_str()),
                         )
-                        .changed();
+                        .changed()
+                    {
+                        *v = shown / k;
+                        edited = true;
+                    }
                 };
                 field(ui, "LOA", &mut boat.loa_m, 60.0);
                 field(ui, "beam", &mut boat.beam_m, 15.0);

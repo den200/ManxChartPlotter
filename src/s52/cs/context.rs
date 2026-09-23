@@ -20,6 +20,11 @@ pub struct CsContext {
     pub area_drval1: Vec<f64>,
     /// DRVAL2 of each intersecting depth *line*.
     pub line_drval2: Vec<f64>,
+    /// The chart's selected safety contour: the shallowest contour the chart
+    /// actually has at or deeper than the mariner's setting (s52cnsy.cpp reads
+    /// it from the chart context, not from the setting). `None` falls back to
+    /// the setting itself.
+    pub safety_contour: Option<f64>,
 }
 
 impl CsContext {
@@ -29,10 +34,11 @@ impl CsContext {
     pub const EMPTY: &'static CsContext = &CsContext {
         area_drval1: Vec::new(),
         line_drval2: Vec::new(),
+        safety_contour: None,
     };
 
     pub fn is_empty(&self) -> bool {
-        self.area_drval1.is_empty() && self.line_drval2.is_empty()
+        self.area_drval1.is_empty() && self.line_drval2.is_empty() && self.safety_contour.is_none()
     }
 
     /// The UDWHAZ03 test over the associated objects (s52cnsy.cpp `_UDWHAZ03`):
@@ -58,6 +64,7 @@ impl CsContext {
         for v in &self.line_drval2 {
             v.to_bits().hash(&mut h);
         }
+        self.safety_contour.map(f64::to_bits).hash(&mut h);
         h.finish()
     }
 }
@@ -87,6 +94,19 @@ impl DepthAreaIndex {
     /// Build from one chart's features. `ref_lat`/`ref_lon` are the chart's
     /// SENC reference point — area triangles are stored relative to it.
     pub fn build(features: &[crate::senc::Feature], ref_lat: f64, ref_lon: f64) -> Self {
+        Self::build_near(features, ref_lat, ref_lon, None)
+    }
+
+    /// As [`build`](Self::build), keeping only the areas that reach into
+    /// `near` (global Mercator `[min, max]`). The tile builder asks about one
+    /// tile's dangers at a time; copying out every depth area in the chart
+    /// for each tile would cost far more than the question.
+    pub fn build_near(
+        features: &[crate::senc::Feature],
+        ref_lat: f64,
+        ref_lon: f64,
+        near: Option<([f64; 2], [f64; 2])>,
+    ) -> Self {
         use crate::senc::ObjectClass;
 
         let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(ref_lat, ref_lon);
@@ -105,6 +125,21 @@ impl DepthAreaIndex {
             // A depth area with no DRVAL1 cannot make anything safe, and
             // GetDoubleAttr would leave OpenCPN's local at 0.0 — same effect.
             let drval1 = feature.drval1().unwrap_or(0.0);
+
+            if let Some((lo, hi)) = near {
+                // A pass over the vertices with no allocation, to skip areas
+                // that cannot contain anything asked about.
+                let mut min = [f64::MAX; 2];
+                let mut max = [f64::MIN; 2];
+                for p in geom.triangles.iter().flat_map(|t| t.vertices.iter()) {
+                    let (x, y) = (p[0] as f64 + ref_mx, p[1] as f64 + ref_my);
+                    min = [min[0].min(x), min[1].min(y)];
+                    max = [max[0].max(x), max[1].max(y)];
+                }
+                if max[0] < lo[0] || min[0] > hi[0] || max[1] < lo[1] || min[1] > hi[1] {
+                    continue;
+                }
+            }
 
             let mut tris: Vec<[f64; 2]> = Vec::new();
             for prim in &geom.triangles {
@@ -180,6 +215,7 @@ impl DepthAreaIndex {
         CsContext {
             area_drval1,
             line_drval2: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -245,6 +281,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![10.0],
             line_drval2: vec![],
+            ..Default::default()
         };
         assert!(ctx.indicates_danger(10.0, 0));
     }
@@ -255,6 +292,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![0.0],
             line_drval2: vec![],
+            ..Default::default()
         };
         assert!(!ctx.indicates_danger(10.0, 0));
     }
@@ -264,6 +302,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![20.0],
             line_drval2: vec![],
+            ..Default::default()
         };
         assert!(!ctx.indicates_danger(10.0, 1));
     }
@@ -273,6 +312,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![],
             line_drval2: vec![5.0],
+            ..Default::default()
         };
         assert!(ctx.indicates_danger(10.0, 1));
     }

@@ -21,6 +21,10 @@ use egui_wgpu::ScreenDescriptor;
 pub enum UiAction {
     /// Close the object-query bubble.
     DismissPick,
+    /// Abandon the passage plan being computed.
+    PlanCancel,
+    /// Keep the boat centred on the chart, or stop.
+    FollowSet { on: bool },
     /// Sign in to the chart shop and list what the account owns.
     ShopSignIn { email: String, password: String },
     /// Re-read the entitlement list.
@@ -105,16 +109,160 @@ pub enum UiAction {
         to: String,
         sail: bool,
     },
-    /// Show or hide the wind forecast over the chart.
+    /// Load this folder of charts, replacing whatever is showing.
+    ChartFolderOpen { path: String },
+    /// Show or hide the weather sheet along the bottom of the chart.
+    WeatherSheetToggle,
+    /// Take the whole forecast for what is on screen now: the point forecast
+    /// behind the sheet, and whichever chart fields are switched on.
+    WeatherRefreshHere,
+    /// Show or hide the wind field (the barbs) over the chart.
     WindToggle,
-    /// Fetch the wind for the area now on screen.
-    WindRefresh,
+    /// Show or hide the wind as a wash of colour over the chart.
+    WindFillToggle,
+    /// Show or hide the surface current over the chart.
+    CurrentFieldToggle,
     /// Search ORC certificates for a class or boat name.
     BoatSearch { query: String, country: String },
     /// Install the polar (and specs) of a search hit by index.
     BoatUsePolar { index: usize },
     /// Weather-route between a route's endpoints, on the current forecast.
     WeatherRoute { route_id: uuid::Uuid },
+}
+
+/// The chart folder in use, and the browser for choosing another.
+///
+/// Only the chosen folder is written to disk; where the user happened to be
+/// browsing when they picked it is nobody's business next session. A plotter
+/// that boots on a boat should come up on its own charts without a command
+/// line, which is the whole reason this is remembered at all.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ChartFolderView {
+    /// The folder the charts came from. Empty until one is chosen.
+    pub chosen: String,
+    /// Browsing the disk rather than the shop.
+    #[serde(skip)]
+    pub browsing: bool,
+    /// The directory on show.
+    #[serde(skip)]
+    pub at: String,
+    /// Which directory [`entries`](Self::entries) describes. The listing is
+    /// re-read when this falls behind `at` and never per frame: a folder of
+    /// six hundred cells is a syscall per entry, and this window is drawn
+    /// sixty times a second.
+    #[serde(skip)]
+    pub scanned: Option<String>,
+    /// Sub-directories of `at`, by name, in reading order.
+    #[serde(skip)]
+    pub entries: Vec<String>,
+    /// How many `.oesu` cells sit in `at` — the catalogue reads no other
+    /// extension, so this is exactly what would load.
+    #[serde(skip)]
+    pub cells: usize,
+    #[serde(skip)]
+    pub status: String,
+    /// A folder is being loaded in the background.
+    #[serde(skip)]
+    pub loading: bool,
+}
+
+impl ChartFolderView {
+    /// Re-read the listing if it has fallen behind the directory on show.
+    pub fn rescan(&mut self) {
+        if self.scanned.as_deref() == Some(self.at.as_str()) {
+            return;
+        }
+        self.entries.clear();
+        self.cells = 0;
+        match std::fs::read_dir(&self.at) {
+            Ok(rd) => {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    // Dot-directories are noise on a chart plotter.
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        self.entries.push(name.to_string());
+                    } else if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("oesu"))
+                    {
+                        self.cells += 1;
+                    }
+                }
+                self.entries.sort_by_key(|n| n.to_lowercase());
+                self.status.clear();
+            }
+            Err(e) => self.status = format!("cannot read this folder: {e}"),
+        }
+        self.scanned = Some(self.at.clone());
+    }
+
+    /// Move to `dir` and mark the listing stale.
+    pub fn go(&mut self, dir: String) {
+        self.at = dir;
+    }
+}
+
+#[cfg(test)]
+mod chart_folder_tests {
+    use super::ChartFolderView;
+
+    /// The listing is read once per folder, not once per frame: this window
+    /// is drawn sixty times a second and a chart set is six hundred entries.
+    #[test]
+    fn a_folder_is_read_once_and_then_left_alone() {
+        let dir = std::env::temp_dir().join("navcore-chart-folder-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Denmark")).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        std::fs::write(dir.join("OC-45-A.oesu"), b"x").unwrap();
+        std::fs::write(dir.join("OC-45-B.OESU"), b"x").unwrap();
+        std::fs::write(dir.join("ChartList.XML"), b"x").unwrap();
+
+        let mut v = ChartFolderView {
+            at: dir.display().to_string(),
+            ..Default::default()
+        };
+        v.rescan();
+        // Sub-folders are offered; dot-folders are noise on a plotter.
+        assert_eq!(v.entries, vec!["Denmark".to_string()]);
+        // Counted the way the catalogue counts — `.oesu`, either case, and
+        // nothing else. The XML is not a chart.
+        assert_eq!(v.cells, 2);
+        assert!(v.status.is_empty());
+
+        // A second pass must not touch the disk, so a file appearing behind
+        // its back changes nothing until the folder is left and returned to.
+        std::fs::write(dir.join("OC-45-C.oesu"), b"x").unwrap();
+        v.rescan();
+        assert_eq!(v.cells, 2, "the listing was re-read when it need not be");
+        v.go(dir.display().to_string() + "/Denmark");
+        v.rescan();
+        assert_eq!(v.cells, 0);
+        assert!(v.entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that is not there must say so rather than look empty: an
+    /// unplugged memory stick and a stick full of holiday photographs are
+    /// different problems and the user has to be able to tell them apart.
+    #[test]
+    fn an_unreadable_folder_says_so() {
+        let mut v = ChartFolderView {
+            at: "/no/such/folder/anywhere".into(),
+            ..Default::default()
+        };
+        v.rescan();
+        assert!(!v.status.is_empty(), "no complaint about a missing folder");
+        assert_eq!(v.cells, 0);
+    }
 }
 
 /// Weather-routing preferences, persisted.
@@ -198,19 +346,23 @@ impl Default for BoatView {
     }
 }
 
-/// The wind overlay's own state. Runtime only: the field belongs to a
-/// forecast and an area, and a plotter that silently redisplayed yesterday's
-/// wind at boot would be worse than one that asks.
+/// The wind *field* — the barbs on the water — and the fetch behind it.
+///
+/// Runtime only: the field belongs to a forecast and an area, and a plotter
+/// that silently redisplayed yesterday's wind at boot would be worse than one
+/// that asks.
+///
+/// Which hour the barbs show is deliberately *not* here. That is the weather
+/// sheet's cursor, so the barbs and the sheet cannot disagree about the time.
 #[derive(Default)]
 pub struct WindView {
-    /// Drawing the field, and showing its window.
+    /// Drawing the field over the chart as barbs.
     pub show: bool,
-    /// Which forecast step is on screen.
-    pub step: usize,
+    /// Drawing it as a wash of colour as well — the two read the same
+    /// forecast and are independently useful, so they are separate switches.
+    pub fill: bool,
     /// Valid times of the loaded steps; empty until one is loaded.
     pub steps: Vec<i64>,
-    /// "valid 02 Aug 06:00 UTC (+9 h)".
-    pub valid_label: String,
     pub source: String,
     pub busy: bool,
     pub status: String,
@@ -255,10 +407,16 @@ pub struct RoutesView {
     pub visible: std::collections::HashSet<uuid::Uuid>,
     /// This frame's guidance, for the strip.
     pub guidance: Option<crate::nav::Guidance>,
+    /// Why a route being followed has no guidance right now. The strip says
+    /// so rather than vanishing, which read as "following is off".
+    pub guidance_waiting: Option<String>,
     pub status: String,
     /// The route open in the editor. While one is open its waypoints are
     /// listed and a chart tap appends to it.
     pub editing: Option<uuid::Uuid>,
+    /// A publish or fetch is on the wire. Their buttons wait for it rather
+    /// than inviting a second click that would send the same PUT twice.
+    pub net_busy: bool,
 }
 
 /// A quarter of a nautical mile, and twelve minutes: tight enough not to cry
@@ -310,6 +468,11 @@ pub struct InstrumentView {
     pub status: String,
     #[serde(skip)]
     pub connected: bool,
+    /// A connection is wanted: connecting, connected, or waiting to retry.
+    /// What decides whether the button offers Connect or Stop — a server that
+    /// keeps refusing must still be stoppable.
+    #[serde(skip)]
+    pub active: bool,
     /// Paths the server has actually sent, for the picker.
     #[serde(skip)]
     pub available: Vec<String>,
@@ -332,6 +495,7 @@ impl Default for InstrumentView {
             open: false,
             status: "Not connected".into(),
             connected: false,
+            active: false,
             available: Vec::new(),
         }
     }
@@ -350,6 +514,10 @@ pub struct PendingDownload {
     pub edition: Option<String>,
     /// Where that edition came from, in words.
     pub because: String,
+    /// The download claims a new licence slot for this machine (a live
+    /// subscription this machine does not hold yet), rather than asking for
+    /// an older edition of a lapsed one.
+    pub new_slot: bool,
 }
 
 /// What the shop panel is showing.
@@ -376,6 +544,10 @@ pub struct ShopView {
     pub grants: std::collections::HashMap<String, String>,
     /// A download the user has not yet confirmed.
     pub pending: Option<PendingDownload>,
+    /// A standing problem with this machine — no chart licence found — kept
+    /// apart from `status`, which every worker event overwrites. Set as a
+    /// status, it was gone before anyone could read it.
+    pub warning: String,
 }
 
 /// What the UI is allowed to see.
@@ -384,6 +556,9 @@ pub struct UiState<'a> {
     pub picked: Option<&'a [crate::pick::PickedObject]>,
     /// Where the picked position currently is on screen, in *logical* points.
     pub pick_anchor: Option<[f32; 2]>,
+    /// Which query the bubble answers. Each one gets its own window, so a
+    /// new tap opens beside itself rather than where the first one did.
+    pub pick_id: u64,
     /// The boat, already projected — the renderer owns the camera, not the UI.
     pub own_ship: Option<super::ui_ownship::OwnShip>,
     /// The AIS traffic, likewise, with its closest approaches already worked
@@ -397,6 +572,13 @@ pub struct UiState<'a> {
     pub plan_pins: Vec<PlanPin>,
     /// The wind field, projected onto the screen grid.
     pub wind: Vec<super::ui_wind::WindBarb>,
+    /// The wind as a colour wash, under everything.
+    pub wind_fill: super::ui_wind::WindFill,
+    /// The surface current, likewise.
+    pub current: Vec<super::ui_weather::CurrentArrow>,
+    /// Where the sheet's point forecast was taken, projected. `None` when
+    /// there is none, or when it has panned off the screen.
+    pub weather_anchor: Option<[f32; 2]>,
 }
 
 pub struct Ui {
@@ -409,6 +591,8 @@ pub struct Ui {
     repaint_after: Option<std::time::Duration>,
     /// The chart shop panel's own state.
     pub shop: ShopView,
+    /// Which folder the charts came from, and the browser for changing it.
+    pub charts: ChartFolderView,
     /// The instrument strip and its Signal K connection.
     pub instruments: InstrumentView,
     /// The routes window and following state.
@@ -419,8 +603,11 @@ pub struct Ui {
     pub plan: PlanView,
     /// The boat's specs and polar.
     pub boat: BoatView,
-    /// The wind overlay.
+    /// The wind field over the chart.
     pub wind: WindView,
+    /// The weather sheet: the time axis, the lanes, and the cursor that every
+    /// other weather display on screen reads.
+    pub sheet: super::ui_weather::SheetView,
 }
 
 impl Ui {
@@ -452,11 +639,13 @@ impl Ui {
             // is expected to answer without being asked.
             instruments: crate::render::state::RenderState::load_settings().unwrap_or_default(),
             shop: ShopView::default(),
+            charts: ChartFolderView::default(),
             routes: RoutesView::default(),
             weather: crate::render::state::RenderState::load_weather_settings(),
             plan: PlanView::default(),
             boat: crate::render::state::RenderState::load_boat_settings(),
             wind: WindView::default(),
+            sheet: Default::default(),
         }
     }
 
@@ -508,6 +697,34 @@ impl Ui {
         self.ctx.is_pointer_over_area()
     }
 
+    /// Whether a physical-pixel position is under the interface: a window
+    /// or area, or one of the panels round the edge. The same test egui's
+    /// `is_pointer_over_area` makes, for a position rather than the pointer.
+    pub fn covers(&self, x: f32, y: f32) -> bool {
+        let ppp = self.ctx.pixels_per_point().max(0.01);
+        let pos = egui::pos2(x / ppp, y / ppp);
+        match self.ctx.layer_id_at(pos) {
+            Some(layer) if layer.order == egui::Order::Background => {
+                !self.ctx.available_rect().contains(pos)
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// The chart still showing between the panels, in logical points.
+    ///
+    /// The menu bar, the instrument strip and the weather sheet are all panels
+    /// laid over the chart, and anything drawn under one of them is drawn for
+    /// nobody. With the sheet open that is better than a third of the window,
+    /// and the wind field is expensive enough per barb to be worth not
+    /// drawing. It is last frame's rectangle — egui only knows what the panels
+    /// took once they have run — which matters for exactly one frame after the
+    /// sheet opens or the window resizes.
+    pub fn chart_area(&self) -> egui::Rect {
+        self.ctx.available_rect()
+    }
+
     /// Build a frame, draw it over `view`, and return what the user asked for.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
@@ -525,15 +742,18 @@ impl Ui {
         let input = self.state.take_egui_input(window);
         let actions = &mut self.actions;
         let shop = &mut self.shop;
+        let charts = &mut self.charts;
         let instruments = &mut self.instruments;
         let routes = &mut self.routes;
         let weather = &mut self.weather;
         let plan = &mut self.plan;
         let boat = &mut self.boat;
         let wind = &mut self.wind;
+        let sheet = &mut self.sheet;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
-                ctx, &state, shop, instruments, routes, weather, plan, boat, wind, fleet, actions,
+                ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
+                fleet, actions,
             );
         });
         self.state

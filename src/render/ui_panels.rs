@@ -15,12 +15,14 @@ pub fn build(
     ctx: &Context,
     state: &UiState<'_>,
     shop: &mut ShopView,
+    charts: &mut crate::render::ui::ChartFolderView,
     instruments: &mut crate::render::ui::InstrumentView,
     routes: &mut crate::render::ui::RoutesView,
     weather: &mut crate::render::ui::WeatherView,
     plan: &mut crate::render::ui::PlanView,
     boat: &mut crate::render::ui::BoatView,
     wind: &mut crate::render::ui::WindView,
+    sheet: &mut crate::render::ui_weather::SheetView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -35,7 +37,13 @@ pub fn build(
     //
     // Within the chart, bottom to top: weather, the plan, then the vessels.
     // The boat sails over her plan, not beneath it.
+    // The wash goes down first: it is background even to the barbs.
+    super::ui_wind::draw_fill(ctx, &state.wind_fill);
     super::ui_wind::draw(ctx, &state.wind);
+    super::ui_weather::draw_current_field(ctx, &state.current);
+    if let Some(at) = state.weather_anchor {
+        super::ui_weather::draw_anchor(ctx, at, !sheet.busy && sheet.data.is_some());
+    }
     super::ui_routes::draw_overlay(ctx, &state.routes);
     draw_plan_pins(ctx, &state.plan_pins);
     if instruments.show_ais {
@@ -53,20 +61,26 @@ pub fn build(
         super::ui_ownship::draw(ctx, ship);
     }
 
-    menu_bar(ctx, shop, instruments, plan, boat, wind, weather, actions);
+    menu_bar(ctx, shop, instruments, routes, plan, boat, sheet, weather, actions);
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
     // the helm's hand, which is the opposite of what was wanted.
     super::ui_instruments::bar(ctx, instruments, &fleet.own);
     if let Some(ref g) = routes.guidance {
-        super::ui_routes::guidance_strip(ctx, g);
+        super::ui_routes::guidance_strip(ctx, g, &instruments.units);
+    } else if let Some(ref why) = routes.guidance_waiting {
+        super::ui_routes::waiting_strip(ctx, why);
     }
+    // Last of the bottom panels, so it sits *above* the instrument strip and
+    // the guidance line rather than pushing them off the screen edge — the
+    // same ordering rule the strip and the bar already rely on.
+    super::ui_weather::sheet(ctx, sheet, wind, actions);
     if let Some(objects) = state.picked {
-        object_query(ctx, objects, state.pick_anchor, actions);
+        object_query(ctx, objects, state.pick_anchor, state.pick_id, actions);
     }
     if shop.open {
-        chart_shop(ctx, shop, actions);
+        chart_shop(ctx, shop, charts, actions);
     }
     if instruments.open {
         super::ui_instruments::settings(ctx, instruments, &fleet.own, actions);
@@ -75,11 +89,82 @@ pub fn build(
         super::ui_routes::window(ctx, routes, weather, actions);
     }
     if boat.open {
-        super::ui_boat::window(ctx, boat, weather, actions);
+        super::ui_boat::window(ctx, boat, weather, instruments.units.depth, actions);
     }
-    if wind.show {
-        super::ui_wind::window(ctx, wind, actions);
+    // Last, over the chart area the panels have left: what a chart tap will
+    // do right now, and the way back to following the boat.
+    tap_mode_chip(ctx, plan);
+    if state.own_ship.is_some() {
+        follow_button(ctx, instruments, actions);
     }
+}
+
+/// While a tap means something other than "what is that?", say so on the
+/// chart itself, with the way out beside it. A mode that lives only in a
+/// window the user has scrolled past, or in small grey text in the menu
+/// bar, is a mode the user does not know they are in.
+fn tap_mode_chip(ctx: &Context, plan: &mut crate::render::ui::PlanView) {
+    use crate::render::ui::PlanPickTarget;
+    let (text, button) = if let Some(target) = plan.picking {
+        let text = match target {
+            PlanPickTarget::From => "Tap the chart to set the start".to_string(),
+            PlanPickTarget::To => "Tap the chart to set the destination".to_string(),
+        };
+        (text, "Cancel")
+    } else {
+        // Route editing needs no chip: it only runs while the Routes window
+        // is open (closing it ends editing), and the window says so itself.
+        return;
+    };
+    // Bottom centre of the chart: windows open from the top, so down here
+    // it neither covers their buttons nor hides under them.
+    let area = ctx.available_rect();
+    egui::Area::new(egui::Id::new("tap-mode-chip"))
+        .fixed_pos(egui::pos2(area.center().x, area.bottom() - 10.0))
+        .pivot(Align2::CENTER_BOTTOM)
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(text).strong());
+                    if ui.button(button).on_hover_text("Esc does the same").clicked() {
+                        plan.picking = None;
+                    }
+                });
+            });
+        });
+}
+
+/// Follow the boat, as a button on the chart. Panning by hand turns follow
+/// off, which is right, but the only way back used to be a checkbox in the
+/// Instruments settings — one accidental drag and the chart stopped tracking
+/// the boat for good, with nothing on screen to say so.
+fn follow_button(
+    ctx: &Context,
+    instruments: &crate::render::ui::InstrumentView,
+    actions: &mut Vec<UiAction>,
+) {
+    let area = ctx.available_rect();
+    egui::Area::new(egui::Id::new("follow-button"))
+        .fixed_pos(egui::pos2(area.right() - 10.0, area.bottom() - 10.0))
+        .pivot(Align2::RIGHT_BOTTOM)
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                let on = instruments.follow;
+                if ui
+                    .selectable_label(on, if on { "Following boat" } else { "Follow boat" })
+                    .on_hover_text(if on {
+                        "The chart keeps the boat centred. Drag the chart to look elsewhere."
+                    } else {
+                        "Centre the chart on the boat and keep it there"
+                    })
+                    .clicked()
+                {
+                    actions.push(UiAction::FollowSet { on: !on });
+                }
+            });
+        });
 }
 
 /// The planner's pins: a classic map pin — a filled head on a stem whose
@@ -109,10 +194,14 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
             color,
             egui::Stroke::NONE,
         ));
-        painter.circle(head, r, color, egui::Stroke::new(1.5, egui::Color32::WHITE));
+        painter.circle(head, r, color, egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
         painter.circle_filled(head, 2.5, egui::Color32::WHITE);
     }
 }
+
+/// What the position fields accept, for their hover.
+const POSITION_FORMATS: &str = "Tap 📍 and then the chart, or type a position:\n\
+    56°24.6'N 10°58.8'E  ·  56 24.6N 10 58.8E  ·  56.41, 10.98";
 
 /// A thin strip along the top. Deliberately thin: the chart is the instrument,
 /// and every row of pixels the interface takes is a row of sea it does not show.
@@ -125,32 +214,52 @@ fn menu_bar(
     ctx: &Context,
     shop: &mut ShopView,
     instruments: &mut crate::render::ui::InstrumentView,
+    routes: &crate::render::ui::RoutesView,
     plan: &mut crate::render::ui::PlanView,
     boat: &mut crate::render::ui::BoatView,
-    wind: &mut crate::render::ui::WindView,
-    weather: &crate::render::ui::WeatherView,
+    sheet: &crate::render::ui_weather::SheetView,
+    weather: &mut crate::render::ui::WeatherView,
     actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("Charts").clicked() {
+        // Wrapped, so on a narrow plotter screen the planner drops to a
+        // second row instead of running Sail and Motor off the edge.
+        ui.horizontal_wrapped(|ui| {
+            // Every window button shows whether its window is open, as the
+            // Weather button always did.
+            if ui.selectable_label(shop.open, "Charts").clicked() {
                 shop.open = !shop.open;
             }
-            if ui.button("Instruments").clicked() {
+            if ui.selectable_label(instruments.open, "Instruments").clicked() {
                 instruments.open = !instruments.open;
             }
-            if ui.button("Routes").clicked() {
+            // With the instrument bar hidden, its connection dot would go
+            // with it; keep one here so a dropped link is still visible.
+            let bar_shown = instruments.position != crate::render::ui::BarPosition::Hidden
+                && !instruments.tiles.is_empty();
+            if !bar_shown && instruments.active {
+                let colour = if instruments.connected {
+                    egui::Color32::from_rgb(80, 190, 120)
+                } else {
+                    egui::Color32::from_rgb(210, 130, 60)
+                };
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
+                ui.painter().circle_filled(rect.center(), 4.0, colour);
+                response.on_hover_text(&instruments.status);
+            }
+            if ui.selectable_label(routes.open, "Routes").clicked() {
                 actions.push(UiAction::RoutesOpen);
             }
-            if ui.button("Boat").clicked() {
+            if ui.selectable_label(boat.open, "Boat").clicked() {
                 boat.open = !boat.open;
             }
             if ui
-                .selectable_label(wind.show, "Wind")
-                .on_hover_text("Show the wind forecast over the chart")
+                .selectable_label(sheet.show, "Weather")
+                .on_hover_text("Wind, sea, current, rain and tide, on one time axis")
                 .clicked()
             {
-                actions.push(UiAction::WindToggle);
+                actions.push(UiAction::WeatherSheetToggle);
             }
             ui.separator();
 
@@ -159,34 +268,60 @@ fn menu_bar(
             // field instead of identifying an object. Tapping the chart is
             // how a sailor points at water; typing coordinates is the
             // fallback, not the primary.
-            ui.label(RichText::new("from").weak());
-            ui.add(
-                egui::TextEdit::singleline(&mut plan.from)
-                    .hint_text("boat position")
-                    .desired_width(110.0),
-            );
-            let armed = plan.picking == Some(PlanPickTarget::From);
-            if ui
-                .selectable_label(armed, "📍")
-                .on_hover_text("Tap the chart to set the start")
-                .clicked()
-            {
-                plan.picking = (!armed).then_some(PlanPickTarget::From);
+            // Each label stays with its field and pin: the row wraps on a
+            // narrow screen, and "to" must not end one line with its field
+            // starting the next.
+            // A group laid out with `horizontal` is not itself wrapped, so
+            // move to the next row by hand when the rest will not fit.
+            const GROUP_WIDTH: f32 = 200.0;
+            if ui.available_size_before_wrap().x < GROUP_WIDTH {
+                ui.end_row();
             }
-            ui.label(RichText::new("to").weak());
-            let to_edit = ui.add(
-                egui::TextEdit::singleline(&mut plan.to)
-                    .hint_text("lat, lon")
-                    .desired_width(110.0),
-            );
-            let armed = plan.picking == Some(PlanPickTarget::To);
-            if ui
-                .selectable_label(armed, "📍")
-                .on_hover_text("Tap the chart to set the destination")
-                .clicked()
-            {
-                plan.picking = (!armed).then_some(PlanPickTarget::To);
+            let from_edit = ui
+                .horizontal(|ui| {
+                    ui.label(RichText::new("from").weak());
+                    let edit = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut plan.from)
+                                .hint_text("boat position")
+                                .desired_width(110.0),
+                        )
+                        .on_hover_text(POSITION_FORMATS);
+                    let armed = plan.picking == Some(PlanPickTarget::From);
+                    if ui
+                        .selectable_label(armed, "📍")
+                        .on_hover_text("Tap the chart to set the start")
+                        .clicked()
+                    {
+                        plan.picking = (!armed).then_some(PlanPickTarget::From);
+                    }
+                    edit
+                })
+                .inner;
+            if ui.available_size_before_wrap().x < GROUP_WIDTH {
+                ui.end_row();
             }
+            let to_edit = ui
+                .horizontal(|ui| {
+                    ui.label(RichText::new("to").weak());
+                    let edit = ui
+                        .add(
+                            egui::TextEdit::singleline(&mut plan.to)
+                                .hint_text("destination")
+                                .desired_width(110.0),
+                        )
+                        .on_hover_text(POSITION_FORMATS);
+                    let armed = plan.picking == Some(PlanPickTarget::To);
+                    if ui
+                        .selectable_label(armed, "📍")
+                        .on_hover_text("Tap the chart to set the destination")
+                        .clicked()
+                    {
+                        plan.picking = (!armed).then_some(PlanPickTarget::To);
+                    }
+                    edit
+                })
+                .inner;
             // Enter in the destination field is the promise the layout makes:
             // type where you are going, press enter, sail.
             let entered = to_edit.lost_focus()
@@ -196,46 +331,201 @@ fn menu_bar(
                 to: plan.to.clone(),
                 sail,
             };
-            if (ui.button("Sail").clicked() || entered) && !weather.busy {
+            // Greyed while a plan runs, like the Routes window's Wx button,
+            // rather than looking ready and ignoring the click.
+            if (ui
+                .add_enabled(!weather.busy, egui::Button::new("Sail"))
+                .on_hover_text("Weather-routed passage on the forecast and your polar")
+                .clicked()
+                || entered)
+                && !weather.busy
+            {
                 actions.push(go(true));
             }
             if ui
-                .button("Motor")
+                .add_enabled(!weather.busy, egui::Button::new("Motor"))
                 .on_hover_text("Shortest safe route, no weather")
                 .clicked()
-                && !weather.busy
             {
                 actions.push(go(false));
             }
+            if weather.busy
+                && ui
+                    .small_button("Cancel")
+                    .on_hover_text("Stop planning this passage")
+                    .clicked()
+            {
+                actions.push(UiAction::PlanCancel);
+            }
+            // A message about the last plan stops being true once the
+            // plan's fields change — an error about a malformed destination
+            // must not outlive the fix.
+            if (from_edit.changed() || to_edit.changed()) && !weather.busy {
+                weather.status.clear();
+            }
             ui.separator();
+            // One line, cut to fit: a long summary or error would otherwise
+            // push the row wider than a plotter's screen. All of it on hover.
+            let line = |ui: &mut egui::Ui, text: &str, weak: bool| {
+                let mut rt = RichText::new(text).small();
+                if weak {
+                    rt = rt.weak();
+                }
+                ui.add(egui::Label::new(rt).truncate()).on_hover_text(text);
+            };
             if weather.busy {
                 ui.spinner();
-                ui.label(RichText::new(&weather.status).small());
-            } else if let Some(target) = plan.picking {
-                ui.label(
-                    RichText::new(match target {
-                        PlanPickTarget::From => "tap the chart to set the start",
-                        PlanPickTarget::To => "tap the chart to set the destination",
-                    })
-                    .small(),
-                );
+                line(ui, &weather.status, false);
+            } else if plan.picking.is_some() {
+                // The chip on the chart says what a tap does; nothing to add.
+            } else if routes.editing.is_some() {
+                line(ui, "tap the chart to add a waypoint", false);
             } else if !weather.status.is_empty() {
-                ui.label(RichText::new(&weather.status).small().weak());
+                line(ui, &weather.status, true);
             } else {
-                ui.label(
-                    RichText::new("tap the chart to identify an object")
-                        .small()
-                        .weak(),
-                );
+                line(ui, "tap the chart to identify an object", true);
             }
         });
     });
 }
 
-/// The chart shop: sign in, see what the account owns, see what is stale.
-fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
+/// Walk the disk for a folder of charts.
+///
+/// A list of folders with big rows rather than a native file dialog: the
+/// plotter runs on a Raspberry Pi behind a touchscreen, where the OS dialog
+/// is either absent or unusable with a finger, and where pulling in GTK for
+/// one button would be the heaviest dependency in the build. This also looks
+/// and behaves the same on the Mac it is developed on.
+fn chart_folder_browser(
+    ui: &mut egui::Ui,
+    charts: &mut crate::render::ui::ChartFolderView,
+    actions: &mut Vec<UiAction>,
+) {
+    charts.rescan();
+    let here = std::path::PathBuf::from(&charts.at);
+
+    // Words, not symbols. egui's bundled fonts have no 🗀, no ⌂ and no ↑, and
+    // every one of them drew as an empty box — the same trap the weather
+    // sheet's chevrons fell into. A word cannot be missing from a font.
+    ui.horizontal(|ui| {
+        if ui.button("Home").clicked() {
+            if let Some(home) = dirs::home_dir() {
+                charts.go(home.display().to_string());
+            }
+        }
+        if ui
+            .add_enabled(here.parent().is_some(), egui::Button::new("Up"))
+            .on_hover_text("The folder above this one")
+            .clicked()
+        {
+            if let Some(parent) = here.parent() {
+                charts.go(parent.display().to_string());
+            }
+        }
+        ui.add(
+            egui::Label::new(RichText::new(&charts.at).small().weak())
+                .truncate(),
+        );
+    });
+    ui.add_space(4.0);
+
+    // A folder of six hundred cells is a long list; it scrolls, and the rows
+    // are full width so they can be hit with a thumb.
+    let mut descend: Option<String> = None;
+    egui::ScrollArea::vertical()
+        .max_height(220.0)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            if charts.entries.is_empty() {
+                ui.label(RichText::new("no folders here").small().weak());
+            }
+            for name in &charts.entries {
+                // Painted rather than added as a Button: a button centres its
+                // label, and a centred list of folder names is unreadable.
+                // The row is the full width and 26 points tall so it can be
+                // hit with a thumb on the plotter's touchscreen.
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 26.0),
+                    egui::Sense::click(),
+                );
+                if ui.is_rect_visible(rect) {
+                    if resp.hovered() {
+                        ui.painter().rect_filled(
+                            rect,
+                            3.0,
+                            ui.visuals().widgets.hovered.bg_fill,
+                        );
+                    }
+                    ui.painter().text(
+                        rect.left_center() + egui::vec2(8.0, 0.0),
+                        Align2::LEFT_CENTER,
+                        name,
+                        egui::TextStyle::Body.resolve(ui.style()),
+                        ui.visuals().text_color(),
+                    );
+                }
+                if resp.clicked() {
+                    descend = Some(here.join(name).display().to_string());
+                }
+            }
+        });
+    if let Some(dir) = descend {
+        charts.go(dir);
+    }
+
+    ui.add_space(6.0);
+    ui.separator();
+    // What is actually in the folder on show, counted the way the catalogue
+    // counts: it reads `.oesu` and nothing else, so this is exactly what
+    // would load. Saying "no charts here" before the button is pressed saves
+    // the twenty seconds it takes to find that out by decrypting.
+    let ready = charts.cells > 0;
+    ui.horizontal(|ui| {
+        ui.label(match charts.cells {
+            0 => RichText::new("no .oesu cells in this folder").weak(),
+            1 => RichText::new("1 cell here").strong(),
+            n => RichText::new(format!("{n} cells here")).strong(),
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(ready && !charts.loading, egui::Button::new("Use this folder"))
+                .on_hover_text("Decrypt and load these charts, and open them again next time")
+                .clicked()
+            {
+                actions.push(UiAction::ChartFolderOpen {
+                    path: charts.at.clone(),
+                });
+            }
+            if charts.loading {
+                ui.spinner();
+            }
+        });
+    });
+    if !charts.status.is_empty() {
+        ui.label(RichText::new(&charts.status).small().weak());
+    }
+    if !charts.chosen.is_empty() && charts.chosen != charts.at {
+        ui.label(
+            RichText::new(format!("in use: {}", charts.chosen))
+                .small()
+                .weak(),
+        );
+    }
+}
+
+/// The chart shop: sign in, see what the account owns, see what is stale —
+/// and, beside it, the charts already on this disk.
+fn chart_shop(
+    ctx: &Context,
+    shop: &mut ShopView,
+    charts: &mut crate::render::ui::ChartFolderView,
+    actions: &mut Vec<UiAction>,
+) {
     let mut open = shop.open;
     Window::new("Charts")
+        // No title-bar collapse: on a touchscreen it is an easy accidental
+        // tap that leaves an empty title bar and no obvious way back.
+        .collapsible(false)
         .open(&mut open)
         .default_size([620.0, 460.0])
         .default_pos([60.0, 80.0])
@@ -243,9 +533,40 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
         // drag: an area that egui re-places from an anchor each frame cannot
         // be moved by hand, and one that is free to leave the screen can be
         // dragged somewhere it cannot be dragged back from.
-        .constrain(true)
+        // Inside the space the menu bar and instrument strip leave: a window
+        // over the menu bar hides the very button that closes it.
+        .constrain_to(ctx.available_rect())
         .collapsible(false)
         .show(ctx, |ui| {
+            // Two ways to get a chart: buy one, or point at the folder the
+            // last purchase was unpacked into. The second is the common case
+            // and had no way in at all before — the charts could only be named
+            // on the command line, which is no use on a plotter with no
+            // keyboard.
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!charts.browsing, "Shop").clicked() {
+                    charts.browsing = false;
+                }
+                if ui.selectable_label(charts.browsing, "Open a folder").clicked() {
+                    charts.browsing = true;
+                    if charts.at.is_empty() {
+                        // Start where the charts already are, else where the
+                        // user is: both beat starting at the root of the disk.
+                        charts.at = if charts.chosen.is_empty() {
+                            std::env::current_dir()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_else(|_| "/".into())
+                        } else {
+                            charts.chosen.clone()
+                        };
+                    }
+                }
+            });
+            ui.separator();
+            if charts.browsing {
+                chart_folder_browser(ui, charts, actions);
+                return;
+            }
             // Numbered to match o-charts' own instructions — sign in, identify
             // this system, install the chart — so a user who has read their
             // page recognises where they are.
@@ -258,6 +579,7 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                 );
                 ui.add_space(4.0);
                 ui.add_space(6.0);
+                let mut submitted = false;
                 egui::Grid::new("shop-login")
                     .num_columns(2)
                     .spacing([10.0, 8.0])
@@ -270,19 +592,25 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                         );
                         ui.end_row();
                         ui.label("Password");
-                        ui.add(
+                        let pw = ui.add(
                             egui::TextEdit::singleline(&mut shop.password)
                                 .password(true)
                                 .desired_width(280.0),
                         );
+                        // Enter in a text field presses its window's main
+                        // button, here as in the planner and the boat search.
+                        submitted = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         ui.end_row();
                     });
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     let ready = !shop.email.trim().is_empty() && !shop.password.is_empty();
-                    if ui
+                    if (ui
                         .add_enabled(ready && !shop.busy, egui::Button::new("Sign in"))
                         .clicked()
+                        || submitted)
+                        && ready
+                        && !shop.busy
                     {
                         actions.push(UiAction::ShopSignIn {
                             email: shop.email.trim().to_string(),
@@ -315,7 +643,9 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Sign out").clicked() {
+                        // Not mid-download: signing out drops the session
+                        // the download is running on.
+                        if ui.add_enabled(!shop.busy, egui::Button::new("Sign out")).clicked() {
                             actions.push(UiAction::ShopSignOut);
                         }
                         if ui.add_enabled(!shop.busy, egui::Button::new("Refresh")).clicked() {
@@ -379,15 +709,20 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                     }
                     ui.horizontal(|ui| {
                         ui.label("Name:");
-                        ui.add(
+                        let field = ui.add(
                             egui::TextEdit::singleline(&mut shop.new_system_name)
                                 .hint_text("e.g. saloon-mac")
                                 .desired_width(180.0),
                         );
+                        let entered =
+                            field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let ready = !shop.new_system_name.trim().is_empty();
-                        if ui
+                        if (ui
                             .add_enabled(ready && !shop.busy, egui::Button::new("Register"))
                             .clicked()
+                            || entered)
+                            && ready
+                            && !shop.busy
                         {
                             actions.push(UiAction::ShopRegister {
                                 system_name: shop.new_system_name.trim().to_string(),
@@ -427,6 +762,14 @@ fn chart_shop(ctx: &Context, shop: &mut ShopView, actions: &mut Vec<UiAction>) {
                 }
             }
 
+            if !shop.warning.is_empty() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(&shop.warning)
+                        .small()
+                        .color(egui::Color32::from_rgb(180, 120, 40)),
+                );
+            }
             if !shop.status.is_empty() {
                 ui.add_space(6.0);
                 ui.separator();
@@ -449,13 +792,24 @@ fn confirm_download(
 ) {
     ui.add_space(8.0);
     egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.label(
-            RichText::new(format!("{} — subscription lapsed", pending.chart_name)).strong(),
-        );
+        let title = if pending.new_slot {
+            format!("{} — use a licence slot?", pending.chart_name)
+        } else {
+            format!("{} — subscription lapsed", pending.chart_name)
+        };
+        ui.label(RichText::new(title).strong());
         ui.label(RichText::new(&pending.because).small());
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             match &pending.edition {
+                None if pending.new_slot => {
+                    if ui.button("Assign and download").clicked() {
+                        actions.push(UiAction::ShopDownload {
+                            chart_id: pending.chart_id.clone(),
+                            edition: None,
+                        });
+                    }
+                }
                 Some(edition) => {
                     if ui
                         .button(format!("Ask for edition {edition}"))
@@ -583,7 +937,9 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                         // so navcore must ask for a different one. That is a
                         // decision about the user's licence, so it is put to
                         // them rather than made silently.
-                        actions.push(if c.expired {
+                        // So is the first download to this machine: it spends
+                        // a licence slot that can never be taken back.
+                        actions.push(if c.expired || mine.is_none() {
                             UiAction::ShopConfirmDownload {
                                 chart_id: c.id.clone(),
                             }
@@ -656,6 +1012,7 @@ fn object_query(
     ctx: &Context,
     objects: &[PickedObject],
     anchor: Option<[f32; 2]>,
+    pick_id: u64,
     actions: &mut Vec<UiAction>,
 ) {
     let mut open = true;
@@ -665,7 +1022,11 @@ fn object_query(
     let max_h = (screen.height() * 0.6).max(160.0);
     let max_w = (screen.width() * 0.45).clamp(260.0, 460.0);
 
+    // `default_pos` only applies to a window egui has not seen before; one
+    // id per query is what lets each bubble open beside its own tap.
     let mut window = Window::new("Chart object")
+        .id(egui::Id::new(("chart-object", pick_id)))
+        .constrain_to(ctx.available_rect())
         .open(&mut open)
         .resizable(true)
         .collapsible(false)

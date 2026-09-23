@@ -5,10 +5,90 @@
 //! it — a pennant for fifty knots, a full barb for ten, a half for five,
 //! with a bare circle for calm. Colour carries the same number again, so
 //! strength reads at a glance from the helm without counting anything.
+//!
+//! The colour comes from [`super::spectrum`], which is also what the weather
+//! sheet's wind lane uses. That is deliberate: a barb on the water and a
+//! column in the sheet are the same colour for the same wind, so the eye can
+//! move between the two without translating.
+//!
+//! Which *hour* is drawn is not this module's business either. The sheet owns
+//! the cursor and the renderer samples the field at it, so scrubbing the
+//! sheet moves the barbs.
 
-use egui::{Color32, Context, RichText};
+use egui::{Color32, Context};
 
-use super::ui::{UiAction, WindView};
+use super::spectrum;
+use super::ui_batch::Batch;
+
+/// The wind as a wash of colour over the chart, the way Windy draws it.
+///
+/// Barbs answer "which way, how hard, exactly here". A fill answers "where is
+/// the breeze and where is the gale" in one glance, which is the question you
+/// ask when you are deciding whether to go at all. Orca carries both, and the
+/// teardown in `doc/orca-weather-overlay-teardown.md` shows it feeding its map
+/// overlay from the very spectrum that colours its lanes — the same trick
+/// [`super::spectrum`] was written for here.
+///
+/// Sampled on a screen-space grid rather than the forecast's own, so the cost
+/// is bounded by the window and not by how coarse or fine the model happens to
+/// be. The corners are shared and the GPU does the gradient between them, so
+/// the whole layer is one mesh of a few thousand vertices — cheaper than the
+/// barbs it sits under.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WindFill {
+    /// Where each lattice corner landed on screen, logical points, row-major.
+    /// Carried in full rather than as an origin and a step, because the
+    /// lattice is laid out in Mercator and projected: only an untilted camera
+    /// maps that to an evenly spaced screen grid.
+    pub screen: Vec<[f32; 2]>,
+    pub cols: usize,
+    pub rows: usize,
+    /// `cols × rows` wind speeds in knots, row-major. `None` where the field
+    /// does not reach.
+    pub kt: Vec<Option<f32>>,
+}
+
+impl WindFill {
+    pub fn is_empty(&self) -> bool {
+        self.cols < 2
+            || self.rows < 2
+            || self.screen.len() < self.cols * self.rows
+            || self.kt.len() < self.cols * self.rows
+            || self.kt.iter().all(|v| v.is_none())
+    }
+}
+
+/// How much of the chart the fill is allowed to take.
+///
+/// Enough to read the colour at a glance, little enough that a depth contour,
+/// a wreck and a buoy all still read straight through it. Orca's own overlay
+/// is a raster layer with an opacity for exactly this reason: a weather layer
+/// that hides a rock is worse than no weather layer.
+const FILL_ALPHA: u8 = 96;
+
+/// Draw the wind fill. Below everything — it is a wash, not a mark.
+pub fn draw_fill(ctx: &Context, fill: &WindFill) {
+    if fill.is_empty() {
+        return;
+    }
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let mut batch = Batch::new(ctx);
+    // Colour is taken from the speed at each corner, not interpolated between
+    // colours: the ramp bends at every Beaufort stop, and mixing two colours
+    // across a cell would slide the boundary off the number it stands for.
+    let colours: Vec<Option<Color32>> = fill
+        .kt
+        .iter()
+        .map(|kt| {
+            kt.map(|kt| {
+                let c = spectrum::WIND_KT.at(kt);
+                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), FILL_ALPHA)
+            })
+        })
+        .collect();
+    batch.grid(&fill.screen, fill.cols, fill.rows, &colours);
+    batch.paint(&painter);
+}
 
 /// One barb, already projected by the renderer.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,40 +107,40 @@ const SHAFT_PX: f32 = 26.0;
 const FEATHER_PX: f32 = 9.0;
 const FEATHER_GAP: f32 = 4.5;
 
-/// Speed to colour: the Beaufort story in five steps, light to storm.
-/// Deliberately not a continuous rainbow — a helmsman wants "is that a reef
-/// or not", and a band answers faster than a hue.
+/// Speed to colour. One line, because the ramp lives in one place now.
 fn colour_for(kt: f32) -> Color32 {
-    // Chosen against the Day palette's pale blue sea, where a light tint
-    // simply disappears — every band here is darker than the water.
-    match kt {
-        k if k < 6.0 => Color32::from_rgb(90, 120, 160),
-        k if k < 12.0 => Color32::from_rgb(30, 120, 60),
-        k if k < 20.0 => Color32::from_rgb(170, 130, 10),
-        k if k < 30.0 => Color32::from_rgb(215, 100, 20),
-        _ => Color32::from_rgb(200, 30, 30),
-    }
+    spectrum::WIND_KT.at(kt)
 }
 
 /// Draw the field. Under the vessels and the routes: weather is background,
 /// the boat and her plan are not.
+///
+/// Every barb goes into one mesh. Five hundred of them, each some five
+/// separate strokes, is more shapes than egui's tessellator wants to see in a
+/// frame on a Pi; see [`super::ui_batch`].
 pub fn draw(ctx: &Context, barbs: &[WindBarb]) {
     if barbs.is_empty() {
         return;
     }
     let painter = ctx.layer_painter(egui::LayerId::background());
+    let mut batch = Batch::new(ctx);
+    // A shaft and a feather or three apiece. Deliberately a little short:
+    // over-reserving here cost more in the allocator than the one regrowth it
+    // saved, which is the sort of thing only a measurement tells you.
+    batch.reserve(barbs.len() * 4);
     for barb in barbs {
-        draw_one(&painter, barb);
+        draw_one(&mut batch, barb);
     }
+    batch.paint(&painter);
 }
 
-fn draw_one(painter: &egui::Painter, barb: &WindBarb) {
+fn draw_one(batch: &mut Batch, barb: &WindBarb) {
     let at = egui::pos2(barb.screen[0], barb.screen[1]);
     let colour = colour_for(barb.kt);
-    let stroke = egui::Stroke::new(1.9, colour);
+    const W: f32 = 1.9;
 
     if barb.kt < CALM_KT {
-        painter.circle(at, 3.0, Color32::TRANSPARENT, stroke);
+        batch.circle_outline(at, 3.0, W, colour);
         return;
     }
 
@@ -69,7 +149,7 @@ fn draw_one(painter: &egui::Painter, barb: &WindBarb) {
     let rad = (barb.from_deg as f64).to_radians();
     let dir = egui::vec2(rad.sin() as f32, -(rad.cos() as f32));
     let tip = at + dir * SHAFT_PX;
-    painter.line_segment([at, tip], stroke);
+    batch.line(at, tip, W, colour);
 
     // Feathers hang off the outer end, working inwards. They sit on the side
     // that makes the barb read the same in both hemispheres here — northern
@@ -81,17 +161,13 @@ fn draw_one(painter: &egui::Painter, barb: &WindBarb) {
     while remaining >= 50.0 {
         let base = tip - dir * along;
         let inner = base - dir * FEATHER_GAP * 1.6;
-        painter.add(egui::Shape::convex_polygon(
-            vec![base, inner, base + side * FEATHER_PX],
-            colour,
-            egui::Stroke::NONE,
-        ));
+        batch.convex(&[base, inner, base + side * FEATHER_PX], colour);
         along += FEATHER_GAP * 2.0;
         remaining -= 50.0;
     }
     while remaining >= 10.0 {
         let base = tip - dir * along;
-        painter.line_segment([base, base + side * FEATHER_PX], stroke);
+        batch.line(base, base + side * FEATHER_PX, W, colour);
         along += FEATHER_GAP;
         remaining -= 10.0;
     }
@@ -101,99 +177,8 @@ fn draw_one(painter: &egui::Painter, barb: &WindBarb) {
             along = FEATHER_GAP;
         }
         let base = tip - dir * along;
-        painter.line_segment([base, base + side * (FEATHER_PX * 0.5)], stroke);
+        batch.line(base, base + side * (FEATHER_PX * 0.5), W, colour);
     }
-}
-
-/// The wind window: which forecast, which hour, and how to refresh it.
-pub fn window(ctx: &Context, view: &mut WindView, actions: &mut Vec<UiAction>) {
-    let mut open = view.show;
-    egui::Window::new("Wind")
-        .open(&mut open)
-        .default_size([420.0, 120.0])
-        .default_pos([80.0, 70.0])
-        .constrain(true)
-        .collapsible(true)
-        .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Forecast:").weak());
-                ui.label(&view.source);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(!view.busy, egui::Button::new("Refresh here"))
-                        .on_hover_text("Fetch the wind for the area now on screen")
-                        .clicked()
-                    {
-                        actions.push(UiAction::WindRefresh);
-                    }
-                });
-            });
-
-            if view.steps.is_empty() {
-                if view.busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(RichText::new(&view.status).small());
-                    });
-                } else {
-                    ui.label(
-                        RichText::new(if view.status.is_empty() {
-                            "No forecast loaded yet."
-                        } else {
-                            &view.status
-                        })
-                        .small(),
-                    );
-                }
-                return;
-            }
-
-            let last = view.steps.len() - 1;
-            view.step = view.step.min(last);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(view.step > 0, egui::Button::new("−").small())
-                    .clicked()
-                {
-                    view.step -= 1;
-                }
-                let mut step = view.step;
-                ui.add(
-                    egui::Slider::new(&mut step, 0..=last)
-                        .show_value(false)
-                        .trailing_fill(true),
-                );
-                if step != view.step {
-                    view.step = step;
-                }
-                if ui
-                    .add_enabled(view.step < last, egui::Button::new("+").small())
-                    .clicked()
-                {
-                    view.step += 1;
-                }
-            });
-            ui.label(RichText::new(&view.valid_label).strong());
-            if !view.status.is_empty() {
-                ui.label(RichText::new(&view.status).small().weak());
-            }
-
-            // The key, so the colours mean something without a manual.
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                for (label, kt) in [
-                    ("<6", 3.0f32),
-                    ("6–12", 9.0),
-                    ("12–20", 16.0),
-                    ("20–30", 25.0),
-                    ("30+", 35.0),
-                ] {
-                    ui.label(RichText::new(label).small().color(colour_for(kt)));
-                }
-                ui.label(RichText::new("kt").small().weak());
-            });
-        });
-    view.show = open;
 }
 
 #[cfg(test)]
@@ -225,13 +210,20 @@ mod tests {
         assert_eq!(expect(13.0), (0, 1, true));
     }
 
+    /// A barb on the water and a column in the sheet must agree, or the two
+    /// displays are quietly telling different stories.
     #[test]
-    fn the_colour_bands_climb_with_the_wind() {
+    fn a_barb_takes_its_colour_from_the_shared_ramp() {
+        for kt in [0.0f32, 7.0, 18.5, 33.0, 70.0] {
+            assert_eq!(colour_for(kt), spectrum::WIND_KT.at(kt));
+        }
+    }
+
+    #[test]
+    fn the_colours_climb_with_the_wind() {
         let ordered = [3.0, 9.0, 16.0, 25.0, 40.0].map(colour_for);
         for w in ordered.windows(2) {
-            assert_ne!(w[0], w[1], "each band must be distinguishable");
+            assert_ne!(w[0], w[1], "each step must be distinguishable");
         }
-        assert_eq!(colour_for(5.9), colour_for(3.0));
-        assert_eq!(colour_for(6.0), colour_for(11.9));
     }
 }

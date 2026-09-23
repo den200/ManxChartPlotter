@@ -112,11 +112,40 @@ impl S52Engine {
     /// safety contour is the one line on the chart that must never be dropped.
     /// navcore did neither, so with a 2 m safety contour three segments of it
     /// were SCAMIN-filtered out of a 1:11600 view.
-    pub fn is_promoted_safety_contour(&self, feature: &crate::senc::Feature) -> bool {
+    ///
+    /// `selected` is the chart's safety contour ([`select_safety_contour`]);
+    /// `None` tests against the mariner's setting as-is.
+    ///
+    /// [`select_safety_contour`]: super::cs::select_safety_contour
+    pub fn is_promoted_safety_contour(
+        &self,
+        feature: &crate::senc::Feature,
+        selected: Option<f64>,
+    ) -> bool {
         // DEPCNT (43). DEPARE's own boundary reaches the same test through
         // DEPCNT02's "continuation A", but navcore draws that as an area
         // boundary, which is not SCAMIN-filtered separately.
-        feature.type_code == 43 && super::cs::is_safety_contour(feature, &self.settings)
+        feature.type_code == 43 && super::cs::is_safety_contour(feature, &self.settings, selected)
+    }
+
+    /// The chart's selected safety contour: the shallowest DEPCNT value or
+    /// depth-area limit at least as deep as the mariner's setting.
+    pub fn chart_safety_contour(&self, features: &[crate::senc::Feature]) -> Option<f64> {
+        let depths = features.iter().flat_map(|f| {
+            let mut out = [None, None];
+            match f.type_code {
+                43 => out[0] = f.valdco(),
+                // DEPARE: an area's limits are contours too, and some cells
+                // carry depth areas without separate DEPCNT lines.
+                42 => {
+                    out[0] = f.drval1();
+                    out[1] = f.drval2();
+                }
+                _ => {}
+            }
+            out.into_iter().flatten()
+        });
+        super::cs::select_safety_contour(depths, self.settings.safety_contour as f64)
     }
 
     fn bypass_display_category_filter(&self, type_code: u16) -> bool {
@@ -258,10 +287,21 @@ impl S52Engine {
 
         // Display category check. DEPCNT02 promotes the selected safety
         // contour to DISPLAYBASE, so it survives any display category.
-        if !self.settings.should_show(entry.display_category)
+        let category_hidden = !self.settings.should_show(entry.display_category)
             && !self.bypass_display_category_filter(feature.type_code)
-            && !self.is_promoted_safety_contour(feature)
-        {
+            && !self.is_promoted_safety_contour(feature, ctx.safety_contour);
+        // UDWHAZ03 promotes an isolated danger to DISPLAYBASE
+        // (s52cnsy.cpp sets `m_DisplayCat = DISPLAYBASE`), but whether it is
+        // one is only known once its CS has run. Rocks, wrecks and
+        // obstructions are category OTHER, so testing the category first
+        // hid the ISODGR51 danger symbol under the Standard display.
+        const OBSTRN: u16 = 86;
+        const UWTROC: u16 = 153;
+        const WRECKS: u16 = 159;
+        let may_be_isolated_danger = geom_type == GeometryType::Point
+            && matches!(feature.type_code, OBSTRN | UWTROC | WRECKS)
+            && !ctx.is_empty();
+        if category_hidden && !may_be_isolated_danger {
             return None;
         }
 
@@ -301,9 +341,21 @@ impl S52Engine {
             }
         }
 
+        let mut category = entry.display_category;
+        if category_hidden {
+            let isolated = expanded.iter().any(
+                |i| matches!(i, RenderInstruction::Symbol { name, .. } if name == "ISODGR51"),
+            );
+            if !isolated {
+                self.resolve_cache.lock().unwrap().insert(resolve_key, None);
+                return None;
+            }
+            category = DisplayCategory::Displaybase;
+        }
+
         let resolved = Some(ResolvedFeature {
             priority: entry.display_priority.as_u8(),
-            category: entry.display_category,
+            category,
             instructions: expanded,
         });
         self.resolve_cache

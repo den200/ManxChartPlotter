@@ -50,10 +50,14 @@ pub fn bar(ctx: &Context, view: &mut InstrumentView, vessel: &Vessel) {
             // otherwise.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
+                // Orange is a warning — a link that should be up and is
+                // not. With no server asked for, there is nothing to warn of.
                 let (colour, tip) = if view.connected {
                     (Color32::from_rgb(80, 190, 120), view.status.clone())
-                } else {
+                } else if view.active {
                     (Color32::from_rgb(210, 130, 60), view.status.clone())
+                } else {
+                    (ui.visuals().weak_text_color(), view.status.clone())
                 };
                 let (rect, response) =
                     ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
@@ -161,7 +165,7 @@ fn tile(
                 egui::pos2(text_pos.x - 2.0, y),
                 egui::pos2(text_pos.x + galley.size().x + 2.0, y),
             ],
-            Stroke::new(1.5, ui.visuals().warn_fg_color),
+            Stroke::new(1.5_f32, ui.visuals().warn_fg_color),
         );
         if let Some(r) = reading {
             return response.on_hover_text(format!(
@@ -183,6 +187,10 @@ pub fn settings(
 ) {
     let mut open = view.open;
     egui::Window::new("Instruments")
+        .constrain_to(ctx.available_rect())
+        // No title-bar collapse: on a touchscreen it is an easy accidental
+        // tap that leaves an empty title bar and no obvious way back.
+        .collapsible(false)
         .open(&mut open)
         .resizable(true)
         .default_width(460.0)
@@ -209,13 +217,22 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
         .weak(),
     );
     ui.horizontal(|ui| {
-        ui.add(
+        let field = ui.add(
             egui::TextEdit::singleline(&mut view.url)
                 .hint_text("openplotter.local  ·  192.168.1.50  ·  demo.signalk.org")
                 .desired_width(260.0),
         );
-        if view.connected {
-            if ui.button("Disconnect").clicked() {
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if entered {
+            // Enter connects to what was typed — reconnecting if a stream
+            // is already open, since the address may have changed.
+            actions.push(UiAction::SignalKConnect {
+                url: view.url.clone(),
+            });
+        }
+        if view.active {
+            let label = if view.connected { "Disconnect" } else { "Stop" };
+            if ui.button(label).clicked() {
                 actions.push(UiAction::SignalKDisconnect);
             }
         } else if ui.button("Connect").clicked() {
@@ -235,7 +252,7 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
         ui.label(RichText::new(&view.status).small());
     });
     // One tap to the public demo, so the feature can be tried without a boat.
-    if !view.connected && ui.link("Try the public Signal K demo").clicked() {
+    if !view.active && ui.link("Try the public Signal K demo").clicked() {
         view.url = "demo.signalk.org".into();
         actions.push(UiAction::SignalKConnect {
             url: view.url.clone(),
@@ -376,10 +393,16 @@ fn picker(
                     move_to = Some((i, i - 1));
                 }
                 if !live {
+                    // Offline, nothing is sent at all; saying the boat does
+                    // not send this path would read as a data fault.
                     ui.label(
-                        RichText::new("not sent by this boat")
-                            .small()
-                            .weak(),
+                        RichText::new(if view.connected {
+                            "not sent by this boat"
+                        } else {
+                            "not connected"
+                        })
+                        .small()
+                        .weak(),
                     );
                 }
             });
@@ -407,6 +430,10 @@ fn picker(
             .small()
             .weak(),
         );
+        // Removing or reordering tiles offline is still a change to keep.
+        if changed {
+            actions.push(UiAction::SettingsChanged);
+        }
         return;
     }
 

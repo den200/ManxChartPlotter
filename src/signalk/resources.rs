@@ -112,7 +112,7 @@ pub fn resource_to_route(resource_id: &str, value: &Value) -> Option<(Route, Vec
             .and_then(|n| n.get(i))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| format!("{:03}", i + 1));
+            .unwrap_or_else(|| format!("WP {}", i + 1));
         let mut wp = Waypoint::new(name, lat, lon);
         if let Some(id) = guids
             .and_then(|g| g.get(i))
@@ -253,7 +253,7 @@ mod tests {
         let (route, wps) = resource_to_route("not-a-uuid", &foreign).unwrap();
         assert_eq!(route.name, "qtVlm route");
         assert_eq!(wps.len(), 2);
-        assert_eq!(wps[0].name, "001");
+        assert_eq!(wps[0].name, "WP 1");
         assert!((wps[1].position.lat - 56.5).abs() < 1e-12);
 
         // Degenerate ones are refused, not half-loaded.
