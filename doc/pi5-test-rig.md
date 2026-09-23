@@ -50,9 +50,16 @@ This is the everyday loop: edit on the Mac, run it, look at the Dell.
   build took 10 min; incremental ones take a minute or two.
 - Don't run a deploy while a build is still going on the Pi. The rsync would
   change sources under the running cargo.
-- `pi-setup.sh` has already run: apt deps, rustup in `~/.cargo`, and XDG
-  autostart in `~/.config/autostart/navcore.desktop`. Autostart isn't needed
-  for testing; delete that file if the app starting at boot gets in the way.
+- `pi-setup.sh` has already run: apt deps and rustup in `~/.cargo`. Its XDG
+  autostart is **disabled** on this rig (moved to
+  `~/navcore-autostart.desktop.disabled`), because a crash at startup would
+  loop.
+- **If the desktop dies** (e.g. a GPU hang: `dmesg` shows
+  `v3d_reset: Resetting GPU for hang`), labwc exits and the Pi drops to the
+  LightDM login screen. `den` has no password, so it can't be typed in there.
+  Recover over SSH with `ssh rpi5 'sudo systemctl restart lightdm'` (autologin
+  runs again). First seen 2026-09-23: zooming into NOAA California cells
+  (US5SAN*, US6CA77M) hung V3D.
 - `deploy/pi-run.sh` (on the Pi) kills any running navcore and starts it on the
   desktop's Wayland session (`wayland-0`, `/run/user/1000`) with
   `RUST_LOG=info`, logging to `~/navcore.log`. Restart the app without
