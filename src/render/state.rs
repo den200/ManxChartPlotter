@@ -783,7 +783,11 @@ impl RenderState {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::default(),
+                    // What the adapter actually supports, not wgpu's defaults:
+                    // the default asks for 8192 px textures and the Pi 5's
+                    // V3D stops at 7680, so device creation panicked there.
+                    // navcore's largest texture is the 4096x512 pattern atlas.
+                    required_limits: adapter.limits(),
                     label: Some("navcore_device"),
                     memory_hints: Default::default(),
                 },
