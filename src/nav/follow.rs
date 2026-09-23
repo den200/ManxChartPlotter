@@ -82,19 +82,25 @@ impl Following {
         route.legs.get(self.leg).map(|l| l.to)
     }
 
+    /// The marks still ahead: the one being steered to, then each after it.
+    /// Taken before an edit and handed to [`retarget`](Self::retarget) after.
+    pub fn marks_ahead(&self, route: &Route) -> Vec<Uuid> {
+        route.legs.iter().skip(self.leg).map(|l| l.to).collect()
+    }
+
     /// Re-point the follower after the route's waypoint list was edited.
     ///
     /// A follower holds a leg *index*. Reordering, reversing or removing a
     /// waypoint renumbers the legs, so the index alone would quietly start
     /// guiding towards a mark the crew never chose — the worst kind of bug
-    /// on a boat, because nothing looks wrong. Given the waypoint it was
-    /// steering to, this finds that mark's new leg; if the mark itself was
-    /// deleted, it lands on the last leg rather than anywhere arbitrary.
-    pub fn retarget(&mut self, route: &Route, steering_to: Uuid) {
-        self.leg = route
-            .legs
+    /// on a boat, because nothing looks wrong. Given the marks that were
+    /// ahead ([`marks_ahead`](Self::marks_ahead)), this steers to the first
+    /// of them the route still has: the same mark if it survived, the next
+    /// one if it was deleted — never skipping to the end of the route.
+    pub fn retarget(&mut self, route: &Route, ahead: &[Uuid]) {
+        self.leg = ahead
             .iter()
-            .position(|l| l.to == steering_to)
+            .find_map(|mark| route.legs.iter().position(|l| l.to == *mark))
             .unwrap_or(route.legs.len().saturating_sub(1));
     }
 
@@ -228,11 +234,12 @@ mod tests {
         f.leg = 2; // steering to "d", the last mark
         let target = f.target(&route).expect("a target");
         assert_eq!(set.get(target).unwrap().name, "d");
+        let ahead = f.marks_ahead(&route);
 
         // Drop "b" from the middle: "d" is now the end of leg 1.
         route.waypoints.remove(1);
         route.recompute_legs(&set);
-        f.retarget(&route, target);
+        f.retarget(&route, &ahead);
         assert_eq!(f.leg, 1);
         assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "d");
 
@@ -240,7 +247,7 @@ mod tests {
         // the follower lands on the last leg rather than off the end.
         route.waypoints.reverse();
         route.recompute_legs(&set);
-        f.retarget(&route, target);
+        f.retarget(&route, &ahead);
         assert!(f.leg < route.legs.len(), "leg {} is past the end", f.leg);
 
         // Delete the mark we were steering to: land on the last leg, and
@@ -249,12 +256,27 @@ mod tests {
         let mut f = Following::start(&route, FollowConfig::default()).unwrap();
         f.leg = 1;
         let target = f.target(&route).unwrap();
+        let ahead = f.marks_ahead(&route);
         let gone = route.waypoints.iter().position(|w| *w == target).unwrap();
         route.waypoints.remove(gone);
         route.recompute_legs(&set);
-        f.retarget(&route, target);
+        f.retarget(&route, &ahead);
         assert_eq!(f.leg, route.legs.len() - 1);
         assert!(f.update(&route, &set, LatLon::new(56.1, 11.0), None, None).is_some());
+    }
+
+    /// Deleting the mark being steered to moves on to the *next* mark, not
+    /// the last one: on a-b-c-d, heading for b, dropping b steers to c.
+    #[test]
+    fn deleting_the_target_steers_to_the_next_mark_not_the_last() {
+        let (mut route, set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "b");
+        let ahead = f.marks_ahead(&route);
+        route.waypoints.remove(1);
+        route.recompute_legs(&set);
+        f.retarget(&route, &ahead);
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "c");
     }
 
     /// Down to a single mark there are no legs at all; the follower must not
@@ -264,10 +286,10 @@ mod tests {
         let (mut route, set) = four_marks();
         let mut f = Following::start(&route, FollowConfig::default()).unwrap();
         f.leg = 2;
-        let target = f.target(&route).unwrap();
+        let ahead = f.marks_ahead(&route);
         route.waypoints.truncate(1);
         route.recompute_legs(&set);
-        f.retarget(&route, target);
+        f.retarget(&route, &ahead);
         assert_eq!(f.leg, 0);
         assert!(f.update(&route, &set, LatLon::new(56.0, 11.0), None, None).is_none());
     }

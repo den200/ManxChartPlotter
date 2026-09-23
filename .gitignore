@@ -49,3 +49,6 @@
 
 # macOS directory metadata
 .DS_Store
+
+# Per-folder agent settings
+doc/.claude/

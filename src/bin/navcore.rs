@@ -46,6 +46,34 @@ enum ChartSource {
     Directory(PathBuf),
 }
 
+/// Run from the directory that holds `assets/`.
+///
+/// The symbology, fonts, the decryption helper and the licence are all found
+/// by paths relative to it. Started by hand from the project that is always
+/// so; started by the system at boot (a systemd service on the plotter) the
+/// working directory is `/`, and the chart would come up with no S-52
+/// symbology at all. So when `assets/` is not here, look beside the
+/// executable and up from it — `target/release/navcore` sits two levels
+/// below the project — and move there.
+fn find_install_dir() {
+    let marker = std::path::Path::new("assets/s52/chartsymbols.xml");
+    if marker.exists() {
+        return;
+    }
+    let Ok(exe) = env::current_exe().and_then(|p| p.canonicalize()) else {
+        return;
+    };
+    for dir in exe.ancestors().skip(1) {
+        if dir.join(marker).exists() {
+            if env::set_current_dir(dir).is_ok() {
+                log::info!("working directory set to {}", dir.display());
+            }
+            return;
+        }
+    }
+    log::warn!("assets/ not found beside {}; S-52 symbology will be missing", exe.display());
+}
+
 fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
@@ -54,7 +82,15 @@ fn main() {
     .filter_module("wgpu_hal", log::LevelFilter::Warn)
     .init();
 
-    let args: Vec<String> = env::args().collect();
+    // Paths on the command line mean what they meant where the command was
+    // typed; fix them before the working directory can move.
+    let args: Vec<String> = env::args()
+        .map(|a| match std::path::Path::new(&a).canonicalize() {
+            Ok(abs) if !a.starts_with('-') => abs.display().to_string(),
+            _ => a,
+        })
+        .collect();
+    find_install_dir();
 
     // Handle --info mode
     if args.len() >= 3 && args[1] == "--info" {
@@ -171,7 +207,11 @@ fn main() {
         return;
     }
 
-    // Determine chart source from args
+    // Where the charts come from: what was asked for on the command line,
+    // else the folder the last session settled on, else nothing. The argument
+    // wins so a developer can point at one set without disturbing the folder
+    // the boat boots into — and a plotter with no keyboard needs the second
+    // line, because otherwise it can only ever show the test triangle.
     let source = match args.get(1) {
         Some(p) => {
             let path = PathBuf::from(p);
@@ -181,7 +221,13 @@ fn main() {
                 ChartSource::SingleFile(path)
             }
         }
-        None => ChartSource::TestTriangle,
+        None => match RenderState::remembered_chart_folder() {
+            Some(dir) => {
+                println!("Opening the remembered chart folder: {}", dir.display());
+                ChartSource::Directory(dir)
+            }
+            None => ChartSource::TestTriangle,
+        },
     };
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
@@ -526,6 +572,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
         // supply, so UDWHAZ03 can decide isolated dangers.
         let depth_index =
             DepthAreaIndex::build(&chart.features, chart.header.ref_lat, chart.header.ref_lon);
+        let chart_safety = engine.chart_safety_contour(&chart.features);
 
         for (fi, feature) in chart.features.iter().enumerate() {
             // Stable across chart ordering, filtering and single-chart runs, so
@@ -533,7 +580,10 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
             // chart and kept as a regression fixture.
             let id = format!("{}#{}", name, fi);
             let acronym = s57_code_to_acronym(feature.type_code);
-            let ctx = depth_index.context_for(feature);
+            let mut ctx = depth_index.context_for(feature);
+            if feature.type_code == 43 {
+                ctx.safety_contour = chart_safety;
+            }
             let (prim, geom) = match feature.feature_type {
                 FeatureType::Point | FeatureType::Multipoint => ("P", GeometryType::Point),
                 FeatureType::Line => ("L", GeometryType::Line),
@@ -568,7 +618,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
                 // harness has to model it or it reports a divergence that is
                 // really the promotion.
                 let bypass = cat == Some(navcore2::s52::DisplayCategory::Displaybase)
-                    || engine.is_promoted_safety_contour(feature);
+                    || engine.is_promoted_safety_contour(feature, chart_safety);
                 let scale_ok = navcore2::tiles::builder::should_render_at_scale_ex(
                     feature,
                     vs,
@@ -1777,10 +1827,25 @@ struct App {
     // Touch state for pinch-zoom
     touches: HashMap<u64, PhysicalPosition<f64>>,
     pinch_start_distance: Option<f32>,
+    /// Where the two fingers' midpoint was, so a pinch can pan as it zooms.
+    pinch_centroid: Option<(f32, f32)>,
+    /// Shift, Ctrl, Cmd — for the keyboard shortcuts and Ctrl-scroll zoom.
+    modifiers: winit::keyboard::ModifiersState,
     // Headless capture (NAVCORE_SHOT=path): render until tiles settle, save PNG, exit.
     shot_path: Option<String>,
     shot_requested: bool,
     frame_count: u32,
+}
+
+/// Where a wheel or trackpad zoom should hold still: under the pointer, or
+/// on the boat while the chart is following her — zooming anywhere else
+/// would be undone by the next position report.
+fn zoom_anchor(state: &RenderState, pointer: PhysicalPosition<f64>) -> (f32, f32) {
+    if state.follow_on() {
+        (state.camera.viewport_width * 0.5, state.camera.viewport_height * 0.5)
+    } else {
+        (pointer.x as f32, pointer.y as f32)
+    }
 }
 
 impl App {
@@ -1800,6 +1865,8 @@ impl App {
             pinch_start_distance: None,
             shot_path: std::env::var("NAVCORE_SHOT").ok().filter(|s| !s.is_empty()),
             shot_requested: false,
+            pinch_centroid: None,
+            modifiers: winit::keyboard::ModifiersState::empty(),
             frame_count: 0,
         }
     }
@@ -2013,6 +2080,13 @@ impl ApplicationHandler for App {
                     std::time::Instant::now() + std::time::Duration::from_millis(150),
                 ));
                 state.window().request_redraw();
+            } else if state.signalk_live() {
+                // Live data arrives on its own schedule, not the user's.
+                // Four frames a second is enough for a plotter and cheap.
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    std::time::Instant::now() + std::time::Duration::from_millis(250),
+                ));
+                state.window().request_redraw();
             } else {
                 // Idle — block until next event
                 event_loop.set_control_flow(ControlFlow::Wait);
@@ -2059,6 +2133,31 @@ impl ApplicationHandler for App {
         // panel, a drag of its title bar — the chart must not also act on it,
         // or dragging the object bubble would pan the map underneath.
         let consumed = state.ui_on_window_event(&event);
+
+        // Bookkeeping that must happen whoever takes the event. The pointer
+        // is where it is even when a window's title bar is being dragged —
+        // skipping this left the next zoom anchored where the drag began —
+        // and a finger lifted off a button has still left the glass, or the
+        // next single-finger drag would pinch against a phantom.
+        match &event {
+            WindowEvent::CursorMoved { position, .. } if consumed => {
+                self.last_mouse_pos = *position;
+            }
+            WindowEvent::Touch(Touch { id, phase: TouchPhase::Ended | TouchPhase::Cancelled, .. })
+                if consumed =>
+            {
+                self.touches.remove(id);
+                self.touch_start = None;
+                self.gesture_on_ui = false;
+                self.pinch_start_distance = None;
+                self.pinch_centroid = None;
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+            }
+            _ => {}
+        }
+
         if consumed
             && !matches!(
                 event,
@@ -2095,31 +2194,67 @@ impl ApplicationHandler for App {
                 self.frame_count = self.frame_count.saturating_add(1);
             }
 
-            // Up/Down pitch the camera; 0 returns to the plan view. Tilt is a
-            // display mode, so it is a transient key, not a saved setting.
+            // The keyboard, for a plotter at a chart table. Text fields take
+            // their keys first (egui consumes them above), so typing a
+            // position never pans the chart.
+            //   arrows         pan            Shift+Up/Down  tilt
+            //   + / -          zoom           0              plan view
+            //   C              follow boat    Esc            back out
             WindowEvent::KeyboardInput {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
             } => {
                 const STEP: f32 = 5.0_f32 * std::f32::consts::PI / 180.0;
-                let tilt = &mut state.camera.tilt;
+                let shift = self.modifiers.shift_key();
+                // A tenth of the window per press.
+                let (w, h) = (state.camera.viewport_width, state.camera.viewport_height);
+                let (pan_x, pan_y) = (w * 0.1, h * 0.1);
+                let pan = |state: &mut RenderState, dx: f32, dy: f32| {
+                    state.release_follow();
+                    state.camera.pan(dx, dy);
+                };
                 let changed = match logical_key.as_ref() {
+                    Key::Named(NamedKey::ArrowUp) if shift => {
+                        state.camera.tilt = (state.camera.tilt + STEP).min(navcore2::render::MAX_TILT);
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowDown) if shift => {
+                        state.camera.tilt = (state.camera.tilt - STEP).max(0.0);
+                        true
+                    }
                     Key::Named(NamedKey::ArrowUp) => {
-                        *tilt = (*tilt + STEP).min(navcore2::render::MAX_TILT);
+                        pan(state, 0.0, pan_y);
                         true
                     }
                     Key::Named(NamedKey::ArrowDown) => {
-                        *tilt = (*tilt - STEP).max(0.0);
+                        pan(state, 0.0, -pan_y);
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        pan(state, pan_x, 0.0);
+                        true
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        pan(state, -pan_x, 0.0);
+                        true
+                    }
+                    Key::Character("+" | "=") => {
+                        state.camera.zoom_at(1.5, w * 0.5, h * 0.5);
+                        true
+                    }
+                    Key::Character("-" | "_") => {
+                        state.camera.zoom_at(1.0 / 1.5, w * 0.5, h * 0.5);
                         true
                     }
                     Key::Character("0") => {
-                        *tilt = 0.0;
+                        state.camera.tilt = 0.0;
                         true
                     }
-                    Key::Named(NamedKey::Escape) => {
-                        state.dismiss_pick();
-                        false
+                    Key::Character("c" | "C") => {
+                        state.set_follow(true);
+                        true
                     }
+                    Key::Named(NamedKey::Escape) => state.escape(),
                     _ => false,
                 };
                 if changed {
@@ -2146,13 +2281,9 @@ impl ApplicationHandler for App {
                         let moved = ((self.last_mouse_pos.x - start.x).powi(2)
                             + (self.last_mouse_pos.y - start.y).powi(2))
                         .sqrt();
-                        if moved <= CLICK_SLOP {
+                        if moved <= CLICK_SLOP * state.window().scale_factor() {
                             let (x, y) = (self.last_mouse_pos.x as f32, self.last_mouse_pos.y as f32);
-                            if state.pick_active() {
-                                state.dismiss_pick();
-                            } else {
-                                state.pick_at_screen(x, y);
-                            }
+                            state.tap_at_screen(x, y);
                         }
                     }
                     self.mouse_pressed = pressed;
@@ -2169,7 +2300,7 @@ impl ApplicationHandler for App {
                             let moved = ((position.x - start.x).powi(2)
                                 + (position.y - start.y).powi(2))
                             .sqrt();
-                            self.panning = moved > CLICK_SLOP;
+                            self.panning = moved > CLICK_SLOP * state.window().scale_factor();
                         }
                     }
                     if self.panning {
@@ -2185,16 +2316,26 @@ impl ApplicationHandler for App {
                 self.last_mouse_pos = position;
             }
 
+            // A wheel zooms. A trackpad's two-finger swipe arrives as pixel
+            // deltas and pans, as it does in every Mac map; Ctrl or Cmd held
+            // makes it zoom instead. (winit's PanGesture never fires on macOS,
+            // so the swipe has to be read here.)
             WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 50.0,
-                };
-                state.camera.zoom_by_wheel(
-                    scroll,
-                    self.last_mouse_pos.x as f32,
-                    self.last_mouse_pos.y as f32,
-                );
+                let (ax, ay) = zoom_anchor(state, self.last_mouse_pos);
+                match delta {
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        state.camera.zoom_by_wheel(y, ax, ay);
+                    }
+                    MouseScrollDelta::PixelDelta(pos)
+                        if self.modifiers.control_key() || self.modifiers.super_key() =>
+                    {
+                        state.camera.zoom_by_wheel(pos.y as f32 / 50.0, ax, ay);
+                    }
+                    MouseScrollDelta::PixelDelta(pos) => {
+                        state.release_follow();
+                        state.camera.pan(pos.x as f32, pos.y as f32);
+                    }
+                }
                 state.mark_dirty();
             }
 
@@ -2202,11 +2343,8 @@ impl ApplicationHandler for App {
             WindowEvent::PinchGesture { delta, .. } => {
                 // delta is additive: positive = zoom in
                 let factor = 1.0 + delta as f32;
-                state.camera.zoom_at(
-                    factor,
-                    self.last_mouse_pos.x as f32,
-                    self.last_mouse_pos.y as f32,
-                );
+                let (ax, ay) = zoom_anchor(state, self.last_mouse_pos);
+                state.camera.zoom_at(factor, ax, ay);
                 state.mark_dirty();
             }
 
@@ -2225,7 +2363,12 @@ impl ApplicationHandler for App {
                         // from a pan on release.
                         if self.touches.len() == 1 {
                             self.touch_start = Some(location);
-                            self.gesture_on_ui = state.ui_pointer_over();
+                            // At the finger, not egui's hover: a touch screen
+                            // has no hover, so egui forgets the pointer
+                            // between touches and would answer "not over the
+                            // interface" for every tap on a panel.
+                            self.gesture_on_ui =
+                                state.ui_covers(location.x as f32, location.y as f32);
                             self.panning = false;
                         } else {
                             self.touch_start = None;
@@ -2254,11 +2397,27 @@ impl ApplicationHandler for App {
                             if let Some(sd) = self.pinch_start_distance {
                                 if sd > 10.0 {
                                     let factor = new_distance / sd;
-                                    state.camera.zoom_at(factor, cx, cy);
+                                    if state.follow_on() {
+                                        // Following: zoom about the boat,
+                                        // which is where the chart keeps her.
+                                        let (w, h) = (
+                                            state.camera.viewport_width,
+                                            state.camera.viewport_height,
+                                        );
+                                        state.camera.zoom_at(factor, w * 0.5, h * 0.5);
+                                    } else {
+                                        state.camera.zoom_at(factor, cx, cy);
+                                        // Two fingers move the chart as well
+                                        // as scale it, as on any phone map.
+                                        if let Some((px, py)) = self.pinch_centroid {
+                                            state.camera.pan(cx - px, cy - py);
+                                        }
+                                    }
                                     state.mark_dirty();
                                 }
                             }
                             self.pinch_start_distance = Some(new_distance);
+                            self.pinch_centroid = Some((cx, cy));
                         } else if self.touches.len() == 1 && !self.gesture_on_ui {
                             // Single-finger pan, once it is clearly a drag.
                             if !self.panning {
@@ -2266,7 +2425,7 @@ impl ApplicationHandler for App {
                                     let moved = ((location.x - start.x).powi(2)
                                         + (location.y - start.y).powi(2))
                                     .sqrt();
-                                    self.panning = moved > TOUCH_SLOP;
+                                    self.panning = moved > TOUCH_SLOP * state.window().scale_factor();
                                 }
                             }
                             if let (true, Some(old_loc)) = (self.panning, old_location) {
@@ -2287,25 +2446,26 @@ impl ApplicationHandler for App {
                                 let moved = ((location.x - start.x).powi(2)
                                     + (location.y - start.y).powi(2))
                                 .sqrt();
-                                if moved <= TOUCH_SLOP
+                                if moved <= TOUCH_SLOP * state.window().scale_factor()
                                     && self.touches.len() == 1
                                     && !self.gesture_on_ui
                                 {
-                                    if state.pick_active() {
-                                        state.dismiss_pick();
-                                    } else {
-                                        state.pick_at_screen(
-                                            location.x as f32,
-                                            location.y as f32,
-                                        );
-                                    }
+                                    state.tap_at_screen(location.x as f32, location.y as f32);
                                 }
                             }
                         }
-                        self.touch_start = None;
-                        self.gesture_on_ui = false;
                         self.touches.remove(&id);
                         self.pinch_start_distance = None;
+                        self.pinch_centroid = None;
+                        // The finger left behind by a pinch carries on panning
+                        // straight away, rather than having to be lifted and
+                        // put down again. It can no longer be a tap.
+                        self.touch_start = None;
+                        if self.touches.len() == 1 && !self.gesture_on_ui {
+                            self.panning = true;
+                        } else {
+                            self.gesture_on_ui = false;
+                        }
                     }
                 }
             }

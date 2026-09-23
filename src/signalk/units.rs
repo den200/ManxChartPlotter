@@ -77,7 +77,7 @@ impl DepthUnit {
             DepthUnit::Fathoms => "fm",
         }
     }
-    fn from_metres(self, m: f64) -> f64 {
+    pub fn from_metres(self, m: f64) -> f64 {
         match self {
             DepthUnit::Metres => m,
             DepthUnit::Feet => m * 3.280_839_895,

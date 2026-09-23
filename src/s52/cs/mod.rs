@@ -30,7 +30,10 @@ mod wrecks;
 pub use context::{CsContext, DepthAreaIndex};
 pub use datcvr::datcvr01_instructions;
 pub use depare::{depare02, depare02_color_token, depare02_instructions, DepthColorToken};
-pub use depcnt::{depcnt02, depcnt02_params, is_safety_contour, DepthContourStyle};
+pub use depcnt::{
+    depcnt02, depcnt02_params, depcnt02_selected, is_safety_contour, select_safety_contour,
+    DepthContourStyle,
+};
 pub use lights::{
     light_render_info, light_sector_info, lights06, lights06_symbol, litdsn01, LightRenderInfo,
     LightSectorInfo, LightSymbol,
@@ -68,7 +71,7 @@ pub fn execute_cs(
         "DATCVR01" => Some(datcvr01_instructions(feature)),
         "DEPARE01" | "DEPARE02" => Some(depare02_instructions(feature, settings)),
         "DEPCNT02" => {
-            let (pattern, width, color_token) = depcnt02_params(feature, settings);
+            let (pattern, width, color_token) = depcnt02_params(feature, settings, ctx.safety_contour);
             Some(vec![RenderInstruction::LineStyle {
                 pattern,
                 width,

@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_lc_pattern_table() {
         let table = LineStyleTable::load_from_xml(
-            "doc/reference projects/OpenCPN/data/s57data/chartsymbols.xml"
+            "assets/s52/chartsymbols.xml"
         ).unwrap();
 
         let patterns = LcPatternTable::from_line_style_table(&table);
@@ -540,7 +540,7 @@ mod tests {
     fn test_lowacc21_end_to_end() {
         // Load actual LOWACC21 symbol
         let table = LineStyleTable::load_from_xml(
-            "doc/reference projects/OpenCPN/data/s57data/chartsymbols.xml"
+            "assets/s52/chartsymbols.xml"
         ).unwrap();
 
         let symbol = table.get("LOWACC21").expect("LOWACC21 should exist");
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn test_lc_scale_at_zoom_levels() {
         let table = LineStyleTable::load_from_xml(
-            "doc/reference projects/OpenCPN/data/s57data/chartsymbols.xml"
+            "assets/s52/chartsymbols.xml"
         ).unwrap();
 
         println!("\n=== LC Pattern Scale Analysis ===\n");

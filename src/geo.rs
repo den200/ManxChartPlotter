@@ -58,18 +58,165 @@ pub fn advance(from: LatLon, bearing: f64, distance_m: f64) -> LatLon {
 /// One nautical mile, by definition.
 pub const METRES_PER_NM: f64 = 1852.0;
 
-/// Read a position a user typed: "lat, lon" in decimal degrees, the form
-/// every phone map hands out. Anything else — one number, three, letters,
-/// out-of-range values — is `None`, never a guess.
+/// Read a position a user typed.
+///
+/// Accepts what sailors and phones actually hand out:
+/// - decimal degrees, `56.41, 10.98` or `56.41 10.98` (signed for S and W);
+/// - decimal commas, when a semicolon separates the halves: `56,41; 10,98`;
+/// - degrees and minutes, or degrees, minutes and seconds, with hemisphere
+///   letters before or after: `56°24.6'N 10°58.8'E`, `N56 24.6 E010 58.8`,
+///   `56 24 36N 10 58 48E` — including what [`format_latlon`] writes, so a
+///   position shown anywhere in navcore can be typed back in.
+///
+/// Anything ambiguous or out of range — one number, three, minutes past 60,
+/// two latitudes — is `None`, never a guess.
 pub fn parse_latlon(s: &str) -> Option<LatLon> {
-    let parts: Vec<f64> = s
-        .split(',')
-        .map(str::trim)
-        .map(str::parse)
-        .collect::<Result<_, _>>()
-        .ok()?;
-    let [lat, lon] = parts[..] else { return None };
+    let s = s.trim();
+    let text = if s.contains(';') {
+        s.replace(',', ".").replace(';', " ")
+    } else {
+        s.replace(',', " ")
+    };
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Tok {
+        Num(f64),
+        Hemi(char),
+    }
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let flush = |cur: &mut String, toks: &mut Vec<Tok>| -> Option<()> {
+        if !cur.is_empty() {
+            toks.push(Tok::Num(cur.parse().ok()?));
+            cur.clear();
+        }
+        Some(())
+    };
+    for ch in text.chars() {
+        let up = ch.to_ascii_uppercase();
+        if matches!(up, 'N' | 'S' | 'E' | 'W') {
+            flush(&mut cur, &mut toks)?;
+            toks.push(Tok::Hemi(up));
+        } else if ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+') {
+            cur.push(ch);
+        } else if ch.is_whitespace() || matches!(ch, '°' | 'º' | '\'' | '"' | '′' | '″') {
+            flush(&mut cur, &mut toks)?;
+        } else {
+            return None;
+        }
+    }
+    flush(&mut cur, &mut toks)?;
+
+    // Degrees, or degrees and minutes, or degrees, minutes and seconds.
+    // Only the degrees may carry a sign.
+    let angle = |nums: &[f64]| -> Option<f64> {
+        let (d, rest) = nums.split_first()?;
+        if rest.len() > 2 || rest.iter().any(|v| *v < 0.0 || *v >= 60.0) {
+            return None;
+        }
+        if !rest.is_empty() && d.fract() != 0.0 {
+            return None;
+        }
+        let m = rest.first().copied().unwrap_or(0.0);
+        let sec = rest.get(1).copied().unwrap_or(0.0);
+        if rest.len() == 2 && m.fract() != 0.0 {
+            return None;
+        }
+        let mag = d.abs() + m / 60.0 + sec / 3600.0;
+        Some(if *d < 0.0 || (*d == 0.0 && d.is_sign_negative()) { -mag } else { mag })
+    };
+
+    let hemis: Vec<usize> = toks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| matches!(t, Tok::Hemi(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let nums_of = |ts: &[Tok]| -> Option<Vec<f64>> {
+        ts.iter()
+            .map(|t| match t {
+                Tok::Num(v) => Some(*v),
+                Tok::Hemi(_) => None,
+            })
+            .collect()
+    };
+
+    let (lat, lon) = match hemis.len() {
+        0 => {
+            let nums = nums_of(&toks)?;
+            match nums.len() {
+                2 | 4 | 6 => {
+                    let half = nums.len() / 2;
+                    (angle(&nums[..half])?, angle(&nums[half..])?)
+                }
+                _ => return None,
+            }
+        }
+        2 => {
+            // Letters all before their numbers, or all after.
+            let parts: Vec<(char, &[Tok])> = if hemis[0] == 0 {
+                vec![
+                    (letter(toks[0])?, &toks[1..hemis[1]]),
+                    (letter(toks[hemis[1]])?, &toks[hemis[1] + 1..]),
+                ]
+            } else if hemis[1] == toks.len() - 1 {
+                vec![
+                    (letter(toks[hemis[0]])?, &toks[..hemis[0]]),
+                    (letter(toks[hemis[1]])?, &toks[hemis[0] + 1..hemis[1]]),
+                ]
+            } else {
+                return None;
+            };
+            let mut lat = None;
+            let mut lon = None;
+            for (h, ts) in parts {
+                let nums = nums_of(ts)?;
+                // With a hemisphere letter a sign would say it twice.
+                if nums.first().is_some_and(|d| *d < 0.0) {
+                    return None;
+                }
+                let v = angle(&nums)?;
+                match h {
+                    'N' if lat.is_none() => lat = Some(v),
+                    'S' if lat.is_none() => lat = Some(-v),
+                    'E' if lon.is_none() => lon = Some(v),
+                    'W' if lon.is_none() => lon = Some(-v),
+                    _ => return None,
+                }
+            }
+            (lat?, lon?)
+        }
+        _ => return None,
+    };
+    fn letter(t: Tok) -> Option<char> {
+        match t {
+            Tok::Hemi(c) => Some(c),
+            Tok::Num(_) => None,
+        }
+    }
     (lat.abs() <= 90.0 && lon.abs() <= 180.0).then(|| LatLon::new(lat, lon))
+}
+
+/// A position as navcore shows it: degrees and decimal minutes with
+/// hemisphere letters, `56°24.62'N 010°58.81'E` — the form on the chart,
+/// and one [`parse_latlon`] reads back. Hundredths of a minute are about
+/// 18 m, fine enough for a waypoint in a harbour.
+pub fn format_latlon(lat: f64, lon: f64) -> String {
+    let one = |v: f64, width: usize, pos: char, neg: char| {
+        let hemi = if v >= 0.0 { pos } else { neg };
+        // Round in hundredths of a minute first, so 59.996' carries into
+        // the next degree instead of printing as 60.00'.
+        let total = (v.abs() * 6000.0).round() as i64;
+        let (deg, cmin) = (total / 6000, total % 6000);
+        format!("{deg:0width$}°{:02}.{:02}'{hemi}", cmin / 100, cmin % 100)
+    };
+    format!("{} {}", one(lat, 2, 'N', 'S'), one(lon, 3, 'E', 'W'))
+}
+
+/// A true bearing for display, `045°T`. Rounded before wrapping, so 359.6°
+/// reads 000°T rather than 360°T.
+pub fn format_bearing(deg: f64) -> String {
+    format!("{:03.0}°T", deg.round().rem_euclid(360.0))
 }
 
 pub fn to_nm(metres: f64) -> f64 {
@@ -225,7 +372,9 @@ mod tests {
         let other = Motion { speed: 4.0, ..other };
         let c = cpa(own, other).expect("relative motion exists");
         assert!((to_nm(c.distance_m) - 0.5).abs() < 0.01, "{}", to_nm(c.distance_m));
-        assert_eq!(c.seconds, 0.0);
+        // "Now", to within floating-point noise: the geodesic arithmetic
+        // lands on 7e-10 s on Linux and exactly 0 on macOS.
+        assert!(c.seconds.abs() < 1e-6, "{}", c.seconds);
     }
 
     #[test]
@@ -260,8 +409,40 @@ mod tests {
         assert!(parse_latlon("56.41").is_none(), "one number is not a place");
         assert!(parse_latlon("56.41,10.98,3").is_none());
         assert!(parse_latlon("91,0").is_none(), "off the planet");
-        assert!(parse_latlon("56°24'N 10°58'E").is_none(), "DMS is not parsed, not misparsed");
         assert!(parse_latlon("").is_none());
+    }
+
+    #[test]
+    fn positions_parse_in_every_form_a_sailor_writes() {
+        let near = |p: Option<LatLon>, lat: f64, lon: f64| {
+            let p = p.expect("should parse");
+            assert!((p.lat - lat).abs() < 1e-6 && (p.lon - lon).abs() < 1e-6, "{p:?}");
+        };
+        near(parse_latlon("56°24.6'N 10°58.8'E"), 56.41, 10.98);
+        near(parse_latlon("N56 24.6 E010 58.8"), 56.41, 10.98);
+        near(parse_latlon("56 24 36N 10 58 48E"), 56.41, 10.98);
+        near(parse_latlon("33°54.0'S 151°12.0'E"), -33.9, 151.2);
+        near(parse_latlon("10°58.8'E 56°24.6'N"), 56.41, 10.98);
+        near(parse_latlon("56.41 10.98"), 56.41, 10.98);
+        near(parse_latlon("56,41; 10,98"), 56.41, 10.98);
+        near(parse_latlon("56 24.6, 10 58.8"), 56.41, 10.98);
+        // What navcore displays reads back in.
+        let shown = format_latlon(56.41, -10.98);
+        near(parse_latlon(&shown), 56.41, -10.98);
+
+        assert!(parse_latlon("56°64'N 10°58'E").is_none(), "no 64th minute");
+        assert!(parse_latlon("56°24'N 10°58'N").is_none(), "two latitudes");
+        assert!(parse_latlon("-56°24'N 10°58'E").is_none(), "sign and letter disagree");
+        assert!(parse_latlon("56.41 10.98 3").is_none());
+        assert!(parse_latlon("somewhere").is_none());
+    }
+
+    #[test]
+    fn positions_and_bearings_display_without_rounding_slips() {
+        assert_eq!(format_latlon(56.41, 10.98), "56°24.60'N 010°58.80'E");
+        assert_eq!(format_latlon(55.99999, -0.5), "56°00.00'N 000°30.00'W");
+        assert_eq!(format_bearing(359.6), "000°T");
+        assert_eq!(format_bearing(45.2), "045°T");
     }
 
     #[test]

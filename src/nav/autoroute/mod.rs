@@ -40,6 +40,8 @@ pub enum PlanError {
     EndpointBuried { which: &'static str },
     /// The sea between the endpoints is closed at this draft and offing.
     Unreachable,
+    /// The user cancelled the plan.
+    Cancelled,
 }
 
 impl std::fmt::Display for PlanError {
@@ -50,6 +52,7 @@ impl std::fmt::Display for PlanError {
             PlanError::EndpointBuried { which } => {
                 write!(f, "the {which} point is too far inside a hazard to nudge free")
             }
+            PlanError::Cancelled => write!(f, "cancelled"),
             PlanError::Unreachable => {
                 write!(f, "no safe water connects the endpoints at this draft and offing")
             }
@@ -133,6 +136,7 @@ pub fn plan(
         Err(SearchError::Unreachable) | Err(SearchError::OffGrid) => {
             return Err(PlanError::Unreachable)
         }
+        Err(SearchError::Cancelled) => return Err(PlanError::Cancelled),
     };
     let pulled = grid::string_pull(&grid, &path, offing_min_m);
 

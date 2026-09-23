@@ -23,7 +23,7 @@ pub enum DepthShadeMode {
 
 /// User-configurable display settings.
 /// Controls which features are visible based on S-52 display categories.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MarinerSettings {
     /// Show Displaybase features (always true for safety - ECDIS requirement)
     pub show_displaybase: bool,

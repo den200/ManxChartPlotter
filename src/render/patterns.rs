@@ -130,6 +130,60 @@ pub struct PatternRenderer {
     camera_bind_group_layout: wgpu::BindGroupLayout,
     #[allow(dead_code)]
     metadata_buffer: wgpu::Buffer,
+    /// Kept to be rewritten when the palette changes: the atlas is rendered
+    /// in day colours only, and at night a bright day pattern over a dimmed
+    /// chart is exactly what the night palette exists to prevent.
+    atlas_texture: wgpu::Texture,
+    atlas_size: [u32; 2],
+    day_rgba: Vec<u8>,
+}
+
+/// The colours `tools/render_patterns.py` paints with, by token. The atlas
+/// holds these exact day values (plus anti-aliased blends of them), so each
+/// pixel can be traced back to its token and repainted in another palette.
+const PATTERN_DAY_COLOURS: &[(&str, [u8; 3])] = &[
+    ("LANDF", [201, 185, 122]),
+    ("CHGRD", [156, 142, 106]),
+    ("DEPVS", [129, 194, 236]),
+    ("DEPDW", [255, 255, 255]),
+    ("DEPMD", [201, 226, 245]),
+    ("DEPMS", [164, 210, 241]),
+    ("CHMGD", [136, 96, 81]),
+    ("CHMGF", [214, 163, 185]),
+    ("DNGHL", [255, 0, 0]),
+    ("RESBL", [200, 200, 255]),
+    ("RADHI", [0, 255, 0]),
+    ("NODTA", [178, 178, 178]),
+    ("CHBLK", [0, 0, 0]),
+    ("CHYLW", [255, 255, 0]),
+    ("CHGRN", [0, 200, 0]),
+    ("DEFAULT", [128, 128, 128]),
+];
+
+/// Repaint a day-palette atlas: each opaque pixel takes the colour its
+/// nearest day token has in the target palette. Alpha is kept, so the
+/// anti-aliased edges stay soft. `colour_of` returns `None` for a token the
+/// target palette lacks, which leaves that pixel as it was.
+fn recolour_atlas(day: &[u8], colour_of: impl Fn(&str) -> Option<[u8; 3]>) -> Vec<u8> {
+    let targets: Vec<([u8; 3], Option<[u8; 3]>)> = PATTERN_DAY_COLOURS
+        .iter()
+        .map(|(token, rgb)| (*rgb, colour_of(token)))
+        .collect();
+    let mut out = day.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let nearest = targets.iter().min_by_key(|(rgb, _)| {
+            (0..3)
+                .map(|i| (rgb[i] as i32 - px[i] as i32).pow(2))
+                .sum::<i32>()
+        });
+        if let Some((_, Some(to))) = nearest {
+            px[..3].copy_from_slice(to);
+        }
+    }
+    out
 }
 
 impl PatternRenderer {
@@ -454,7 +508,43 @@ impl PatternRenderer {
             vertex_count: 0,
             camera_bind_group_layout,
             metadata_buffer,
+            atlas_texture: texture,
+            atlas_size: [width, height],
+            day_rgba: rgba.into_raw(),
         })
+    }
+
+    /// Repaint the atlas for a palette. `colour_of` gives a token's colour in
+    /// that palette; `None` for the day palette restores the atlas as drawn.
+    pub fn switch_palette(
+        &self,
+        queue: &wgpu::Queue,
+        colour_of: Option<&dyn Fn(&str) -> Option<[u8; 3]>>,
+    ) {
+        let rgba = match colour_of {
+            Some(f) => recolour_atlas(&self.day_rgba, f),
+            None => self.day_rgba.clone(),
+        };
+        let [width, height] = self.atlas_size;
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.atlas_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Get the camera bind group layout for external use
@@ -581,4 +671,25 @@ pub fn calculate_pattern_offset(
     let x_offset = world_x % tile_width;
     let y_offset = world_y % tile_height;
     [x_offset, y_offset]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A day pixel takes its token's night colour; transparency and alpha
+    /// survive, so the pattern keeps its shape and its soft edges.
+    #[test]
+    fn recolouring_maps_each_pixel_through_its_token() {
+        let day = [
+            156, 142, 106, 255, // CHGRD
+            150, 140, 100, 128, // an anti-aliased CHGRD edge
+            0, 0, 0, 0, // transparent
+        ];
+        let night = |token: &str| (token == "CHGRD").then_some([40, 30, 20]);
+        let out = recolour_atlas(&day, night);
+        assert_eq!(&out[0..4], &[40, 30, 20, 255]);
+        assert_eq!(&out[4..8], &[40, 30, 20, 128]);
+        assert_eq!(&out[8..12], &[0, 0, 0, 0]);
+    }
 }

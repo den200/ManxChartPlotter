@@ -80,7 +80,9 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
             continue;
         }
 
-        let dangerous = alarm.triggered_by(target.cpa);
+        // A lost target's CPA is extrapolated from its last report; ringing
+        // it red would contradict the strike-through that says so.
+        let dangerous = !target.lost && alarm.triggered_by(target.cpa);
         let colour = if target.lost {
             Color32::from_gray(140)
         } else if dangerous {
@@ -99,7 +101,7 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
                     if length > SIZE {
                         painter.line_segment(
                             [pos, pos + unit(cog) * length],
-                            Stroke::new(1.4, colour),
+                            Stroke::new(1.4_f32, colour),
                         );
                     }
                 }
@@ -110,7 +112,7 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
         // forty others. The S-52 symbol underneath is unchanged: this adds
         // emphasis rather than replacing symbology.
         if dangerous {
-            painter.circle_stroke(pos, SIZE * 1.6, Stroke::new(2.0, colour));
+            painter.circle_stroke(pos, SIZE * 1.6, Stroke::new(2.0_f32, colour));
         }
 
         // A lost target is struck through rather than removed, so it reads as
@@ -119,11 +121,11 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
             let d = SIZE * 1.1;
             painter.line_segment(
                 [pos + Vec2::new(-d, -d), pos + Vec2::new(d, d)],
-                Stroke::new(1.4, colour),
+                Stroke::new(1.4_f32, colour),
             );
             painter.line_segment(
                 [pos + Vec2::new(-d, d), pos + Vec2::new(d, -d)],
-                Stroke::new(1.4, colour),
+                Stroke::new(1.4_f32, colour),
             );
         }
 

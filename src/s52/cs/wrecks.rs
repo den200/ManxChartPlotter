@@ -485,6 +485,7 @@ mod tests {
         let ctx = CsContext {
             area_drval1: vec![10.0],
             line_drval2: vec![],
+            ..Default::default()
         };
         let result = wrecks02(&feature, &settings, &ctx);
         assert_eq!(result.symbol, WrecksSymbol::Isodgr51);

@@ -197,6 +197,8 @@ pub enum IsoError {
     Unreachable,
     /// Step limit hit before arrival — a guard, not a strategy.
     TookTooLong,
+    /// The user cancelled the plan.
+    Cancelled,
 }
 
 impl std::fmt::Display for IsoError {
@@ -207,6 +209,7 @@ impl std::fmt::Display for IsoError {
                 "no sailable path: the wind, the polar or the chart closed every door"
             ),
             IsoError::TookTooLong => write!(f, "gave up: no arrival within the step limit"),
+            IsoError::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -279,6 +282,42 @@ const SECTOR_SHIFT: u32 = 8; // 65536 / 256
 /// second slot is the two-sided-island insurance — both passages around an
 /// obstacle survive even when they project into the same sector.
 const PER_SECTOR: usize = 2;
+
+/// Bumped to abandon every plan in progress. A plan's worker thread records
+/// the value it started under ([`begin_cancellable`]); once the two differ,
+/// [`solve`] stops at its next ring. A thread that never called
+/// `begin_cancellable` — the CLI, the tests — is never cancelled.
+static PLAN_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static STARTED_UNDER: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Abandon every plan now running. Their solves return
+/// [`IsoError::Cancelled`] at the next ring.
+pub fn cancel_plans() {
+    PLAN_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Mark the calling thread's plan as cancellable, and return the generation
+/// it belongs to (for [`plan_cancelled`]).
+pub fn begin_cancellable() -> u64 {
+    let g = PLAN_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+    STARTED_UNDER.with(|c| c.set(Some(g)));
+    g
+}
+
+/// Whether a plan begun under `generation` has since been cancelled.
+pub fn plan_cancelled(generation: u64) -> bool {
+    PLAN_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation
+}
+
+/// Whether the plan running on this thread has been cancelled. Checked by
+/// the slow steps before the solve too — the forecast download, the grid
+/// search — so Cancel frees the machine, not just the interface.
+pub fn this_plan_cancelled() -> bool {
+    STARTED_UNDER.with(|c| c.get()).is_some_and(plan_cancelled)
+}
 
 pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
     let start_m = merc(input.start);
@@ -354,6 +393,9 @@ pub fn solve(input: &IsochroneInput<'_>) -> Result<Isoroute, IsoError> {
     let mut rings_since_nearer = 0usize;
 
     for ring in 0..MAX_STEPS {
+        if this_plan_cancelled() {
+            return Err(IsoError::Cancelled);
+        }
         // Rings are equal-time, so once the ring's own clock has caught up
         // with the best analytic arrival, no later node can beat it: closing
         // times are non-negative. Stop, optimally.

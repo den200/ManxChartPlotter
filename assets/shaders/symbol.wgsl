@@ -6,7 +6,9 @@ struct CameraUniform {
     view_proj: mat4x4<f32>,
     view_size: vec2<f32>,
     pixels_per_meter: f32,
-    _pad: f32,
+    // Physical pixels per logical point: 2 on the Retina display the sizes
+    // here were calibrated on, 1 on a standard screen such as the Pi's.
+    px_per_point: f32,
 }
 
 struct SymbolMeta {
@@ -75,8 +77,11 @@ fn vs_main(
     // Offset from pivot (pivot is normalized [0,1] within symbol)
     let offset = corner - pivot;
 
-    // Symbol size - use atlas native size scaled by SYMBOL_SCALE and instance soft SCAMIN scale
-    let scaled_size = size_px * SYMBOL_SCALE * instance.scale;
+    // Symbol size - use atlas native size scaled by SYMBOL_SCALE and instance soft SCAMIN scale.
+    // SYMBOL_SCALE was fitted on a 2x display; follow the display's density
+    // from there, as the lines and the text do.
+    let density = camera.px_per_point * 0.5;
+    let scaled_size = size_px * SYMBOL_SCALE * density * instance.scale;
     let pixel_offset = offset * scaled_size;
 
     // Apply rotation.

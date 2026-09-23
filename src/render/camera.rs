@@ -30,6 +30,15 @@ const FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
 /// out, which is what the visible-tile count scales with.
 pub const MAX_TILT: f32 = 60.0 * std::f32::consts::PI / 180.0;
 
+/// The closest zoom allowed, in Mercator metres per pixel.
+///
+/// Chart vertices are stored as f32 global Mercator, where one step is
+/// 0.5–1 m at Danish latitudes (y ≈ 7.5–8.4e6 m). At the old 0.1 m/px limit
+/// that step was 5–10 px, and symbols, lines and the boat shuffled in jumps
+/// as the chart panned. At 0.5 m/px it is about a pixel — still close enough
+/// to put a boat in her berth — until the vertices are made camera-relative.
+pub const MIN_METRES_PER_PIXEL: f32 = 0.5;
+
 /// 2D camera for chart viewing
 #[derive(Debug, Clone)]
 pub struct Camera {
@@ -67,7 +76,8 @@ impl Camera {
             zoom,
             viewport_width,
             viewport_height,
-            min_zoom: zoom * 0.001, // Allow zooming in 1000x
+            // Allow zooming in 1000x, but no closer than the f32 floor.
+            min_zoom: (zoom * 0.001).max(MIN_METRES_PER_PIXEL),
             max_zoom: zoom * 10.0,  // Allow zooming out 10x
             tilt: 0.0,
         }
@@ -80,7 +90,7 @@ impl Camera {
             zoom,
             viewport_width: width,
             viewport_height: height,
-            min_zoom: 0.1,
+            min_zoom: MIN_METRES_PER_PIXEL,
             max_zoom: 1_000_000.0,
             tilt: 0.0,
         }

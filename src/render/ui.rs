@@ -21,6 +21,12 @@ use egui_wgpu::ScreenDescriptor;
 pub enum UiAction {
     /// Close the object-query bubble.
     DismissPick,
+    /// The display settings changed: re-apply them and save.
+    DisplayChanged,
+    /// Abandon the passage plan being computed.
+    PlanCancel,
+    /// Keep the boat centred on the chart, or stop.
+    FollowSet { on: bool },
     /// Sign in to the chart shop and list what the account owns.
     ShopSignIn { email: String, password: String },
     /// Re-read the entitlement list.
@@ -81,6 +87,8 @@ pub enum UiAction {
         index: usize,
         waypoint: uuid::Uuid,
     },
+    /// Put back the waypoint removed last.
+    RouteWaypointUndo,
     /// Move a waypoint one place earlier (`-1`) or later (`+1`).
     RouteWaypointMove {
         route_id: uuid::Uuid,
@@ -105,16 +113,160 @@ pub enum UiAction {
         to: String,
         sail: bool,
     },
-    /// Show or hide the wind forecast over the chart.
+    /// Load this folder of charts, replacing whatever is showing.
+    ChartFolderOpen { path: String },
+    /// Show or hide the weather sheet along the bottom of the chart.
+    WeatherSheetToggle,
+    /// Take the whole forecast for what is on screen now: the point forecast
+    /// behind the sheet, and whichever chart fields are switched on.
+    WeatherRefreshHere,
+    /// Show or hide the wind field (the barbs) over the chart.
     WindToggle,
-    /// Fetch the wind for the area now on screen.
-    WindRefresh,
+    /// Show or hide the wind as a wash of colour over the chart.
+    WindFillToggle,
+    /// Show or hide the surface current over the chart.
+    CurrentFieldToggle,
     /// Search ORC certificates for a class or boat name.
     BoatSearch { query: String, country: String },
     /// Install the polar (and specs) of a search hit by index.
     BoatUsePolar { index: usize },
     /// Weather-route between a route's endpoints, on the current forecast.
     WeatherRoute { route_id: uuid::Uuid },
+}
+
+/// The chart folder in use, and the browser for choosing another.
+///
+/// Only the chosen folder is written to disk; where the user happened to be
+/// browsing when they picked it is nobody's business next session. A plotter
+/// that boots on a boat should come up on its own charts without a command
+/// line, which is the whole reason this is remembered at all.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ChartFolderView {
+    /// The folder the charts came from. Empty until one is chosen.
+    pub chosen: String,
+    /// Browsing the disk rather than the shop.
+    #[serde(skip)]
+    pub browsing: bool,
+    /// The directory on show.
+    #[serde(skip)]
+    pub at: String,
+    /// Which directory [`entries`](Self::entries) describes. The listing is
+    /// re-read when this falls behind `at` and never per frame: a folder of
+    /// six hundred cells is a syscall per entry, and this window is drawn
+    /// sixty times a second.
+    #[serde(skip)]
+    pub scanned: Option<String>,
+    /// Sub-directories of `at`, by name, in reading order.
+    #[serde(skip)]
+    pub entries: Vec<String>,
+    /// How many `.oesu` cells sit in `at` — the catalogue reads no other
+    /// extension, so this is exactly what would load.
+    #[serde(skip)]
+    pub cells: usize,
+    #[serde(skip)]
+    pub status: String,
+    /// A folder is being loaded in the background.
+    #[serde(skip)]
+    pub loading: bool,
+}
+
+impl ChartFolderView {
+    /// Re-read the listing if it has fallen behind the directory on show.
+    pub fn rescan(&mut self) {
+        if self.scanned.as_deref() == Some(self.at.as_str()) {
+            return;
+        }
+        self.entries.clear();
+        self.cells = 0;
+        match std::fs::read_dir(&self.at) {
+            Ok(rd) => {
+                for entry in rd.flatten() {
+                    let path = entry.path();
+                    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                        continue;
+                    };
+                    // Dot-directories are noise on a chart plotter.
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        self.entries.push(name.to_string());
+                    } else if path
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("oesu"))
+                    {
+                        self.cells += 1;
+                    }
+                }
+                self.entries.sort_by_key(|n| n.to_lowercase());
+                self.status.clear();
+            }
+            Err(e) => self.status = format!("cannot read this folder: {e}"),
+        }
+        self.scanned = Some(self.at.clone());
+    }
+
+    /// Move to `dir` and mark the listing stale.
+    pub fn go(&mut self, dir: String) {
+        self.at = dir;
+    }
+}
+
+#[cfg(test)]
+mod chart_folder_tests {
+    use super::ChartFolderView;
+
+    /// The listing is read once per folder, not once per frame: this window
+    /// is drawn sixty times a second and a chart set is six hundred entries.
+    #[test]
+    fn a_folder_is_read_once_and_then_left_alone() {
+        let dir = std::env::temp_dir().join("navcore-chart-folder-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Denmark")).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        std::fs::write(dir.join("OC-45-A.oesu"), b"x").unwrap();
+        std::fs::write(dir.join("OC-45-B.OESU"), b"x").unwrap();
+        std::fs::write(dir.join("ChartList.XML"), b"x").unwrap();
+
+        let mut v = ChartFolderView {
+            at: dir.display().to_string(),
+            ..Default::default()
+        };
+        v.rescan();
+        // Sub-folders are offered; dot-folders are noise on a plotter.
+        assert_eq!(v.entries, vec!["Denmark".to_string()]);
+        // Counted the way the catalogue counts — `.oesu`, either case, and
+        // nothing else. The XML is not a chart.
+        assert_eq!(v.cells, 2);
+        assert!(v.status.is_empty());
+
+        // A second pass must not touch the disk, so a file appearing behind
+        // its back changes nothing until the folder is left and returned to.
+        std::fs::write(dir.join("OC-45-C.oesu"), b"x").unwrap();
+        v.rescan();
+        assert_eq!(v.cells, 2, "the listing was re-read when it need not be");
+        v.go(dir.display().to_string() + "/Denmark");
+        v.rescan();
+        assert_eq!(v.cells, 0);
+        assert!(v.entries.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that is not there must say so rather than look empty: an
+    /// unplugged memory stick and a stick full of holiday photographs are
+    /// different problems and the user has to be able to tell them apart.
+    #[test]
+    fn an_unreadable_folder_says_so() {
+        let mut v = ChartFolderView {
+            at: "/no/such/folder/anywhere".into(),
+            ..Default::default()
+        };
+        v.rescan();
+        assert!(!v.status.is_empty(), "no complaint about a missing folder");
+        assert_eq!(v.cells, 0);
+    }
 }
 
 /// Weather-routing preferences, persisted.
@@ -198,19 +350,23 @@ impl Default for BoatView {
     }
 }
 
-/// The wind overlay's own state. Runtime only: the field belongs to a
-/// forecast and an area, and a plotter that silently redisplayed yesterday's
-/// wind at boot would be worse than one that asks.
+/// The wind *field* — the barbs on the water — and the fetch behind it.
+///
+/// Runtime only: the field belongs to a forecast and an area, and a plotter
+/// that silently redisplayed yesterday's wind at boot would be worse than one
+/// that asks.
+///
+/// Which hour the barbs show is deliberately *not* here. That is the weather
+/// sheet's cursor, so the barbs and the sheet cannot disagree about the time.
 #[derive(Default)]
 pub struct WindView {
-    /// Drawing the field, and showing its window.
+    /// Drawing the field over the chart as barbs.
     pub show: bool,
-    /// Which forecast step is on screen.
-    pub step: usize,
+    /// Drawing it as a wash of colour as well — the two read the same
+    /// forecast and are independently useful, so they are separate switches.
+    pub fill: bool,
     /// Valid times of the loaded steps; empty until one is loaded.
     pub steps: Vec<i64>,
-    /// "valid 02 Aug 06:00 UTC (+9 h)".
-    pub valid_label: String,
     pub source: String,
     pub busy: bool,
     pub status: String,
@@ -255,10 +411,19 @@ pub struct RoutesView {
     pub visible: std::collections::HashSet<uuid::Uuid>,
     /// This frame's guidance, for the strip.
     pub guidance: Option<crate::nav::Guidance>,
+    /// Why a route being followed has no guidance right now. The strip says
+    /// so rather than vanishing, which read as "following is off".
+    pub guidance_waiting: Option<String>,
     pub status: String,
     /// The route open in the editor. While one is open its waypoints are
     /// listed and a chart tap appends to it.
     pub editing: Option<uuid::Uuid>,
+    /// The waypoint removed last, so a mistaken Del can be taken back:
+    /// (route, where it was, the mark, its name).
+    pub undo: Option<(uuid::Uuid, usize, uuid::Uuid, String)>,
+    /// A publish or fetch is on the wire. Their buttons wait for it rather
+    /// than inviting a second click that would send the same PUT twice.
+    pub net_busy: bool,
 }
 
 /// A quarter of a nautical mile, and twelve minutes: tight enough not to cry
@@ -277,6 +442,126 @@ pub enum BarPosition {
     #[default]
     Bottom,
     Hidden,
+}
+
+/// Day, dusk or night: the S-52 colour tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum Palette {
+    #[default]
+    Day,
+    Dusk,
+    Night,
+}
+
+impl Palette {
+    /// The colour table's name in chartsymbols.xml.
+    pub fn table(self) -> &'static str {
+        match self {
+            Palette::Day => "DAY_BRIGHT",
+            Palette::Dusk => "DUSK",
+            Palette::Night => "NIGHT",
+        }
+    }
+}
+
+/// How much of the chart to show, as ECDIS names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ChartDetail {
+    /// Display base: coastline, dangers, the safety contour. Never less.
+    Base,
+    Standard,
+    /// Everything the chart carries.
+    #[default]
+    All,
+}
+
+/// How the chart itself is drawn: the palette, and the mariner's settings
+/// that decide which water reads as safe.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct DisplayView {
+    #[serde(skip)]
+    pub open: bool,
+    pub palette: Palette,
+    pub detail: ChartDetail,
+    /// Safety depth = the boat's draft + `clearance_m`, and the safety
+    /// contour follows it. Off, the two manual values below are used.
+    pub depth_from_draft: bool,
+    pub clearance_m: f32,
+    pub safety_depth_m: f32,
+    pub safety_contour_m: f32,
+    pub shallow_contour_m: f32,
+    pub deep_contour_m: f32,
+    pub show_text: bool,
+    pub show_soundings: bool,
+}
+
+impl Default for DisplayView {
+    fn default() -> Self {
+        let m = crate::s52::MarinerSettings::default();
+        Self {
+            open: false,
+            palette: Palette::Day,
+            detail: ChartDetail::All,
+            depth_from_draft: true,
+            // Half a metre under the keel: a common minimum for coastal
+            // pilotage. Raise it for a swell.
+            clearance_m: 0.5,
+            safety_depth_m: m.safety_depth,
+            safety_contour_m: m.safety_contour,
+            shallow_contour_m: m.shallow_contour,
+            deep_contour_m: m.deep_contour,
+            show_text: m.show_text,
+            show_soundings: m.show_soundings,
+        }
+    }
+}
+
+impl DisplayView {
+    /// Apply these choices to `base`. A setting pinned by a `NAVCORE_*`
+    /// variable is left alone, so a capture or a conformance run stays
+    /// reproducible whatever the user last chose. `draft_m` is the boat's;
+    /// zero means unknown, and then the manual depths are used.
+    pub fn apply(&self, base: &crate::s52::MarinerSettings, draft_m: f64) -> crate::s52::MarinerSettings {
+        let pinned = |k: &str| std::env::var(k).is_ok();
+        let mut s = base.clone();
+        if !pinned("NAVCORE_DISPLAY_CAT") {
+            (s.show_standard, s.show_other) = match self.detail {
+                ChartDetail::Base => (false, false),
+                ChartDetail::Standard => (true, false),
+                ChartDetail::All => (true, true),
+            };
+        }
+        let (depth, contour) = if self.depth_from_draft && draft_m > 0.0 {
+            // The chart then selects the next contour it actually has at or
+            // below this depth as the safety contour.
+            let d = draft_m as f32 + self.clearance_m.max(0.0);
+            (d, d)
+        } else {
+            (self.safety_depth_m, self.safety_contour_m)
+        };
+        if !pinned("NAVCORE_SAFETY_DEPTH") {
+            s.safety_depth = depth;
+        }
+        if !pinned("NAVCORE_SAFETY_CONTOUR") {
+            s.safety_contour = contour;
+        }
+        if !pinned("NAVCORE_SHALLOW_CONTOUR") {
+            s.shallow_contour = self.shallow_contour_m;
+        }
+        if !pinned("NAVCORE_DEEP_CONTOUR") {
+            s.deep_contour = self.deep_contour_m;
+        }
+        // S-52's order: shallow <= safety <= deep, and a safety contour no
+        // shallower than the safety depth — or the shading calls water safe
+        // that the soundings call dangerous.
+        s.safety_contour = s.safety_contour.max(s.safety_depth);
+        s.shallow_contour = s.shallow_contour.min(s.safety_contour);
+        s.deep_contour = s.deep_contour.max(s.safety_contour);
+        s.show_text = self.show_text;
+        s.show_soundings = self.show_soundings;
+        s
+    }
 }
 
 /// The instrument strip and the connection behind it.
@@ -310,6 +595,11 @@ pub struct InstrumentView {
     pub status: String,
     #[serde(skip)]
     pub connected: bool,
+    /// A connection is wanted: connecting, connected, or waiting to retry.
+    /// What decides whether the button offers Connect or Stop — a server that
+    /// keeps refusing must still be stoppable.
+    #[serde(skip)]
+    pub active: bool,
     /// Paths the server has actually sent, for the picker.
     #[serde(skip)]
     pub available: Vec<String>,
@@ -332,6 +622,7 @@ impl Default for InstrumentView {
             open: false,
             status: "Not connected".into(),
             connected: false,
+            active: false,
             available: Vec::new(),
         }
     }
@@ -350,6 +641,10 @@ pub struct PendingDownload {
     pub edition: Option<String>,
     /// Where that edition came from, in words.
     pub because: String,
+    /// The download claims a new licence slot for this machine (a live
+    /// subscription this machine does not hold yet), rather than asking for
+    /// an older edition of a lapsed one.
+    pub new_slot: bool,
 }
 
 /// What the shop panel is showing.
@@ -376,6 +671,10 @@ pub struct ShopView {
     pub grants: std::collections::HashMap<String, String>,
     /// A download the user has not yet confirmed.
     pub pending: Option<PendingDownload>,
+    /// A standing problem with this machine — no chart licence found — kept
+    /// apart from `status`, which every worker event overwrites. Set as a
+    /// status, it was gone before anyone could read it.
+    pub warning: String,
 }
 
 /// What the UI is allowed to see.
@@ -384,6 +683,9 @@ pub struct UiState<'a> {
     pub picked: Option<&'a [crate::pick::PickedObject]>,
     /// Where the picked position currently is on screen, in *logical* points.
     pub pick_anchor: Option<[f32; 2]>,
+    /// Which query the bubble answers. Each one gets its own window, so a
+    /// new tap opens beside itself rather than where the first one did.
+    pub pick_id: u64,
     /// The boat, already projected — the renderer owns the camera, not the UI.
     pub own_ship: Option<super::ui_ownship::OwnShip>,
     /// The AIS traffic, likewise, with its closest approaches already worked
@@ -397,6 +699,13 @@ pub struct UiState<'a> {
     pub plan_pins: Vec<PlanPin>,
     /// The wind field, projected onto the screen grid.
     pub wind: Vec<super::ui_wind::WindBarb>,
+    /// The wind as a colour wash, under everything.
+    pub wind_fill: super::ui_wind::WindFill,
+    /// The surface current, likewise.
+    pub current: Vec<super::ui_weather::CurrentArrow>,
+    /// Where the sheet's point forecast was taken, projected. `None` when
+    /// there is none, or when it has panned off the screen.
+    pub weather_anchor: Option<[f32; 2]>,
 }
 
 pub struct Ui {
@@ -409,6 +718,8 @@ pub struct Ui {
     repaint_after: Option<std::time::Duration>,
     /// The chart shop panel's own state.
     pub shop: ShopView,
+    /// Which folder the charts came from, and the browser for changing it.
+    pub charts: ChartFolderView,
     /// The instrument strip and its Signal K connection.
     pub instruments: InstrumentView,
     /// The routes window and following state.
@@ -419,8 +730,12 @@ pub struct Ui {
     pub plan: PlanView,
     /// The boat's specs and polar.
     pub boat: BoatView,
-    /// The wind overlay.
+    /// The wind field over the chart.
     pub wind: WindView,
+    /// The weather sheet: the time axis, the lanes, and the cursor that every
+    /// other weather display on screen reads.
+    pub sheet: super::ui_weather::SheetView,
+    pub display: DisplayView,
 }
 
 impl Ui {
@@ -452,11 +767,14 @@ impl Ui {
             // is expected to answer without being asked.
             instruments: crate::render::state::RenderState::load_settings().unwrap_or_default(),
             shop: ShopView::default(),
+            charts: ChartFolderView::default(),
             routes: RoutesView::default(),
             weather: crate::render::state::RenderState::load_weather_settings(),
             plan: PlanView::default(),
             boat: crate::render::state::RenderState::load_boat_settings(),
             wind: WindView::default(),
+            sheet: Default::default(),
+            display: crate::render::state::RenderState::load_display_settings(),
         }
     }
 
@@ -508,6 +826,34 @@ impl Ui {
         self.ctx.is_pointer_over_area()
     }
 
+    /// Whether a physical-pixel position is under the interface: a window
+    /// or area, or one of the panels round the edge. The same test egui's
+    /// `is_pointer_over_area` makes, for a position rather than the pointer.
+    pub fn covers(&self, x: f32, y: f32) -> bool {
+        let ppp = self.ctx.pixels_per_point().max(0.01);
+        let pos = egui::pos2(x / ppp, y / ppp);
+        match self.ctx.layer_id_at(pos) {
+            Some(layer) if layer.order == egui::Order::Background => {
+                !self.ctx.available_rect().contains(pos)
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// The chart still showing between the panels, in logical points.
+    ///
+    /// The menu bar, the instrument strip and the weather sheet are all panels
+    /// laid over the chart, and anything drawn under one of them is drawn for
+    /// nobody. With the sheet open that is better than a third of the window,
+    /// and the wind field is expensive enough per barb to be worth not
+    /// drawing. It is last frame's rectangle — egui only knows what the panels
+    /// took once they have run — which matters for exactly one frame after the
+    /// sheet opens or the window resizes.
+    pub fn chart_area(&self) -> egui::Rect {
+        self.ctx.available_rect()
+    }
+
     /// Build a frame, draw it over `view`, and return what the user asked for.
     #[allow(clippy::too_many_arguments)]
     pub fn run(
@@ -525,15 +871,19 @@ impl Ui {
         let input = self.state.take_egui_input(window);
         let actions = &mut self.actions;
         let shop = &mut self.shop;
+        let charts = &mut self.charts;
         let instruments = &mut self.instruments;
         let routes = &mut self.routes;
         let weather = &mut self.weather;
         let plan = &mut self.plan;
         let boat = &mut self.boat;
         let wind = &mut self.wind;
+        let sheet = &mut self.sheet;
+        let display = &mut self.display;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
-                ctx, &state, shop, instruments, routes, weather, plan, boat, wind, fleet, actions,
+                ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
+                display, fleet, actions,
             );
         });
         self.state
@@ -609,4 +959,36 @@ fn style(ctx: &egui::Context, dark: bool) {
     style.spacing.interact_size.y = 32.0;
     style.visuals.window_rounding = egui::Rounding::same(6.0);
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// Safety depth follows the draft, and the S-52 ordering holds whatever
+    /// was typed: shallow <= safety contour <= deep, contour >= depth.
+    #[test]
+    fn display_choices_become_consistent_mariner_settings() {
+        let base = crate::s52::MarinerSettings::default();
+        let d = DisplayView {
+            clearance_m: 0.5,
+            shallow_contour_m: 9.0,
+            deep_contour_m: 1.0,
+            detail: ChartDetail::Standard,
+            show_text: false,
+            ..DisplayView::default()
+        };
+        let s = d.apply(&base, 2.1);
+        assert!((s.safety_depth - 2.6).abs() < 1e-6);
+        assert!(s.safety_contour >= s.safety_depth);
+        assert!(s.shallow_contour <= s.safety_contour);
+        assert!(s.deep_contour >= s.safety_contour);
+        assert!(s.show_standard && !s.show_other && s.show_displaybase);
+        assert!(!s.show_text);
+
+        // Unknown draft: the manual values are used instead.
+        let manual = DisplayView { safety_depth_m: 4.0, safety_contour_m: 5.0, ..d };
+        let s = manual.apply(&base, 0.0);
+        assert_eq!((s.safety_depth, s.safety_contour), (4.0, 5.0));
+    }
 }

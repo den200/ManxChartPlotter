@@ -20,7 +20,7 @@ use crate::render::text::SoundingInstance;
 use crate::render::{build_line_vertices_multi_indexed, LineVertex};
 use crate::render::{HJust, TextParams, VJust};
 use crate::s52::{
-    depare02_color_token, depcnt02, light_render_info, light_sector_info, litdsn01, sndfrm02,
+    depare02_color_token, depcnt02_selected, light_render_info, light_sector_info, litdsn01, sndfrm02,
     DisplayCategory, GeometryType, LinePattern, LineStyleKey, LineStyleTable, RenderInstruction,
     S52Engine,
 };
@@ -1415,7 +1415,10 @@ impl<'a> TileBuilder<'a> {
 
         // Two-phase label decluttering: cheap AABB pre-check then full glyph layout (C4a).
         // Only ~20% of labels survive decluttering, so we save ~80% of layout_text() calls.
-        packet.label_candidates = label_candidates;
+        // The mariner's "text" switch: names, light descriptions and other
+        // TX/TE labels go; soundings have their own switch.
+        let show_text = self.s52_engine.is_none_or(|e| e.settings.show_text);
+        packet.label_candidates = if show_text { label_candidates } else { Vec::new() };
         // Text layout and decluttering deferred to global pass
 
         let fin_ms = fin_start.map(|t| t.elapsed().as_micros()).unwrap_or(0);
@@ -2499,6 +2502,15 @@ impl<'a> TileBuilder<'a> {
     ) -> LineBuildStats {
         let mut stats = LineBuildStats::default();
 
+        // The chart's own safety contour — the next contour it actually has
+        // at or deeper than the setting — decided once for all its lines.
+        let safety_ctx = crate::s52::CsContext {
+            safety_contour: self
+                .s52_engine
+                .and_then(|e| e.chart_safety_contour(&chart.features)),
+            ..Default::default()
+        };
+
         // Enumerated over all features, not over `chart.lines()`, so the index
         // matches the `chart#index` ids `--dump-ir` emits and a finding in one
         // tool can be looked up in the other.
@@ -2528,7 +2540,7 @@ impl<'a> TileBuilder<'a> {
                         // DEPCNT02 clears the safety contour's SCAMIN outright
                         // (`Scamin = 1e8+1`). It is the one line that must be on
                         // the chart at every zoom.
-                        || e.is_promoted_safety_contour(feature)
+                        || e.is_promoted_safety_contour(feature, safety_ctx.safety_contour)
                 })
                 .unwrap_or(false);
             let scamin_scale = should_render_at_scale_ex(
@@ -2559,7 +2571,12 @@ impl<'a> TileBuilder<'a> {
                     u32,
                     Vec<(u8, LineStyleKey, Option<(String, String)>)>,
                 )> = if let Some(engine) = self.s52_engine {
-                    let resolved = match engine.resolve_feature(feature, GeometryType::Line) {
+                    let ctx = if feature.type_code == 43 {
+                        &safety_ctx
+                    } else {
+                        crate::s52::CsContext::EMPTY
+                    };
+                    let resolved = match engine.resolve_feature_ctx(feature, GeometryType::Line, ctx) {
                         Some(r) => r,
                         None => {
                             // No LUP match or filtered by display category
@@ -2729,7 +2746,8 @@ impl<'a> TileBuilder<'a> {
                     }
                 } else {
                     // No S-52 engine - fallback to legacy path
-                    let fallback_key = legacy_line_style(feature, self.s52_engine);
+                    let fallback_key =
+                        legacy_line_style(feature, self.s52_engine, safety_ctx.safety_contour);
                     if let Some(key) = fallback_key {
                         Some((4, 0, vec![(0u8, key, None)]))
                     } else {
@@ -2906,6 +2924,12 @@ impl<'a> TileBuilder<'a> {
         // Track last light position to avoid duplicate text at co-located lights
         let mut last_light_pos: Option<(f64, f64)> = None;
 
+        // The depth areas around this tile, for UDWHAZ03's "is this rock an
+        // isolated danger?" — built only if the tile has a rock, wreck or
+        // obstruction to ask about. Without it every danger was resolved
+        // with no surroundings, and ISODGR51 could never be drawn.
+        let mut depth_index: Option<crate::s52::DepthAreaIndex> = None;
+
         for feature in &chart.features {
             // Only process point features
             if feature.feature_type != FeatureType::Point {
@@ -2954,7 +2978,28 @@ impl<'a> TileBuilder<'a> {
                 None => continue,
             };
 
-            let resolved = match engine.resolve_feature(feature, GeometryType::Point) {
+            let danger_ctx = if matches!(feature.type_code, 86 | 153 | 159) {
+                let index = depth_index.get_or_insert_with(|| {
+                    let margin = (bounds.max_x - bounds.min_x) * 0.1;
+                    crate::s52::DepthAreaIndex::build_near(
+                        &chart.features,
+                        chart.header.ref_lat,
+                        chart.header.ref_lon,
+                        Some((
+                            [bounds.min_x - margin, bounds.min_y - margin],
+                            [bounds.max_x + margin, bounds.max_y + margin],
+                        )),
+                    )
+                });
+                Some(index.context_for(feature))
+            } else {
+                None
+            };
+            let resolved = match engine.resolve_feature_ctx(
+                feature,
+                GeometryType::Point,
+                danger_ctx.as_ref().unwrap_or(crate::s52::CsContext::EMPTY),
+            ) {
                 Some(r) => r,
                 None => {
                     log::debug!("no LUP for point class={:?}", feature.object_class);
@@ -3276,8 +3321,19 @@ impl<'a> TileBuilder<'a> {
         // Use the tile's z-implied scale for SCAMIN filtering, NOT camera zoom.
         // This ensures tiles are consistent: z=13 tiles always show soundings if SCAMIN allows,
         // regardless of exactly where in the zoom range the camera is.
+        //
+        // Corrected to ground metres at the tile's latitude, as
+        // `view_scale_denominator` does for every other layer: Mercator
+        // metres are 1/cos(lat) too long, and without this soundings were
+        // SCAMIN-dropped ~1.7x too early at Danish latitudes while the
+        // contours and areas around them stayed.
         let tile_mpp = super::meters_per_pixel(tile_id.z);
-        let tile_view_scale = tile_mpp * (self.view_ppmm as f64) * 1000.0;
+        let (tile_lat, _) = crate::tiles::mercator_to_latlon(
+            (bounds.min_x + bounds.max_x) * 0.5,
+            (bounds.min_y + bounds.max_y) * 0.5,
+        );
+        let ground_mpp = tile_mpp * tile_lat.to_radians().cos().max(0.01);
+        let tile_view_scale = ground_mpp * (self.view_ppmm as f64) * 1000.0;
 
         log::debug!("build_soundings: chart has {} sounding features, show_soundings={}, tile_z={}, tile_scale=1:{}",
             sounding_count, settings.show_soundings, tile_id.z, tile_view_scale as u64);
@@ -3384,7 +3440,11 @@ impl<'a> TileBuilder<'a> {
             sector.sectr2
         };
         let sweep = sectr2 - sectr1;
-        if sweep < 1.0 || sweep == 360.0 {
+        // Only a degenerate sweep is dropped. The caller has already removed
+        // the light's symbol, so returning here for a full circle (a major
+        // all-round light) or a sub-degree leading sector would leave the
+        // light drawn as nothing at all.
+        if sweep <= 0.0 || sweep > 360.0 {
             return;
         }
 
@@ -4185,7 +4245,11 @@ struct SymbolBuildStats {
 
 /// Legacy line style lookup for when S-52 lookup table is unavailable.
 /// Uses ObjectClass matching as fallback.
-fn legacy_line_style(feature: &Feature, s52_engine: Option<&S52Engine>) -> Option<LineStyleKey> {
+fn legacy_line_style(
+    feature: &Feature,
+    s52_engine: Option<&S52Engine>,
+    safety_contour: Option<f64>,
+) -> Option<LineStyleKey> {
     match feature.object_class {
         ObjectClass::Coastline => Some(LineStyleKey::new(LinePattern::Solid, 1, "CSTLN")),
         ObjectClass::ShorelineConstruction => {
@@ -4200,7 +4264,7 @@ fn legacy_line_style(feature: &Feature, s52_engine: Option<&S52Engine>) -> Optio
         ObjectClass::DepthContour => {
             if let Some(engine) = s52_engine {
                 // Use full depcnt02 which handles safety contour AND QUAPOS (low accuracy)
-                let style = depcnt02(feature, &engine.settings);
+                let style = depcnt02_selected(feature, &engine.settings, safety_contour);
                 return Some(LineStyleKey::new(
                     style.pattern(),
                     style.width(),

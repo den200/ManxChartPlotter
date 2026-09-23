@@ -51,8 +51,12 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
 
     let painter = ctx.layer_painter(egui::LayerId::background());
 
+    // Same ink as the AIS overlay: near-black on the day chart would vanish
+    // against the dusk and night palettes.
     let line = if ship.stale {
         Color32::from_gray(140)
+    } else if ctx.style().visuals.dark_mode {
+        Color32::from_gray(225)
     } else {
         Color32::from_rgb(30, 30, 30)
     };
@@ -66,19 +70,19 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
                 let end = pos + unit(cog) * length;
                 painter.line_segment(
                     [pos, end],
-                    Stroke::new(2.0, line.gamma_multiply(0.8)),
+                    Stroke::new(2.0_f32, line.gamma_multiply(0.8)),
                 );
                 // A tick at each minute, so distance-to-go can be read off the
                 // vector without measuring it.
                 for minute in 1..VECTOR_MINUTES as i32 {
                     let at = pos + unit(cog) * (length * minute as f32 / VECTOR_MINUTES);
                     let across = unit(cog + std::f32::consts::FRAC_PI_2) * 3.0;
-                    painter.line_segment([at - across, at + across], Stroke::new(1.5, line));
+                    painter.line_segment([at - across, at + across], Stroke::new(1.5_f32, line));
                 }
                 painter.text(
                     end + unit(cog) * 8.0,
                     egui::Align2::CENTER_CENTER,
-                    format!("{VECTOR_MINUTES:.0}′"),
+                    format!("{VECTOR_MINUTES:.0} min"),
                     FontId::proportional(10.0),
                     line,
                 );
@@ -93,7 +97,7 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
     if let Some(b) = ship.heading.or(ship.cog) {
         painter.line_segment(
             [pos + unit(b) * HULL, pos + unit(b) * (HULL * 3.5)],
-            Stroke::new(1.5, line),
+            Stroke::new(1.5_f32, line),
         );
     }
 
