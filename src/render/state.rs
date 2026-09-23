@@ -178,7 +178,7 @@ impl LineVertex {
     }
 }
 
-/// Per-style uniforms for the line shader (32 bytes).
+/// Per-style uniforms for the line shader (48 bytes).
 ///
 /// The camera comes from the per-draw camera slot, so nothing here changes
 /// when the view moves.
@@ -199,8 +199,17 @@ pub struct LineUniforms {
     pub disp_prio: f32,
     /// Dot on length in screen pixels (>0 for DASD dash-dot pattern)
     pub dot_on_px: f32,
-    /// Padding for 16-byte alignment
-    pub _pad: u32,
+    /// LC() symbol repeat distance in pixels; 0 for an ordinary line. When
+    /// set, the stroke is a ribbon `line_width_px` wide and the symbol's
+    /// segments are drawn in it (see `render::lc_pattern`).
+    pub lc_advance_px: f32,
+    /// First segment of the LC() symbol in the segment buffer.
+    pub lc_first: u32,
+    /// Number of segments of the LC() symbol.
+    pub lc_count: u32,
+    /// How far before / after its place on the line the LC() symbol reaches,
+    /// pixels.
+    pub lc_x_range_px: [f32; 2],
 }
 
 /// Line style configuration for a batch of lines.
@@ -492,6 +501,17 @@ pub struct RenderState {
     pub line_pipeline: wgpu::RenderPipeline,
     // Background line pipeline (stencil test: pass when stencil==0)
     pub bg_line_pipeline: wgpu::RenderPipeline,
+    /// Light sector arcs and legs, sized on screen.
+    sector_renderer: super::sectors::SectorRenderer,
+    /// LC() lines: instanced segments, drawn by the line shader's LC entry
+    /// points with the line pipelines' bind groups.
+    lc_pipeline: wgpu::RenderPipeline,
+    /// LC() symbol segments in pixels, bound to the line shader.
+    lc_segment_buffer: wgpu::Buffer,
+    /// Where each LC() symbol sits in `lc_segment_buffer`, and its size.
+    lc_symbols: Vec<super::lc_pattern::LcSymbolGpu>,
+    /// The density `lc_segment_buffer` was laid out at.
+    lc_atlas_ppmm: f32,
     pub line_bind_group_layout: wgpu::BindGroupLayout,
     pub line_uniform_buffer: wgpu::Buffer,
     pub line_bind_group: wgpu::BindGroup,
@@ -932,16 +952,39 @@ impl RenderState {
 
         let line_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("line_bind_group_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // LC() symbol segments, in pixels (render::lc_pattern::LcAtlas)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // The LC symbols at this display's density. The segment count does not
+        // depend on the density, so a density change rewrites it in place.
+        let lc_atlas_ppmm = effective_ppmm.max(1.0);
+        let lc_atlas = super::lc_pattern::LcAtlas::shared(lc_atlas_ppmm);
+        let lc_segment_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("LC Segment Buffer"),
+            contents: bytemuck::cast_slice(&lc_atlas.segments),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let line_uniform_align = device.limits().min_uniform_buffer_offset_alignment;
@@ -957,14 +1000,20 @@ impl RenderState {
         let line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("line_bind_group"),
             layout: &line_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &line_uniform_buffer,
-                    offset: 0,
-                    size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
-                }),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &line_uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lc_segment_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let line_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1138,6 +1187,55 @@ impl RenderState {
             cache: None,
         });
 
+        let sector_renderer =
+            super::sectors::SectorRenderer::new(&device, config.format, &uniform_bind_group_layout);
+
+        // LC() lines: each segment an instanced quad (see render::lc_pattern).
+        let lc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("LC Line Pipeline"),
+            layout: Some(&line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: "vs_lc",
+                buffers: &[super::lc_pattern::LcSegment::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: "fs_lc",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            // As the line pipelines: ordered on the CPU, no depth test.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: super::msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         // Symbol renderer (optional - may fail if assets not found)
         let (symbol_renderer, symbol_camera_bind_group) = match SymbolRenderer::new(
             &device,
@@ -1289,6 +1387,11 @@ impl RenderState {
             bg_pipeline,
             line_pipeline,
             bg_line_pipeline,
+            sector_renderer,
+            lc_pipeline,
+            lc_segment_buffer,
+            lc_symbols: lc_atlas.symbols,
+            lc_atlas_ppmm,
             line_bind_group_layout,
             line_uniform_buffer,
             line_bind_group,
@@ -2151,7 +2254,7 @@ impl RenderState {
             let key = TileCacheKey::new(*tile_id, self.style_hash);
             if let Some(buffers) = self.tile_cache.get(&key) {
                 for batch in &buffers.line_batches {
-                    if batch.index_count > 0 {
+                    if batch.vertex_count > 0 {
                         styles.push(batch.key.style.clone());
                     }
                 }
@@ -2223,6 +2326,16 @@ impl RenderState {
             }
 
             let line_uniforms_key = self.current_line_uniforms_key(styles_key);
+            if self.lc_atlas_ppmm != self.line_style_ppmm() {
+                let atlas = super::lc_pattern::LcAtlas::shared(self.line_style_ppmm());
+                self.queue.write_buffer(
+                    &self.lc_segment_buffer,
+                    0,
+                    bytemuck::cast_slice(&atlas.segments),
+                );
+                self.lc_symbols = atlas.symbols;
+                self.lc_atlas_ppmm = self.line_style_ppmm();
+            }
             if self.last_line_uniforms_key != line_uniforms_key {
                 let uniform_start = profile_enabled().then(Instant::now);
                 let tables = self.s52_engine.as_ref().map(|e| &e.tables);
@@ -2237,7 +2350,30 @@ impl RenderState {
                         dash_off_px: style.dash_off_px,
                         disp_prio: 0.0,
                         dot_on_px: style.dot_on_px,
-                        _pad: 0,
+                        lc_advance_px: 0.0,
+                        lc_first: 0,
+                        lc_count: 0,
+                        lc_x_range_px: [0.0; 2],
+                    };
+                    // An LC() line: segments drawn as quads wide enough for its
+                    // symbol, which the fragment shader repeats along them.
+                    let line_uniforms = match style_key.lc {
+                        Some(lc) => {
+                            let sym = self.lc_symbols.get(lc as usize).copied().unwrap_or_default();
+                            LineUniforms {
+                                line_width_px: 2.0 * sym.half_extent_px,
+                                dash_on_px: 0.0,
+                                dash_off_px: 0.0,
+                                dot_on_px: 0.0,
+                                // Never zero: the shader divides by it.
+                                lc_advance_px: sym.advance_px.max(1.0),
+                                lc_first: sym.first,
+                                lc_count: sym.count,
+                                lc_x_range_px: sym.x_range_px,
+                                ..line_uniforms
+                            }
+                        }
+                        None => line_uniforms,
                     };
                     self.queue.write_buffer(
                         &self.line_uniform_buffer,
@@ -2269,7 +2405,10 @@ impl RenderState {
                     dash_off_px: batch.style.dash_off_px,
                     disp_prio: 4.0,
                     dot_on_px: batch.style.dot_on_px,
-                    _pad: 0,
+                    lc_advance_px: 0.0,
+                    lc_first: 0,
+                    lc_count: 0,
+                    lc_x_range_px: [0.0; 2],
                 };
                 self.queue.write_buffer(
                     &self.line_uniform_buffer,
@@ -3055,6 +3194,36 @@ impl RenderState {
         renderer.draw_range(render_pass, buffer, 0, self.mariner_count);
     }
 
+    /// Draw one line batch: an ordinary stroke (an indexed strip through
+    /// `stroke`) or an LC() line (instanced segments through the LC
+    /// pipeline). `lc_bound` remembers which of the two is set.
+    fn draw_line_batch<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        batch: &'a LineBatchGpu,
+        stroke: &'a wgpu::RenderPipeline,
+        lc_bound: &mut Option<bool>,
+    ) {
+        render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+        match &batch.index_buffer {
+            Some(indices) => {
+                if *lc_bound != Some(false) {
+                    render_pass.set_pipeline(stroke);
+                    *lc_bound = Some(false);
+                }
+                render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+            }
+            None => {
+                if *lc_bound != Some(true) {
+                    render_pass.set_pipeline(&self.lc_pipeline);
+                    *lc_bound = Some(true);
+                }
+                render_pass.draw(0..6, 0..batch.vertex_count);
+            }
+        }
+    }
+
     /// Byte offset of a camera slot in the uniform buffer.
     fn camera_slot_offset(&self, slot: usize) -> u32 {
         slot as u32 * self.camera_slot_align
@@ -3594,7 +3763,7 @@ impl RenderState {
             let Some(cam) = self.tile_cam(i) else { continue };
             if let Some(buffers) = self.tile_cache.get(key) {
                 for batch in &buffers.line_batches {
-                    if batch.index_count > 0 {
+                    if batch.vertex_count > 0 {
                         legacy_draws.push((batch, batch.key.style.clone(), *scissor, cam));
                     }
                 }
@@ -3768,7 +3937,7 @@ impl RenderState {
 
             // Background lines (stencil test: pass when stencil==0)
             if bg_end > l_start {
-                render_pass.set_pipeline(&self.bg_line_pipeline);
+                let mut lc_bound = None;
                 render_pass.set_stencil_reference(0);
                 for (batch, style_key, scissor, cam) in &legacy_draws[l_start..bg_end] {
                     if last_style.as_ref() != Some(style_key) {
@@ -3779,9 +3948,7 @@ impl RenderState {
                     self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
-                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    self.draw_line_batch(render_pass, batch, &self.bg_line_pipeline, &mut lc_bound);
                     drew_line_batches += 1;
                     line_index_count += batch.index_count;
                     line_vertex_count += batch.vertex_count;
@@ -3790,7 +3957,7 @@ impl RenderState {
 
             // Foreground lines (no stencil test)
             if l_end > bg_end {
-                render_pass.set_pipeline(&self.line_pipeline);
+                let mut lc_bound = None;
                 for (batch, style_key, scissor, cam) in &legacy_draws[bg_end..l_end] {
                     if last_style.as_ref() != Some(style_key) {
                         last_style = Some(style_key.clone());
@@ -3800,12 +3967,30 @@ impl RenderState {
                     self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
-                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    self.draw_line_batch(render_pass, batch, &self.line_pipeline, &mut lc_bound);
                     drew_line_batches += 1;
                     line_index_count += batch.index_count;
                     line_vertex_count += batch.vertex_count;
+                }
+            }
+
+            // --- Light sector arcs and legs at this priority ---
+            // After the lines, as they were when they were line batches.
+            let mut sector_pipeline_set = false;
+            for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+                let Some(cam) = self.tile_cam(i) else { continue };
+                let Some(buffers) = self.tile_cache.get(key) else { continue };
+                let Some(ref buf) = buffers.sector_buffer else { continue };
+                let start = buffers.sector_priority_offsets[p];
+                let end = buffers.sector_priority_offsets[p + 1];
+                if end > start {
+                    if !sector_pipeline_set {
+                        self.sector_renderer.set_pipeline(render_pass);
+                        sector_pipeline_set = true;
+                    }
+                    self.apply_scissor(render_pass, *scissor);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
+                    self.sector_renderer.draw_range(render_pass, buf, start, end - start);
                 }
             }
 

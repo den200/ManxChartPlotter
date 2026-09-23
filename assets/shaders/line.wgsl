@@ -3,6 +3,8 @@
 // Uses triangle strip topology with adjacency data (prev/curr/next) to compute
 // miter/bevel joins in the vertex shader. Width is in screen pixels, not world units.
 // Dash patterns are computed in the fragment shader using arc-length.
+//
+// vs_lc / fs_lc, at the end, draw LC() complex lines with the same bindings.
 
 // The camera, per draw: positions are metres from the draw's origin (a tile
 // centre) and view_proj already has that origin folded in, in f64 on the CPU.
@@ -25,8 +27,11 @@ struct LineUniforms {
     dash_off_px: f32,            // dash off (gap) length in screen pixels
     disp_prio: f32,              // display priority for depth sorting
     dot_on_px: f32,              // dot length in gap for DASD pattern
-    _pad: u32,
-    // Total: 32 bytes
+    lc_advance_px: f32,          // LC() symbol repeat, px (LC pipeline only)
+    lc_first: u32,               // first LC() segment in lc_segments
+    lc_count: u32,               // number of LC() segments
+    lc_x_range: vec2<f32>,       // LC() symbol's reach before/after its place, px
+    // Total: 48 bytes
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -34,6 +39,9 @@ struct LineUniforms {
 var<storage, read> palette: array<vec4<f32>>;
 
 @group(1) @binding(0) var<uniform> u: LineUniforms;
+// LC() symbols in pixels: per segment [x0, y0, x1, y1] then [half stroke, ...],
+// from the symbol's pivot: x along the direction of travel, y to its left.
+@group(1) @binding(1) var<storage, read> lc_segments: array<vec4<f32>>;
 
 struct VertexInput {
     @location(0) prev: vec2<f32>,
@@ -130,6 +138,16 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     return out;
 }
 
+fn segment_distance(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
+    let ab = b - a;
+    let len2 = dot(ab, ab);
+    var t = 0.0;
+    if len2 > 0.0 {
+        t = clamp(dot(p - a, ab) / len2, 0.0, 1.0);
+    }
+    return length(p - (a + ab * t));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Convert arc_len (meters) to screen pixels
@@ -157,4 +175,112 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     return palette[u.color_index];
+}
+
+// ---------------------------------------------------------------------------
+// LC() lines. One instance per straight segment of the line. A repeat of the
+// symbol sits at every multiple of lc_advance_px of arc length; each segment
+// draws — whole, turned with the segment — the repeats that fall on it, so its
+// quad covers just those, `u.line_width_px / 2` either side. All in pixels at
+// the current zoom.
+
+struct LcInstance {
+    @location(0) p0: vec2<f32>,    // metres from the tile centre
+    @location(1) p1: vec2<f32>,
+    @location(2) arc0: f32,        // arc length at p0 along the whole line, m
+}
+
+struct LcOutput {
+    @builtin(position) position: vec4<f32>,
+    // Pixels from p0: along the segment, and to its left.
+    @location(0) local: vec2<f32>,
+    // Arc length at p0 and the segment's length along the line, pixels.
+    @location(1) @interpolate(flat) seg: vec2<f32>,
+}
+
+@vertex
+fn vs_lc(@builtin(vertex_index) vi: u32, inst: LcInstance) -> LcOutput {
+    var out: LcOutput;
+    let c0 = camera.view_proj * vec4<f32>(inst.p0, 0.0, 1.0);
+    let c1 = camera.view_proj * vec4<f32>(inst.p1, 0.0, 1.0);
+    // Behind a tilted eye: drop it (see vs_main).
+    if c0.w <= 0.0 || c1.w <= 0.0 {
+        out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        return out;
+    }
+    let half_view = camera.view_size * 0.5;
+    let s0 = c0.xy / c0.w * half_view;
+    let s1 = c1.xy / c1.w * half_view;
+    let d = s1 - s0;
+    let len = length(d);
+    var t = vec2<f32>(1.0, 0.0);
+    if len > 1e-4 {
+        t = d / len;
+    }
+    let n = vec2<f32>(-t.y, t.x);
+    let e = u.line_width_px * 0.5;
+
+    // The repeats this segment owns: those placed in [start, end), measured
+    // along the line in metres, so neighbouring segments (and tiles) share
+    // their ends exactly.
+    let adv = u.lc_advance_px;
+    let start = inst.arc0 * camera.pixels_per_meter;
+    let end = (inst.arc0 + length(inst.p1 - inst.p0)) * camera.pixels_per_meter;
+    let k_first = ceil(start / adv);
+    let k_last = ceil(end / adv) - 1.0;
+    if k_last < k_first {
+        out.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+        return out;
+    }
+    let first_at = k_first * adv - start;
+    let last_at = k_last * adv - start;
+
+    var corner: vec2<f32>;
+    switch (vi) {
+        case 0u: { corner = vec2(0.0, 0.0); }
+        case 1u: { corner = vec2(1.0, 0.0); }
+        case 2u: { corner = vec2(0.0, 1.0); }
+        case 3u: { corner = vec2(0.0, 1.0); }
+        case 4u: { corner = vec2(1.0, 0.0); }
+        default: { corner = vec2(1.0, 1.0); }
+    }
+    let along = mix(first_at + u.lc_x_range.x, last_at + u.lc_x_range.y, corner.x);
+    let across = mix(-e, e, corner.y);
+    let p = s0 + t * along + n * across;
+    out.position = vec4<f32>(p / half_view, 0.5, 1.0);
+    out.local = vec2<f32>(along, across);
+    out.seg = vec2<f32>(start, end - start);
+    return out;
+}
+
+@fragment
+fn fs_lc(in: LcOutput) -> @location(0) vec4<f32> {
+    let adv = u.lc_advance_px;
+    let start = in.seg.x;
+    let end = in.seg.x + in.seg.y;
+    let a = start + in.local.x;
+    // The repeats whose drawing can reach this pixel — placed between
+    // a - reach_after and a - reach_before — that this segment owns.
+    let k_lo = max(ceil((a - u.lc_x_range.y) / adv), ceil(start / adv));
+    let k_hi = min(floor((a - u.lc_x_range.x) / adv), ceil(end / adv) - 1.0);
+    var cov = 0.0;
+    for (var j = 0; j < 4; j++) {
+        let k = k_lo + f32(j);
+        if k > k_hi {
+            break;
+        }
+        let s = k * adv;
+        let p = vec2<f32>(a - s, in.local.y);
+        for (var i = 0u; i < u.lc_count; i++) {
+            let seg = lc_segments[2u * (u.lc_first + i)];
+            let half_stroke = lc_segments[2u * (u.lc_first + i) + 1u].x;
+            let dist = segment_distance(p, seg.xy, seg.zw);
+            cov = max(cov, clamp(half_stroke + 0.5 - dist, 0.0, 1.0));
+        }
+    }
+    if cov <= 0.0 {
+        discard;
+    }
+    let c = palette[u.color_index];
+    return vec4<f32>(c.rgb, c.a * cov);
 }

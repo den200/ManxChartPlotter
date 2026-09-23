@@ -22,6 +22,10 @@ pub struct LineStyleKey {
     pub pattern: LinePattern,
     pub width: u8,
     pub color_token: String,
+    /// An LC() complex line: the symbol, as an index into
+    /// `render::lc_pattern::lc_symbol_names`, repeated along the line by the
+    /// line shader. `None` for an ordinary LS() line.
+    pub lc: Option<u16>,
 }
 
 impl LineStyleKey {
@@ -30,6 +34,17 @@ impl LineStyleKey {
             pattern,
             width,
             color_token: color_token.into(),
+            lc: None,
+        }
+    }
+
+    /// An LC() line drawing symbol `lc` in `color_token`.
+    pub fn complex(lc: u16, color_token: impl Into<String>) -> Self {
+        Self {
+            pattern: LinePattern::Solid,
+            width: 1,
+            color_token: color_token.into(),
+            lc: Some(lc),
         }
     }
 }

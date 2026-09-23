@@ -29,9 +29,13 @@ impl TileCacheKey {
 pub struct LineBatchGpu {
     /// Batch key (pass order + S-52 style)
     pub key: LineBatchKey,
+    /// Line vertices — or, for an LC() line (`index_buffer` None), its
+    /// `LcSegment` instances.
     pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer: wgpu::Buffer,
+    /// Strip indices; None for an LC() line, which is drawn instanced.
+    pub index_buffer: Option<wgpu::Buffer>,
     pub index_count: u32,
+    /// Vertices, or LC() segment instances.
     pub vertex_count: u32,
 }
 
@@ -73,6 +77,10 @@ pub struct TileGpuBuffers {
     pub bg_pattern_vertex_count: u32,
     /// Background pattern vertex offsets per priority level
     pub bg_pattern_priority_offsets: [u32; 11],
+    /// Light sector arcs and legs (instances)
+    pub sector_buffer: Option<wgpu::Buffer>,
+    /// Sector instance offsets per priority level
+    pub sector_priority_offsets: [u32; 11],
     /// Byte size for cache budgeting
     pub byte_size: usize,
 }
@@ -86,6 +94,7 @@ impl TileGpuBuffers {
             && self.text_instances.is_empty()
             && self.label_candidates.is_empty()
             && self.pattern_vertex_count == 0
+            && self.sector_buffer.is_none()
     }
 
     /// Total line index count across all batches
@@ -191,10 +200,12 @@ impl TileGpuCache {
         // Track empty tiles so we don't re-request them every frame.
         if packet.area_vertices.is_empty()
             && packet.line_batches.is_empty()
+            && packet.lc_batches.is_empty()
             && packet.symbol_instances.is_empty()
             && packet.text_instances.is_empty()
             && packet.label_candidates.is_empty()
             && packet.pattern_vertices.is_empty()
+            && packet.sector_instances.is_empty()
         {
             log::debug!("  -> empty packet, marking as known-empty");
             if self.empty_tiles.insert(key) {
@@ -244,9 +255,26 @@ impl TileGpuCache {
             line_batches_gpu.push(LineBatchGpu {
                 key: batch.key.clone(),
                 vertex_buffer,
-                index_buffer,
+                index_buffer: Some(index_buffer),
                 index_count: batch.indices.len() as u32,
                 vertex_count: batch.vertices.len() as u32,
+            });
+        }
+        for batch in packet.lc_batches {
+            if batch.segments.is_empty() {
+                continue;
+            }
+            let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&batch.segments),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+            line_batches_gpu.push(LineBatchGpu {
+                key: batch.key,
+                vertex_buffer,
+                index_buffer: None,
+                index_count: 0,
+                vertex_count: batch.segments.len() as u32,
             });
         }
 
@@ -300,6 +328,14 @@ impl TileGpuCache {
             (None, 0)
         };
 
+        let sector_buffer = (!packet.sector_instances.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: None,
+                contents: bytemuck::cast_slice(&packet.sector_instances),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+
         let byte_size = packet.byte_size;
 
         let buffers = TileGpuBuffers {
@@ -321,6 +357,8 @@ impl TileGpuCache {
             bg_pattern_buffer,
             bg_pattern_vertex_count,
             bg_pattern_priority_offsets: packet.bg_pattern_priority_offsets,
+            sector_buffer,
+            sector_priority_offsets: packet.sector_priority_offsets,
             byte_size,
         };
 
