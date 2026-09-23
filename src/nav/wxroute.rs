@@ -718,7 +718,7 @@ pub fn with_chart_sources<T>(
     f: impl FnOnce(&[ChartSource<'_>]) -> T,
 ) -> Result<T, String> {
     use crate::cache::CachedDecryptor;
-    use crate::decrypt::{ChartDecryptor, KeyStore};
+    use crate::decrypt::KeyStore;
     use crate::senc::ChartCatalog;
     use crate::tiles::builder::TileBuilder;
     use std::collections::HashMap;
@@ -726,8 +726,7 @@ pub fn with_chart_sources<T>(
 
     let mut keys = KeyStore::new();
     let _ = keys.load_keylists_in_dir(chart_dir);
-    let base = ChartDecryptor::new("license").map_err(|e| e.to_string())?;
-    let mut decryptor = CachedDecryptor::new(base);
+    let mut decryptor = CachedDecryptor::open("license");
     let catalog =
         ChartCatalog::from_directory(chart_dir, &keys, &mut decryptor).map_err(|e| e.to_string())?;
 

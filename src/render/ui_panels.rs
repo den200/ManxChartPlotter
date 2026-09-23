@@ -611,7 +611,7 @@ fn chart_folder_browser(
     let ready = charts.cells > 0;
     ui.horizontal(|ui| {
         ui.label(match charts.cells {
-            0 => RichText::new("no .oesu cells in this folder").weak(),
+            0 => RichText::new("no charts in this folder (o-charts .oesu or S-57 .000)").weak(),
             1 => RichText::new("1 cell here").strong(),
             n => RichText::new(format!("{n} cells here")).strong(),
         });
