@@ -13,6 +13,7 @@ pub mod iso8211;
 pub mod cell;
 pub mod attr_types;
 pub mod senc_encode;
+pub mod basemap;
 
 #[cfg(test)]
 mod tests {

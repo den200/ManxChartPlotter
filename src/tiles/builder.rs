@@ -1401,6 +1401,14 @@ impl<'a> TileBuilder<'a> {
             return Ok(Arc::clone(chart));
         }
 
+        // The world basemap, built into the program.
+        if crate::s57::basemap::is_basemap(&info.path) {
+            let bytes = crate::s57::basemap::senc().to_vec();
+            let chart = Arc::new(ChartData::parse(bytes).map_err(BuildError::Parse)?);
+            *slot = Some(Arc::clone(&chart));
+            return Ok(chart);
+        }
+
         // A free S-57 cell: converted (or read from the cache), no key.
         if ChartCatalog::is_s57(&info.path) {
             let bytes = self

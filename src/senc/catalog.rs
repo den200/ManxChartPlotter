@@ -304,6 +304,23 @@ impl ChartCatalog {
         })
     }
 
+    /// Put the world basemap under the charts, so the whole world can be
+    /// panned across and there is land to steer by between chart sets. The
+    /// catalogue then spans the world.
+    pub fn add_world_basemap(&mut self) {
+        if self.charts.iter().any(|c| crate::s57::basemap::is_basemap(&c.path)) {
+            return;
+        }
+        let Some(info) = crate::s57::basemap::chart_info() else { return };
+        self.combined_extent = if self.charts.is_empty() {
+            info.extent_mercator
+        } else {
+            self.combined_extent.union(&info.extent_mercator)
+        };
+        // Coarsest first, as the quilt expects.
+        self.charts.insert(0, info);
+    }
+
     /// Whether a chart is an unencrypted S-57 cell rather than an o-charts one.
     pub fn is_s57(path: &Path) -> bool {
         path.extension().is_some_and(|e| e == "000")
@@ -335,11 +352,12 @@ impl ChartCatalog {
         tile_scale_denom: f64,
     ) -> Vec<&ChartInfo> {
         // A chart overzoomed out by more than this factor relative to the tile
-        // scale is dropped (its detail is wasted and bloats the tile). Kept
-        // generous so zoomed-out tiles still retain a coarse chart for coverage
-        // (we only want to drop the truly over-detailed large-scale cells that
-        // made low-zoom tiles enormous), while preserving overview land/water.
-        const MAX_OVERZOOM_OUT: f64 = 16.0;
+        // scale is dropped (its detail is wasted and bloats the tile). This was
+        // 16, to keep some land and water on screen when zoomed out past the
+        // coarsest chart; the world basemap does that now, and at 16 the
+        // Danish 1:1 500 000 overview still drew every light and track on it
+        // as one black knot over a view of all of Europe.
+        const MAX_OVERZOOM_OUT: f64 = 4.0;
 
         let intersecting: Vec<&ChartInfo> = self.charts.iter().filter(|c| c.intersects(tile)).collect();
         if intersecting.len() <= 1 {
@@ -480,6 +498,23 @@ fn subtract_rect(region: &mut Vec<TileBounds>, cut: &TileBounds, eps: f64) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bounded search stops, says so, and still returns what it found —
+    /// so pointing the folder picker at a home folder cannot stall the UI.
+    #[test]
+    fn a_bounded_cell_search_stops_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..50 {
+            let cell = dir.path().join(format!("ENC_ROOT/US5XX{i:03}/US5XX{i:03}.000"));
+            std::fs::create_dir_all(cell.parent().unwrap()).unwrap();
+            std::fs::write(&cell, b"").unwrap();
+        }
+        let (all, capped) = find_s57_cells_within(dir.path(), 5, 10_000);
+        assert_eq!((all.len(), capped), (50, false));
+        let (some, capped) = find_s57_cells_within(dir.path(), 5, 20);
+        assert!(capped);
+        assert!(some.len() < 50);
+    }
 
     #[test]
     fn chart_info_id_is_stable() {
@@ -651,25 +686,45 @@ mod tests {
 /// Every `*.000` below `dir`, to `depth` levels, hidden folders skipped.
 /// Sorted, so a catalog lists the same cells in the same order every run.
 pub fn find_s57_cells(dir: &Path, depth: usize) -> Vec<PathBuf> {
+    // Generous: an ENC_ROOT of every NOAA state is some 6 000 folders.
+    find_s57_cells_within(dir, depth, 200_000).0
+}
+
+/// [`find_s57_cells`] visiting at most `budget` directory entries. The
+/// second value is true when the budget ran out before the search did.
+///
+/// Pointed at a home folder, an unbounded walk goes through all of
+/// `Library` and every project on the disk; on the UI thread that froze the
+/// Charts window. Symbolic links are not followed (a link back up the tree
+/// would never end), and folders that never hold charts are skipped.
+pub fn find_s57_cells_within(dir: &Path, depth: usize, budget: usize) -> (Vec<PathBuf>, bool) {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let mut left = budget;
+    walk(dir, depth, &mut left, &mut out);
+    out.sort();
+    (out, left == 0)
+}
+
+fn walk(dir: &Path, depth: usize, left: &mut usize, out: &mut Vec<PathBuf>) {
+    const SKIP: &[&str] = &["Library", "node_modules", "target", "Applications", "System"];
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.filter_map(Result::ok) {
+        if *left == 0 {
+            return;
+        }
+        *left -= 1;
         let p = e.path();
-        let hidden = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with('.'));
-        if hidden {
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        if name.starts_with('.') {
             continue;
         }
-        if p.is_dir() {
-            if depth > 0 {
-                out.extend(find_s57_cells(&p, depth - 1));
+        let Ok(kind) = e.file_type() else { continue };
+        if kind.is_dir() {
+            if depth > 0 && !SKIP.contains(&name) {
+                walk(&p, depth - 1, left, out);
             }
-        } else if p.extension().is_some_and(|x| x == "000") {
+        } else if kind.is_file() && p.extension().is_some_and(|x| x == "000") {
             out.push(p);
         }
     }
-    out.sort();
-    out
 }

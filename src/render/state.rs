@@ -2157,7 +2157,7 @@ impl RenderState {
 
     pub fn load_catalog(
         &mut self,
-        catalog: ChartCatalog,
+        mut catalog: ChartCatalog,
         keys: Arc<KeyStore>,
         decryptor: CachedDecryptor,
     ) {
@@ -2224,6 +2224,9 @@ impl RenderState {
         log::debug!("Catalog: {} charts, camera at ({:.0}, {:.0}) Mercator, zoom {:.0} m/px",
             catalog.charts.len(), center_x, center_y, zoom);
 
+        // After the camera has framed the charts themselves: the basemap
+        // widens the catalogue to the whole world.
+        catalog.add_world_basemap();
         let catalog_arc = Arc::new(catalog);
         let keys_arc = keys;
 
@@ -3599,13 +3602,13 @@ impl RenderState {
         // 2. Compute zoom level with hysteresis (prevents z-flip on small zoom changes)
         let raw_z = zoom_from_camera_raw(self.camera.zoom);
         let z = if self.current_z == 0 {
-            raw_z.round().clamp(6.0, 18.0) as u8
+            raw_z.round().clamp(crate::tiles::MIN_TILE_Z as f64, 18.0) as u8
         } else {
             let diff = raw_z - self.current_z as f64;
             if diff > 0.6 {
                 self.current_z + 1
             } else if diff < -0.6 {
-                self.current_z.saturating_sub(1).max(6)
+                self.current_z.saturating_sub(1).max(crate::tiles::MIN_TILE_Z)
             } else {
                 self.current_z
             }
@@ -3632,7 +3635,7 @@ impl RenderState {
             let eye = cam.eye();
             crate::tiles::visible_tiles_lod(
                 &view_bounds,
-                z.saturating_sub(4).max(6),
+                z.saturating_sub(4).max(crate::tiles::MIN_TILE_Z),
                 z,
                 &|x, y| cam.ground_mpp_at(x, y),
                 &|b| {
