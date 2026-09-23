@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=navcore (test)
+Comment=Start the latest deployed navcore build, traced (~/navcore-traces)
+# pi-run.sh restarts any running navcore; on a failed start the log tail is
+# shown in a dialog instead of vanishing.
+Exec=bash -c 'out=$(bash ~/navcore/deploy/pi-run.sh 2>&1) || zenity --error --title="navcore did not start" --no-markup --text="$out"'
+Icon=applications-science
+Terminal=false
+Categories=Development;

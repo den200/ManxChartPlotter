@@ -60,11 +60,42 @@ This is the everyday loop: edit on the Mac, run it, look at the Dell.
   Recover over SSH with `ssh rpi5 'sudo systemctl restart lightdm'` (autologin
   runs again). First seen 2026-09-23: zooming into NOAA California cells
   (US5SAN*, US6CA77M) hung V3D.
-- `deploy/pi-run.sh` (on the Pi) kills any running navcore and starts it on the
-  desktop's Wayland session (`wayland-0`, `/run/user/1000`) with
-  `RUST_LOG=info`, logging to `~/navcore.log`. Restart the app without
-  rebuilding: `ssh rpi5 'bash ~/navcore/deploy/pi-run.sh'`. Follow the log:
+- `deploy/pi-run.sh` (on the Pi) kills any running navcore and starts it,
+  traced, on the desktop's Wayland session (`wayland-0`, `/run/user/1000`),
+  with `RUST_LOG=info` and `RUST_BACKTRACE=1`. Restart without rebuilding:
+  `ssh rpi5 'bash ~/navcore/deploy/pi-run.sh'`. Follow the log:
   `ssh rpi5 'tail -f ~/navcore.log'`.
+- **Desktop shortcut** "navcore (test)" (`deploy/navcore-test.desktop`,
+  reinstalled by every deploy) runs the same `pi-run.sh`. Denis double-clicks it
+  to test the latest deployed build. On a failed start it shows the log tail
+  in a zenity dialog. `quick_exec=1` in `~/.config/libfm/libfm.conf` stops the
+  "execute?" prompt.
+
+## Tracing
+
+Every start through `pi-run.sh` is a trace session in
+`~/navcore-traces/<UTC time>/` on the SD card (`latest` → newest; 30 kept).
+It's written by `deploy/pi-trace.sh` and deliberately not in `/tmp`, which
+is RAM here, so it survives a desktop crash:
+
+| file | what |
+|---|---|
+| `navcore.log` | app log, panics, backtraces |
+| `system.csv` | 1 s samples (`deploy/pi_sampler.py`, fsync'd each row): CPU %, load, mem available, zram, navcore CPU/RSS/threads, V3D render/bin busy % and jobs/s (from `/sys/class/drm/card0/device/gpu_stats`), temp, ARM/V3D MHz, core V, EXT5V V, `get_throttled` |
+| `kernel.log` | kernel messages during the run (`v3d_reset … hang` lands here) |
+| `session.txt` | build (`~/navcore/BUILD`, written by deploy: git describe + branch), binary time, kernel, Mesa, start/end, exit code/signal, throttle flags |
+
+On the Mac: `deploy/pi-trace-pull.sh [session]` rsyncs everything to
+`traces/pi/` (gitignored) and runs `tools/pi_trace_report.py`. That prints
+min/avg/max per metric, throttle flags decoded over time, each suspicious
+kernel line with the navcore log and samples of the 5 s before it, and
+WARN/ERROR grouped by message.
+
+Known from the first traces (2026-09-23): no fan on this Pi, so throttle flags
+`0xe0000` (soft temp limit and ARM cap *occurred*) show up; no under-voltage
+despite the "can't supply 5 A" popup (that's only PD negotiation with the
+Dell dock). NOAA California cells log ~1300 `Corrupt prim … huge=true`
+warnings at load. That's the lead for the V3D hang, not yet confirmed.
 - Screenshot of the Pi's screen: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/s.png' && scp rpi5:/tmp/s.png .`
 - Check the outputs: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 wlr-randr'`
 - GPU: V3D through Mesa Vulkan (`vulkaninfo --summary`).
