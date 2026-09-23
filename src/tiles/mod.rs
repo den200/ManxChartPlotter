@@ -151,6 +151,15 @@ impl TileId {
         TileBounds { min_x, max_x, min_y, max_y }
     }
 
+    /// The point this tile's geometry is measured from: its centre, in
+    /// global Mercator metres. Every position in the tile's packet is
+    /// relative to it (see `builder::tile_relative`), and the renderer draws
+    /// the tile with the camera re-based on it.
+    pub fn origin(&self) -> glam::DVec2 {
+        let (x, y) = self.bounds().center();
+        glam::DVec2::new(x, y)
+    }
+
     /// Get tile containing a Mercator point
     pub fn from_mercator(mx: f64, my: f64, z: u8) -> Self {
         let n_i = 1i64 << z;

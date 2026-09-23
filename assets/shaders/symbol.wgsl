@@ -25,7 +25,7 @@ struct SymbolMeta {
 @group(1) @binding(1) var s_atlas: sampler;
 
 struct InstanceInput {
-    @location(0) position: vec2<f32>,  // World position (SM meters)
+    @location(0) position: vec2<f32>,  // Metres from this draw's origin (tile centre)
     @location(1) symbol_id: u32,       // Index into symbol_meta
     @location(2) rotation: f32,        // Rotation in radians
     @location(3) disp_prio: u32,       // Display priority for depth sorting

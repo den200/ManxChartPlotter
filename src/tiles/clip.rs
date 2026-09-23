@@ -130,49 +130,73 @@ pub fn triangulate_fan(polygon: &[[f64; 2]]) -> Vec<[f64; 2]> {
 /// may become multiple output segments when crossing tile boundaries.
 ///
 /// NOTE: Does NOT preserve global arc_length - dash patterns will have seams.
-/// This is a known MVP artifact (see plan).
+/// This is a known MVP artifact (see plan). [`clip_polyline_arc`] does, for
+/// the LC symbols that need it.
 pub fn clip_polyline(points: &[[f64; 2]], bounds: &TileBounds) -> Vec<Vec<[f64; 2]>> {
+    clip_polyline_arc(points, bounds)
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect()
+}
+
+/// [`clip_polyline`], also returning for each piece how far along the whole
+/// input polyline its first point lies (metres).
+///
+/// Every tile clips the same feature line independently. Measuring each
+/// piece's arc length from the start of the *unclipped* line gives two tiles
+/// the same figure at their shared edge, so a pattern repeated along the arc
+/// length (an LC symbol) runs on across the tile boundary without a seam.
+pub fn clip_polyline_arc(points: &[[f64; 2]], bounds: &TileBounds) -> Vec<(Vec<[f64; 2]>, f64)> {
     if points.len() < 2 {
         return Vec::new();
     }
 
     let mut result = Vec::new();
     let mut current_segment: Vec<[f64; 2]> = Vec::new();
+    let mut current_start = 0.0;
+    // Arc length of the input polyline up to points[i].
+    let mut arc = 0.0;
 
     for i in 0..points.len() - 1 {
         let p0 = points[i];
         let p1 = points[i + 1];
+        let seg_len = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt();
 
         let clipped = clip_line_segment(p0, p1, bounds);
 
         if let Some((start, end)) = clipped {
+            let start_arc = arc + ((start[0] - p0[0]).powi(2) + (start[1] - p0[1]).powi(2)).sqrt();
             // Check if this segment connects to the current one
             if current_segment.is_empty() {
                 current_segment.push(start);
                 current_segment.push(end);
+                current_start = start_arc;
             } else if current_segment.last().map_or(false, |last| points_equal_epsilon(last, &start)) {
                 // Continuous within epsilon - just add the end point
                 current_segment.push(end);
             } else {
                 // Discontinuous - start a new segment
                 if current_segment.len() >= 2 {
-                    result.push(std::mem::take(&mut current_segment));
+                    result.push((std::mem::take(&mut current_segment), current_start));
                 }
+                current_segment.clear();
                 current_segment.push(start);
                 current_segment.push(end);
+                current_start = start_arc;
             }
         } else {
             // Segment is outside - finish current segment
             if current_segment.len() >= 2 {
-                result.push(std::mem::take(&mut current_segment));
+                result.push((std::mem::take(&mut current_segment), current_start));
             }
             current_segment.clear();
         }
+        arc += seg_len;
     }
 
     // Don't forget the last segment
     if current_segment.len() >= 2 {
-        result.push(current_segment);
+        result.push((current_segment, current_start));
     }
 
     result
@@ -314,6 +338,35 @@ pub fn point_in_bounds(p: [f64; 2], bounds: &TileBounds) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two neighbouring tiles clipping one line agree on the arc length at
+    /// their shared edge, and a piece that re-enters a tile carries the
+    /// distance it travelled outside.
+    #[test]
+    fn clipped_pieces_carry_their_arc_length_along_the_whole_line() {
+        let line = [[-50.0, 10.0], [150.0, 10.0], [150.0, 90.0], [50.0, 90.0]];
+        let west = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        let east = TileBounds::new(100.0, 200.0, 0.0, 100.0);
+
+        let w = clip_polyline_arc(&line, &west);
+        let e = clip_polyline_arc(&line, &east);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(e.len(), 1, "{e:?}");
+        // West tile: enters at x=0 after 50 m; re-enters at x=100 on the top
+        // edge after 200 + 80 + 50 = 330 m.
+        assert!((w[0].1 - 50.0).abs() < 1e-9);
+        assert!((w[1].1 - 330.0).abs() < 1e-9);
+        // East tile: starts at x=100, 150 m along — where the west piece ends.
+        assert!((e[0].1 - 150.0).abs() < 1e-9);
+        let w0 = &w[0].0;
+        let west_len: f64 = w0
+            .windows(2)
+            .map(|p| ((p[1][0] - p[0][0]).powi(2) + (p[1][1] - p[0][1]).powi(2)).sqrt())
+            .sum();
+        assert!((w[0].1 + west_len - e[0].1).abs() < 1e-9);
+        // And the plain clip is unchanged.
+        assert_eq!(clip_polyline(&line, &west), w.into_iter().map(|p| p.0).collect::<Vec<_>>());
+    }
 
     #[test]
     fn clip_triangle_fully_inside() {

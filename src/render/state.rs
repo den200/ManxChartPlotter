@@ -54,10 +54,17 @@ impl Vertex {
     }
 }
 
-/// Uniform buffer for view-projection matrix and camera info
+/// Camera uniforms for one draw origin (96 bytes).
+///
+/// The uniform buffer holds an array of these, one per *slot*, each at a
+/// `min_uniform_buffer_offset_alignment` stride, bound with a dynamic offset
+/// (wgpu ref notes §3, "Dynamic Bindings vs. Separate Bindings"). Every tile
+/// is drawn with its own slot, whose `view_proj` maps positions relative to
+/// the tile's centre — see `Camera::view_projection_relative` for why.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Uniforms {
+    /// View-projection for positions relative to this slot's origin.
     pub view_proj: [[f32; 4]; 4],
     /// View size in pixels [width, height]
     pub view_size: [f32; 2],
@@ -68,6 +75,49 @@ pub struct Uniforms {
     /// were twice their S-52 size on a standard-density screen relative to
     /// the lines and text, which already scale with the display.
     pub px_per_point: f32,
+    /// This slot's origin minus the frame's pattern anchor (the camera), in
+    /// metres. Area patterns are anchored to the world grid through it.
+    pub anchor_offset: [f32; 2],
+    pub _pad: [f32; 2],
+}
+
+/// Camera slots in the uniform buffer. The first few are fixed; tiles follow.
+///
+/// 2048 slots at a 256-byte stride is 512 KiB — small next to one tile's
+/// vertices, and several times the largest draw list a tilted view makes.
+pub const CAMERA_SLOTS: usize = 2048;
+/// Slot for data still in global Mercator (the single-chart debug path).
+pub const SLOT_GLOBAL: usize = 0;
+/// Slot for the globally decluttered soundings and labels.
+pub const SLOT_TEXT: usize = 1;
+/// Slot for own ship and AIS targets.
+pub const SLOT_MARINER: usize = 2;
+/// First tile slot; entry `i` of the tile draw list uses `SLOT_FIRST_TILE + i`.
+pub const SLOT_FIRST_TILE: usize = 3;
+
+/// Bind group layout entry for the camera slot: a uniform bound with a
+/// dynamic offset, one `Uniforms` wide.
+pub fn camera_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: true,
+            min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+        },
+        count: None,
+    }
+}
+
+/// The binding for [`camera_layout_entry`]: one slot's worth of the buffer,
+/// moved along it by the dynamic offset.
+pub fn camera_binding(buffer: &wgpu::Buffer) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer,
+        offset: 0,
+        size: std::num::NonZeroU64::new(std::mem::size_of::<Uniforms>() as u64),
+    })
 }
 
 /// Line vertex with adjacency data for shader-based polyline rendering.
@@ -128,14 +178,13 @@ impl LineVertex {
     }
 }
 
-/// Uniforms for line shader (112 bytes).
+/// Per-style uniforms for the line shader (48 bytes).
+///
+/// The camera comes from the per-draw camera slot, so nothing here changes
+/// when the view moves.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct LineUniforms {
-    /// View-projection matrix (SM -> clip space)
-    pub view_proj: [[f32; 4]; 4],
-    /// Viewport size in pixels [width, height]
-    pub viewport_size: [f32; 2],
     /// Line width in screen pixels
     pub line_width_px: f32,
     /// Miter limit (bevel fallback when exceeded)
@@ -146,14 +195,21 @@ pub struct LineUniforms {
     pub dash_on_px: f32,
     /// Dash OFF length in pixels
     pub dash_off_px: f32,
-    /// Pixels per meter at current zoom (for arc_len conversion)
-    pub px_per_meter: f32,
     /// Display priority for depth sorting
     pub disp_prio: f32,
     /// Dot on length in screen pixels (>0 for DASD dash-dot pattern)
     pub dot_on_px: f32,
-    /// Padding for 16-byte alignment
-    pub _pad: [u32; 2],
+    /// LC() symbol repeat distance in pixels; 0 for an ordinary line. When
+    /// set, the stroke is a ribbon `line_width_px` wide and the symbol's
+    /// segments are drawn in it (see `render::lc_pattern`).
+    pub lc_advance_px: f32,
+    /// First segment of the LC() symbol in the segment buffer.
+    pub lc_first: u32,
+    /// Number of segments of the LC() symbol.
+    pub lc_count: u32,
+    /// How far before / after its place on the line the LC() symbol reaches,
+    /// pixels.
+    pub lc_x_range_px: [f32; 2],
 }
 
 /// Line style configuration for a batch of lines.
@@ -323,7 +379,14 @@ pub struct RenderState {
 
     // Pipeline
     pub pipeline: wgpu::RenderPipeline,
+    /// Camera slots (see [`Uniforms`]), bound with a dynamic offset.
     pub uniform_buffer: wgpu::Buffer,
+    /// Stride between camera slots in `uniform_buffer`.
+    camera_slot_align: u32,
+    /// World origin the global text buffers (soundings, labels) are relative to.
+    text_origin: glam::DVec2,
+    /// World origin the mariner symbol instances are relative to.
+    mariner_origin: glam::DVec2,
     pub uniform_bind_group: wgpu::BindGroup,
     /// Palette color buffer for indexed area colors (Day/Dusk/Night switching)
     pub palette_buffer: wgpu::Buffer,
@@ -422,7 +485,7 @@ pub struct RenderState {
     route_net_jobs: usize,
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
-    pick_anchor: Option<[f32; 2]>,
+    pick_anchor: Option<[f64; 2]>,
     pick_objects: Vec<crate::pick::PickedObject>,
     /// The query the open bubble is answering.
     pick_shown: u64,
@@ -445,6 +508,17 @@ pub struct RenderState {
     pub line_pipeline: wgpu::RenderPipeline,
     // Background line pipeline (stencil test: pass when stencil==0)
     pub bg_line_pipeline: wgpu::RenderPipeline,
+    /// Light sector arcs and legs, sized on screen.
+    sector_renderer: super::sectors::SectorRenderer,
+    /// LC() lines: instanced segments, drawn by the line shader's LC entry
+    /// points with the line pipelines' bind groups.
+    lc_pipeline: wgpu::RenderPipeline,
+    /// LC() symbol segments in pixels, bound to the line shader.
+    lc_segment_buffer: wgpu::Buffer,
+    /// Where each LC() symbol sits in `lc_segment_buffer`, and its size.
+    lc_symbols: Vec<super::lc_pattern::LcSymbolGpu>,
+    /// The density `lc_segment_buffer` was laid out at.
+    lc_atlas_ppmm: f32,
     pub line_bind_group_layout: wgpu::BindGroupLayout,
     pub line_uniform_buffer: wgpu::Buffer,
     pub line_bind_group: wgpu::BindGroup,
@@ -616,8 +690,8 @@ fn sample_grid_for(
         // corners because a tilted camera does not map a screen rectangle to a
         // world one, and the bounding box of the corners is the honest
         // conservative answer.
-        let (mut lo_x, mut lo_y) = (f32::INFINITY, f32::INFINITY);
-        let (mut hi_x, mut hi_y) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+        let (mut lo_x, mut lo_y) = (f64::INFINITY, f64::INFINITY);
+        let (mut hi_x, mut hi_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
         for (x, y) in [
             (area.left(), area.top()),
             (area.right(), area.top()),
@@ -634,6 +708,7 @@ fn sample_grid_for(
             return empty;
         }
 
+        let step = step as f64;
         let i0 = (lo_x / step).floor() as i64 - 1;
         let i1 = (hi_x / step).ceil() as i64 + 1;
         let j0 = (lo_y / step).floor() as i64 - 1;
@@ -653,11 +728,10 @@ fn sample_grid_for(
         // screen, which is what the fill's mesh expects.
         for j in (j0..=j1).rev() {
             for i in i0..=i1 {
-                let (wx, wy) = (i as f32 * step, j as f32 * step);
+                let (wx, wy) = (i as f64 * step, j as f64 * step);
                 let s = camera.world_to_screen(wx, wy);
                 screen.push([s.x / ppp, s.y / ppp]);
-                let (lat, lon) =
-                    crate::render::projection::Projection::to_wgs84(wx as f64, wy as f64);
+                let (lat, lon) = crate::render::projection::Projection::to_wgs84(wx, wy);
                 geo.push((lat, lon));
             }
         }
@@ -753,16 +827,17 @@ impl RenderState {
 
         let (free_tx, free_rx) = std::sync::mpsc::channel();
 
-        // Uniforms
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(&[Uniforms {
-                view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                view_size: [size.width as f32, size.height as f32],
-                pixels_per_meter: 1.0,
-                px_per_point: scale_factor.max(0.5),
-            }]),
+        // Camera slots: one `Uniforms` per draw origin, at the device's
+        // dynamic-offset alignment. Written every frame by write_camera_slots.
+        let camera_slot_align = device
+            .limits()
+            .min_uniform_buffer_offset_alignment
+            .max(std::mem::size_of::<Uniforms>() as u32);
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera Slot Buffer"),
+            size: camera_slot_align as u64 * CAMERA_SLOTS as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         // Default palette buffer (64 colors, initialized to black — populated on chart load)
@@ -776,16 +851,7 @@ impl RenderState {
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
+                    camera_layout_entry(0),
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -805,7 +871,7 @@ impl RenderState {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: uniform_buffer.as_entire_binding(),
+                    resource: camera_binding(&uniform_buffer),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -895,16 +961,39 @@ impl RenderState {
 
         let line_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("line_bind_group_layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: true,
-                    min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // LC() symbol segments, in pixels (render::lc_pattern::LcAtlas)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // The LC symbols at this display's density. The segment count does not
+        // depend on the density, so a density change rewrites it in place.
+        let lc_atlas_ppmm = effective_ppmm.max(1.0);
+        let lc_atlas = super::lc_pattern::LcAtlas::shared(lc_atlas_ppmm);
+        let lc_segment_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("LC Segment Buffer"),
+            contents: bytemuck::cast_slice(&lc_atlas.segments),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let line_uniform_align = device.limits().min_uniform_buffer_offset_alignment;
@@ -920,14 +1009,20 @@ impl RenderState {
         let line_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("line_bind_group"),
             layout: &line_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: &line_uniform_buffer,
-                    offset: 0,
-                    size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
-                }),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &line_uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(std::mem::size_of::<LineUniforms>() as u64),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lc_segment_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let line_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1101,6 +1196,55 @@ impl RenderState {
             cache: None,
         });
 
+        let sector_renderer =
+            super::sectors::SectorRenderer::new(&device, config.format, &uniform_bind_group_layout);
+
+        // LC() lines: each segment an instanced quad (see render::lc_pattern).
+        let lc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("LC Line Pipeline"),
+            layout: Some(&line_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &line_shader,
+                entry_point: "vs_lc",
+                buffers: &[super::lc_pattern::LcSegment::desc()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &line_shader,
+                entry_point: "fs_lc",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            // As the line pipelines: ordered on the CPU, no depth test.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: super::msaa_samples(),
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
         // Symbol renderer (optional - may fail if assets not found)
         let (symbol_renderer, symbol_camera_bind_group) = match SymbolRenderer::new(
             &device,
@@ -1132,7 +1276,7 @@ impl RenderState {
                     layout: renderer.camera_bind_group_layout(),
                     entries: &[wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
+                        resource: camera_binding(&uniform_buffer),
                     }],
                 });
                 log::debug!("Pattern renderer initialized");
@@ -1196,6 +1340,9 @@ impl RenderState {
             effective_ppmm,
             pipeline,
             uniform_buffer,
+            camera_slot_align,
+            text_origin: glam::DVec2::ZERO,
+            mariner_origin: glam::DVec2::ZERO,
             uniform_bind_group,
             palette_buffer,
             uniform_bind_group_layout,
@@ -1253,6 +1400,11 @@ impl RenderState {
             bg_pipeline,
             line_pipeline,
             bg_line_pipeline,
+            sector_renderer,
+            lc_pipeline,
+            lc_segment_buffer,
+            lc_symbols: lc_atlas.symbols,
+            lc_atlas_ppmm,
             line_bind_group_layout,
             line_uniform_buffer,
             line_bind_group,
@@ -1534,7 +1686,7 @@ impl RenderState {
         // Center camera on actual geometry bounds (not assumed 0,0)
         let center_x = (min_x + max_x) / 2.0;
         let center_y = (min_y + max_y) / 2.0;
-        self.camera = Camera::new(center_x, center_y, zoom, screen_w, screen_h);
+        self.camera = Camera::new(center_x as f64, center_y as f64, zoom, screen_w, screen_h);
         log::debug!("Camera at ({:.0}, {:.0}), zoom: {:.2} m/px (SM bounds: {:.0}x{:.0})", center_x, center_y, zoom, width, height);
 
         // Log view_proj matrix to verify it's sensible
@@ -1619,7 +1771,7 @@ impl RenderState {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: camera_binding(&self.uniform_buffer),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -2012,8 +2164,8 @@ impl RenderState {
         // Camera position must be in GLOBAL MERCATOR meters
         // catalog.combined_extent is already in global Mercator (computed during catalog build)
         let extent = &catalog.combined_extent;
-        let center_x = ((extent.min_x + extent.max_x) / 2.0) as f32;
-        let center_y = ((extent.min_y + extent.max_y) / 2.0) as f32;
+        let center_x = (extent.min_x + extent.max_x) / 2.0;
+        let center_y = (extent.min_y + extent.max_y) / 2.0;
         let width = (extent.max_x - extent.min_x) as f32;
         let height = (extent.max_y - extent.min_y) as f32;
 
@@ -2031,14 +2183,14 @@ impl RenderState {
         // positions the camera at a specific WGS84 point with a given zoom
         // (meters per pixel). Lets us reproduce a reference view exactly.
         if let Ok(view) = std::env::var("NAVCORE_VIEW") {
-            let parts: Vec<f32> = view
+            let parts: Vec<f64> = view
                 .split(',')
-                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .filter_map(|s| s.trim().parse::<f64>().ok())
                 .collect();
             if parts.len() == 3 {
-                let (mx, my) = crate::tiles::latlon_to_mercator(parts[0] as f64, parts[1] as f64);
+                let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
                 self.camera = Camera::new(
-                    mx as f32, my as f32, parts[2],
+                    mx, my, parts[2] as f32,
                     self.size.width as f32, self.size.height as f32,
                 );
                 log::debug!(
@@ -2159,7 +2311,7 @@ impl RenderState {
             let parts: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
             if parts.len() == 2 {
                 let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
-                self.pick_at_world(mx as f32, my as f32);
+                self.pick_at_world(mx, my);
             } else {
                 log::warn!("NAVCORE_PICK must be 'lat,lon'; ignoring {:?}", spec);
             }
@@ -2243,14 +2395,11 @@ impl RenderState {
     }
 
     fn current_line_uniforms_key(&self, styles_key: u64) -> u64 {
+        // Style only: the camera reaches the line shader through the camera
+        // slots, so a pan or zoom no longer rewrites every style.
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         styles_key.hash(&mut hasher);
-        self.size.width.hash(&mut hasher);
-        self.size.height.hash(&mut hasher);
         self.effective_ppmm.to_bits().hash(&mut hasher);
-        self.camera.position.x.to_bits().hash(&mut hasher);
-        self.camera.position.y.to_bits().hash(&mut hasher);
-        self.camera.zoom.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -2273,7 +2422,7 @@ impl RenderState {
             let key = TileCacheKey::new(*tile_id, self.style_hash);
             if let Some(buffers) = self.tile_cache.get(&key) {
                 for batch in &buffers.line_batches {
-                    if batch.index_count > 0 {
+                    if batch.vertex_count > 0 {
                         styles.push(batch.key.style.clone());
                     }
                 }
@@ -2305,15 +2454,6 @@ impl RenderState {
             self.clamp_camera_to_catalog();
         }
 
-        // Update uniforms
-        let uniforms = Uniforms {
-            view_proj: self.camera.view_projection_matrix().to_cols_array_2d(),
-            view_size: [self.size.width as f32, self.size.height as f32],
-            pixels_per_meter: 1.0 / self.camera.zoom, // Convert zoom (m/px) to px/m
-            px_per_point: self.scale_factor.max(0.5),
-        };
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-
         // CRITICAL: Build tiles BEFORE starting render pass (avoid stalls during draw)
         if self.tile_mode {
             let build_start = profile_enabled().then(Instant::now);
@@ -2336,12 +2476,12 @@ impl RenderState {
             }
         }
 
+        // Camera slots, now that the draw list and the text origin are known.
+        self.write_camera_slots();
+
         // Pre-write line uniform styles to dynamic UBO BEFORE the render pass.
         // Each unique style gets its own aligned slot; draw calls reference by dynamic offset.
         let line_style_offsets: HashMap<LineStyleKey, u32> = if self.tile_mode {
-            let px_per_meter = 1.0 / self.camera.zoom;
-            let view_proj = self.camera.view_projection_matrix().to_cols_array_2d();
-            let viewport_size = [self.size.width as f32, self.size.height as f32];
             let align = self.line_uniform_align;
             let styles_key = self.current_visible_line_styles_key();
             if self.cached_visible_line_styles_key != styles_key {
@@ -2355,6 +2495,16 @@ impl RenderState {
             }
 
             let line_uniforms_key = self.current_line_uniforms_key(styles_key);
+            if self.lc_atlas_ppmm != self.line_style_ppmm() {
+                let atlas = super::lc_pattern::LcAtlas::shared(self.line_style_ppmm());
+                self.queue.write_buffer(
+                    &self.lc_segment_buffer,
+                    0,
+                    bytemuck::cast_slice(&atlas.segments),
+                );
+                self.lc_symbols = atlas.symbols;
+                self.lc_atlas_ppmm = self.line_style_ppmm();
+            }
             if self.last_line_uniforms_key != line_uniforms_key {
                 let uniform_start = profile_enabled().then(Instant::now);
                 let tables = self.s52_engine.as_ref().map(|e| &e.tables);
@@ -2362,17 +2512,37 @@ impl RenderState {
                     let offset = (slot as u32) * align;
                     let style = style_for_key(style_key, self.line_style_ppmm(), tables);
                     let line_uniforms = LineUniforms {
-                        view_proj,
-                        viewport_size,
                         line_width_px: style.width_px,
                         join_limit: 4.0,
                         color_index: style.color_index,
                         dash_on_px: style.dash_on_px,
                         dash_off_px: style.dash_off_px,
-                        px_per_meter,
                         disp_prio: 0.0,
                         dot_on_px: style.dot_on_px,
-                        _pad: [0, 0],
+                        lc_advance_px: 0.0,
+                        lc_first: 0,
+                        lc_count: 0,
+                        lc_x_range_px: [0.0; 2],
+                    };
+                    // An LC() line: segments drawn as quads wide enough for its
+                    // symbol, which the fragment shader repeats along them.
+                    let line_uniforms = match style_key.lc {
+                        Some(lc) => {
+                            let sym = self.lc_symbols.get(lc as usize).copied().unwrap_or_default();
+                            LineUniforms {
+                                line_width_px: 2.0 * sym.half_extent_px,
+                                dash_on_px: 0.0,
+                                dash_off_px: 0.0,
+                                dot_on_px: 0.0,
+                                // Never zero: the shader divides by it.
+                                lc_advance_px: sym.advance_px.max(1.0),
+                                lc_first: sym.first,
+                                lc_count: sym.count,
+                                lc_x_range_px: sym.x_range_px,
+                                ..line_uniforms
+                            }
+                        }
+                        None => line_uniforms,
                     };
                     self.queue.write_buffer(
                         &self.line_uniform_buffer,
@@ -2392,25 +2562,22 @@ impl RenderState {
             offsets
         } else {
             // Single-chart mode: pre-write each batch's style to its own slot
-            let px_per_meter = 1.0 / self.camera.zoom;
-            let view_proj = self.camera.view_projection_matrix().to_cols_array_2d();
-            let viewport_size = [self.size.width as f32, self.size.height as f32];
             let align = self.line_uniform_align;
 
             for (i, batch) in self.line_batches.iter().enumerate() {
                 let offset = (i as u32) * align;
                 let line_uniforms = LineUniforms {
-                    view_proj,
-                    viewport_size,
                     line_width_px: batch.style.width_px,
                     join_limit: 4.0,
                     color_index: batch.style.color_index,
                     dash_on_px: batch.style.dash_on_px,
                     dash_off_px: batch.style.dash_off_px,
-                    px_per_meter,
                     disp_prio: 4.0,
                     dot_on_px: batch.style.dot_on_px,
-                    _pad: [0, 0],
+                    lc_advance_px: 0.0,
+                    lc_first: 0,
+                    lc_count: 0,
+                    lc_x_range_px: [0.0; 2],
                 };
                 self.queue.write_buffer(
                     &self.line_uniform_buffer,
@@ -2479,8 +2646,9 @@ impl RenderState {
             } else {
                 // Single chart mode (existing code)
                 // 1. Render areas (land, depth)
+                let cam = self.camera_slot_offset(SLOT_GLOBAL);
                 render_pass.set_pipeline(&self.pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
 
                 if let Some(ref buffer) = self.vertex_buffer {
                     render_pass.set_vertex_buffer(0, buffer.slice(..));
@@ -2489,7 +2657,7 @@ impl RenderState {
 
                 // 2. Render lines (coastlines + depth contours) with shader-based pipeline
                 render_pass.set_pipeline(&self.line_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                 let mut slot = 0u32;
                 for batch in &self.line_batches {
                     let offset = slot * self.line_uniform_align;
@@ -2505,9 +2673,9 @@ impl RenderState {
                     (&self.symbol_renderer, &self.symbol_camera_bind_group)
                 {
                     if debug_render_mode() == 3 {
-                        symbol_renderer.render_atlas_debug(&mut render_pass, symbol_bind_group);
+                        symbol_renderer.render_atlas_debug(&mut render_pass, symbol_bind_group, cam);
                     } else {
-                        symbol_renderer.render(&mut render_pass, symbol_bind_group);
+                        symbol_renderer.render(&mut render_pass, symbol_bind_group, cam);
                     }
                 }
 
@@ -2515,7 +2683,7 @@ impl RenderState {
                 if let (Some(ref text_renderer), Some(ref text_bind_group)) =
                     (&self.text_renderer, &self.text_camera_bind_group)
                 {
-                    text_renderer.render(&mut render_pass, text_bind_group);
+                    text_renderer.render(&mut render_pass, text_bind_group, cam);
                 }
 
                 if debug_render_mode() != 0 {
@@ -3129,13 +3297,13 @@ impl RenderState {
         // Allow some panning outside the chart area, but keep the view bounded.
         let extent = catalog.combined_extent.expand(1.2);
 
-        let half_w = self.camera.viewport_width * self.camera.zoom / 2.0;
-        let half_h = self.camera.viewport_height * self.camera.zoom / 2.0;
+        let half_w = (self.camera.viewport_width * self.camera.zoom / 2.0) as f64;
+        let half_h = (self.camera.viewport_height * self.camera.zoom / 2.0) as f64;
 
-        let min_x = (extent.min_x as f32) + half_w;
-        let max_x = (extent.max_x as f32) - half_w;
-        let min_y = (extent.min_y as f32) + half_h;
-        let max_y = (extent.max_y as f32) - half_h;
+        let min_x = extent.min_x + half_w;
+        let max_x = extent.max_x - half_w;
+        let min_y = extent.min_y + half_h;
+        let max_y = extent.max_y - half_h;
 
         // If the extent is smaller than the viewport at the current zoom there
         // is no range that keeps the screen full of chart. The centre of the
@@ -3150,7 +3318,7 @@ impl RenderState {
                 .camera
                 .position
                 .x
-                .clamp(extent.min_x as f32, extent.max_x as f32);
+                .clamp(extent.min_x, extent.max_x);
         }
 
         if min_y.is_finite() && max_y.is_finite() && min_y <= max_y {
@@ -3160,7 +3328,7 @@ impl RenderState {
                 .camera
                 .position
                 .y
-                .clamp(extent.min_y as f32, extent.max_y as f32);
+                .clamp(extent.min_y, extent.max_y);
         }
     }
 
@@ -3197,8 +3365,103 @@ impl RenderState {
             return;
         };
         self.apply_scissor(render_pass, None);
-        renderer.set_state(render_pass, bind_group);
+        renderer.set_state(render_pass, bind_group, self.camera_slot_offset(SLOT_MARINER));
         renderer.draw_range(render_pass, buffer, 0, self.mariner_count);
+    }
+
+    /// Draw one line batch: an ordinary stroke (an indexed strip through
+    /// `stroke`) or an LC() line (instanced segments through the LC
+    /// pipeline). `lc_bound` remembers which of the two is set.
+    fn draw_line_batch<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        batch: &'a LineBatchGpu,
+        stroke: &'a wgpu::RenderPipeline,
+        lc_bound: &mut Option<bool>,
+    ) {
+        render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
+        match &batch.index_buffer {
+            Some(indices) => {
+                if *lc_bound != Some(false) {
+                    render_pass.set_pipeline(stroke);
+                    *lc_bound = Some(false);
+                }
+                render_pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+            }
+            None => {
+                if *lc_bound != Some(true) {
+                    render_pass.set_pipeline(&self.lc_pipeline);
+                    *lc_bound = Some(true);
+                }
+                render_pass.draw(0..6, 0..batch.vertex_count);
+            }
+        }
+    }
+
+    /// Byte offset of a camera slot in the uniform buffer.
+    fn camera_slot_offset(&self, slot: usize) -> u32 {
+        slot as u32 * self.camera_slot_align
+    }
+
+    /// Camera slot offset for entry `i` of the tile draw list, if it got one.
+    fn tile_cam(&self, i: usize) -> Option<u32> {
+        let slot = SLOT_FIRST_TILE + i;
+        (slot < CAMERA_SLOTS).then(|| self.camera_slot_offset(slot))
+    }
+
+    /// Fill the camera slots for this frame.
+    ///
+    /// One slot per draw origin: the fixed ones (global, text, mariner) and
+    /// then one per entry of the tile draw list, each re-basing the camera on
+    /// that tile's centre. The matrices are made in f64 and only then cast,
+    /// which is the whole point — see `Camera::view_projection_relative`.
+    fn write_camera_slots(&mut self) {
+        let ppm = 1.0 / self.camera.zoom;
+        let px_per_point = self.scale_factor.max(0.5);
+        let view_size = [self.size.width as f32, self.size.height as f32];
+        let anchor = self.camera.position;
+
+        let mut origins = vec![glam::DVec2::ZERO; SLOT_FIRST_TILE];
+        origins[SLOT_GLOBAL] = glam::DVec2::ZERO;
+        origins[SLOT_TEXT] = self.text_origin;
+        origins[SLOT_MARINER] = self.mariner_origin;
+        let tiles = self.tile_draw_list.len().min(CAMERA_SLOTS - SLOT_FIRST_TILE);
+        if tiles < self.tile_draw_list.len() {
+            log::warn!(
+                "{} tiles to draw but only {} camera slots; the rest are skipped",
+                self.tile_draw_list.len(),
+                tiles
+            );
+        }
+        origins.extend(
+            self.tile_draw_list[..tiles]
+                .iter()
+                .map(|(key, _)| key.tile_id.origin()),
+        );
+
+        let stride = self.camera_slot_align as usize;
+        let size = std::mem::size_of::<Uniforms>();
+        let mut bytes = vec![0u8; origins.len() * stride];
+        for (i, origin) in origins.iter().enumerate() {
+            let u = Uniforms {
+                view_proj: self.camera.view_projection_relative(*origin).to_cols_array_2d(),
+                view_size,
+                pixels_per_meter: ppm,
+                px_per_point,
+                anchor_offset: [
+                    (origin.x - anchor.x) as f32,
+                    (origin.y - anchor.y) as f32,
+                ],
+                _pad: [0.0; 2],
+            };
+            bytes[i * stride..i * stride + size].copy_from_slice(bytemuck::bytes_of(&u));
+        }
+        self.queue.write_buffer(&self.uniform_buffer, 0, &bytes);
+
+        if let Some(ref patterns) = self.pattern_renderer {
+            patterns.update_phase(&self.queue, [anchor.x, anchor.y], ppm as f64, px_per_point);
+        }
     }
 
     fn apply_scissor<'a>(
@@ -3228,7 +3491,7 @@ impl RenderState {
             (b.max_x, b.max_y),
             (b.min_x, b.max_y),
         ] {
-            let p = self.camera.world_to_screen(wx as f32, wy as f32);
+            let p = self.camera.world_to_screen(wx, wy);
             if !p.x.is_finite() || !p.y.is_finite() {
                 return None;
             }
@@ -3318,8 +3581,7 @@ impl RenderState {
                 if self.pick_pending == Some(answer.seq) {
                     self.pick_pending = None;
                     self.pick_shown = answer.seq;
-                    self.pick_anchor =
-                        Some([answer.position[0] as f32, answer.position[1] as f32]);
+                    self.pick_anchor = Some([answer.position[0], answer.position[1]]);
                     self.pick_objects = answer.objects;
                     // Vessels first. A tap that lands on both a ship and the
                     // depth area under it is asking about the ship: the chart
@@ -3379,9 +3641,10 @@ impl RenderState {
                     // view direction is (0, sin t, -cos t) from an eye at
                     // height d cos t, so a ground point is in front when
                     // (y - eye.y) sin t + d cos^2 t > 0.
-                    let (st, ct) = (cam.tilt.sin(), cam.tilt.cos());
+                    let tilt = cam.tilt as f64;
+                    let (st, ct) = (tilt.sin(), tilt.cos());
                     let d = cam.eye_distance();
-                    if (b.max_y as f32 - eye.y) * st + d * ct * ct <= 0.0 {
+                    if (b.max_y - eye.y) * st + d * ct * ct <= 0.0 {
                         return false;
                     }
                     tile_meets_footprint(b, &footprint)
@@ -3496,8 +3759,8 @@ impl RenderState {
                     ppmm: self.effective_ppmm,
                     width_px: self.size.width as f32,
                     height_px: self.size.height as f32,
-                    center_x: self.camera.position.x,
-                    center_y: self.camera.position.y,
+                    center_x: self.camera.position.x as f32,
+                    center_y: self.camera.position.y as f32,
                 };
                 // A new request supersedes the last, and the worker abandons
                 // whatever of it has not started. Those tiles never report
@@ -3559,15 +3822,34 @@ impl RenderState {
         let mut all_soundings = Vec::new();
         let mut all_labels = Vec::new();
 
+        // Tile packets hold positions relative to their own tile's centre.
+        // Gathered here into one buffer, they are re-based on a single text
+        // origin — the camera position — with the shift taken in f64 so
+        // nothing is lost; the text slot then draws them with the camera
+        // re-based on the same origin.
+        let origin = self.camera.position;
+        self.text_origin = origin;
         for tile_id in &self.visible_tiles_cache {
             let key = crate::tiles::cache::TileCacheKey::new(*tile_id, self.style_hash);
             if let Some(buffers) = self.tile_cache.get(&key) {
-                all_soundings.extend_from_slice(&buffers.text_instances);
-                all_labels.extend_from_slice(&buffers.label_candidates);
+                let shift = tile_id.origin() - origin;
+                let rebase = |p: [f32; 2]| {
+                    [(shift.x + p[0] as f64) as f32, (shift.y + p[1] as f64) as f32]
+                };
+                all_soundings.extend(buffers.text_instances.iter().map(|s| {
+                    let mut s = *s;
+                    s.position = rebase(s.position);
+                    s
+                }));
+                all_labels.extend(buffers.label_candidates.iter().map(|l| {
+                    let mut l = l.clone();
+                    l.position = rebase(l.position);
+                    l
+                }));
             }
         }
 
-        declutter_soundings(&mut all_soundings, &self.camera);
+        declutter_soundings(&mut all_soundings, &self.camera, origin);
         // S-52 portrays soundings with the presentation library's digit
         // symbols. navcore can, and does under NAVCORE_SOUNDING_SYMBOLS=1, but
         // the raster atlas is too coarse to magnify — see
@@ -3594,7 +3876,7 @@ impl RenderState {
             .unwrap_or(false)
             && crate::tiles::zoom_from_camera(self.camera.zoom) < 14;
         let mut decluttered_labels =
-            declutter_and_layout_labels_ex(&all_labels, &self.camera, important_only);
+            declutter_and_layout_labels_ex(&all_labels, &self.camera, origin, important_only);
         decluttered_labels.extend(sounding_glyphs);
 
         self.global_text_buffer = None;
@@ -3651,12 +3933,13 @@ impl RenderState {
         // draw areas → patterns → lines → symbols, then text on top.
 
         // Pre-collect and sort all line batches by priority
-        let mut legacy_draws: Vec<(&LineBatchGpu, LineStyleKey, Option<[u32; 4]>)> = Vec::new();
-        for (key, scissor) in &self.tile_draw_list {
+        let mut legacy_draws: Vec<(&LineBatchGpu, LineStyleKey, Option<[u32; 4]>, u32)> = Vec::new();
+        for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+            let Some(cam) = self.tile_cam(i) else { continue };
             if let Some(buffers) = self.tile_cache.get(key) {
                 for batch in &buffers.line_batches {
-                    if batch.index_count > 0 {
-                        legacy_draws.push((batch, batch.key.style.clone(), *scissor));
+                    if batch.vertex_count > 0 {
+                        legacy_draws.push((batch, batch.key.style.clone(), *scissor, cam));
                     }
                 }
             }
@@ -3677,7 +3960,7 @@ impl RenderState {
         {
             let mut start = 0;
             for prio in 0..10u8 {
-                let end = legacy_draws.partition_point(|(b, _, _)| b.key.disp_prio <= prio);
+                let end = legacy_draws.partition_point(|(b, _, _, _)| b.key.disp_prio <= prio);
                 legacy_prio_ranges[prio as usize] = (start, end);
                 start = end;
             }
@@ -3722,16 +4005,16 @@ impl RenderState {
 
             // --- Background areas at this priority (stencil test: pass when stencil==0) ---
             render_pass.set_pipeline(&self.bg_pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_stencil_reference(0);
-            for (key, scissor) in &self.tile_draw_list {
-                let _ = &key.tile_id;
+            for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+                let Some(cam) = self.tile_cam(i) else { continue };
                 if let Some(buffers) = self.tile_cache.get(key) {
                     self.apply_scissor(render_pass, *scissor);
                     if let Some(ref bg_buf) = buffers.bg_area_buffer {
                         let start = buffers.bg_area_priority_offsets[p];
                         let end = buffers.bg_area_priority_offsets[p + 1];
                         if end > start {
+                            render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                             render_pass.set_vertex_buffer(0, bg_buf.slice(..));
                             render_pass.draw(start..end, 0..1);
                             drew_tiles += 1;
@@ -3742,14 +4025,14 @@ impl RenderState {
 
             // --- Foreground areas at this priority (no stencil test) ---
             render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            for (key, scissor) in &self.tile_draw_list {
-                let _ = &key.tile_id;
+            for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+                let Some(cam) = self.tile_cam(i) else { continue };
                 if let Some(buffers) = self.tile_cache.get(key) {
                     self.apply_scissor(render_pass, *scissor);
                     let start = buffers.area_priority_offsets[p];
                     let end = buffers.area_priority_offsets[p + 1];
                     if end > start {
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                         render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
                         render_pass.draw(start..end, 0..1);
                         drew_tiles += 1;
@@ -3769,8 +4052,8 @@ impl RenderState {
             {
                 let mut bg_pattern_state_set = false;
                 let mut fg_pattern_state_set = false;
-                for (key, scissor) in &self.tile_draw_list {
-                    let _ = &key.tile_id;
+                for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+                    let Some(cam) = self.tile_cam(i) else { continue };
                     if let Some(buffers) = self.tile_cache.get(key) {
                         self.apply_scissor(render_pass, *scissor);
                         // Draw bg patterns
@@ -3780,10 +4063,12 @@ impl RenderState {
                             if end > start {
                                 if !bg_pattern_state_set {
                                     pattern_renderer
-                                        .set_background_state(render_pass, pattern_bind_group);
+                                        .set_background_state(render_pass, pattern_bind_group, cam);
                                     render_pass.set_stencil_reference(0);
                                     bg_pattern_state_set = true;
+                                    fg_pattern_state_set = false;
                                 }
+                                render_pass.set_bind_group(0, pattern_bind_group, &[cam]);
                                 pattern_renderer.draw_range(
                                     render_pass,
                                     bg_pat_buf,
@@ -3798,9 +4083,11 @@ impl RenderState {
                             let end = buffers.pattern_priority_offsets[p + 1];
                             if end > start {
                                 if !fg_pattern_state_set {
-                                    pattern_renderer.set_state(render_pass, pattern_bind_group);
+                                    pattern_renderer.set_state(render_pass, pattern_bind_group, cam);
                                     fg_pattern_state_set = true;
+                                    bg_pattern_state_set = false;
                                 }
+                                render_pass.set_bind_group(0, pattern_bind_group, &[cam]);
                                 pattern_renderer.draw_range(
                                     render_pass,
                                     pattern_buffer,
@@ -3820,25 +4107,23 @@ impl RenderState {
 
             // Find the split point: bg batches (is_background=true) sort first
             let bg_end = legacy_draws[l_start..l_end]
-                .partition_point(|(b, _, _)| b.key.is_background)
+                .partition_point(|(b, _, _, _)| b.key.is_background)
                 + l_start;
 
             // Background lines (stencil test: pass when stencil==0)
             if bg_end > l_start {
-                render_pass.set_pipeline(&self.bg_line_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                let mut lc_bound = None;
                 render_pass.set_stencil_reference(0);
-                for (batch, style_key, scissor) in &legacy_draws[l_start..bg_end] {
+                for (batch, style_key, scissor, cam) in &legacy_draws[l_start..bg_end] {
                     if last_style.as_ref() != Some(style_key) {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
                     let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
                     self.apply_scissor(render_pass, *scissor);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
-                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    self.draw_line_batch(render_pass, batch, &self.bg_line_pipeline, &mut lc_bound);
                     drew_line_batches += 1;
                     line_index_count += batch.index_count;
                     line_vertex_count += batch.vertex_count;
@@ -3847,22 +4132,40 @@ impl RenderState {
 
             // Foreground lines (no stencil test)
             if l_end > bg_end {
-                render_pass.set_pipeline(&self.line_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                for (batch, style_key, scissor) in &legacy_draws[bg_end..l_end] {
+                let mut lc_bound = None;
+                for (batch, style_key, scissor, cam) in &legacy_draws[bg_end..l_end] {
                     if last_style.as_ref() != Some(style_key) {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
                     let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
                     self.apply_scissor(render_pass, *scissor);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
-                    render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(batch.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..batch.index_count, 0, 0..1);
+                    self.draw_line_batch(render_pass, batch, &self.line_pipeline, &mut lc_bound);
                     drew_line_batches += 1;
                     line_index_count += batch.index_count;
                     line_vertex_count += batch.vertex_count;
+                }
+            }
+
+            // --- Light sector arcs and legs at this priority ---
+            // After the lines, as they were when they were line batches.
+            let mut sector_pipeline_set = false;
+            for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+                let Some(cam) = self.tile_cam(i) else { continue };
+                let Some(buffers) = self.tile_cache.get(key) else { continue };
+                let Some(ref buf) = buffers.sector_buffer else { continue };
+                let start = buffers.sector_priority_offsets[p];
+                let end = buffers.sector_priority_offsets[p + 1];
+                if end > start {
+                    if !sector_pipeline_set {
+                        self.sector_renderer.set_pipeline(render_pass);
+                        sector_pipeline_set = true;
+                    }
+                    self.apply_scissor(render_pass, *scissor);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
+                    self.sector_renderer.draw_range(render_pass, buf, start, end - start);
                 }
             }
 
@@ -3871,11 +4174,16 @@ impl RenderState {
                 (&self.symbol_renderer, &self.symbol_camera_bind_group)
             {
                 if debug_mode == 3 && priority == 0 {
-                    symbol_renderer.render_atlas_debug(render_pass, symbol_bind_group);
+                    symbol_renderer.render_atlas_debug(
+                        render_pass,
+                        symbol_bind_group,
+                        self.camera_slot_offset(SLOT_GLOBAL),
+                    );
                     symbol_draw_calls = 1;
                 } else if debug_mode != 3 {
                     let mut symbol_state_set = false;
-                    for (key, scissor) in &self.tile_draw_list {
+                    for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
+                        let Some(cam) = self.tile_cam(i) else { continue };
                         if let Some(buffers) = self.tile_cache.get(key) {
                             self.apply_scissor(render_pass, *scissor);
                             if let Some(ref symbol_buffer) = buffers.symbol_buffer {
@@ -3883,9 +4191,10 @@ impl RenderState {
                                 let end = buffers.symbol_priority_offsets[p + 1];
                                 if end > start {
                                     if !symbol_state_set {
-                                        symbol_renderer.set_state(render_pass, symbol_bind_group);
+                                        symbol_renderer.set_state(render_pass, symbol_bind_group, cam);
                                         symbol_state_set = true;
                                     }
+                                    render_pass.set_bind_group(0, symbol_bind_group, &[cam]);
                                     symbol_renderer.draw_range(
                                         render_pass,
                                         symbol_buffer,
@@ -3937,6 +4246,7 @@ impl RenderState {
                     text_renderer.render_with_buffer(
                         render_pass,
                         text_bind_group,
+                        self.camera_slot_offset(SLOT_TEXT),
                         text_buffer,
                         self.global_text_count,
                     );
@@ -3961,6 +4271,7 @@ impl RenderState {
                 symbol_renderer.render_with_buffer(
                     render_pass,
                     symbol_bind_group,
+                    self.camera_slot_offset(SLOT_TEXT),
                     buf,
                     self.global_sounding_count,
                 );
@@ -3976,6 +4287,7 @@ impl RenderState {
                     label_renderer.render_with_buffer(
                         render_pass,
                         label_bind_group,
+                        self.camera_slot_offset(SLOT_TEXT),
                         label_buffer,
                         self.global_label_count,
                     );
@@ -4074,7 +4386,7 @@ impl RenderState {
                 let parts: Vec<f64> = at.split(',').filter_map(|v| v.trim().parse().ok()).collect();
                 if parts.len() == 2 {
                     let (x, y) = crate::render::projection::Projection::to_mercator(parts[0], parts[1]);
-                    self.pick_at_world(x as f32, y as f32);
+                    self.pick_at_world(x, y);
                 }
             }
             // `NAVCORE_ROUTES_OPEN=1` opens the routes window at startup.
@@ -4255,14 +4567,14 @@ impl RenderState {
 
     /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
     /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
-    pub fn pick_at_world(&mut self, x: f32, y: f32) {
+    pub fn pick_at_world(&mut self, x: f64, y: f64) {
         // An armed planner pin claims the tap first — it is a deliberate
         // one-shot — then an open route editor, which is a standing mode.
         // Only if neither wants it does the tap ask "what is that?".
-        if self.plan_pick_fill(x as f64, y as f64) {
+        if self.plan_pick_fill(x, y) {
             return;
         }
-        if self.route_edit_append(x as f64, y as f64) {
+        if self.route_edit_append(x, y) {
             return;
         }
         // A fingertip is about 9 mm across; a mouse pointer is exact. Sizing
@@ -4273,7 +4585,7 @@ impl RenderState {
         self.pick_objects.clear();
         if let Some(ref worker) = self.tile_worker {
             self.pick_pending = Some(worker.request_pick(
-                [x as f64, y as f64],
+                [x, y],
                 (radius_px * self.camera.zoom) as f64,
             ));
         }
@@ -4305,7 +4617,7 @@ impl RenderState {
         for (text, is_start) in [(&ui.plan.from, true), (&ui.plan.to, false)] {
             let Some(p) = crate::geo::parse_latlon(text) else { continue };
             let (wx, wy) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
-            let s = self.camera.world_to_screen(wx as f32, wy as f32);
+            let s = self.camera.world_to_screen(wx, wy);
             pins.push(crate::render::ui::PlanPin {
                 screen: [s.x / ppp, s.y / ppp],
                 is_start,
@@ -4496,7 +4808,7 @@ impl RenderState {
     fn own_ship_view(&self) -> Option<crate::render::ui_ownship::OwnShip> {
         let (lat, lon) = self.fleet.own.position()?;
         let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
-        let screen = self.camera.world_to_screen(wx as f32, wy as f32);
+        let screen = self.camera.world_to_screen(wx, wy);
         let ppp = self.scale_factor.max(0.01);
 
         // The fix, not the heading, decides staleness: a boat that has lost
@@ -4648,7 +4960,14 @@ impl RenderState {
             .get("navigation.position")
             .map(|r| r.is_stale())
             .unwrap_or(true);
-        let instances = crate::render::mariner::instances(&self.fleet, &symbols, stale_own);
+        let origin = self.camera.position;
+        self.mariner_origin = origin;
+        let instances = crate::render::mariner::instances(
+            &self.fleet,
+            &symbols,
+            stale_own,
+            [origin.x, origin.y],
+        );
         self.mariner_count = instances.len() as u32;
         if instances.is_empty() {
             return;
@@ -4711,7 +5030,7 @@ impl RenderState {
                             wp.position.lat,
                             wp.position.lon,
                         );
-                        let s = self.camera.world_to_screen(x as f32, y as f32);
+                        let s = self.camera.world_to_screen(x, y);
                         // The plan's ETA lives on the leg ENDING here.
                         let eta = (i > 0)
                             .then(|| r.legs.get(i - 1))
@@ -4792,7 +5111,7 @@ impl RenderState {
             .filter_map(|target| {
                 let (lat, lon) = target.position()?;
                 let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
-                let screen = self.camera.world_to_screen(wx as f32, wy as f32);
+                let screen = self.camera.world_to_screen(wx, wy);
 
                 let approach = own.and_then(|own| {
                     let theirs = Motion {
@@ -4876,7 +5195,7 @@ impl RenderState {
             .is_some_and(|r| !r.is_stale());
         if fresh {
             let (x, y) = crate::render::projection::Projection::to_mercator(lat, lon);
-            self.camera.position = glam::Vec2::new(x as f32, y as f32);
+            self.camera.position = glam::DVec2::new(x, y);
             self.following = true;
         }
     }
@@ -5603,7 +5922,7 @@ impl RenderState {
         }
         let [lat, lon] = ui.sheet.anchor?;
         let (mx, my) = crate::render::projection::Projection::to_mercator(lat, lon);
-        let s = self.camera.world_to_screen(mx as f32, my as f32);
+        let s = self.camera.world_to_screen(mx, my);
         let ppp = self.scale_factor.max(0.01);
         let (x, y) = (s.x / ppp, s.y / ppp);
         let (w, h) = (
@@ -6578,18 +6897,18 @@ fn unique_route_name(store: Option<&crate::nav::RouteStore>) -> String {
         .unwrap_or_else(|| "Route".into())
 }
 
-fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::Vec2; 4]) -> bool {
+fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::DVec2; 4]) -> bool {
     let rect = [
-        glam::Vec2::new(b.min_x as f32, b.min_y as f32),
-        glam::Vec2::new(b.max_x as f32, b.min_y as f32),
-        glam::Vec2::new(b.max_x as f32, b.max_y as f32),
-        glam::Vec2::new(b.min_x as f32, b.max_y as f32),
+        glam::DVec2::new(b.min_x, b.min_y),
+        glam::DVec2::new(b.max_x, b.min_y),
+        glam::DVec2::new(b.max_x, b.max_y),
+        glam::DVec2::new(b.min_x, b.max_y),
     ];
-    let axes = |p: &[glam::Vec2; 4]| {
-        let mut out = [glam::Vec2::ZERO; 4];
+    let axes = |p: &[glam::DVec2; 4]| {
+        let mut out = [glam::DVec2::ZERO; 4];
         for i in 0..4 {
             let e = p[(i + 1) % 4] - p[i];
-            out[i] = glam::Vec2::new(-e.y, e.x);
+            out[i] = glam::DVec2::new(-e.y, e.x);
         }
         out
     };
@@ -6597,9 +6916,9 @@ fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::Vec2; 4]) ->
         if axis.length_squared() < 1e-12 {
             continue;
         }
-        let proj = |p: &[glam::Vec2; 4]| {
-            let mut lo = f32::MAX;
-            let mut hi = f32::MIN;
+        let proj = |p: &[glam::DVec2; 4]| {
+            let mut lo = f64::MAX;
+            let mut hi = f64::MIN;
             for v in p {
                 let d = axis.dot(*v);
                 lo = lo.min(d);
@@ -6621,8 +6940,8 @@ mod footprint_tests {
     use super::*;
     use crate::tiles::TileBounds;
 
-    fn quad(pts: [(f32, f32); 4]) -> [glam::Vec2; 4] {
-        pts.map(|(x, y)| glam::Vec2::new(x, y))
+    fn quad(pts: [(f64, f64); 4]) -> [glam::DVec2; 4] {
+        pts.map(|(x, y)| glam::DVec2::new(x, y))
     }
 
     #[test]
@@ -6677,7 +6996,7 @@ mod fallback_tests {
 mod sample_grid_tests {
     use super::*;
 
-    fn camera_at(cx: f32, cy: f32, zoom: f32) -> Camera {
+    fn camera_at(cx: f64, cy: f64, zoom: f32) -> Camera {
         Camera::new(cx, cy, zoom, 1400.0, 900.0)
     }
 
@@ -6694,7 +7013,7 @@ mod sample_grid_tests {
         let zoom = 50.0;
         let a = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
         // Shift the camera by a whole number of world units.
-        let shift_world = 500.0f32;
+        let shift_world = 500.0f64;
         let b = sample_grid_for(
             &camera_at(1_380_000.0 + shift_world, 7_540_000.0, zoom),
             1.0,
@@ -6704,7 +7023,7 @@ mod sample_grid_tests {
         assert!(!a.is_empty() && !b.is_empty());
         // Moving the camera east moves the chart west on screen, and the
         // lattice with it.
-        let expected = -shift_world / zoom;
+        let expected = -(shift_world as f32) / zoom;
 
         // Find a sample in `b` that is the same point of the earth as a
         // sample in `a`, and check where it landed.

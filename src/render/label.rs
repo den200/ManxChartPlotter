@@ -52,16 +52,7 @@ impl LabelRenderer {
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("label_camera_layout"),
             entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
+                super::state::camera_layout_entry(0),
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -240,7 +231,7 @@ impl LabelRenderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
+                    resource: super::state::camera_binding(camera_buffer),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -254,6 +245,7 @@ impl LabelRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
         instance_buffer: &'a wgpu::Buffer,
         instance_count: u32,
     ) {
@@ -262,7 +254,7 @@ impl LabelRenderer {
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, instance_buffer.slice(..));
         render_pass.draw(0..6, 0..instance_count);

@@ -1002,7 +1002,14 @@ fn tile_debug_mode(dir_path: &str) {
                     packet.byte_size
                 );
                 if let Some(v) = packet.area_vertices.first() {
-                    println!("  first area vert: pos=({:.0},{:.0}) color_index={}", v.position[0], v.position[1], v.color_index);
+                    // Packet positions are relative to the tile centre.
+                    let o = tile_id.origin();
+                    println!(
+                        "  first area vert: pos=({:.0},{:.0}) color_index={}",
+                        o.x + v.position[0] as f64,
+                        o.y + v.position[1] as f64,
+                        v.color_index
+                    );
                 }
             }
             Err(e) => eprintln!("  build_cpu failed: {}", e),

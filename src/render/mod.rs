@@ -74,12 +74,13 @@ pub mod projection;
 pub mod s52_styles;
 mod state;
 pub mod patterns;
+pub mod sectors;
 pub mod symbols;
 pub mod text;
 
 pub use camera::Camera;
 pub use colors::{depth_color, DepthPalette, LAND_COLOR, WATER_DEEP, WATER_SHALLOW};
-pub use lc_pattern::{LcPatternData, LcPatternTable, LcRenderConfig, LcStamp, compute_phase_offset, generate_stamps_along_polyline, generate_stamps_along_polyline_with_phase, stamps_to_line_vertices};
+pub use lc_pattern::{lc_segments, lc_symbol_index, lc_symbol_names, LcAtlas, LcSegment, LcSymbolGpu};
 pub use line_vertices::{build_line_vertices, build_line_vertices_multi_indexed, PRIMITIVE_RESTART_INDEX};
 pub use projection::Projection;
 pub use state::RenderState;
@@ -87,6 +88,7 @@ pub use state::{LineStyle, LineUniforms, LineVertex};
 pub use label::{LabelGlyphInstance, LabelRenderer};
 pub use symbols::{SymbolId, SymbolInstance, SymbolRenderer};
 pub use patterns::{PatternRenderer, PatternVertex, pattern_id_from_name};
+pub use sectors::{SectorInstance, SectorRenderer};
 pub use text::{SoundingInstance, TextRenderer};
 pub use text_layout::{layout_text, layout_light_text, declutter_and_layout_labels, TextParams, HJust, VJust};
 

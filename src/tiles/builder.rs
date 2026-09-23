@@ -2,7 +2,7 @@
 //!
 //! Builds TilePackets (CPU-side) from chart data, ready for GPU upload.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -11,10 +11,6 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::cache::CachedDecryptor;
 use crate::decrypt::KeyStore;
-use crate::render::lc_pattern::{
-    compute_phase_offset, generate_stamps_along_polyline_with_phase, stamps_to_polylines_by_width,
-    LcPatternTable, LcRenderConfig,
-};
 use crate::render::symbols::SymbolInstance;
 use crate::render::text::SoundingInstance;
 use crate::render::{build_line_vertices_multi_indexed, LineVertex};
@@ -25,7 +21,7 @@ use crate::s52::{
     S52Engine,
 };
 
-use super::clip::{clip_polyline, clip_triangle, outcode, triangulate_fan};
+use super::clip::{clip_polyline, clip_polyline_arc, clip_triangle, outcode, triangulate_fan};
 use super::{LineBatchKey, TileBounds, TileId};
 use crate::senc::BBoxTileRelation;
 use crate::senc::{ChartCatalog, ChartData, ChartInfo, Feature, ObjectClass, SencError, s57_code_to_acronym};
@@ -57,27 +53,10 @@ pub(crate) fn get_line_style_table() -> Option<&'static LineStyleTable> {
         .as_ref()
 }
 
-/// Shared LC pattern table (precomputed HPGL primitives), loaded once on first access
-static LC_PATTERN_TABLE: OnceLock<Option<LcPatternTable>> = OnceLock::new();
-
-/// Get the shared LC pattern table, loading it on first access.
-pub(crate) fn get_lc_pattern_table() -> Option<&'static LcPatternTable> {
-    LC_PATTERN_TABLE
-        .get_or_init(|| {
-            // First ensure line style table is loaded
-            if let Some(line_styles) = get_line_style_table() {
-                let patterns = LcPatternTable::from_line_style_table(line_styles);
-                log::info!(
-                    "Built LC pattern table: {} patterns with HPGL primitives",
-                    patterns.len()
-                );
-                Some(patterns)
-            } else {
-                None
-            }
-        })
-        .as_ref()
-}
+/// LC() lines of a tile, by batch: each piece of line with the arc length
+/// (metres) at which it starts along its whole feature line, so the symbol
+/// the line shader repeats along it continues across tile boundaries.
+type LcPolylines = HashMap<LineBatchKey, Vec<(Vec<[f32; 2]>, f32)>>;
 
 /// Check if a feature should be rendered at the given view scale.
 ///
@@ -188,6 +167,7 @@ impl std::error::Error for BuildError {}
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct AreaVertex {
+    /// Metres from the tile centre (see [`tile_relative`]).
     pub position: [f32; 2],
     pub color_index: u32,
     pub disp_prio: u32,
@@ -212,6 +192,14 @@ pub struct LineBatch {
     pub indices: Vec<u32>,
 }
 
+/// An LC() line's segments, drawn by the line shader's LC entry points.
+#[derive(Debug)]
+pub struct LcBatch {
+    /// Batch key; `key.style.lc` names the symbol
+    pub key: LineBatchKey,
+    pub segments: Vec<crate::render::LcSegment>,
+}
+
 /// CPU-side tile data ready for GPU upload
 #[derive(Debug)]
 pub struct TilePacket {
@@ -222,6 +210,8 @@ pub struct TilePacket {
     pub area_priority_offsets: [u32; 11],
     /// Line batches by style (multi-class rendering)
     pub line_batches: Vec<LineBatch>,
+    /// LC() lines, by style
+    pub lc_batches: Vec<LcBatch>,
     /// Point symbol instances (sorted by priority)
     pub symbol_instances: Vec<SymbolInstance>,
     /// Instance offsets per priority level
@@ -245,6 +235,10 @@ pub struct TilePacket {
     pub bg_pattern_vertices: Vec<crate::render::PatternVertex>,
     /// Background pattern vertex offsets per priority level
     pub bg_pattern_priority_offsets: [u32; 11],
+    /// Light sector arcs and legs, sized in pixels (sorted by priority)
+    pub sector_instances: Vec<crate::render::SectorInstance>,
+    /// Sector instance offsets per priority level
+    pub sector_priority_offsets: [u32; 11],
 }
 
 impl TilePacket {
@@ -254,6 +248,7 @@ impl TilePacket {
             area_vertices: Vec::new(),
             area_priority_offsets: [0; 11],
             line_batches: Vec::new(),
+            lc_batches: Vec::new(),
             symbol_instances: Vec::new(),
             symbol_priority_offsets: [0; 11],
             text_instances: Vec::new(),
@@ -265,6 +260,8 @@ impl TilePacket {
             bg_area_priority_offsets: [0; 11],
             bg_pattern_vertices: Vec::new(),
             bg_pattern_priority_offsets: [0; 11],
+            sector_instances: Vec::new(),
+            sector_priority_offsets: [0; 11],
         }
     }
 
@@ -287,7 +284,16 @@ impl TilePacket {
         let bg_area_bytes = self.bg_area_vertices.len() * std::mem::size_of::<AreaVertex>();
         let bg_pattern_bytes =
             self.bg_pattern_vertices.len() * std::mem::size_of::<crate::render::PatternVertex>();
+        let sector_bytes =
+            self.sector_instances.len() * std::mem::size_of::<crate::render::SectorInstance>();
+        let lc_bytes: usize = self
+            .lc_batches
+            .iter()
+            .map(|b| b.segments.len() * std::mem::size_of::<crate::render::LcSegment>())
+            .sum();
         self.byte_size = self.area_vertices.len() * std::mem::size_of::<AreaVertex>()
+            + sector_bytes
+            + lc_bytes
             + line_bytes
             + symbol_bytes
             + text_bytes
@@ -304,6 +310,8 @@ impl TilePacket {
             && self.symbol_instances.is_empty()
             && self.text_instances.is_empty()
             && self.label_candidates.is_empty()
+            && self.sector_instances.is_empty()
+            && self.lc_batches.is_empty()
     }
 
     /// Total line vertex count across all batches
@@ -469,10 +477,6 @@ impl<'a> TileBuilder<'a> {
     /// Without quilt-style scale selection, some tiles can intersect 100+ charts and
     /// generate enormous vertex buffers (tens of MB), which can stall rendering.
     const MAX_CHARTS_PER_TILE: usize = 8;
-
-    /// Safety cap to prevent LC stamping from exploding vertex counts on dense tiles.
-    /// This is an approximation path; missing some stamps is preferable to stalling.
-    const MAX_LC_STAMPS_PER_TILE: usize = 5000;
 
     /// Create a new tile builder with its own internal cache (for standalone use)
     pub fn new(
@@ -976,18 +980,7 @@ impl<'a> TileBuilder<'a> {
         // Shared line collections across all charts — merged batches reduce GPU buffer count
         let mut polylines_by_key: HashMap<LineBatchKey, Vec<Vec<[f32; 2]>>> =
             HashMap::with_capacity(32);
-        #[allow(clippy::type_complexity)]
-        let mut lc_patterns: Vec<(
-            String,
-            String,
-            u8,
-            u8,
-            u32,
-            String,
-            [f32; 2],
-            Vec<Vec<[f32; 2]>>,
-            bool, // is_background
-        )> = Vec::new();
+        let mut lc_polylines: LcPolylines = HashMap::new();
         let mut line_stats_total = LineBuildStats::default();
 
         let mut loaded_charts: Vec<LoadedChartContext<'_>> = Vec::new();
@@ -1067,7 +1060,7 @@ impl<'a> TileBuilder<'a> {
                     ctx.ref_my,
                     &mut label_candidates,
                     &mut all_area_ranges,
-                    &mut lc_patterns,
+                    &mut lc_polylines,
                     &detailed_coverages,
                     &ctx.coverage_triangles,
                     is_background,
@@ -1096,7 +1089,7 @@ impl<'a> TileBuilder<'a> {
                         ctx.info,
                         &bounds,
                         &mut polylines_by_key,
-                        &mut lc_patterns,
+                        &mut lc_polylines,
                         &detailed_coverages,
                         is_background,
                         &mut label_candidates,
@@ -1112,14 +1105,13 @@ impl<'a> TileBuilder<'a> {
                             line_stats.vertices_added
                         );
                         log::debug!(
-                            "    S-52: ls={} cs={} cs_fb={} lc={} lc_miss={} lc_fb={} lc_stamps={} skip_other={} no_lookup={}",
+                            "    S-52: ls={} cs={} cs_fb={} lc={} lc_miss={} lc_fb={} skip_other={} no_lookup={}",
                             line_stats.styled_by_ls,
                             line_stats.styled_by_cs,
                             line_stats.styled_by_cs_fallback,
                             line_stats.styled_by_lc,
                             line_stats.styled_by_lc_missing,
                             line_stats.styled_by_lc_fallback,
-                            line_stats.lc_stamps_emitted,
                             line_stats.skipped_other,
                             line_stats.skipped_no_lookup
                         );
@@ -1197,102 +1189,25 @@ impl<'a> TileBuilder<'a> {
                 });
             }
 
-            // Generate LC pattern stamps from collected LC polylines
-            if !lc_patterns.is_empty() {
-                if let (Some(lc_table), Some(_pattern_table)) =
-                    (get_line_style_table(), get_lc_pattern_table())
-                {
-                    let dpi = self.view_ppmm * 25.4;
-                    let config = LcRenderConfig::new(dpi, self.view_meters_per_pixel);
-
-                    for (
-                        symbol_name,
-                        color_ref,
-                        disp_prio,
-                        pass,
-                        lookup_id,
-                        acronym,
-                        first_point,
-                        polylines,
-                        lc_is_background,
-                    ) in lc_patterns
-                    {
-                        if let Some(symbol) = lc_table.get(&symbol_name) {
-                            let color = if let Some(engine) = self.s52_engine {
-                                engine.get_color(&color_ref).unwrap_or([0.0, 0.0, 0.0, 1.0])
-                            } else {
-                                [0.0, 0.0, 0.0, 1.0]
-                            };
-
-                            let advance_px = symbol.width_pixels(config.ppmm);
-                            let advance_meters = advance_px * config.meters_per_pixel;
-
-                            let phase_offset = compute_phase_offset(
-                                lookup_id,
-                                first_point,
-                                &acronym,
-                                advance_meters,
-                            );
-
-                            let mut pattern_polylines_by_width: BTreeMap<u8, Vec<Vec<[f32; 2]>>> =
-                                BTreeMap::new();
-                            for polyline in &polylines {
-                                if line_stats_total.lc_stamps_emitted
-                                    >= Self::MAX_LC_STAMPS_PER_TILE
-                                {
-                                    break;
-                                }
-                                let stamps = generate_stamps_along_polyline_with_phase(
-                                    polyline,
-                                    symbol,
-                                    &config,
-                                    color,
-                                    phase_offset,
-                                );
-                                if !stamps.is_empty() {
-                                    for (width, stamp_polylines) in
-                                        stamps_to_polylines_by_width(&stamps, symbol, &config)
-                                    {
-                                        pattern_polylines_by_width
-                                            .entry(width)
-                                            .or_default()
-                                            .extend(stamp_polylines);
-                                    }
-                                    line_stats_total.lc_stamps_emitted += stamps.len();
-                                }
-                            }
-
-                            for (width, pattern_polylines) in pattern_polylines_by_width {
-                                let (vertices, indices) =
-                                    build_line_vertices_multi_indexed(&pattern_polylines);
-                                if !vertices.is_empty() {
-                                    line_stats_total.vertices_added += vertices.len();
-                                    let lc_key = LineBatchKey::new_with_priority(
-                                        disp_prio,
-                                        pass,
-                                        LineStyleKey::new(LinePattern::Solid, width, &color_ref),
-                                        lookup_id,
-                                        lc_is_background,
-                                    );
-                                    packet.line_batches.push(LineBatch {
-                                        key: lc_key,
-                                        vertices,
-                                        indices,
-                                    });
-                                }
-                            }
-                        }
-                    }
+            // LC() lines: their segments, which the line shader dresses with
+            // the symbol at a constant size on screen (see render::lc_pattern).
+            let mut lc_keys: Vec<_> = lc_polylines.keys().cloned().collect();
+            lc_keys.sort();
+            for key in lc_keys {
+                let pieces = lc_polylines.remove(&key).unwrap();
+                let segments = crate::render::lc_segments(&pieces);
+                if segments.is_empty() {
+                    continue;
                 }
+                packet.lc_batches.push(LcBatch { key, segments });
             }
 
             if log::log_enabled!(log::Level::Debug) {
                 log::debug!(
-                    "  line totals: features={} batches={} verts={} lc_stamps={}",
+                    "  line totals: features={} batches={} verts={}",
                     line_stats_total.total_features,
                     packet.line_batches.len(),
                     line_stats_total.vertices_added,
-                    line_stats_total.lc_stamps_emitted
                 );
             }
         }
@@ -1368,15 +1283,16 @@ impl<'a> TileBuilder<'a> {
             // ground the features did, the reorder mis-sliced.
             if let Some(log) = &self.scene_log {
                 let mut bboxes = Vec::new();
+                let (ox, oy) = bounds.center();
                 for p in 0..10usize {
                     let (s0, e0) = (fg_area_offsets[p] as usize, fg_area_offsets[p + 1] as usize);
                     if e0 > s0 {
                         let mut b = [f64::MAX, f64::MAX, f64::MIN, f64::MIN];
                         for v in &packet.area_vertices[s0..e0] {
-                            b[0] = b[0].min(v.position[0] as f64);
-                            b[1] = b[1].min(v.position[1] as f64);
-                            b[2] = b[2].max(v.position[0] as f64);
-                            b[3] = b[3].max(v.position[1] as f64);
+                            b[0] = b[0].min(v.position[0] as f64 + ox);
+                            b[1] = b[1].min(v.position[1] as f64 + oy);
+                            b[2] = b[2].max(v.position[0] as f64 + ox);
+                            b[3] = b[3].max(v.position[1] as f64 + oy);
                         }
                         bboxes.push((p as u8, (e0 - s0) as u32, b));
                     }
@@ -1414,6 +1330,15 @@ impl<'a> TileBuilder<'a> {
                 current_prio += 1;
             }
             packet.symbol_priority_offsets = offsets;
+        }
+
+        // Sector arcs and legs, by priority, keeping their emission order
+        // (outline, colour, legs) within a priority.
+        if !packet.sector_instances.is_empty() {
+            packet.sector_instances.sort_by_key(|s| s.disp_prio.min(9));
+            packet.sector_priority_offsets = priority_offsets(
+                packet.sector_instances.iter().map(|s| s.disp_prio.min(9) as u8),
+            );
         }
 
         // Two-phase label decluttering: cheap AABB pre-check then full glyph layout (C4a).
@@ -1526,17 +1451,7 @@ impl<'a> TileBuilder<'a> {
         ref_my: f64,
         label_candidates: &mut Vec<TextParams>,
         all_area_ranges: &mut Vec<(u8, bool, usize, usize, usize, usize)>,
-        lc_patterns: &mut Vec<(
-            String,
-            String,
-            u8,
-            u8,
-            u32,
-            String,
-            [f32; 2],
-            Vec<Vec<[f32; 2]>>,
-            bool, // is_background
-        )>,
+        lc_polylines: &mut LcPolylines,
         detailed_coverages: &[[[f64; 2]; 3]],
         // The chart's own M_COVR rings. Reported by `--dump-scene` so a chart
         // painting outside its declared coverage is visible; not used to gate
@@ -1762,7 +1677,8 @@ impl<'a> TileBuilder<'a> {
                         // No clipping, no f64 conversion, no heap allocations
                         // (the quilt is resolved by draw order, not by masking)
                         stats.fast_path_features += 1;
-                        geom.for_each_triangle_direct(ref_mx as f32, ref_my as f32, |tri| {
+                        let (ox, oy) = bounds.center();
+                        geom.for_each_triangle_direct(ref_mx - ox, ref_my - oy, |tri| {
                             if self.below_min_triangle_area(&tri) {
                                 stats.subpixel_triangles += 1;
                                 return;
@@ -1938,18 +1854,14 @@ impl<'a> TileBuilder<'a> {
                             geom.extent.max_y,
                             geom.extent.max_x,
                         );
-                        // Vertices are already global Mercator (global_to_vertex
-                        // is the identity), pushed as a flat triangle list.
+                        // Vertices are tile-relative (see global_to_vertex);
+                        // the log is in global Mercator, so add the origin back.
+                        let (ox, oy) = bounds.center();
+                        let g = |p: [f32; 2]| [p[0] as f64 + ox, p[1] as f64 + oy];
                         let tris: Vec<[[f64; 2]; 3]> = packet.area_vertices
                             [vert_start..packet.area_vertices.len()]
                             .chunks_exact(3)
-                            .map(|t| {
-                                [
-                                    [t[0].position[0] as f64, t[0].position[1] as f64],
-                                    [t[1].position[0] as f64, t[1].position[1] as f64],
-                                    [t[2].position[0] as f64, t[2].position[1] as f64],
-                                ]
-                            })
+                            .map(|t| [g(t[0].position), g(t[1].position), g(t[2].position)])
                             .collect();
                         let mut log = log.lock().unwrap();
                         log.begin_feature(
@@ -2064,10 +1976,11 @@ impl<'a> TileBuilder<'a> {
                         );
                     }
                     let rings = if draw_chart_outline {
-                        let min_x = info.extent_mercator.min_x as f32;
-                        let min_y = info.extent_mercator.min_y as f32;
-                        let max_x = info.extent_mercator.max_x as f32;
-                        let max_y = info.extent_mercator.max_y as f32;
+                        // Rings are chart-local (relative to the chart's
+                        // reference point), like `resolve_rings` returns.
+                        let e = &info.extent_mercator;
+                        let (min_x, min_y) = ((e.min_x - ref_mx) as f32, (e.min_y - ref_my) as f32);
+                        let (max_x, max_y) = ((e.max_x - ref_mx) as f32, (e.max_y - ref_my) as f32);
                         vec![vec![
                             [min_x, min_y],
                             [max_x, min_y],
@@ -2082,17 +1995,20 @@ impl<'a> TileBuilder<'a> {
                     } else {
                         geom.resolve_rings(&chart.edge_table)
                     };
-                    let first_point: [f32; 2] = rings
+                    // One LC() batch per pass, for the symbols the table has.
+                    let lc_keys: Vec<LineBatchKey> = lc_style_ops
                         .iter()
-                        .filter_map(|ring| ring.first())
-                        .map(|p| [(ref_mx + p[0] as f64) as f32, (ref_my + p[1] as f64) as f32])
-                        .min_by(|a, b| {
-                            a[0].partial_cmp(&b[0])
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then(a[1].partial_cmp(&b[1]).unwrap_or(std::cmp::Ordering::Equal))
+                        .filter_map(|(pass_idx, symbol_name, color_ref)| {
+                            let lc = crate::render::lc_symbol_index(symbol_name)?;
+                            Some(LineBatchKey::new_with_priority(
+                                boundary_priority,
+                                *pass_idx,
+                                LineStyleKey::complex(lc, color_ref.as_str()),
+                                0,
+                                is_background,
+                            ))
                         })
-                        .unwrap_or([0.0, 0.0]);
-                    let mut lc_polylines_by_pass: HashMap<u8, Vec<Vec<[f32; 2]>>> = HashMap::new();
+                        .collect();
 
                     for ring in &rings {
                         let mut global: Vec<[f64; 2]> = ring
@@ -2107,6 +2023,24 @@ impl<'a> TileBuilder<'a> {
                         // reaching the shore came out as a straight magenta
                         // chord across several kilometres of land.
                         close_open_ring_if_rounding_gap(&mut global);
+                        if !lc_keys.is_empty() {
+                            let lc_ring = lc_direction(global.clone());
+                            for (segment, start_arc) in clip_polyline_arc(&lc_ring, bounds) {
+                                if segment.len() < 2 {
+                                    continue;
+                                }
+                                let pts: Vec<[f32; 2]> = segment
+                                    .iter()
+                                    .map(|p| self.global_to_vertex(*p, bounds))
+                                    .collect();
+                                for key in &lc_keys {
+                                    lc_polylines
+                                        .entry(key.clone())
+                                        .or_default()
+                                        .push((pts.clone(), start_arc as f32));
+                                }
+                            }
+                        }
                         let clipped = clip_polyline(&global, bounds);
                         for segment in clipped {
                             if segment.len() < 2 {
@@ -2152,33 +2086,6 @@ impl<'a> TileBuilder<'a> {
                                     });
                                 }
                             }
-                            for (pass_idx, _, _) in &lc_style_ops {
-                                lc_polylines_by_pass
-                                    .entry(*pass_idx)
-                                    .or_default()
-                                    .push(pts.clone());
-                            }
-                        }
-                    }
-
-                    if !lc_style_ops.is_empty() {
-                        let acronym = s57_code_to_acronym(feature.type_code).to_string();
-                        for (pass_idx, symbol_name, color_ref) in &lc_style_ops {
-                            if let Some(polylines) = lc_polylines_by_pass.get(pass_idx) {
-                                if !polylines.is_empty() {
-                                    lc_patterns.push((
-                                        symbol_name.clone(),
-                                        color_ref.clone(),
-                                        boundary_priority,
-                                        *pass_idx,
-                                        0,
-                                        acronym.clone(),
-                                        first_point,
-                                        polylines.clone(),
-                                        is_background,
-                                    ));
-                                }
-                            }
                         }
                     }
                 }
@@ -2218,7 +2125,7 @@ impl<'a> TileBuilder<'a> {
 	                                let color_index =
 	                                    engine.get_color_index(color_token).unwrap_or(0) as u32;
 	                                label_candidates.push(TextParams {
-	                                    position: [cx as f32, cy as f32],
+	                                    position: self.global_to_vertex([cx, cy], bounds),
 	                                    text,
 	                                    color,
 	                                    color_index,
@@ -2501,17 +2408,7 @@ impl<'a> TileBuilder<'a> {
         info: &ChartInfo,
         bounds: &TileBounds,
         polylines_by_key: &mut HashMap<LineBatchKey, Vec<Vec<[f32; 2]>>>,
-        lc_patterns: &mut Vec<(
-            String,
-            String,
-            u8,
-            u8,
-            u32,
-            String,
-            [f32; 2],
-            Vec<Vec<[f32; 2]>>,
-            bool, // is_background
-        )>,
+        lc_polylines: &mut LcPolylines,
         _detailed_coverages: &[[[f64; 2]; 3]],
         is_background: bool,
         label_candidates: &mut Vec<TextParams>,
@@ -2736,7 +2633,7 @@ impl<'a> TileBuilder<'a> {
                                         continue;
                                     }
                                     label_candidates.push(TextParams {
-                                        position: [cx as f32, cy as f32],
+                                        position: self.global_to_vertex([cx, cy], bounds),
 	                                        text: text.clone(),
 	                                        color,
 	                                        color_index,
@@ -2791,29 +2688,37 @@ impl<'a> TileBuilder<'a> {
 
                 let polylines = geom.resolve_global(&chart.edge_table, info.ref_lat, info.ref_lon);
 
-                // Track LC polylines for this feature
-                // LC info: (symbol_name, color_ref, pass)
-                let mut feature_lc_polylines: Vec<Vec<[f32; 2]>> = Vec::new();
-                let mut feature_lc_info: Option<(String, String, u8)> = None;
-                // Capture a deterministic anchor point for phase hashing.
-                // Use the minimum (x,y) among the first point of each polyline, so the
-                // anchor is stable even if polyline ordering differs across loads/tiles.
-                let first_point: [f32; 2] = polylines
+                // Track LC polylines for this feature, with the arc length
+                // each piece starts at along its feature line.
+                let mut feature_lc_polylines: Vec<(Vec<[f32; 2]>, f32)> = Vec::new();
+                // The first LC() of the feature: (symbol, colour, pass).
+                let feature_lc_info: Option<(String, String, u8)> =
+                    style_ops.iter().find_map(|(pass, _, lc)| {
+                        lc.as_ref().map(|(sym, col)| (sym.clone(), col.clone(), *pass))
+                    });
+                let non_lc_keys: Vec<LineBatchKey> = style_ops
                     .iter()
-                    .filter_map(|pl| pl.first().copied())
-                    .min_by(|a, b| {
-                        a[0].partial_cmp(&b[0])
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then(a[1].partial_cmp(&b[1]).unwrap_or(std::cmp::Ordering::Equal))
+                    .filter(|(_, _, lc)| lc.is_none())
+                    .map(|(pass, key, _)| {
+                        LineBatchKey::new_with_priority(
+                            disp_prio,
+                            *pass,
+                            key.clone(),
+                            lookup_id,
+                            is_background,
+                        )
                     })
-                    .map(|p| [p[0] as f32, p[1] as f32])
-                    .unwrap_or([0.0, 0.0]);
+                    .collect();
 
                 // LOD: simplification tolerance = half a screen pixel in Mercator meters
                 let simplify_eps = self.view_meters_per_pixel as f64 * 0.5;
 
                 for polyline in polylines {
-                    let clipped_segments = clip_polyline(&polyline, bounds);
+                    let clipped_segments = if non_lc_keys.is_empty() {
+                        Vec::new()
+                    } else {
+                        clip_polyline(&polyline, bounds)
+                    };
 
                     for segment in clipped_segments {
                         // No coverage masking: draw order resolves the quilt.
@@ -2845,32 +2750,7 @@ impl<'a> TileBuilder<'a> {
                             pts.push(self.global_to_vertex(p, bounds));
                         }
 
-                        // Collect LC info first (doesn't consume pts)
-                        for (_pass, _key, lc_info) in &style_ops {
-                            if let Some((sym, col)) = lc_info {
-                                if feature_lc_info.is_none() {
-                                    feature_lc_info = Some((sym.clone(), col.clone(), *_pass));
-                                }
-                            }
-                        }
-
-                        // Distribute pts to non-LC batch keys.
-                        // Use move for the last consumer to avoid unnecessary clone.
-                        let needs_for_lc = feature_lc_info.is_some();
-                        let non_lc_keys: Vec<LineBatchKey> = style_ops
-                            .iter()
-                            .filter(|(_, _, lc)| lc.is_none())
-                            .map(|(pass, key, _)| {
-                                LineBatchKey::new_with_priority(
-                                    disp_prio,
-                                    *pass,
-                                    key.clone(),
-                                    lookup_id,
-                                    is_background,
-                                )
-                            })
-                            .collect();
-
+                        // Distribute pts to the batch keys; move into the last.
                         if let Some((last, rest)) = non_lc_keys.split_last() {
                             for batch_key in rest {
                                 polylines_by_key
@@ -2878,42 +2758,63 @@ impl<'a> TileBuilder<'a> {
                                     .or_default()
                                     .push(pts.clone());
                             }
-                            if needs_for_lc {
-                                // LC also needs pts, so clone for the last non-LC key
-                                polylines_by_key
-                                    .entry(last.clone())
-                                    .or_default()
-                                    .push(pts.clone());
-                            } else {
-                                // Last consumer: move instead of clone
-                                polylines_by_key
-                                    .entry(last.clone())
-                                    .or_default()
-                                    .push(std::mem::take(&mut pts));
-                            }
+                            polylines_by_key
+                                .entry(last.clone())
+                                .or_default()
+                                .push(std::mem::take(&mut pts));
                         }
+                    }
 
-                        // Collect polylines for LC pattern generation
-                        if needs_for_lc {
-                            feature_lc_polylines.push(pts);
+                    // The LC() line: clipped with its arc length along the whole
+                    // line, and run in the direction the symbols face.
+                    if feature_lc_info.is_some() {
+                        let lc_line = lc_direction(polyline);
+                        for (segment, start_arc) in clip_polyline_arc(&lc_line, bounds) {
+                            let segment = super::clip::simplify_polyline(&segment, simplify_eps);
+                            if segment.len() < 2 {
+                                continue;
+                            }
+                            // An LC()-only line is recorded here; one that
+                            // also has LS() was recorded with those.
+                            if non_lc_keys.is_empty() {
+                                if let (Some(log), Some((_, style, _))) =
+                                    (&self.scene_log, style_ops.first())
+                                {
+                                    log.lock().unwrap().record_line(
+                                        &info.path.file_stem().unwrap_or_default().to_string_lossy(),
+                                        feature_index,
+                                        acronym,
+                                        super::scene::LineSource::LineFeature,
+                                        disp_prio,
+                                        is_background,
+                                        style_label(style),
+                                        vec![segment.clone()],
+                                    );
+                                }
+                                stats.segments_out += segment.len() - 1;
+                            }
+                            let pts: Vec<[f32; 2]> = segment
+                                .iter()
+                                .map(|p| self.global_to_vertex(*p, bounds))
+                                .collect();
+                            feature_lc_polylines.push((pts, start_arc as f32));
                         }
                     }
                 }
 
                 // If this feature has LC pattern info, store for later processing
                 if let Some((symbol_name, color_ref, pass)) = feature_lc_info {
-                    if !feature_lc_polylines.is_empty() {
-                        lc_patterns.push((
-                            symbol_name,
-                            color_ref,
-                            disp_prio,
-                            pass,
-                            lookup_id,
-                            acronym.to_string(),
-                            first_point,
-                            feature_lc_polylines,
-                            is_background,
-                        ));
+                    if let Some(lc) = crate::render::lc_symbol_index(&symbol_name) {
+                        if !feature_lc_polylines.is_empty() {
+                            let key = LineBatchKey::new_with_priority(
+                                disp_prio,
+                                pass,
+                                LineStyleKey::complex(lc, color_ref),
+                                lookup_id,
+                                is_background,
+                            );
+                            lc_polylines.entry(key).or_default().extend(feature_lc_polylines);
+                        }
                     }
                 }
             }
@@ -3125,7 +3026,7 @@ impl<'a> TileBuilder<'a> {
                     .unwrap_or(0.0);
                 let sym_idx = packet.symbol_instances.len();
                 packet.symbol_instances.push(SymbolInstance {
-                    position: [mx as f32, my as f32],
+                    position: self.global_to_vertex([mx, my], bounds),
                     symbol_id,
                     rotation,
                     disp_prio: sym_priority as u32,
@@ -3144,7 +3045,7 @@ impl<'a> TileBuilder<'a> {
                 if let Some(ref sector) = light_sector {
                     self.add_light_sector_lines(
                         packet,
-                        [mx as f32, my as f32],
+                        self.global_to_vertex([mx, my], bounds),
                         sector,
                         resolved.priority,
                     );
@@ -3188,7 +3089,7 @@ impl<'a> TileBuilder<'a> {
 	                            .and_then(|e| e.get_color_index("CHBLK"))
 	                            .unwrap_or(0) as u32;
 	                            label_candidates.push(TextParams {
-	                                position: [mx as f32, my as f32],
+	                                position: self.global_to_vertex([mx, my], bounds),
 	                                text: desc,
 	                                color,
 	                                color_index,
@@ -3213,7 +3114,7 @@ impl<'a> TileBuilder<'a> {
 	                            .and_then(|e| e.get_color_index("CHBLK"))
 	                            .unwrap_or(0) as u32;
 	                        label_candidates.push(TextParams {
-	                            position: [mx as f32, my as f32],
+	                            position: self.global_to_vertex([mx, my], bounds),
 	                            text,
 	                            color,
 	                            color_index,
@@ -3268,7 +3169,7 @@ impl<'a> TileBuilder<'a> {
                                 let color_index =
                                     engine.get_color_index(info.color_token()).unwrap_or(0) as u32;
                                 packet.text_instances.push(SoundingInstance {
-                                    position: [mx as f32, my as f32],
+                                    position: self.global_to_vertex([mx, my], bounds),
                                     depth: info.whole_part as f32,
                                     flags: info.to_flags(),
                                     scale: 1.8,
@@ -3286,7 +3187,7 @@ impl<'a> TileBuilder<'a> {
 	                            let color_index =
 	                                engine.get_color_index(color_token).unwrap_or(0) as u32;
 	                            label_candidates.push(TextParams {
-	                                position: [mx as f32, my as f32],
+	                                position: self.global_to_vertex([mx, my], bounds),
 	                                text,
 	                                color,
 	                                color_index,
@@ -3420,7 +3321,7 @@ impl<'a> TileBuilder<'a> {
                     .and_then(|engine| engine.get_color_index(render_info.color_token()))
                     .unwrap_or(0) as u32;
                 packet.text_instances.push(SoundingInstance {
-                    position: [x as f32, y as f32],
+                    position: self.global_to_vertex([x, y], bounds),
                     depth: render_info.whole_part as f32,
                     flags: render_info.to_flags(),
                     scale: scamin_scale * 1.8,
@@ -3442,6 +3343,7 @@ impl<'a> TileBuilder<'a> {
         added
     }
 
+    /// A sector light's figure, sized on screen: see [`light_sector_instances`].
     fn add_light_sector_lines(
         &self,
         packet: &mut TilePacket,
@@ -3449,117 +3351,25 @@ impl<'a> TileBuilder<'a> {
         sector: &crate::s52::LightSectorInfo,
         priority: u8,
     ) {
-        let sectr1 = sector.sectr1;
-        let sectr2 = if sector.sectr2 <= sectr1 {
-            sector.sectr2 + 360.0
-        } else {
-            sector.sectr2
-        };
-        let sweep = sectr2 - sectr1;
-        // Only a degenerate sweep is dropped. The caller has already removed
-        // the light's symbol, so returning here for a full circle (a major
-        // all-round light) or a sub-degree leading sector would leave the
-        // light drawn as nothing at all.
-        if sweep <= 0.0 || sweep > 360.0 {
-            return;
-        }
-
-        let to_chart = |angle: f64| {
-            if angle > 180.0 {
-                angle - 180.0
-            } else {
-                angle + 180.0
-            }
-        };
-        let s1 = to_chart(sectr1);
-        let s2 = {
-            let raw = to_chart(sectr2);
-            if raw <= s1 {
-                raw + 360.0
-            } else {
-                raw
-            }
-        };
-
-        // The CA() radius argument behaves as a *diameter* on screen: OpenCPN
-        // computes `rad = radius * canvas_pix_per_mm`, but the circle it draws
-        // for `CA(...,10.0,25.0)` measures 76 px across in the 1:2600 reference
-        // capture, where 10 mm at that canvas density would be 160 px. Halving
-        // reproduces the reference to within 5% across all four views.
-        let mm_to_meters = |mm: f64| {
-            mm * 0.5 * (self.view_ppmm as f64) * (self.view_meters_per_pixel as f64)
-        };
-        let arc_radius_m = mm_to_meters(sector.arc_radius_mm);
-        let sector_radius_m = mm_to_meters(sector.sector_radius_mm);
-
-        let arc_points = light_sector_arc_points(center, arc_radius_m, s1, s2);
-        if arc_points.len() < 2 {
-            return;
-        }
-
-        let (outline_color, arc_color, arc_width) = if sector.faint {
-            ("CHBLK", "CHBRN", 1u8)
-        } else {
-            ("OUTLW", sector.arc_color_token, 2u8)
-        };
-
-        let outline_key = LineStyleKey::new(LinePattern::Solid, 4, outline_color);
-        let arc_key = LineStyleKey::new(LinePattern::Solid, arc_width, arc_color);
-        let legs_key = LineStyleKey::new(LinePattern::Dashed, 2, "CHBLK");
-
-        // The arc belongs to the LIGHTS object and draws at that object's LUP
-        // priority (Hazards, 8) — not a fixed level. A hardcoded 4 happened to
-        // sit above everything while navcore's priority ladder was shifted one
-        // step low; with the correct S-52 numbering it fell under the line
-        // symbology and the sector arcs vanished from the chart.
-        let lookup_id = 0u32;
-
-        // Outline arc
-        let (vertices, indices) = build_line_vertices_multi_indexed(&[arc_points.clone()]);
-        if !vertices.is_empty() {
-            let key = LineBatchKey::new_with_priority(priority, 0, outline_key, lookup_id, false);
-            packet.line_batches.push(LineBatch {
-                key,
-                vertices,
-                indices,
-            });
-        }
-
-        // Color arc
-        let (vertices, indices) = build_line_vertices_multi_indexed(&[arc_points]);
-        if !vertices.is_empty() {
-            let key = LineBatchKey::new_with_priority(priority, 1, arc_key, lookup_id, false);
-            packet.line_batches.push(LineBatch {
-                key,
-                vertices,
-                indices,
-            });
-        }
-
-        // Sector legs — a full circle (an all-round light) has none.
-        let leg_lines = if sector.sector_radius_mm <= 0.0 || sweep >= 360.0 {
-            Vec::new()
-        } else {
-            light_sector_leg_lines(center, sector_radius_m, s1, s2)
-        };
-        if !leg_lines.is_empty() {
-            let (vertices, indices) = build_line_vertices_multi_indexed(&leg_lines);
-            if !vertices.is_empty() {
-                let key = LineBatchKey::new_with_priority(priority, 2, legs_key, lookup_id, false);
-                packet.line_batches.push(LineBatch {
-                    key,
-                    vertices,
-                    indices,
-                });
-            }
-        }
+        packet.sector_instances.extend(light_sector_instances(
+            center,
+            sector,
+            self.view_ppmm.max(1.0),
+            self.s52_engine.map(|e| &e.tables),
+            priority,
+        ));
     }
 
-    /// Convert global Mercator coordinates to f32 for GPU
-    /// Keeps coordinates in global Mercator meters - camera view-projection handles transform
-    fn global_to_vertex(&self, global: [f64; 2], _bounds: &TileBounds) -> [f32; 2] {
-        // Keep in global Mercator - camera view-projection matrix does the transform
-        [global[0] as f32, global[1] as f32]
+    /// Convert global Mercator coordinates to a tile vertex position.
+    ///
+    /// Every position in a tile packet is in metres *relative to the tile's
+    /// centre* (`TileBounds::center`), taken in f64 before the cast. Global
+    /// Mercator is 7.5–8.4e6 m here, where an f32 cannot resolve better than
+    /// 0.5–1 m; relative to the centre of even the largest tile the error is
+    /// a fraction of a millimetre. The renderer draws each tile with the
+    /// camera matrix re-based on the same centre (`Camera::view_projection_relative`).
+    fn global_to_vertex(&self, global: [f64; 2], bounds: &TileBounds) -> [f32; 2] {
+        tile_relative(global, bounds)
     }
 
     /// Get area color index for a feature using S-52 palette.
@@ -4067,47 +3877,160 @@ fn format_s52_text(fmt: &str, value: f64) -> String {
     }
 }
 
-fn light_sector_arc_points(
+/// A sector light's figure: the outlined, coloured arc and the two dashed
+/// legs, as screen-sized instances centred on the light (metres from the tile
+/// centre).
+///
+/// S-52 sizes all three in millimetres on the display, so they are built in
+/// pixels at the display density `ppmm` — never in Mercator metres, which made
+/// them scale with the zoom (see `render::sectors`). Nothing here depends on
+/// the zoom.
+fn light_sector_instances(
     center: [f32; 2],
-    radius_m: f64,
-    start_deg: f64,
-    end_deg: f64,
-) -> Vec<[f32; 2]> {
-    let sweep = end_deg - start_deg;
-    if sweep <= 0.0 {
+    sector: &crate::s52::LightSectorInfo,
+    ppmm: f32,
+    tables: Option<&crate::s52::LookupTables>,
+    priority: u8,
+) -> Vec<crate::render::SectorInstance> {
+    use crate::render::sectors::{SectorInstance, SECTOR_ARC, SECTOR_LEG};
+
+    let sectr1 = sector.sectr1;
+    let sectr2 = if sector.sectr2 <= sectr1 {
+        sector.sectr2 + 360.0
+    } else {
+        sector.sectr2
+    };
+    let sweep = sectr2 - sectr1;
+    // Only a degenerate sweep is dropped. The caller has already removed
+    // the light's symbol, so returning here for a full circle (a major
+    // all-round light) or a sub-degree leading sector would leave the
+    // light drawn as nothing at all.
+    if sweep <= 0.0 || sweep > 360.0 {
         return Vec::new();
     }
 
-    let steps = (sweep / 3.0).ceil().clamp(8.0, 180.0) as usize;
-    let step = sweep / steps as f64;
+    let to_chart = |angle: f64| {
+        if angle > 180.0 {
+            angle - 180.0
+        } else {
+            angle + 180.0
+        }
+    };
+    let s1 = to_chart(sectr1);
+    let s2 = {
+        let raw = to_chart(sectr2);
+        if raw <= s1 {
+            raw + 360.0
+        } else {
+            raw
+        }
+    };
 
-    let mut points = Vec::with_capacity(steps + 1);
-    for i in 0..=steps {
-        let angle_deg = start_deg + (i as f64 * step);
-        let rad = angle_deg.to_radians();
-        let dx = rad.sin() * radius_m;
-        let dy = rad.cos() * radius_m;
-        points.push([center[0] + dx as f32, center[1] + dy as f32]);
+    // The CA() radius argument behaves as a *diameter* on screen: OpenCPN
+    // computes `rad = radius * canvas_pix_per_mm`, but the circle it draws
+    // for `CA(...,10.0,25.0)` measures 76 px across in the 1:2600 reference
+    // capture, where 10 mm at that canvas density would be 160 px. Halving
+    // reproduces the reference to within 5% across all four views.
+    let mm_to_px = |mm: f64| (mm * 0.5 * ppmm as f64) as f32;
+    let arc_radius_px = mm_to_px(sector.arc_radius_mm);
+    let sector_radius_px = mm_to_px(sector.sector_radius_mm);
+    if arc_radius_px <= 0.0 {
+        return Vec::new();
     }
 
-    points
+    let (outline_color, arc_color, arc_width) = if sector.faint {
+        ("CHBLK", "CHBRN", 1u8)
+    } else {
+        ("OUTLW", sector.arc_color_token, 2u8)
+    };
+    // The same widths, colours and dash as the line styles these were
+    // once drawn with.
+    let style = |pattern, width, color: &str| {
+        crate::render::s52_styles::style_for_key(&LineStyleKey::new(pattern, width, color), ppmm, tables)
+    };
+    let outline = style(LinePattern::Solid, 4, outline_color);
+    let arc = style(LinePattern::Solid, arc_width, arc_color);
+    let legs = style(LinePattern::Dashed, 2, "CHBLK");
+
+    // The arc belongs to the LIGHTS object and draws at that object's LUP
+    // priority (Hazards, 8) — not a fixed level. A hardcoded 4 happened to
+    // sit above everything while navcore's priority ladder was shifted one
+    // step low; with the correct S-52 numbering it fell under the line
+    // symbology and the sector arcs vanished from the chart.
+    let bearings = [s1.to_radians() as f32, s2.to_radians() as f32];
+    let instance = |kind, radius_px, style: &crate::render::LineStyle, bearings: [f32; 2]| {
+        SectorInstance {
+            position: center,
+            radius_px,
+            width_px: style.width_px,
+            bearings,
+            dash_px: [style.dash_on_px, style.dash_off_px],
+            color_index: style.color_index,
+            kind,
+            disp_prio: priority as u32,
+        }
+    };
+    // Outline under the colour, then the legs.
+    let mut out = vec![
+        instance(SECTOR_ARC, arc_radius_px, &outline, bearings),
+        instance(SECTOR_ARC, arc_radius_px, &arc, bearings),
+    ];
+    // Sector legs — a full circle (an all-round light) has none.
+    if sector.sector_radius_mm > 0.0 && sweep < 360.0 {
+        for b in bearings {
+            out.push(instance(SECTOR_LEG, sector_radius_px, &legs, [b, b]));
+        }
+    }
+    out
 }
 
-fn light_sector_leg_lines(
-    center: [f32; 2],
-    radius_m: f64,
-    start_deg: f64,
-    end_deg: f64,
-) -> Vec<Vec<[f32; 2]>> {
-    let mut lines = Vec::with_capacity(2);
-    for angle_deg in [start_deg, end_deg] {
-        let rad = angle_deg.to_radians();
-        let dx = rad.sin() * radius_m;
-        let dy = rad.cos() * radius_m;
-        let end = [center[0] + dx as f32, center[1] + dy as f32];
-        lines.push(vec![center, end]);
+/// A line in the direction its LC() symbols are laid along.
+///
+/// As s52plib's `draw_lc_poly`: it takes the winding of the whole line
+/// (closing it) and, if that is clockwise *on screen* — y down, so
+/// anticlockwise in Mercator, y up — walks it backwards. A symbol drawn to
+/// one side of the line therefore faces the same way round every area.
+fn lc_direction(mut line: Vec<[f64; 2]>) -> Vec<[f64; 2]> {
+    let Some(&o) = line.first() else { return line };
+    // Relative to the first point, so the products stay small.
+    let rel = |p: [f64; 2]| [p[0] - o[0], p[1] - o[1]];
+    let mut twice_area = 0.0;
+    for i in 0..line.len() {
+        let a = rel(line[i]);
+        let b = rel(line[(i + 1) % line.len()]);
+        twice_area += a[0] * b[1] - a[1] * b[0];
     }
-    lines
+    if twice_area > 0.0 {
+        line.reverse();
+    }
+    line
+}
+
+/// Start of each priority level in a list already sorted by priority: entry
+/// `p` is the first index at priority `p` or above, entry 10 the length.
+fn priority_offsets(prios: impl Iterator<Item = u8>) -> [u32; 11] {
+    let mut offsets = [0u32; 11];
+    let mut next = 0usize;
+    let mut n = 0u32;
+    for p in prios {
+        while next <= p as usize {
+            offsets[next] = n;
+            next += 1;
+        }
+        n += 1;
+    }
+    while next <= 10 {
+        offsets[next] = n;
+        next += 1;
+    }
+    offsets
+}
+
+/// A global Mercator point relative to a tile's centre, the frame every
+/// position in a [`TilePacket`] is stored in.
+pub fn tile_relative(global: [f64; 2], bounds: &TileBounds) -> [f32; 2] {
+    let (ox, oy) = bounds.center();
+    [(global[0] - ox) as f32, (global[1] - oy) as f32]
 }
 
 fn bbox_is_degenerate(bbox: crate::senc::BBox) -> bool {
@@ -4225,7 +4148,6 @@ struct LineBuildStats {
     styled_by_lc: usize,          // Features styled via LC() with valid symbol
     styled_by_lc_missing: usize,  // Features with LC() but symbol not found in table
     styled_by_lc_fallback: usize, // Features needing LC() - using LS fallback style
-    lc_stamps_emitted: usize,     // LC pattern stamps generated
     skipped_other: usize,         // Skipped: display_cat == "Other"
     skipped_no_lookup: usize,     // Skipped: no S-52 lookup for object class
 }
@@ -4243,7 +4165,6 @@ impl LineBuildStats {
         self.styled_by_lc += other.styled_by_lc;
         self.styled_by_lc_missing += other.styled_by_lc_missing;
         self.styled_by_lc_fallback += other.styled_by_lc_fallback;
-        self.lc_stamps_emitted += other.lc_stamps_emitted;
         self.skipped_other += other.skipped_other;
         self.skipped_no_lookup += other.skipped_no_lookup;
     }
@@ -4316,6 +4237,98 @@ mod tests {
         // @location(3) shade: f32
         assert_eq!(std::mem::size_of::<AreaVertex>(), 20);
         assert_eq!(std::mem::align_of::<AreaVertex>(), 4);
+    }
+
+    /// Packet positions are metres from the tile centre, and the renderer
+    /// re-bases each tile on `TileId::origin`. The two must agree exactly, and
+    /// the offset must survive f32 at Danish latitudes to well under a
+    /// millimetre — global Mercator in f32 would be 0.5 m out here.
+    #[test]
+    fn tile_relative_positions_keep_millimetres() {
+        let (mx, my) = crate::tiles::latlon_to_mercator(55.70333, 12.61457);
+        let tile = TileId::from_mercator(mx, my, 18);
+        let origin = tile.origin();
+        let p = [mx + 0.0123, my - 0.0456];
+        let rel = tile_relative(p, &tile.bounds());
+        let back = [origin.x + rel[0] as f64, origin.y + rel[1] as f64];
+        assert!((back[0] - p[0]).abs() < 1e-5 && (back[1] - p[1]).abs() < 1e-5, "{back:?} vs {p:?}");
+        assert!(((p[1] as f32) as f64 - p[1]).abs() > 0.01, "global f32 was expected to be coarse here");
+    }
+
+    fn sector(sectr1: f64, sectr2: f64) -> crate::s52::LightSectorInfo {
+        crate::s52::LightSectorInfo {
+            sectr1,
+            sectr2,
+            arc_radius_mm: 10.0,
+            sector_radius_mm: 14.0,
+            arc_color_token: "LITRD",
+            faint: false,
+        }
+    }
+
+    /// A sector light is an outline, a coloured arc and two dashed legs,
+    /// sized in pixels from millimetres at the display density alone —
+    /// there is no zoom anywhere in the input, which is the point.
+    #[test]
+    fn sector_figures_are_sized_in_pixels() {
+        use crate::render::sectors::{SECTOR_ARC, SECTOR_LEG};
+        let ppmm = 8.0;
+        let out = light_sector_instances([1.5, -2.0], &sector(320.0, 336.0), ppmm, None, 8);
+        assert_eq!(out.len(), 4);
+        assert_eq!(out.iter().filter(|s| s.kind == SECTOR_ARC).count(), 2);
+        let legs: Vec<_> = out.iter().filter(|s| s.kind == SECTOR_LEG).collect();
+        assert_eq!(legs.len(), 2);
+        for s in &out {
+            assert_eq!(s.position, [1.5, -2.0]);
+            assert_eq!(s.disp_prio, 8);
+        }
+        // CA radius behaves as a diameter: 10 mm -> 5 mm -> 40 px at 8 px/mm.
+        assert!((out[0].radius_px - 40.0).abs() < 1e-4);
+        assert!((legs[0].radius_px - 56.0).abs() < 1e-4);
+        // The outline is wider than the colour it frames; legs are dashed.
+        assert!(out[0].width_px > out[1].width_px);
+        assert!(legs[0].dash_px[0] > 0.0 && legs[0].dash_px[1] > 0.0);
+        // Bearings: SECTR 320..336 seen from seaward is 140..156 from the light.
+        let deg = |r: f32| r.to_degrees();
+        assert!((deg(out[1].bearings[0]) - 140.0).abs() < 1e-3);
+        assert!((deg(out[1].bearings[1]) - 156.0).abs() < 1e-3);
+        // Twice the density, twice the pixels.
+        let hi = light_sector_instances([0.0, 0.0], &sector(320.0, 336.0), 16.0, None, 8);
+        assert!((hi[0].radius_px - 80.0).abs() < 1e-4);
+    }
+
+    /// An all-round light is a ring with no legs; a sector wrapping through
+    /// north keeps its sweep.
+    #[test]
+    fn full_circles_have_no_legs_and_wraps_keep_their_sweep() {
+        let ring = light_sector_instances([0.0, 0.0], &sector(0.0, 360.0), 4.0, None, 8);
+        assert_eq!(ring.len(), 2);
+        let wrap = light_sector_instances([0.0, 0.0], &sector(350.0, 10.0), 4.0, None, 8);
+        let sweep = (wrap[1].bearings[1] - wrap[1].bearings[0]).to_degrees();
+        assert!((sweep - 20.0).abs() < 1e-3, "{sweep}");
+    }
+
+    #[test]
+    fn priority_offsets_mark_where_each_level_starts() {
+        assert_eq!(
+            priority_offsets([0u8, 0, 3, 3, 9].into_iter()),
+            [0, 2, 2, 2, 4, 4, 4, 4, 4, 4, 5]
+        );
+        assert_eq!(priority_offsets(std::iter::empty()), [0; 11]);
+    }
+
+    /// s52plib walks an LC() line backwards when it winds clockwise on
+    /// screen — anticlockwise in Mercator, where y is up.
+    #[test]
+    fn lc_lines_run_clockwise_in_mercator() {
+        let ccw = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
+        let mut cw = ccw.clone();
+        cw.reverse();
+        assert_eq!(lc_direction(ccw.clone()), cw);
+        assert_eq!(lc_direction(cw.clone()), cw);
+        // Far from the origin, as real coordinates are.
+        let far: Vec<[f64; 2]> = ccw.iter().map(|p| [p[0] + 1.4e6, p[1] + 7.5e6]).collect();
+        assert_eq!(lc_direction(far.clone())[0], far[3]);
     }
 
     #[test]

@@ -129,7 +129,8 @@ impl From<u8> for VJust {
 /// Text layout parameters (based on S-52 TX instruction)
 #[derive(Clone, Debug)]
 pub struct TextParams {
-    /// World position (SM meters)
+    /// Position in metres from an origin its holder knows: the tile centre in
+    /// a tile packet, the text origin once gathered for global layout.
     pub position: [f32; 2],
     /// Text content
     pub text: String,
@@ -437,6 +438,12 @@ struct LabelRect {
     max_y: f32,
 }
 
+/// Where a position stored relative to `origin` lands on screen. The sum is
+/// taken in f64, so a label keeps its pixel at any zoom.
+fn screen_of(camera: &Camera, origin: glam::DVec2, p: [f32; 2]) -> glam::Vec2 {
+    camera.world_to_screen(origin.x + p[0] as f64, origin.y + p[1] as f64)
+}
+
 impl LabelRect {
     fn intersects(&self, other: &LabelRect) -> bool {
         self.min_x < other.max_x
@@ -454,7 +461,12 @@ impl LabelRect {
 /// approach used by OpenCPN's `CheckTextRectList`.
 ///
 /// Labels should be ordered by priority (highest priority first) before calling.
-pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>, camera: &Camera) {
+/// Glyph positions are metres from `origin` (global Mercator).
+pub fn declutter_labels(
+    glyphs: &mut Vec<LabelGlyphInstance>,
+    camera: &Camera,
+    origin: glam::DVec2,
+) {
     if glyphs.len() < 2 {
         return;
     }
@@ -488,7 +500,7 @@ pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>, camera: &Camera) {
             let mut max_x = f32::MIN;
             let mut max_y = f32::MIN;
             for g in &glyphs[start..start + count] {
-                let anchor = camera.world_to_screen(g.position[0], g.position[1]);
+                let anchor = screen_of(camera, origin, g.position);
                 let gx = anchor.x + g.offset_px[0];
                 let gy = anchor.y + g.offset_px[1];
                 min_x = min_x.min(gx);
@@ -546,7 +558,7 @@ pub fn declutter_labels(glyphs: &mut Vec<LabelGlyphInstance>, camera: &Camera) {
 ///
 /// Uses text length * average character width instead of computing per-glyph
 /// metrics. Returns (width, height) in pixels.
-fn estimate_label_bounds(params: &TextParams, camera: &Camera) -> LabelRect {
+fn estimate_label_bounds(params: &TextParams, camera: &Camera, origin: glam::DVec2) -> LabelRect {
     let total_width = text_width_px(&params.text, params.scale, params.bold, params.space);
     let char_height = CELL_H * params.scale;
     let avg_char_width = CELL_W * params.scale;
@@ -567,7 +579,7 @@ fn estimate_label_bounds(params: &TextParams, camera: &Camera) -> LabelRect {
         VJust::Bottom => {}
     }
 
-    let anchor = camera.world_to_screen(params.position[0], params.position[1]);
+    let anchor = screen_of(camera, origin, params.position);
     let x = anchor.x + xadjust;
     let y = anchor.y + yadjust;
 
@@ -590,8 +602,9 @@ fn estimate_label_bounds(params: &TextParams, camera: &Camera) -> LabelRect {
 pub fn declutter_and_layout_labels(
     candidates: &[TextParams],
     camera: &Camera,
+    origin: glam::DVec2,
 ) -> Vec<LabelGlyphInstance> {
-    declutter_and_layout_labels_ex(candidates, camera, false)
+    declutter_and_layout_labels_ex(candidates, camera, origin, false)
 }
 
 /// Declutter variant with the ShowImportantTextOnly filter.
@@ -603,6 +616,7 @@ pub fn declutter_and_layout_labels(
 pub fn declutter_and_layout_labels_ex(
     candidates: &[TextParams],
     camera: &Camera,
+    origin: glam::DVec2,
     important_text_only: bool,
 ) -> Vec<LabelGlyphInstance> {
     if candidates.is_empty() {
@@ -638,7 +652,7 @@ pub fn declutter_and_layout_labels_ex(
     // Phase 1: Cheap AABB pre-check using estimated bounds (in priority order)
     let estimated_rects: Vec<LabelRect> = sorted_indices
         .iter()
-        .map(|&i| estimate_label_bounds(&candidates[i], camera))
+        .map(|&i| estimate_label_bounds(&candidates[i], camera, origin))
         .collect();
 
     let mut accepted_rects: Vec<LabelRect> = Vec::new();
@@ -675,7 +689,12 @@ pub fn declutter_and_layout_labels_ex(
 ///
 /// Shallow soundings (lower depth) have higher priority per S-52.
 /// Each sounding's AABB is estimated from its digit count.
-pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>, camera: &Camera) {
+/// Sounding positions are metres from `origin` (global Mercator).
+pub fn declutter_soundings(
+    soundings: &mut Vec<super::text::SoundingInstance>,
+    camera: &Camera,
+    origin: glam::DVec2,
+) {
     if soundings.len() < 2 {
         return;
     }
@@ -693,7 +712,7 @@ pub fn declutter_soundings(soundings: &mut Vec<super::text::SoundingInstance>, c
             let digit_w = text_width_px("0", s.scale, false, SPACE_STANDARD);
             let width = (digit_count + if has_decimal { SUBSCRIPT_SCALE } else { 0.0 }) * digit_w;
             let height = CELL_H * s.scale;
-            let anchor = camera.world_to_screen(s.position[0], s.position[1]);
+            let anchor = screen_of(camera, origin, s.position);
             LabelRect {
                 min_x: anchor.x,
                 min_y: anchor.y - height,
@@ -857,7 +876,7 @@ mod tests {
             },
         ];
 
-        let glyphs = declutter_and_layout_labels(&labels, &camera);
+        let glyphs = declutter_and_layout_labels(&labels, &camera, glam::DVec2::ZERO);
         assert_eq!(glyphs.len(), 1);
     }
 
@@ -881,7 +900,7 @@ mod tests {
             },
         ];
 
-        declutter_soundings(&mut soundings, &camera);
+        declutter_soundings(&mut soundings, &camera, glam::DVec2::ZERO);
         assert_eq!(soundings.len(), 1);
     }
 }

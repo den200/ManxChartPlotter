@@ -400,21 +400,27 @@ impl AreaGeometry {
         (plain, strip, fan)
     }
 
-    /// Emit all vertices directly as f32 global Mercator coordinates.
+    /// Emit all vertices as f32, offset by `(ref_mx, ref_my)`.
     ///
     /// Zero-allocation fast path for features fully inside a tile.
     /// Expands STRIP/FAN to plain triangles (3 verts each) in-place.
-    /// Stays in f32 throughout — avoids the f32→f64→clip→f64→f32 round-trip.
-    pub fn for_each_vertex_direct<F>(&self, ref_mx: f32, ref_my: f32, mut callback: F)
+    ///
+    /// The offset is the chart's reference point *relative to wherever the
+    /// caller wants the output measured from* — the tile builder passes
+    /// `ref - tile_centre`, so the vertices come out tile-relative. The sum is
+    /// taken in f64: the offset can be tens of kilometres and the chart-local
+    /// coordinate as much again, and the result has to be good to a millimetre.
+    pub fn for_each_vertex_direct<F>(&self, ref_mx: f64, ref_my: f64, mut callback: F)
     where
         F: FnMut([f32; 2]),
     {
+        let at = |v: &[f32; 2]| [(ref_mx + v[0] as f64) as f32, (ref_my + v[1] as f64) as f32];
         for prim in &self.triangles {
             let verts = &prim.vertices;
             match prim.prim_type {
                 TriPrimType::Triangles => {
                     for v in verts {
-                        callback([ref_mx + v[0], ref_my + v[1]]);
+                        callback(at(v));
                     }
                 }
                 TriPrimType::TriangleStrip => {
@@ -424,18 +430,18 @@ impl AreaGeometry {
                         } else {
                             (i + 1, i, i + 2)
                         };
-                        callback([ref_mx + verts[a][0], ref_my + verts[a][1]]);
-                        callback([ref_mx + verts[b][0], ref_my + verts[b][1]]);
-                        callback([ref_mx + verts[c][0], ref_my + verts[c][1]]);
+                        callback(at(&verts[a]));
+                        callback(at(&verts[b]));
+                        callback(at(&verts[c]));
                     }
                 }
                 TriPrimType::TriangleFan => {
                     if verts.len() >= 3 {
                         let center = &verts[0];
                         for i in 1..verts.len() - 1 {
-                            callback([ref_mx + center[0], ref_my + center[1]]);
-                            callback([ref_mx + verts[i][0], ref_my + verts[i][1]]);
-                            callback([ref_mx + verts[i + 1][0], ref_my + verts[i + 1][1]]);
+                            callback(at(center));
+                            callback(at(&verts[i]));
+                            callback(at(&verts[i + 1]));
                         }
                     }
                 }
@@ -445,7 +451,7 @@ impl AreaGeometry {
 
     /// Like [`for_each_vertex_direct`](Self::for_each_vertex_direct) but hands
     /// back whole triangles, so a caller can measure one before emitting it.
-    pub fn for_each_triangle_direct<F>(&self, ref_mx: f32, ref_my: f32, mut callback: F)
+    pub fn for_each_triangle_direct<F>(&self, ref_mx: f64, ref_my: f64, mut callback: F)
     where
         F: FnMut([[f32; 2]; 3]),
     {

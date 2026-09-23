@@ -12,14 +12,26 @@
 //! nominal pixel size at any distance. What changes is which chart *scale* is
 //! right where, since a fixed ground distance covers fewer pixels the further
 //! away it is — see [`Camera::ground_mpp_at`].
+//!
+//! ## Precision
+//!
+//! The position and every transform are kept in f64. Global Mercator
+//! coordinates at Danish latitudes are 7.5–8.4e6 m, where one f32 step is
+//! 0.5–1 m: a camera stored in f32 could not pan by less than that, and a
+//! matrix that carries the full translation loses the same metre again when
+//! the GPU applies it. Geometry is therefore stored relative to a nearby
+//! origin (each tile's centre), and the GPU is handed
+//! [`view_projection_relative`](Camera::view_projection_relative) — the camera
+//! transform with that origin folded in *in f64*, so the large terms cancel
+//! before anything is rounded to f32.
 
-use glam::{Mat4, Vec2, Vec3};
+use glam::{DMat4, DVec2, DVec3, DVec4, Mat4, Vec2};
 
 use super::projection::MercatorBounds;
 use crate::tiles::TileBounds;
 
 /// Vertical field of view used when tilted.
-const FOV_Y: f32 = std::f32::consts::FRAC_PI_4;
+const FOV_Y: f64 = std::f64::consts::FRAC_PI_4;
 
 /// Hard cap on tilt.
 ///
@@ -32,18 +44,18 @@ pub const MAX_TILT: f32 = 60.0 * std::f32::consts::PI / 180.0;
 
 /// The closest zoom allowed, in Mercator metres per pixel.
 ///
-/// Chart vertices are stored as f32 global Mercator, where one step is
-/// 0.5–1 m at Danish latitudes (y ≈ 7.5–8.4e6 m). At the old 0.1 m/px limit
-/// that step was 5–10 px, and symbols, lines and the boat shuffled in jumps
-/// as the chart panned. At 0.5 m/px it is about a pixel — still close enough
-/// to put a boat in her berth — until the vertices are made camera-relative.
-pub const MIN_METRES_PER_PIXEL: f32 = 0.5;
+/// Close enough to put a boat in her berth. This used to be 0.5: chart
+/// vertices were f32 *global* Mercator, one step of which is 0.5–1 m here, and
+/// below 0.5 m/px geometry visibly shuffled as the chart panned. Vertices are
+/// now tile-relative and the camera is f64 (see the module note), so the floor
+/// is a matter of usefulness rather than arithmetic.
+pub const MIN_METRES_PER_PIXEL: f32 = 0.1;
 
 /// 2D camera for chart viewing
 #[derive(Debug, Clone)]
 pub struct Camera {
-    /// Camera center position in Mercator meters
-    pub position: Vec2,
+    /// Camera center position in Mercator meters (f64: see the module note)
+    pub position: DVec2,
     /// Zoom level (meters per screen unit)
     pub zoom: f32,
     /// Viewport width in pixels
@@ -72,11 +84,11 @@ impl Camera {
         let zoom = zoom_x.max(zoom_y);
 
         Self {
-            position: Vec2::new(cx as f32, cy as f32),
+            position: DVec2::new(cx, cy),
             zoom,
             viewport_width,
             viewport_height,
-            // Allow zooming in 1000x, but no closer than the f32 floor.
+            // Allow zooming in 1000x, but no closer than the floor.
             min_zoom: (zoom * 0.001).max(MIN_METRES_PER_PIXEL),
             max_zoom: zoom * 10.0,  // Allow zooming out 10x
             tilt: 0.0,
@@ -84,9 +96,9 @@ impl Camera {
     }
 
     /// Create camera at specific location
-    pub fn new(center_x: f32, center_y: f32, zoom: f32, width: f32, height: f32) -> Self {
+    pub fn new(center_x: f64, center_y: f64, zoom: f32, width: f32, height: f32) -> Self {
         Self {
-            position: Vec2::new(center_x, center_y),
+            position: DVec2::new(center_x, center_y),
             zoom,
             viewport_width: width,
             viewport_height: height,
@@ -109,10 +121,12 @@ impl Camera {
     /// Using `zoom` there instead would make the map slide out from under the
     /// cursor as soon as the eye was pitched back.
     pub fn pan(&mut self, dx: f32, dy: f32) {
+        let (dx, dy) = (dx as f64, dy as f64);
         if self.tilt <= 0.0 {
             // Convert screen movement to world movement
-            self.position.x -= dx * self.zoom;
-            self.position.y += dy * self.zoom; // Y is inverted
+            let zoom = self.zoom as f64;
+            self.position.x -= dx * zoom;
+            self.position.y += dy * zoom; // Y is inverted
             return;
         }
         // The local ground scale at the middle of the screen, by symmetric
@@ -122,9 +136,10 @@ impl Camera {
         // would not return the view to where it started.
         let cx = self.viewport_width * 0.5;
         let cy = self.viewport_height * 0.5;
-        let e = 1.0;
-        let gx = (self.screen_to_world(cx + e, cy) - self.screen_to_world(cx - e, cy)) / (2.0 * e);
-        let gy = (self.screen_to_world(cx, cy + e) - self.screen_to_world(cx, cy - e)) / (2.0 * e);
+        let e = 1.0f32;
+        let two_e = 2.0 * e as f64;
+        let gx = (self.screen_to_world(cx + e, cy) - self.screen_to_world(cx - e, cy)) / two_e;
+        let gy = (self.screen_to_world(cx, cy + e) - self.screen_to_world(cx, cy - e)) / two_e;
         self.position -= gx * dx + gy * dy;
     }
 
@@ -143,8 +158,7 @@ impl Camera {
         let world_after = self.screen_to_world(screen_x, screen_y);
 
         // Adjust position to keep cursor at same world point
-        self.position.x += world_before.x - world_after.x;
-        self.position.y += world_before.y - world_after.y;
+        self.position += world_before - world_after;
     }
 
     /// Zoom in/out by wheel delta (positive = zoom in)
@@ -160,40 +174,42 @@ impl Camera {
     /// pixel. Rays that pass above the horizon have no answer; the tilt cap
     /// keeps them off the viewport, and a ray that somehow escapes is clamped
     /// to the far edge rather than returning a point behind the camera.
-    pub fn screen_to_world(&self, screen_x: f32, screen_y: f32) -> Vec2 {
+    pub fn screen_to_world(&self, screen_x: f32, screen_y: f32) -> DVec2 {
         if self.tilt <= 0.0 {
-            let half_w = self.viewport_width / 2.0;
-            let half_h = self.viewport_height / 2.0;
-            return Vec2::new(
-                self.position.x + (screen_x - half_w) * self.zoom,
-                self.position.y + (half_h - screen_y) * self.zoom, // Y inverted
+            let half_w = self.viewport_width as f64 / 2.0;
+            let half_h = self.viewport_height as f64 / 2.0;
+            let zoom = self.zoom as f64;
+            return DVec2::new(
+                self.position.x + (screen_x as f64 - half_w) * zoom,
+                self.position.y + (half_h - screen_y as f64) * zoom, // Y inverted
             );
         }
-        let ndc = Vec2::new(
-            screen_x / self.viewport_width * 2.0 - 1.0,
-            1.0 - screen_y / self.viewport_height * 2.0,
+        let ndc = DVec2::new(
+            screen_x as f64 / self.viewport_width as f64 * 2.0 - 1.0,
+            1.0 - screen_y as f64 / self.viewport_height as f64 * 2.0,
         );
         self.ndc_to_ground(ndc)
     }
 
     /// Convert world coordinates to screen coordinates
-    pub fn world_to_screen(&self, world_x: f32, world_y: f32) -> Vec2 {
+    pub fn world_to_screen(&self, world_x: f64, world_y: f64) -> Vec2 {
         if self.tilt <= 0.0 {
-            let half_w = self.viewport_width / 2.0;
-            let half_h = self.viewport_height / 2.0;
+            let half_w = self.viewport_width as f64 / 2.0;
+            let half_h = self.viewport_height as f64 / 2.0;
+            let zoom = self.zoom as f64;
             return Vec2::new(
-                half_w + (world_x - self.position.x) / self.zoom,
-                half_h - (world_y - self.position.y) / self.zoom, // Y inverted
+                (half_w + (world_x - self.position.x) / zoom) as f32,
+                (half_h - (world_y - self.position.y) / zoom) as f32, // Y inverted
             );
         }
-        let clip = self.view_projection_matrix() * Vec3::new(world_x, world_y, 0.0).extend(1.0);
-        if clip.w.abs() < 1e-6 {
+        let clip = self.view_projection_f64() * DVec4::new(world_x, world_y, 0.0, 1.0);
+        if clip.w.abs() < 1e-9 {
             return Vec2::new(f32::NAN, f32::NAN);
         }
         let ndc = clip.truncate() / clip.w;
         Vec2::new(
-            (ndc.x * 0.5 + 0.5) * self.viewport_width,
-            (0.5 - ndc.y * 0.5) * self.viewport_height,
+            ((ndc.x * 0.5 + 0.5) * self.viewport_width as f64) as f32,
+            ((0.5 - ndc.y * 0.5) * self.viewport_height as f64) as f32,
         )
     }
 
@@ -202,17 +218,18 @@ impl Camera {
     /// Chosen so the centre of the screen keeps exactly the untilted scale:
     /// the frustum is `2 d tan(fov/2)` tall at the target, and that has to
     /// come to `viewport_height * zoom` metres.
-    pub fn eye_distance(&self) -> f32 {
-        self.viewport_height * self.zoom / (2.0 * (FOV_Y * 0.5).tan())
+    pub fn eye_distance(&self) -> f64 {
+        self.viewport_height as f64 * self.zoom as f64 / (2.0 * (FOV_Y * 0.5).tan())
     }
 
     /// Eye position in world space (metres, chart plane at z = 0).
-    pub fn eye(&self) -> Vec3 {
+    pub fn eye(&self) -> DVec3 {
         let d = self.eye_distance();
-        Vec3::new(
+        let tilt = self.tilt as f64;
+        DVec3::new(
             self.position.x,
-            self.position.y - d * self.tilt.sin(),
-            d * self.tilt.cos(),
+            self.position.y - d * tilt.sin(),
+            d * tilt.cos(),
         )
     }
 
@@ -227,79 +244,97 @@ impl Camera {
             return self.zoom;
         }
         let d = self.eye_distance();
-        let e = self.eye();
-        let dist = (Vec3::new(x as f32, y as f32, 0.0) - e).length();
-        self.zoom * (dist / d).max(1e-3)
+        let dist = (DVec3::new(x, y, 0.0) - self.eye()).length();
+        (self.zoom as f64 * (dist / d).max(1e-3)) as f32
     }
 
-    /// View-projection matrix for shaders.
-    pub fn view_projection_matrix(&self) -> Mat4 {
+    /// View-projection matrix in f64, for world (global Mercator) positions.
+    pub fn view_projection_f64(&self) -> DMat4 {
         if self.tilt <= 0.0 {
             // View: translate world so camera is at origin
-            let view = Mat4::from_translation(Vec3::new(-self.position.x, -self.position.y, 0.0));
+            let view = DMat4::from_translation(DVec3::new(-self.position.x, -self.position.y, 0.0));
 
             // Projection: orthographic, scaled by zoom
-            let half_w = self.viewport_width * self.zoom / 2.0;
-            let half_h = self.viewport_height * self.zoom / 2.0;
+            let half_w = self.viewport_width as f64 * self.zoom as f64 / 2.0;
+            let half_h = self.viewport_height as f64 * self.zoom as f64 / 2.0;
 
-            let proj = Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -1.0, 1.0);
+            let proj = DMat4::orthographic_rh(-half_w, half_w, -half_h, half_h, -1.0, 1.0);
 
             return proj * view;
         }
 
         let d = self.eye_distance();
-        let target = Vec3::new(self.position.x, self.position.y, 0.0);
-        let up = Vec3::new(0.0, self.tilt.cos(), self.tilt.sin());
-        let view = Mat4::look_at_rh(self.eye(), target, up);
+        let tilt = self.tilt as f64;
+        let target = DVec3::new(self.position.x, self.position.y, 0.0);
+        let up = DVec3::new(0.0, tilt.cos(), tilt.sin());
+        let view = DMat4::look_at_rh(self.eye(), target, up);
         // The far plane sits beyond the ground the top edge reaches, so the
         // chart is never cut off in mid-water; the near plane is close enough
         // that the bottom edge is never clipped either.
-        let aspect = self.viewport_width / self.viewport_height;
-        let proj = Mat4::perspective_rh(FOV_Y, aspect, d * 0.02, d * 12.0);
+        let aspect = self.viewport_width as f64 / self.viewport_height as f64;
+        let proj = DMat4::perspective_rh(FOV_Y, aspect, d * 0.02, d * 12.0);
         proj * view
     }
 
+    /// View-projection matrix for positions stored relative to `origin`.
+    ///
+    /// `origin` is folded in before the cast to f32, so the matrix the GPU
+    /// sees only ever carries the (small) distance from the camera to the
+    /// origin. This is what makes tile-relative vertices precise.
+    pub fn view_projection_relative(&self, origin: DVec2) -> Mat4 {
+        (self.view_projection_f64() * DMat4::from_translation(origin.extend(0.0))).as_mat4()
+    }
+
+    /// View-projection matrix for positions in global Mercator metres.
+    ///
+    /// Only for data that is still global (the single-chart debug path);
+    /// anything drawn at close zoom must use
+    /// [`view_projection_relative`](Self::view_projection_relative).
+    pub fn view_projection_matrix(&self) -> Mat4 {
+        self.view_projection_f64().as_mat4()
+    }
+
     /// Where a normalised-device-coordinate point lands on the chart plane.
-    fn ndc_to_ground(&self, ndc: Vec2) -> Vec2 {
-        let inv = self.view_projection_matrix().inverse();
-        let near = inv * ndc.extend(0.0).extend(1.0);
-        let far = inv * ndc.extend(1.0).extend(1.0);
-        if near.w.abs() < 1e-9 || far.w.abs() < 1e-9 {
+    fn ndc_to_ground(&self, ndc: DVec2) -> DVec2 {
+        let inv = self.view_projection_f64().inverse();
+        let near = inv * DVec4::new(ndc.x, ndc.y, 0.0, 1.0);
+        let far = inv * DVec4::new(ndc.x, ndc.y, 1.0, 1.0);
+        if near.w.abs() < 1e-12 || far.w.abs() < 1e-12 {
             return self.position;
         }
         let a = near.truncate() / near.w;
         let b = far.truncate() / far.w;
         let dz = a.z - b.z;
         // Parallel to the plane (at or above the horizon): take the far end.
-        if dz.abs() < 1e-6 {
-            return Vec2::new(b.x, b.y);
+        if dz.abs() < 1e-9 {
+            return DVec2::new(b.x, b.y);
         }
         let t = (a.z / dz).clamp(0.0, 1.0);
         let p = a.lerp(b, t);
-        Vec2::new(p.x, p.y)
+        DVec2::new(p.x, p.y)
     }
 
     /// The four screen corners cast onto the chart plane, in metres.
     ///
     /// Untilted this is just the view rectangle. Tilted it is a trapezium,
     /// narrow at the bottom of the screen and wide at the top.
-    pub fn ground_footprint(&self) -> [Vec2; 4] {
+    pub fn ground_footprint(&self) -> [DVec2; 4] {
         if self.tilt <= 0.0 {
-            let half_w = self.viewport_width * self.zoom / 2.0;
-            let half_h = self.viewport_height * self.zoom / 2.0;
+            let half_w = self.viewport_width as f64 * self.zoom as f64 / 2.0;
+            let half_h = self.viewport_height as f64 * self.zoom as f64 / 2.0;
             let (x, y) = (self.position.x, self.position.y);
             return [
-                Vec2::new(x - half_w, y - half_h),
-                Vec2::new(x + half_w, y - half_h),
-                Vec2::new(x + half_w, y + half_h),
-                Vec2::new(x - half_w, y + half_h),
+                DVec2::new(x - half_w, y - half_h),
+                DVec2::new(x + half_w, y - half_h),
+                DVec2::new(x + half_w, y + half_h),
+                DVec2::new(x - half_w, y + half_h),
             ];
         }
         [
-            self.ndc_to_ground(Vec2::new(-1.0, -1.0)),
-            self.ndc_to_ground(Vec2::new(1.0, -1.0)),
-            self.ndc_to_ground(Vec2::new(1.0, 1.0)),
-            self.ndc_to_ground(Vec2::new(-1.0, 1.0)),
+            self.ndc_to_ground(DVec2::new(-1.0, -1.0)),
+            self.ndc_to_ground(DVec2::new(1.0, -1.0)),
+            self.ndc_to_ground(DVec2::new(1.0, 1.0)),
+            self.ndc_to_ground(DVec2::new(-1.0, 1.0)),
         ]
     }
 
@@ -324,10 +359,10 @@ impl Camera {
         let (mut min_x, mut max_x) = (f64::MAX, f64::MIN);
         let (mut min_y, mut max_y) = (f64::MAX, f64::MIN);
         for p in f {
-            min_x = min_x.min(p.x as f64);
-            max_x = max_x.max(p.x as f64);
-            min_y = min_y.min(p.y as f64);
-            max_y = max_y.max(p.y as f64);
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
         }
         TileBounds::new(min_x, max_x, min_y, max_y)
     }
@@ -416,5 +451,64 @@ mod tests {
         let center = camera.screen_to_world(400.0, 300.0);
         assert!((center.x - 5000.0).abs() < 0.01);
         assert!((center.y - 3000.0).abs() < 0.01);
+    }
+
+    /// Where the GPU puts `rel` (metres from `origin`), in screen pixels,
+    /// doing the arithmetic in f32 exactly as the vertex shader does.
+    fn gpu_screen(cam: &Camera, origin: DVec2, rel: [f32; 2]) -> Vec2 {
+        let clip = cam.view_projection_relative(origin) * glam::Vec4::new(rel[0], rel[1], 0.0, 1.0);
+        let ndc = clip.truncate() / clip.w;
+        Vec2::new(
+            (ndc.x * 0.5 + 0.5) * cam.viewport_width,
+            (0.5 - ndc.y * 0.5) * cam.viewport_height,
+        )
+    }
+
+    /// Copenhagen, at the closest zoom. A point a few metres from the camera,
+    /// stored relative to a tile centre, must land within a hundredth of a
+    /// pixel of where f64 puts it.
+    #[test]
+    fn tile_relative_positions_are_exact_at_the_closest_zoom() {
+        let cam = Camera::new(1_404_812.37, 7_503_991.81, MIN_METRES_PER_PIXEL, 1400.0, 900.0);
+        let origin = DVec2::new(1_404_850.0, 7_503_960.0); // a z18 tile centre nearby
+        let p = cam.position + DVec2::new(12.345, -6.789);
+        let expected = cam.world_to_screen(p.x, p.y);
+        assert!((expected.x - (700.0 + 123.45)).abs() < 1e-3, "{expected:?}");
+
+        let rel = [(p.x - origin.x) as f32, (p.y - origin.y) as f32];
+        let got = gpu_screen(&cam, origin, rel);
+        assert!((got - expected).length() < 0.01, "relative: {got:?} vs {expected:?}");
+        // (The old scheme — `[p.x as f32, p.y as f32]` through the global
+        // matrix — misses here by about 2.6 px, and by a different amount for
+        // every point, which is what made the chart shuffle as it panned.)
+    }
+
+    /// Same, tilted: the perspective matrix is re-based in f64 too.
+    #[test]
+    fn tile_relative_positions_are_exact_when_tilted() {
+        let mut cam = Camera::new(1_404_812.37, 7_503_991.81, 0.2, 1400.0, 900.0);
+        cam.tilt = 0.8;
+        let origin = DVec2::new(1_404_700.0, 7_504_100.0);
+        for off in [DVec2::new(3.3, 20.1), DVec2::new(-40.7, 55.2), DVec2::new(0.01, -0.02)] {
+            let p = cam.position + off;
+            let expected = cam.world_to_screen(p.x, p.y);
+            let rel = [(p.x - origin.x) as f32, (p.y - origin.y) as f32];
+            let got = gpu_screen(&cam, origin, rel);
+            assert!((got - expected).length() < 0.02, "{off:?}: {got:?} vs {expected:?}");
+        }
+    }
+
+    /// A quarter-pixel drag at 0.1 m/px is 2.5 cm, which an f32 camera at
+    /// 7.5e6 m could not represent at all: the chart would not move.
+    #[test]
+    fn a_sub_pixel_pan_moves_the_chart_by_exactly_that_much() {
+        let mut cam = Camera::new(1_404_812.0, 7_503_991.0, MIN_METRES_PER_PIXEL, 1400.0, 900.0);
+        let origin = DVec2::new(1_404_850.0, 7_503_960.0);
+        let rel = [-20.0f32, 15.0];
+        let before = gpu_screen(&cam, origin, rel);
+        cam.pan(0.25, 0.0);
+        let after = gpu_screen(&cam, origin, rel);
+        assert!(((after.x - before.x) - 0.25).abs() < 0.01, "{before:?} -> {after:?}");
+        assert!((after.y - before.y).abs() < 0.01);
     }
 }

@@ -47,7 +47,9 @@ pub fn pattern_id_from_name(name: &str) -> Option<u32> {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PatternVertex {
-    /// World position in SM (Simple Mercator) meters
+    /// Position in metres from the draw's origin: the tile centre in a tile
+    /// packet (see `tiles::builder::tile_relative`), else the origin of the
+    /// camera slot it is drawn with.
     pub position: [f32; 2],
     /// Pattern ID (index into metadata)
     pub pattern_id: u32,
@@ -136,6 +138,28 @@ pub struct PatternRenderer {
     atlas_texture: wgpu::Texture,
     atlas_size: [u32; 2],
     day_rgba: Vec<u8>,
+    /// Each pattern's cell size in pixels at a 2x display (`tile_info.xy`),
+    /// kept on the CPU to compute the grid phase every frame.
+    cell_px: Vec<[f32; 2]>,
+    /// Where the camera anchor falls on each pattern's grid, rewritten per
+    /// frame by [`PatternRenderer::update_phase`].
+    phase_buffer: wgpu::Buffer,
+}
+
+/// Where a pattern grid anchored at the world origin puts `anchor`.
+///
+/// The shader lays each pattern on a grid of cells `cell` pixels across,
+/// pinned to Mercator (0, 0) so that neighbouring tiles agree. At 8e6 m and a
+/// few pixels per metre that grid coordinate is ~1e8 px — far past what f32
+/// can hold to a pixel — so the whole-cell part is removed here, in f64, and
+/// the shader only adds the (small) distance from the anchor. `x` is the
+/// fraction of a cell; `y` is kept modulo *two* rows because a staggered
+/// (brick) pattern offsets every other row.
+pub fn pattern_grid_phase(anchor: [f64; 2], pixels_per_meter: f64, cell: [f64; 2]) -> [f32; 2] {
+    let gx = anchor[0] * pixels_per_meter / cell[0];
+    // Screen y runs down and world y north, as in the shader.
+    let gy = -anchor[1] * pixels_per_meter / cell[1];
+    [gx.rem_euclid(1.0) as f32, gy.rem_euclid(2.0) as f32]
 }
 
 /// The colours `tools/render_patterns.py` paints with, by token. The atlas
@@ -341,16 +365,7 @@ impl PatternRenderer {
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("pattern_camera_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
+                entries: &[super::state::camera_layout_entry(0)],
             });
 
         // Create atlas bind group layout (group 1)
@@ -387,8 +402,30 @@ impl PatternRenderer {
                         },
                         count: None,
                     },
+                    // per-frame grid phase, one vec4 per pattern
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
                 ],
             });
+
+        let cell_px: Vec<[f32; 2]> = metadata
+            .iter()
+            .map(|m| [m.tile_info[0], m.tile_info[1]])
+            .collect();
+        let phase_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pattern_phase"),
+            size: (MAX_PATTERN_TYPES * std::mem::size_of::<[f32; 4]>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Create atlas bind group
         let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -406,6 +443,10 @@ impl PatternRenderer {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: metadata_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: phase_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -511,7 +552,35 @@ impl PatternRenderer {
             atlas_texture: texture,
             atlas_size: [width, height],
             day_rgba: rgba.into_raw(),
+            cell_px,
+            phase_buffer,
         })
+    }
+
+    /// Recompute every pattern's grid phase for this frame.
+    ///
+    /// `anchor` is the world point the per-draw camera slots measure
+    /// `anchor_offset` from (the camera position); `px_per_point` is the
+    /// display density the shader scales cells by.
+    pub fn update_phase(
+        &self,
+        queue: &wgpu::Queue,
+        anchor: [f64; 2],
+        pixels_per_meter: f64,
+        px_per_point: f32,
+    ) {
+        // Exactly the cell size the shader computes, f32 product included.
+        let density = px_per_point * 0.5;
+        let phases: Vec<[f32; 4]> = self
+            .cell_px
+            .iter()
+            .map(|c| {
+                let cell = [(c[0] * density) as f64, (c[1] * density) as f64];
+                let [x, y] = pattern_grid_phase(anchor, pixels_per_meter, cell);
+                [x, y, 0.0, 0.0]
+            })
+            .collect();
+        queue.write_buffer(&self.phase_buffer, 0, bytemuck::cast_slice(&phases));
     }
 
     /// Repaint the atlas for a palette. `colour_of` gives a token's colour in
@@ -570,13 +639,14 @@ impl PatternRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
     ) {
         if self.vertex_count == 0 {
             return;
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, self.vertex_buffer.slice(..));
         render_pass.draw(0..self.vertex_count, 0..1);
@@ -587,6 +657,7 @@ impl PatternRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
         buffer: &'a wgpu::Buffer,
         vertex_count: u32,
     ) {
@@ -595,7 +666,7 @@ impl PatternRenderer {
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(0..vertex_count, 0..1);
@@ -606,6 +677,7 @@ impl PatternRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
         buffer: &'a wgpu::Buffer,
         start: u32,
         count: u32,
@@ -615,7 +687,7 @@ impl PatternRenderer {
         }
 
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(start..start + count, 0..1);
@@ -626,9 +698,10 @@ impl PatternRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
     ) {
         render_pass.set_pipeline(&self.pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
     }
 
@@ -637,9 +710,10 @@ impl PatternRenderer {
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         camera_bind_group: &'a wgpu::BindGroup,
+        cam: u32,
     ) {
         render_pass.set_pipeline(&self.bg_pipeline);
-        render_pass.set_bind_group(0, camera_bind_group, &[]);
+        render_pass.set_bind_group(0, camera_bind_group, &[cam]);
         render_pass.set_bind_group(1, &self.atlas_bind_group, &[]);
     }
 
@@ -676,6 +750,32 @@ pub fn calculate_pattern_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shader adds the (small) distance from the anchor to the phase and
+    /// takes the fraction. That has to agree with the grid a full-precision
+    /// world coordinate would give — in x to within a hair of a cell, and in
+    /// y including which row (odd or even) a point is in, which is what the
+    /// stagger of a brick pattern depends on.
+    #[test]
+    fn grid_phase_reproduces_the_world_anchored_grid() {
+        let anchor = [1_404_812.37, 7_503_991.81];
+        let cell = [23.5, 17.25];
+        for ppm in [10.0, 1.0 / 3.3, 0.02] {
+            let phase = pattern_grid_phase(anchor, ppm, cell);
+            for d in [[0.0, 0.0], [3.7, -12.9], [-250.0, 480.5]] {
+                // What the shader computes, in f32.
+                let gx = phase[0] + (d[0] as f32 * ppm as f32) / cell[0] as f32;
+                let gy = phase[1] + (-d[1] as f32 * ppm as f32) / cell[1] as f32;
+                // The truth, in f64 from the world origin.
+                let wx = (anchor[0] + d[0]) * ppm / cell[0];
+                let wy = -(anchor[1] + d[1]) * ppm / cell[1];
+                let dx = (gx as f64 - wx).rem_euclid(1.0);
+                assert!(dx.min(1.0 - dx) < 1e-3, "x off by {dx} cells at ppm {ppm}");
+                let dy = (gy as f64 - wy).rem_euclid(2.0);
+                assert!(dy.min(2.0 - dy) < 1e-3, "y off by {dy} cells at ppm {ppm}");
+            }
+        }
+    }
 
     /// A day pixel takes its token's night colour; transparency and alpha
     /// survive, so the pattern keeps its shape and its soft edges.
