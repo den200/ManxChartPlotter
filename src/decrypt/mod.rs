@@ -385,7 +385,7 @@ fn run_oex_cli(binary: &Path, args: &[String]) -> DecryptResult<Output> {
             command.env("DYLD_LIBRARY_PATH", dir);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             command.env("LD_LIBRARY_PATH", dir);
         }
@@ -666,7 +666,7 @@ fn build_spawn_command(binary: &Path, fpr_path: &Path) -> DecryptResult<Command>
             command.env("DYLD_LIBRARY_PATH", dir);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             command.env("LD_LIBRARY_PATH", dir);
         }

@@ -261,10 +261,88 @@ fn main() {
     };
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
-    // Control flow is set dynamically in about_to_wait()
+    run(event_loop, source);
+}
 
+fn run(event_loop: EventLoop<()>, source: ChartSource) {
+    // Control flow is set dynamically in about_to_wait()
     let mut app = App::new(source);
     event_loop.run_app(&mut app).expect("Event loop failed");
+}
+
+/// The Android entry, called by `android_main` in android/src/lib.rs.
+///
+/// What a desktop start gets from its surroundings is set up here: `HOME`
+/// is the app's private storage, so settings, cache and charts land there
+/// through `dirs` as they do under a Linux home; `assets/` is unpacked from
+/// the APK and becomes the working directory; the log goes to a file,
+/// because stderr goes nowhere on Android.
+#[cfg(target_os = "android")]
+pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let Some(files) = android.internal_data_path() else { return };
+    env::set_var("HOME", &files);
+
+    let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
+    logger
+        .filter_module("wgpu_core", log::LevelFilter::Warn)
+        .filter_module("wgpu_hal", log::LevelFilter::Warn);
+    if let Ok(f) = std::fs::File::create(files.join("navcore.log")) {
+        logger.target(env_logger::Target::Pipe(Box::new(f)));
+    }
+    logger.init();
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panic: {info}\n{}", std::backtrace::Backtrace::force_capture());
+    }));
+
+    let install = files.join("install");
+    if let Err(e) = unpack_android_assets(&android, &install) {
+        log::error!("could not unpack assets: {e}");
+    }
+    if let Err(e) = env::set_current_dir(&install) {
+        log::error!("could not enter {}: {e}", install.display());
+    }
+
+    let source = match RenderState::remembered_chart_folder() {
+        Some(dir) => ChartSource::Directory(dir),
+        None => ChartSource::TestTriangle,
+    };
+    let event_loop = EventLoop::builder()
+        .with_android_app(android)
+        .build()
+        .expect("Failed to create event loop");
+    run(event_loop, source);
+}
+
+/// Unpack the APK's `assets.zip` (the project's `assets/`) into `dir`, once
+/// per build: a stamp of the zip's size and the app version says whether
+/// what is there is current.
+#[cfg(target_os = "android")]
+fn unpack_android_assets(
+    android: &winit::platform::android::activity::AndroidApp,
+    dir: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::Read;
+    let mut asset = android
+        .asset_manager()
+        .open(c"assets.zip")
+        .ok_or_else(|| std::io::Error::other("assets.zip is missing from the APK"))?;
+    let mut bytes = Vec::new();
+    asset.read_to_end(&mut bytes)?;
+    let stamp = format!("{} {}", env!("CARGO_PKG_VERSION"), bytes.len());
+    let stamp_path = dir.join(".stamp");
+    if std::fs::read_to_string(&stamp_path).is_ok_and(|s| s == stamp) {
+        return Ok(());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    std::fs::create_dir_all(dir)?;
+    zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .and_then(|mut z| z.extract(dir))
+        .map_err(std::io::Error::other)?;
+    std::fs::write(stamp_path, stamp)?;
+    log::info!("unpacked assets into {}", dir.display());
+    Ok(())
 }
 
 /// Dump every area primitive the renderer emits for a viewport, with the
@@ -1803,6 +1881,8 @@ struct App {
     shot_path: Option<String>,
     shot_requested: bool,
     frame_count: u32,
+    /// Between suspended and resumed (Android): there is no surface.
+    suspended: bool,
     /// NAVCORE_STRESS=coast: legs of the coastal tour done so far.
     stress_leg: usize,
 }
@@ -1838,6 +1918,7 @@ impl App {
             pinch_centroid: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             frame_count: 0,
+            suspended: false,
             stress_leg: 0,
         }
     }
@@ -2103,7 +2184,19 @@ impl ApplicationHandler for App {
         }
     }
 
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // Android: the window's surface is about to go. Draw nothing until
+        // resumed hands back a new one.
+        self.suspended = true;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.suspended {
+            self.suspended = false;
+            if let Some(state) = &mut self.state {
+                state.recreate_surface();
+            }
+        }
         if self.state.is_none() {
             let title = match &self.source {
                 ChartSource::TestTriangle => "NavCore - Test Triangle (pass chart path to render)",
@@ -2193,6 +2286,7 @@ impl ApplicationHandler for App {
                 state.set_scale_factor(scale_factor as f32);
             }
 
+            WindowEvent::RedrawRequested if self.suspended => {}
             WindowEvent::RedrawRequested => {
                 match state.render() {
                     Ok(_) => {}

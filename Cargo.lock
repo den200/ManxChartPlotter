@@ -1988,6 +1988,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "navcore-android"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "env_logger",
+ "glam",
+ "log",
+ "navcore2",
+ "pollster",
+ "serde_json",
+ "wgpu",
+ "winit",
+ "zip",
+]
+
+[[package]]
 name = "navcore2"
 version = "0.4.0"
 dependencies = [

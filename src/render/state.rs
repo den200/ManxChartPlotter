@@ -367,6 +367,9 @@ impl Drop for JobGuard {
 
 pub struct RenderState {
     pub window: Arc<Window>,
+    /// Kept to make a new surface: Android destroys the window's surface
+    /// whenever the app goes to the background.
+    instance: wgpu::Instance,
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -1339,6 +1342,7 @@ impl RenderState {
                 .filter(|v| !v.is_empty())
                 .map(|_| std::cell::RefCell::new(Vec::new())),
             window,
+            instance,
             surface,
             device,
             queue,
@@ -2350,6 +2354,21 @@ impl RenderState {
         self.keys = Some(keys_arc);
         // decryptor is now owned by worker - clear main thread reference
         self.decryptor = None;
+    }
+
+    /// A new surface for the same window, after Android gave the app a new
+    /// native window on resume. Everything else — device, tiles, charts —
+    /// survives.
+    pub fn recreate_surface(&mut self) {
+        match self.instance.create_surface(self.window.clone()) {
+            Ok(surface) => {
+                self.surface = surface;
+                self.resize(self.window.inner_size());
+                self.needs_redraw = true;
+                self.window.request_redraw();
+            }
+            Err(e) => log::error!("could not recreate the surface: {e}"),
+        }
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {

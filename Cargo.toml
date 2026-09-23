@@ -6,6 +6,9 @@ edition = "2021"
 # binaries and refuses to guess. The plotter is the one you mean.
 default-run = "navcore"
 
+[workspace]
+members = ["android"]
+
 [[bin]]
 name = "navcore"
 path = "src/bin/navcore.rs"
@@ -87,3 +90,8 @@ geographiclib-rs = "0.2.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 gribberish = "1.6.0"
+
+# Android (ODROID-C5): winit must be told which Android activity it runs in.
+# NativeActivity needs no Java, so the APK is built without Gradle.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["android-native-activity"] }
