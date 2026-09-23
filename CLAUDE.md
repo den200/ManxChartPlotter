@@ -14,6 +14,7 @@ Before writing ANY code, you MUST:
 - `doc/navcore_plan_v2.md` - Master implementation plan with dependency versions
 - `doc/wgpu ref notes.md` - WGPU API patterns to follow exactly
 - `doc/SENC_RENDER_BLUEPRINT.md` - SENC file format details
+- `doc/pi5-test-rig.md` - the Raspberry Pi 5 test machine: `ssh rpi5`, deploy, running on its screen
 
 ## Dependency Versions (from plan)
 
