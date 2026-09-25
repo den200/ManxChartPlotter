@@ -5310,83 +5310,95 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
-    /// This machine's o-charts fingerprint, if it has a licence at all.
-    /// Work out which edition a lapsed licence may still ask for, and put it
-    /// to the user.
+    /// Put a download that needs deciding to the user: one that spends a
+    /// licence slot, or one for a lapsed licence, which cannot have the
+    /// shop's current edition and must name an older one.
     ///
-    /// Two sources, best first: the shop's own record of what this machine's
-    /// slot last received, then the edition installed here. Either is an
-    /// edition the licence demonstrably covered; the shop's current one is
-    /// not, which is why asking for it comes back refused.
+    /// For a lapsed licence every edition it is known to have covered is
+    /// offered — this machine's slot, what is installed here, and what each
+    /// of the account's other machines last received. The shop's current
+    /// edition is not among them, which is why asking for it is refused.
     fn prepare_lapsed_download(&mut self, chart_id: &str) {
         let Some(ref mut ui) = self.ui else { return };
         let Some(chart) = ui.shop.charts.iter().find(|c| c.id == chart_id) else {
             return;
         };
+        let machine = ui.shop.system_name.clone().unwrap_or_default();
 
-        // A live subscription this machine holds no slot for: the download
-        // spends one, for good. Said before, not discovered after.
+        // No slot here yet: the download spends one, for good, whether or
+        // not the subscription is live. Said before, not discovered after.
+        let mine = chart.slot_for(&machine).map(|(_, s)| s.clone());
+        let slot_note = mine.is_none().then(|| {
+            format!(
+                "This assigns 1 of the {} free slot(s) on this licence to \"{machine}\", \
+                 permanently: o-charts cannot move or cancel an assignment once a chart is \
+                 requested for it.",
+                chart.free_slots()
+            )
+        });
+
         if !chart.expired {
-            let machine = ui.shop.system_name.clone().unwrap_or_default();
             ui.shop.pending = Some(crate::render::ui::PendingDownload {
                 chart_id: chart_id.to_string(),
                 chart_name: chart.name.clone(),
-                edition: None,
-                because: format!(
-                    "This assigns one of the {} free slot(s) on this licence to \"{machine}\". \
-                     o-charts cannot move or cancel an assignment once a chart is requested.",
-                    chart.free_slots()
-                ),
-                new_slot: true,
+                expired: false,
+                choices: Vec::new(),
+                because: format!("The shop's current edition, {}.", chart.edition),
+                new_slot: mine.is_none(),
+                slot_note,
             });
             return;
         }
 
-        let from_slot = ui
-            .shop
-            .system_name
-            .as_deref()
-            .and_then(|name| chart.slot_for(name))
-            .map(|(_, s)| s.last_requested.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let from_disk = ui.shop.installed.get(chart_id).map(|e| e.to_string());
+        // Every edition the licence is known to have covered: what this
+        // machine's slot last received, what is installed here, and what the
+        // account's other machines last received. The shop words a slot's
+        // edition its own way, sometimes without the year, so each is echoed
+        // back exactly as sent and labelled with where it came from; ordering
+        // them would mean guessing at a year the shop left out.
+        let mut choices: Vec<(String, String)> = Vec::new();
+        let mut add = |edition: &str, source: String| {
+            let edition = edition.trim();
+            if !edition.is_empty() && !choices.iter().any(|(e, _)| e == edition) {
+                choices.push((edition.to_string(), source));
+            }
+        };
+        if let Some(s) = &mine {
+            add(&s.last_requested, "last sent to this machine".into());
+        }
+        if let Some(e) = ui.shop.installed.get(chart_id) {
+            add(&e.to_string(), "installed here".into());
+        }
+        for q in &chart.quantities {
+            for s in &q.slots {
+                if s.assigned_system != machine {
+                    add(&s.last_requested, format!("as last sent to {}", s.assigned_system));
+                }
+            }
+        }
 
-        let (edition, because) = match (from_slot, from_disk) {
-            (Some(slot), _) => (
-                Some(slot.clone()),
-                format!(
-                    "The shop has {}, published after your licence expired — it will not \
-                     grant that. Edition {slot} is the last one the shop recorded for this \
-                     machine, and your licence covered it.",
-                    chart.edition
-                ),
-            ),
-            (None, Some(disk)) => (
-                Some(disk.clone()),
-                format!(
-                    "The shop has {}, published after your licence expired — it will not \
-                     grant that. Edition {disk} is what is installed here, so your licence \
-                     covered it.",
-                    chart.edition
-                ),
-            ),
-            (None, None) => (
-                None,
-                format!(
-                    "The shop has {}, published after your licence expired. navcore cannot \
-                     tell which edition you last held — nothing for this set is installed \
-                     here and the shop recorded no earlier request.",
-                    chart.edition
-                ),
-            ),
+        let because = if choices.is_empty() {
+            format!(
+                "The shop has {}, published after your licence expired. No machine on the \
+                 account has recorded an earlier edition, so there is none to name.",
+                chart.edition
+            )
+        } else {
+            format!(
+                "The shop has {}, published after your licence expired, and will likely \
+                 refuse it. Your licence did cover the editions below — ask for one of those.",
+                chart.edition
+            )
         };
 
         ui.shop.pending = Some(crate::render::ui::PendingDownload {
             chart_id: chart_id.to_string(),
             chart_name: chart.name.clone(),
-            edition,
+            expired: true,
+            choices,
             because,
-            new_slot: false,
+            new_slot: mine.is_none(),
+            slot_note,
         });
     }
 

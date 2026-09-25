@@ -901,69 +901,18 @@ fn chart_shop(
                 return;
             }
             // Numbered to match o-charts' own instructions — sign in, identify
-            // this system, install the chart — so a user who has read their
-            // page recognises where they are.
-            if !shop.signed_in {
-                ui.label(RichText::new("1. Sign in to o-charts").strong());
-                ui.label(
-                    RichText::new("The same account you bought the charts with.")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(4.0);
-                ui.add_space(6.0);
-                let mut submitted = false;
-                egui::Grid::new("shop-login")
-                    .num_columns(2)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Email");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut shop.email)
-                                .hint_text("you@example.com")
-                                .desired_width(280.0),
-                        );
-                        ui.end_row();
-                        ui.label("Password");
-                        let pw = ui.add(
-                            egui::TextEdit::singleline(&mut shop.password)
-                                .password(true)
-                                .desired_width(280.0),
-                        );
-                        // Enter in a text field presses its window's main
-                        // button, here as in the planner and the boat search.
-                        submitted = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.end_row();
-                    });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let ready = !shop.email.trim().is_empty() && !shop.password.is_empty();
-                    if (ui
-                        .add_enabled(ready && !shop.busy, egui::Button::new("Sign in"))
-                        .clicked()
-                        || submitted)
-                        && ready
-                        && !shop.busy
-                    {
-                        actions.push(UiAction::ShopSignIn {
-                            email: shop.email.trim().to_string(),
-                            password: std::mem::take(&mut shop.password),
-                        });
-                    }
-                    if shop.busy {
-                        ui.spinner();
-                    }
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Your password is sent to o-charts over TLS to sign in, and is \
-                         not stored on this computer.",
-                    )
-                    .small()
-                    .weak(),
-                );
+            // this system, install the chart — and walkable both ways: a step
+            // already reached can be revisited without undoing what came after.
+            let auto = if !shop.signed_in {
+                1
+            } else if shop.system_name.is_none() {
+                2
             } else {
+                3
+            };
+            let step = shop.step.filter(|s| (1..=auto).contains(s)).unwrap_or(auto);
+            step_bar(ui, shop, step, auto);
+            if shop.signed_in {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&shop.email).strong());
                     if let Some(name) = &shop.system_name {
@@ -989,10 +938,88 @@ fn chart_shop(
                         }
                     });
                 });
-                // A machine has to be named before the shop will hand it a
-                // chart: a slot is an assignment to a named computer, not to
-                // an account.
-                if shop.system_name.is_none() {
+            }
+            match step {
+                1 if !shop.signed_in => {
+                    ui.label(RichText::new("1. Sign in to o-charts").strong());
+                    ui.label(
+                        RichText::new("The same account you bought the charts with.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    let mut submitted = false;
+                    egui::Grid::new("shop-login")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Email");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut shop.email)
+                                    .hint_text("you@example.com")
+                                    .desired_width(280.0),
+                            );
+                            ui.end_row();
+                            ui.label("Password");
+                            let pw = ui.add(
+                                egui::TextEdit::singleline(&mut shop.password)
+                                    .password(true)
+                                    .desired_width(280.0),
+                            );
+                            // Enter in a text field presses its window's main
+                            // button, here as in the planner and the boat search.
+                            submitted = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            ui.end_row();
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ready = !shop.email.trim().is_empty() && !shop.password.is_empty();
+                        if (ui
+                            .add_enabled(ready && !shop.busy, egui::Button::new("Sign in"))
+                            .clicked()
+                            || submitted)
+                            && ready
+                            && !shop.busy
+                        {
+                            actions.push(UiAction::ShopSignIn {
+                                email: shop.email.trim().to_string(),
+                                password: std::mem::take(&mut shop.password),
+                            });
+                        }
+                        if shop.busy {
+                            ui.spinner();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Your password is sent to o-charts over TLS to sign in, and is \
+                             not stored on this computer.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                1 => {
+                    ui.label(RichText::new("1. Sign in to o-charts").strong());
+                    ui.label(format!("Signed in as {}.", shop.email));
+                    ui.label(
+                        RichText::new("Sign out above to use another account.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                2 => {
+                    if let Some(name) = shop.system_name.clone() {
+                        ui.label(
+                            RichText::new(format!(
+                                "This machine is registered as \"{name}\". Registering again \
+                                 re-points a name; it does not free a slot."
+                            ))
+                            .small(),
+                        );
+                    }
                     ui.add_space(6.0);
                     ui.label(RichText::new("2. Identify this system").strong());
                     ui.label(
@@ -1086,13 +1113,23 @@ fn chart_shop(
                         );
                     }
                 }
-                ui.add_space(6.0);
-                ui.label(RichText::new("3. Install your charts").strong());
-                ui.separator();
-                chart_table(ui, shop, actions);
-                if let Some(pending) = shop.pending.clone() {
-                    confirm_download(ui, &pending, actions);
+                _ => {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("3. Install your charts").strong());
+                    ui.separator();
+                    chart_table(ui, shop, actions);
+                    if let Some(pending) = shop.pending.clone() {
+                        confirm_download(ui, &pending, actions);
+                    }
                 }
+            }
+            step_nav(ui, shop, step, auto);
+            // Signing in or registering moves the process on; the step shown
+            // goes back to following it.
+            if actions.iter().any(|a| {
+                matches!(a, UiAction::ShopSignIn { .. } | UiAction::ShopRegister { .. })
+            }) {
+                shop.step = None;
             }
 
             if !shop.warning.is_empty() {
@@ -1110,6 +1147,40 @@ fn chart_shop(
             }
         });
     shop.open = open;
+}
+
+/// The three steps as a bar: where the user is, and which steps they may go
+/// back to. A step not yet reached is shown but cannot be chosen.
+fn step_bar(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
+    ui.horizontal(|ui| {
+        for (n, name) in [(1, "Sign in"), (2, "This system"), (3, "Charts")] {
+            if n > 1 {
+                ui.label(RichText::new("›").weak());
+            }
+            let label = egui::SelectableLabel::new(step == n, format!("{n}. {name}"));
+            if ui.add_enabled(n <= reached, label).clicked() {
+                shop.step = Some(n);
+            }
+        }
+    });
+    ui.separator();
+}
+
+/// Back and Next under the step, for a touchscreen where the bar's labels
+/// are small targets.
+fn step_nav(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
+    if step == reached && step == 1 {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if step > 1 && ui.button("◀ Back").clicked() {
+            shop.step = Some(step - 1);
+        }
+        if step < reached && ui.button("Next ▶").clicked() {
+            shop.step = (step + 1 < reached).then_some(step + 1);
+        }
+    });
 }
 
 /// Put a lapsed set's download to the user before sending it.
@@ -1131,47 +1202,48 @@ fn confirm_download(
             format!("{} — subscription lapsed", pending.chart_name)
         };
         ui.label(RichText::new(title).strong());
+        // Spending a slot is said first and in colour, whatever else is
+        // being asked: it is the one part of this that cannot be undone.
+        if let Some(note) = &pending.slot_note {
+            ui.label(RichText::new(note).color(egui::Color32::from_rgb(180, 120, 40)));
+        }
         ui.label(RichText::new(&pending.because).small());
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            match &pending.edition {
-                None if pending.new_slot => {
-                    if ui.button("Assign and download").clicked() {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: pending.chart_id.clone(),
-                            edition: None,
-                        });
-                    }
+        ui.horizontal_wrapped(|ui| {
+            if !pending.expired {
+                if ui.button("Assign and download").clicked() {
+                    actions.push(UiAction::ShopDownload {
+                        chart_id: pending.chart_id.clone(),
+                        edition: None,
+                    });
                 }
-                Some(edition) => {
-                    if ui
-                        .button(format!("Ask for edition {edition}"))
-                        .clicked()
-                    {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: pending.chart_id.clone(),
-                            edition: Some(edition.clone()),
-                        });
-                    }
+            }
+            // One button per edition the licence demonstrably covered, each
+            // saying where it was seen: which to claim is the user's call.
+            for (edition, source) in &pending.choices {
+                if ui.button(format!("Ask for {edition} ({source})")).clicked() {
+                    actions.push(UiAction::ShopDownload {
+                        chart_id: pending.chart_id.clone(),
+                        edition: Some(edition.clone()),
+                    });
                 }
-                None => {
-                    // Nothing on disk and nothing on the slot: there is no
-                    // older edition to name. Asking for the current one will
-                    // almost certainly be refused, but the shop's answer is
-                    // more use than navcore's guess about it.
-                    if ui
-                        .button("Ask for the current edition anyway")
-                        .on_hover_text(
-                            "Expect a refusal — the licence expired before this edition \
-                             was published. The shop's exact answer is worth having.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: pending.chart_id.clone(),
-                            edition: None,
-                        });
-                    }
+            }
+            if pending.expired {
+                // The shop's current edition was published after the licence
+                // lapsed. Asking will almost certainly be refused, but the
+                // shop's answer is more use than navcore's guess about it.
+                if ui
+                    .button("Ask for the current edition anyway")
+                    .on_hover_text(
+                        "Expect a refusal — the licence expired before this edition \
+                         was published. The shop's exact answer is worth having.",
+                    )
+                    .clicked()
+                {
+                    actions.push(UiAction::ShopDownload {
+                        chart_id: pending.chart_id.clone(),
+                        edition: None,
+                    });
                 }
             }
             if ui.button("Cancel").clicked() {
@@ -1224,13 +1296,13 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                     // real one: saying five are free when three are invites
                     // the user to hand out slots they do not have.
                     let mine = shop.system_name.as_deref().and_then(|n| c.slot_for(n));
-                    let on_key = c.dongle_slot();
-                    let cell = match (mine.is_some(), on_key) {
-                        (true, _) => "assigned here".to_string(),
-                        (false, Some(s)) => format!("on USB key {}", s.assigned_system),
-                        (false, None) => {
-                            format!("{} of {} free", c.free_slots(), c.total_slots())
-                        }
+                    // Which other machines hold the rest — a USB key among
+                    // them — is in the hover, not in place of the count: a
+                    // key's name here read as the machine the download was for.
+                    let cell = if mine.is_some() {
+                        "assigned here".to_string()
+                    } else {
+                        format!("not here yet · {} of {} free", c.free_slots(), c.total_slots())
                     };
                     let holders = c.holders();
                     let cell = ui.label(RichText::new(cell).small().weak());
