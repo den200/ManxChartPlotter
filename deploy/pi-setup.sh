@@ -23,6 +23,13 @@ echo "== GPU"
 vulkaninfo --summary 2>/dev/null | grep -E "deviceName|apiVersion" | head -4 || \
     echo "vulkaninfo not available yet — it works after a reboot into the desktop"
 
+echo "== Screen blanking off"
+# A plotter is watched, not touched: Raspberry Pi OS blanks an idle screen,
+# chart and depth with it. The compositor does the blanking, and winit has
+# no call to hold it off, so it is switched off here (1 is raspi-config's
+# "no"). Takes effect after a reboot.
+sudo raspi-config nonint do_blanking 1
+
 echo "== Autostart"
 mkdir -p "$HOME/.config/autostart"
 cp "$HOME/navcore/deploy/navcore.desktop" "$HOME/.config/autostart/navcore.desktop"
