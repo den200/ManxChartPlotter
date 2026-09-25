@@ -77,6 +77,12 @@ known! {
     "navigation.gnss.horizontalDilution"        => "HDOP",     Count;
 }
 
+/// Not a Signal K path: the tile that draws apparent and true wind on a
+/// dial. It lives in the bar's list of paths so that it is saved, ordered
+/// and removed like any other tile; the `navcore.` prefix is one no server
+/// sends.
+pub const WIND_ROSE: &str = "navcore.windRose";
+
 /// The entry for a path, if navcore knows it.
 pub fn lookup(path: &str) -> Option<&'static Known> {
     KNOWN.iter().find(|k| k.path == path)
@@ -88,6 +94,9 @@ pub fn lookup(path: &str) -> Option<&'static Known> {
 /// quantity's own name — `propulsion.starboard.oilPressure` becomes
 /// `oilPressure`. Ugly, but honest and immediately recognisable.
 pub fn label_for(path: &str) -> &str {
+    if path == WIND_ROSE {
+        return "Wind rose";
+    }
     match lookup(path) {
         Some(k) => k.label,
         None => path.rsplit('.').next().unwrap_or(path),

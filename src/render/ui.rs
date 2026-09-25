@@ -507,6 +507,10 @@ pub enum BarPosition {
     /// less often than it covers the top.
     #[default]
     Bottom,
+    /// Down a side, for a wide screen: the chart loses width, which a
+    /// landscape display has to spare, instead of height, which it has not.
+    Left,
+    Right,
     Hidden,
 }
 
