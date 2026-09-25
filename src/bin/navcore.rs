@@ -304,6 +304,29 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
         log::error!("could not enter {}: {e}", install.display());
     }
 
+    // Android's default temporary directory, /data/local/tmp, is not the
+    // app's to write; the fingerprint is generated through one.
+    if let Some(cache) = android.internal_data_path().map(|f| f.join("tmp")) {
+        let _ = std::fs::create_dir_all(&cache);
+        env::set_var("TMPDIR", &cache);
+    }
+    // The fingerprint is this device's o-charts identity, so it has to
+    // outlive the unpacked assets, which are replaced with every build.
+    // `license` stays the relative path the decryptor opens everywhere.
+    let license = files.join("license");
+    let _ = std::fs::create_dir_all(&license);
+    if std::fs::symlink_metadata("license").is_err() {
+        if let Err(e) = std::os::unix::fs::symlink(&license, "license") {
+            log::error!("could not link the licence directory: {e}");
+        }
+    }
+    // o-charts' helper ships in the APK as a native library: the one place
+    // Android lets an app run a program from. That directory is where this
+    // library was loaded from.
+    if let Some(dir) = android_native_library_dir() {
+        env::set_var("OEXSERVERD_BIN", dir.join("liboexserverd.so"));
+    }
+
     let source = match RenderState::remembered_chart_folder() {
         Some(dir) => ChartSource::Directory(dir),
         None => ChartSource::TestTriangle,
@@ -320,6 +343,17 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
         .build()
         .expect("Failed to create event loop");
     run(event_loop, source);
+}
+
+/// The directory Android loaded libnavcore.so from: the app's native library
+/// directory, read from this process's own memory map.
+#[cfg(target_os = "android")]
+fn android_native_library_dir() -> Option<PathBuf> {
+    let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+    maps.lines()
+        .filter_map(|line| line.split_whitespace().nth(5))
+        .find(|path| path.ends_with("/libnavcore.so"))
+        .and_then(|path| std::path::Path::new(path).parent().map(PathBuf::from))
 }
 
 /// Unpack the APK's `assets.zip` (the project's `assets/`) into `dir`, once

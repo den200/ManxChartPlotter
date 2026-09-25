@@ -707,14 +707,18 @@ impl Default for InstrumentView {
 pub struct PendingDownload {
     pub chart_id: String,
     pub chart_name: String,
-    /// The edition to ask for, when one could be worked out.
-    pub edition: Option<String>,
-    /// Where that edition came from, in words.
+    /// The subscription has lapsed, so the shop's current edition is not
+    /// covered and an older one has to be named.
+    pub expired: bool,
+    /// Editions the licence is known to have covered, each with where that
+    /// is known from ("as last sent to macbook"), for the user to choose.
+    pub choices: Vec<(String, String)>,
+    /// Why, in words.
     pub because: String,
-    /// The download claims a new licence slot for this machine (a live
-    /// subscription this machine does not hold yet), rather than asking for
-    /// an older edition of a lapsed one.
+    /// The download claims a new licence slot for this machine.
     pub new_slot: bool,
+    /// Said above everything else when a slot will be spent.
+    pub slot_note: Option<String>,
 }
 
 /// What the shop panel is showing.
@@ -741,6 +745,8 @@ pub struct ShopView {
     pub grants: std::collections::HashMap<String, String>,
     /// A download the user has not yet confirmed.
     pub pending: Option<PendingDownload>,
+    /// The step the user went back (or forward) to; `None` follows progress.
+    pub step: Option<u8>,
     /// A standing problem with this machine — no chart licence found — kept
     /// apart from `status`, which every worker event overwrites. Set as a
     /// status, it was gone before anyone could read it.
