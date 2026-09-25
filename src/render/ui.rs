@@ -870,6 +870,19 @@ impl Ui {
         window: &winit::window::Window,
         event: &winit::event::WindowEvent,
     ) -> egui_winit::EventResponse {
+        // winit's Android backend leaves a key's `text` empty, and egui types
+        // only from `text`: the soft keyboard's letters would reach no field.
+        // The character is in the logical key, so it is copied across.
+        #[cfg(target_os = "android")]
+        if let winit::event::WindowEvent::KeyboardInput { event: key, .. } = event {
+            if let (None, winit::keyboard::Key::Character(c)) = (&key.text, &key.logical_key) {
+                let mut typed = event.clone();
+                if let winit::event::WindowEvent::KeyboardInput { event: key, .. } = &mut typed {
+                    key.text = Some(c.clone());
+                }
+                return self.state.on_window_event(window, &typed);
+            }
+        }
         self.state.on_window_event(window, event)
     }
 
@@ -955,6 +968,8 @@ impl Ui {
                 display, free, fleet, actions,
             );
         });
+        #[cfg(target_os = "android")]
+        android_keyboard(output.platform_output.ime.is_some());
         self.state
             .handle_platform_output(window, output.platform_output);
         self.repaint_after = output
@@ -1059,5 +1074,54 @@ mod display_tests {
         let manual = DisplayView { safety_depth_m: 4.0, safety_contour_m: 5.0, ..d };
         let s = manual.apply(&base, 0.0);
         assert_eq!((s.safety_depth, s.safety_contour), (4.0, 5.0));
+    }
+}
+
+/// Show the soft keyboard while a text field has focus, and hide it after.
+///
+/// egui-winit asks for it through `ANativeActivity_showSoftInput`, which
+/// Android refuses: NativeActivity hands InputMethodManager its content
+/// view, but the view the IME serves is the window's decor view, and the
+/// request fails its "served view" check (the IME tracker in `dumpsys
+/// input_method` logs it as STATUS_FAIL at PHASE_CLIENT_VIEW_SERVED). So
+/// ask InputMethodManager ourselves, for the decor view.
+#[cfg(target_os = "android")]
+fn android_keyboard(show: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if SHOWN.swap(show, Ordering::Relaxed) == show {
+        return;
+    }
+    let result = (|| -> jni::errors::Result<()> {
+        let context = ndk_context::android_context();
+        // SAFETY: android-activity puts the process's JavaVM and the
+        // activity in ndk-context before android_main runs.
+        let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }?;
+        let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
+        let mut env = vm.attach_current_thread()?;
+        // navcore's thread stays attached, so free this call's references.
+        let shown = env.with_local_frame(16, |env| -> jni::errors::Result<()> {
+            let name = env.new_string("input_method")?;
+            let imm = env
+                .call_method(&activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[(&name).into()])?
+                .l()?;
+            let window = env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
+            let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
+            if show {
+                env.call_method(&imm, "showSoftInput", "(Landroid/view/View;I)Z", &[(&decor).into(), 0.into()])?;
+            } else {
+                let token = env.call_method(&decor, "getWindowToken", "()Landroid/os/IBinder;", &[])?.l()?;
+                env.call_method(&imm, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z", &[(&token).into(), 0.into()])?;
+            }
+            Ok(())
+        });
+        // A Java exception left pending would fail every later JNI call.
+        if env.exception_check()? {
+            env.exception_clear()?;
+        }
+        shown
+    })();
+    if let Err(e) = result {
+        log::warn!("soft keyboard: {e}");
     }
 }

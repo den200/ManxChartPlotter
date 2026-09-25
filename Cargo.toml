@@ -95,3 +95,7 @@ gribberish = "1.6.0"
 # NativeActivity needs no Java, so the APK is built without Gradle.
 [target.'cfg(target_os = "android")'.dependencies]
 winit = { version = "0.30", features = ["android-native-activity"] }
+# The soft keyboard, shown through InputMethodManager (src/render/ui.rs).
+# Both already come in with winit's android-activity.
+jni = "0.21"
+ndk-context = "0.1"
