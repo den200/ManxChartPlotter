@@ -971,6 +971,13 @@ fn chart_shop(
                             // button, here as in the planner and the boat search.
                             submitted = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                             ui.end_row();
+                            ui.label("");
+                            ui.checkbox(&mut shop.remember, "Remember me on this device")
+                                .on_hover_text(
+                                    "Keeps o-charts' session key, not your password, so \
+                                     navcore starts signed in. Sign out forgets it.",
+                                );
+                            ui.end_row();
                         });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -985,6 +992,7 @@ fn chart_shop(
                             actions.push(UiAction::ShopSignIn {
                                 email: shop.email.trim().to_string(),
                                 password: std::mem::take(&mut shop.password),
+                                remember: shop.remember,
                             });
                         }
                         if shop.busy {

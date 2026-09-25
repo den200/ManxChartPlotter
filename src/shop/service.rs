@@ -19,6 +19,14 @@ pub enum Request {
         password: String,
         fingerprint: Option<Fingerprint>,
     },
+    /// Carry on with a session remembered from an earlier sign-in: identify
+    /// this machine and list, as after signing in. The shop may have ended
+    /// the session since, which is answered with `ResumeFailed`.
+    Resume {
+        username: String,
+        key: String,
+        fingerprint: Option<Fingerprint>,
+    },
     /// Re-read the entitlement list on the current session.
     Refresh,
     /// Forget the session.
@@ -55,6 +63,13 @@ pub enum Event {
         systems: Vec<String>,
     },
     SignedOut,
+    /// A new session began, for the UI to remember if the user asked it to.
+    /// The key is a credential; the password is never sent back.
+    Session { username: String, key: String },
+    /// A remembered session could not be resumed. `refused` when the shop
+    /// said no, and the session is dead; otherwise the shop was not reached
+    /// — at sea, the usual case — and the session is worth keeping.
+    ResumeFailed { why: String, refused: bool },
     /// The shop's answer to a download request, for one chart.
     Grant { chart_id: String, summary: String },
     /// Bytes fetched so far, and the expected total when known.
@@ -137,6 +152,10 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>) {
                                 }
                             }
                         }
+                        let _ = events.send(Event::Session {
+                            username: s.username.clone(),
+                            key: s.key.clone(),
+                        });
                         let _ = events.send(Event::SignedIn {
                             system_name: system_name.clone(),
                         });
@@ -145,6 +164,41 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>) {
                     }
                     Err(e) => {
                         let _ = events.send(Event::Failed(e.to_string()));
+                    }
+                }
+            }
+            Request::Resume {
+                username,
+                key,
+                fingerprint,
+            } => {
+                let _ = events.send(Event::Status("Signing in…".into()));
+                let s = Session {
+                    username,
+                    key,
+                    system_name: None,
+                };
+                // Identifying the machine doubles as the check that the shop
+                // still honours the session; with no fingerprint to identify,
+                // listing is the check instead.
+                let checked = match &fingerprint {
+                    Some(fpr) => client.identify_system(&s, &fpr.bytes, &fpr.name),
+                    None => client.list_charts(&s).map(|_| None),
+                };
+                match checked {
+                    Ok(system_name) => {
+                        let _ = events.send(Event::SignedIn {
+                            system_name: system_name.clone(),
+                        });
+                        session = Some(Session { system_name, ..s });
+                        list(&client, session.as_ref(), &events);
+                    }
+                    Err(e) => {
+                        let refused = matches!(e, super::Error::Shop(_));
+                        let _ = events.send(Event::ResumeFailed {
+                            why: e.to_string(),
+                            refused,
+                        });
                     }
                 }
             }

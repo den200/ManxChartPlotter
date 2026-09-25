@@ -450,6 +450,10 @@ pub struct RenderState {
     /// The chart shop, on its own thread. Created on first use, because most
     /// sessions never open it.
     shop: Option<crate::shop::service::ShopService>,
+    /// "Remember me" was ticked for the sign-in under way.
+    shop_remember: bool,
+    /// A remembered o-charts session has been tried this run.
+    shop_resume_tried: bool,
     /// The Signal K stream, on its own thread. Also created on first use — a
     /// chart table with no boat around it should not open a socket.
     signalk: Option<crate::signalk::SignalKService>,
@@ -1382,6 +1386,8 @@ impl RenderState {
             label_renderer,
             ui: None,
             shop: None,
+            shop_remember: false,
+            shop_resume_tried: false,
             signalk: None,
             fleet: Default::default(),
             following: false,
@@ -2831,13 +2837,23 @@ impl RenderState {
         for action in ui_actions {
             match action {
                 crate::render::ui::UiAction::DismissPick => self.dismiss_pick(),
-                crate::render::ui::UiAction::ShopSignIn { email, password } => {
+                crate::render::ui::UiAction::ShopSignIn {
+                    email,
+                    password,
+                    remember,
+                } => {
+                    self.shop_remember = remember;
+                    // Unticked is a choice too: forget any session kept before.
+                    if !remember {
+                        Self::forget_shop_session();
+                    }
                     self.shop_sign_in(email, password);
                 }
                 crate::render::ui::UiAction::ShopRefresh => {
                     self.shop_send(crate::shop::service::Request::Refresh);
                 }
                 crate::render::ui::UiAction::ShopSignOut => {
+                    Self::forget_shop_session();
                     self.shop_send(crate::shop::service::Request::SignOut);
                 }
                 crate::render::ui::UiAction::ShopRegister { system_name } => {
@@ -4732,6 +4748,45 @@ impl RenderState {
     ///
     /// A dashboard someone arranged at the chart table must still be there
     /// when they start the engine.
+    /// Where "Remember me" keeps the o-charts session: beside the settings,
+    /// readable by this user only. The session key, never the password.
+    fn shop_session_path() -> Option<std::path::PathBuf> {
+        Some(dirs::config_dir()?.join("navcore").join("ocharts-session.json"))
+    }
+
+    fn save_shop_session(username: &str, key: &str) {
+        let Some(path) = Self::shop_session_path() else { return };
+        let json = serde_json::json!({ "username": username, "key": key }).to_string();
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+                use std::io::Write;
+                options.open(&path)?.write_all(json.as_bytes())
+            });
+        if let Err(e) = written {
+            log::warn!("could not remember the o-charts session: {e}");
+        }
+    }
+
+    fn load_shop_session() -> Option<(String, String)> {
+        let text = std::fs::read_to_string(Self::shop_session_path()?).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let username = v.get("username")?.as_str()?.to_string();
+        let key = v.get("key")?.as_str()?.to_string();
+        (!username.is_empty() && !key.is_empty()).then_some((username, key))
+    }
+
+    fn forget_shop_session() {
+        if let Some(path) = Self::shop_session_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn settings_path() -> Option<std::path::PathBuf> {
         Some(dirs::config_dir()?.join("navcore").join("settings.json"))
     }
@@ -6672,6 +6727,32 @@ impl RenderState {
 
     /// Drain the shop worker into the panel.
     fn poll_shop(&mut self) {
+        // The first time the shop is opened, carry on with a remembered
+        // session rather than asking for the password again.
+        let open = self.ui.as_ref().is_some_and(|u| u.shop.open);
+        if !open {
+            // Closing the window is how to try again after the shop could not
+            // be reached.
+            self.shop_resume_tried = false;
+        }
+        let signed_in = self.ui.as_ref().is_some_and(|u| u.shop.signed_in || u.shop.busy);
+        if open && !signed_in && !self.shop_resume_tried {
+            self.shop_resume_tried = true;
+            if let Some((username, key)) = Self::load_shop_session() {
+                if let Some(ref mut ui) = self.ui {
+                    ui.shop.email = username.clone();
+                    ui.shop.remember = true;
+                    ui.shop.busy = true;
+                }
+                self.shop_remember = true;
+                let fingerprint = Self::machine_fingerprint();
+                self.shop_send(crate::shop::service::Request::Resume {
+                    username,
+                    key,
+                    fingerprint,
+                });
+            }
+        }
         let mut reload_after_install = false;
         self.poll_shop_events(&mut reload_after_install);
         // The new cells are drawn now, not after a restart; the view stays
@@ -6710,6 +6791,20 @@ impl RenderState {
                     ui.shop.systems = systems;
                     ui.shop.busy = false;
                     ui.shop.status = String::new();
+                }
+                Event::Session { username, key } => {
+                    if self.shop_remember {
+                        Self::save_shop_session(&username, &key);
+                    }
+                }
+                Event::ResumeFailed { why, refused } => {
+                    ui.shop.busy = false;
+                    ui.shop.status = if refused {
+                        Self::forget_shop_session();
+                        format!("Please sign in again ({why}).")
+                    } else {
+                        format!("{why}. Still remembered: close and reopen Charts to try again.")
+                    };
                 }
                 Event::SignedOut => {
                     ui.shop.signed_in = false;
