@@ -36,7 +36,12 @@ pub enum UiAction {
     /// Keep the boat centred on the chart, or stop.
     FollowSet { on: bool },
     /// Sign in to the chart shop and list what the account owns.
-    ShopSignIn { email: String, password: String },
+    ShopSignIn {
+        email: String,
+        password: String,
+        /// Keep the session on this device, so the next start is signed in.
+        remember: bool,
+    },
     /// Re-read the entitlement list.
     ShopRefresh,
     /// Forget the session.
@@ -731,6 +736,9 @@ pub struct ShopView {
     pub email: String,
     /// Kept only for as long as it takes to send. Never written to disk.
     pub password: String,
+    /// "Remember me": keep the session key — not the password — on this
+    /// device, and sign in with it next time.
+    pub remember: bool,
     pub status: String,
     pub busy: bool,
     pub signed_in: bool,
