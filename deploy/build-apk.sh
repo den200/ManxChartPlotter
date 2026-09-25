@@ -4,7 +4,8 @@
 #   INSTALL=1 deploy/build-apk.sh    → and adb install it
 # Needs the Android SDK/NDK (ANDROID_HOME, default the Homebrew
 # android-commandlinetools), a JDK for apksigner, and the Rust target
-# aarch64-linux-android. No Gradle: the app is a NativeActivity, so the APK
+# aarch64-linux-android, and navcore's signing key in ~/.navcore/signing
+# (NAVCORE_KEYSTORE to override). No Gradle: the app is a NativeActivity, so the APK
 # is the manifest, libnavcore.so and assets.zip (the project's assets/).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -26,6 +27,20 @@ cargo build --release -p navcore-android --target aarch64-linux-android
 OUT=target/apk
 rm -rf "$OUT" && mkdir -p "$OUT/lib/arm64-v8a" "$OUT/assets"
 "$TC/llvm-strip" -o "$OUT/lib/arm64-v8a/libnavcore.so" target/aarch64-linux-android/release/libnavcore.so
+# o-charts' helper goes beside it: since Android 10 an app may run a program
+# only from its native library directory, and only one named lib*.so. It is
+# the vendor's closed binary, oexserverd 1.23 for arm64 Android, which like
+# the rest of oeserverd/ is not in git: fetched from AvNav's o-charts
+# provider, which ships the same file, and checked against a known digest.
+OEX=oeserverd/android-arm64/oexserverd
+OEX_SHA256=0cb003fb7cb3a3f958a1d12f53df0fbfcabf706ac1e00251c2319890900ecb52
+if [ ! -f "$OEX" ]; then
+    mkdir -p "$(dirname "$OEX")"
+    curl -fsSL -o "$OEX" \
+        https://raw.githubusercontent.com/wellenvogel/ochartsng/master/provider/binaries/android-arm64/oexserverd
+fi
+echo "$OEX_SHA256  $OEX" | shasum -a 256 -c --quiet - || { echo "unexpected $OEX" >&2; exit 1; }
+cp "$OEX" "$OUT/lib/arm64-v8a/liboexserverd.so"
 # Entries keep their assets/ prefix: navcore runs from the directory that
 # holds assets/, and unpacks this zip into that directory.
 zip -qr -X "$OUT/assets/assets.zip" assets -x '*/.*'
@@ -33,17 +48,29 @@ zip -qr -X "$OUT/assets/assets.zip" assets -x '*/.*'
 
 "$BT/aapt2" link -o "$OUT/base.apk" --manifest android/AndroidManifest.xml -I "$PLATFORM" \
     --min-sdk-version $API --target-sdk-version 34 -A "$OUT/assets" -0 zip
-(cd "$OUT" && zip -q base.apk lib/arm64-v8a/libnavcore.so)
+(cd "$OUT" && zip -q base.apk lib/arm64-v8a/libnavcore.so lib/arm64-v8a/liboexserverd.so)
 "$BT/zipalign" -p -f 4 "$OUT/base.apk" "$OUT/aligned.apk"
 
-# A debug key: enough to install for testing. Made once, kept in ~/.android.
-KEY="$HOME/.android/debug.keystore"
-if [ ! -f "$KEY" ]; then
-    mkdir -p "$HOME/.android"
-    keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias androiddebugkey \
-        -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null
+# navcore's own key when it is there. It matters beyond Android's update
+# check: on a device without Widevine, o-charts licenses charts to
+# ANDROID_ID, which Android scopes to the signing key, so an APK signed with
+# another key loses that device's charts. The key and its password live
+# outside the repository; back them up.
+RELEASE_KEY="${NAVCORE_KEYSTORE:-$HOME/.navcore/signing/navcore-release.jks}"
+if [ -f "$RELEASE_KEY" ]; then
+    "$BT/apksigner" sign --ks "$RELEASE_KEY" --ks-key-alias navcore \
+        --ks-pass file:"$(dirname "$RELEASE_KEY")/password" --out target/navcore.apk "$OUT/aligned.apk"
+else
+    echo "warning: no navcore signing key at $RELEASE_KEY; signing with the debug key" >&2
+    # A debug key: enough to install for testing. Made once, kept in ~/.android.
+    KEY="$HOME/.android/debug.keystore"
+    if [ ! -f "$KEY" ]; then
+        mkdir -p "$HOME/.android"
+        keytool -genkeypair -keystore "$KEY" -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US" >/dev/null
+    fi
+    "$BT/apksigner" sign --ks "$KEY" --ks-pass pass:android --out target/navcore.apk "$OUT/aligned.apk"
 fi
-"$BT/apksigner" sign --ks "$KEY" --ks-pass pass:android --out target/navcore.apk "$OUT/aligned.apk"
 echo "built target/navcore.apk ($(du -h target/navcore.apk | cut -f1))"
 
 if [ "${INSTALL:-}" = 1 ]; then
