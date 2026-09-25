@@ -225,7 +225,8 @@ fn tile(
 /// The wind on a dial, bow up: where the apparent and the true wind come
 /// from, and how hard each blows.
 ///
-/// Apparent wind is drawn in the text colour and true wind in blue, the
+/// Apparent wind (AW) is drawn in the text colour and true wind (TW) in
+/// blue, each needle labelled beside its head, the
 /// apparent speed large in the middle and the true speed under it in blue.
 /// The red and green arcs are the close-hauled sectors, 20° to 60° either
 /// side of the bow, so a glance says which tack and how high. A stale needle
@@ -268,8 +269,9 @@ fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f3
     arc(20.0, 60.0, Color32::from_rgb(60, 170, 90));
 
     // A needle points to where the wind comes from, clear of the speeds in
-    // the middle.
-    let needle = |path: &str, colour: Color32, width: f32| {
+    // the middle, and is named beside its head: two arrows on one dial are
+    // otherwise told apart only by colour, which sunlight washes out.
+    let needle = |path: &str, name: &str, colour: Color32, width: f32| {
         let Some(reading) = vessel.get(path) else { return };
         let Some(a) = reading.number() else { return };
         let colour = if reading.is_stale() { warn } else { colour };
@@ -278,10 +280,17 @@ fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f3
         painter.line_segment([at(a, r * 0.5), tip], Stroke::new(width, colour));
         let head = vec![tip, at(a + 0.14, r * 0.74), at(a - 0.14, r * 0.74)];
         painter.add(egui::Shape::convex_polygon(head, colour, Stroke::NONE));
+        painter.text(
+            at(a + 0.42, r * 0.66),
+            Align2::CENTER_CENTER,
+            name,
+            FontId::proportional((r * 0.24).max(9.0)),
+            colour,
+        );
     };
     // True first, so the apparent needle is on top where they overlap.
-    needle(twa, blue, 2.0);
-    needle(AWA, strong, 3.0);
+    needle(twa, "TW", blue, 2.0);
+    needle(AWA, "AW", strong, 3.0);
 
     let speed = |path: &str| {
         let reading = vessel.get(path)?;
@@ -313,8 +322,8 @@ fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f3
     }
 
     response.on_hover_text(
-        "Wind rose, bow up\nApparent wind: white needle, speed in the middle\n\
-         True wind: blue needle, speed below",
+        "Wind rose, bow up\nAW, apparent wind: speed in the middle\n\
+         TW, true wind (blue): speed below",
     )
 }
 
