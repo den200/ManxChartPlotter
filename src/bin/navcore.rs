@@ -308,6 +308,13 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
         Some(dir) => ChartSource::Directory(dir),
         None => ChartSource::TestTriangle,
     };
+    // A plotter is watched, not touched: without this the screen dims and
+    // sleeps between taps, with the chart and the depth on it. Android
+    // honours the flag only while navcore is in front, so it costs the
+    // battery nothing once the app is put away.
+    use winit::platform::android::activity::WindowManagerFlags;
+    android.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
+
     let event_loop = EventLoop::builder()
         .with_android_app(android)
         .build()
