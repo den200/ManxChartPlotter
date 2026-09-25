@@ -3,6 +3,8 @@
 This is what gets navcore from the Mac onto the plotter, and what to expect
 the first time.
 
+For Android (e.g. the ODROID-C5), see [ANDROID.md](ANDROID.md).
+
 ## What you need on the Pi
 
 - Raspberry Pi OS (64-bit) **with desktop**, updated.
