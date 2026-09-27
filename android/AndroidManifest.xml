@@ -22,7 +22,11 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
-            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|uiMode|density">
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|touchscreen|uiMode|density">
+            <!-- touchscreen: a USB touch panel that drops off the bus and comes
+                 back flips Configuration.touchscreen, and an activity that does
+                 not declare it is torn down and restarted each time — a black
+                 screen while it rebuilds. Seen on the Odroid C5's eGalax. -->
             <meta-data android:name="android.app.lib_name" android:value="navcore" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
