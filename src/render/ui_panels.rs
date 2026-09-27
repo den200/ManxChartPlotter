@@ -337,8 +337,7 @@ fn compass_button(ui: &mut egui::Ui, rotation: f32, active: bool) -> egui::Respo
     painter.circle(c, r, visuals.bg_fill, visuals.bg_stroke);
 
     let ink = visuals.fg_stroke.color;
-    // North is `-rotation` clockwise from screen-up; screen y runs down.
-    let north = egui::vec2((-rotation).sin(), -(-rotation).cos());
+    let north = north_on_screen(rotation);
     let east = egui::vec2(-north.y, north.x);
 
     // A tick at each cardinal point, just inside the rim.
@@ -366,6 +365,13 @@ fn compass_button(ui: &mut egui::Ui, rotation: f32, active: bool) -> egui::Respo
     painter.circle_filled(c, r * 0.09, visuals.bg_fill);
 
     response
+}
+
+/// Which way north lies on the screen, as a unit vector (screen y runs
+/// down), when `rotation` is the true bearing at the top: straight up when
+/// north-up, and `rotation` anticlockwise from up otherwise.
+fn north_on_screen(rotation: f32) -> egui::Vec2 {
+    egui::vec2(-rotation.sin(), -rotation.cos())
 }
 
 /// The planner's pins: a classic map pin — a filled head on a stem whose
@@ -1724,5 +1730,35 @@ fn geometry_name(kind: FeatureType) -> &'static str {
         FeatureType::Line => "line",
         FeatureType::Area => "area",
         FeatureType::Multipoint => "soundings",
+    }
+}
+
+#[cfg(test)]
+mod compass_tests {
+    use super::north_on_screen;
+    use crate::render::Camera;
+
+    #[test]
+    fn the_needle_points_up_when_north_up() {
+        let n = north_on_screen(0.0);
+        assert!(n.x.abs() < 1e-6 && (n.y + 1.0).abs() < 1e-6, "{n:?}");
+    }
+
+    /// Head-up at any heading: the needle points exactly where the chart
+    /// draws north — at a point due north of the middle of the screen.
+    #[test]
+    fn the_needle_follows_north_as_the_chart_turns() {
+        for heading_deg in [0.0f64, 30.0, 90.0, 135.0, 180.0, 270.0, 359.0] {
+            let mut cam = Camera::new(1_400_000.0, 7_500_000.0, 2.0, 800.0, 600.0);
+            cam.rotation = heading_deg.to_radians();
+            let middle = cam.world_to_screen(cam.position.x, cam.position.y);
+            let ahead = cam.world_to_screen(cam.position.x, cam.position.y + 100.0);
+            let drawn = (ahead - middle).normalize();
+            let needle = north_on_screen(cam.rotation as f32);
+            assert!(
+                (drawn.x - needle.x).abs() < 1e-3 && (drawn.y - needle.y).abs() < 1e-3,
+                "heading {heading_deg}: chart north {drawn:?}, needle {needle:?}"
+            );
+        }
     }
 }
