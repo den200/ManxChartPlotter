@@ -23,7 +23,7 @@ use egui::{Color32, Context, FontId, Pos2, Stroke, Vec2};
 pub struct OwnShip {
     /// Where the boat is on screen, in logical points.
     pub screen: [f32; 2],
-    /// Heading, radians clockwise from screen-up (north).
+    /// Heading, radians clockwise from screen-up (north, when north-up).
     pub heading: Option<f32>,
     /// Course over ground, same convention.
     pub cog: Option<f32>,

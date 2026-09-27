@@ -3047,11 +3047,12 @@ impl<'a> TileBuilder<'a> {
             let sym_priority = resolved.priority;
 
             for (sym_i, symbol_id) in symbol_ids.into_iter().enumerate() {
-                let rotation = symbol_rotations
+                let rotation_deg = symbol_rotations
                     .get(sym_i)
                     .copied()
                     .flatten()
-                    .or(symbol_rotation_deg)
+                    .or(symbol_rotation_deg);
+                let rotation = rotation_deg
                     .map(|deg| (deg as f32) * (std::f32::consts::PI / 180.0))
                     .unwrap_or(0.0);
                 let sym_idx = packet.symbol_instances.len();
@@ -3061,6 +3062,9 @@ impl<'a> TileBuilder<'a> {
                     rotation,
                     disp_prio: sym_priority as u32,
                     scale: scamin_scale,
+                    // S-52 rotations are all from true north; a symbol given
+                    // none stands upright on the screen.
+                    true_bearing: rotation_deg.is_some() as u32,
                 });
                 all_symbol_priorities.push((sym_priority, sym_idx));
                 stats.instances_added += 1;

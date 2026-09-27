@@ -78,7 +78,10 @@ pub struct Uniforms {
     /// This slot's origin minus the frame's pattern anchor (the camera), in
     /// metres. Area patterns are anchored to the world grid through it.
     pub anchor_offset: [f32; 2],
-    pub _pad: [f32; 2],
+    /// The camera's rotation (the true bearing up the screen), in radians.
+    /// A symbol or sector drawn at a true bearing subtracts it.
+    pub view_rotation: f32,
+    pub _pad: f32,
 }
 
 /// Camera slots in the uniform buffer. The first few are fixed; tiles follow.
@@ -590,6 +593,12 @@ pub struct RenderState {
     s52_engine: Option<S52Engine>,
     /// Dirty flag — set on camera move, tile upload, resize; cleared after render
     needs_redraw: bool,
+    /// The chart is still turning towards the way up it was asked for, and
+    /// wants frames until it gets there.
+    chart_turning: bool,
+    /// When the turn last advanced, so it runs at the same speed at any
+    /// frame rate.
+    chart_turn_at: Option<Instant>,
     /// Incremental key for visible-tile text layout inputs
     last_text_layout_key: u64,
     /// Cached unique visible line styles for the current visible tile set
@@ -1447,6 +1456,8 @@ impl RenderState {
             previous_style_hash: 0,
             s52_engine: None,
             needs_redraw: true,
+            chart_turning: false,
+            chart_turn_at: None,
             last_text_layout_key: 0,
             cached_visible_line_styles: Vec::new(),
             cached_visible_line_styles_key: 0,
@@ -2252,6 +2263,20 @@ impl RenderState {
             }
         }
 
+        // NAVCORE_ROTATE=<degrees> puts that true bearing at the top of the
+        // screen, as a twist would, so a turned chart can be captured.
+        if let Ok(r) = std::env::var("NAVCORE_ROTATE") {
+            match r.trim().parse::<f64>() {
+                Ok(deg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.display.chart_up = crate::render::ui::ChartUp::Free;
+                    }
+                    self.camera.rotation = deg.to_radians().rem_euclid(std::f64::consts::TAU);
+                }
+                Err(_) => log::warn!("NAVCORE_ROTATE must be a number of degrees; ignoring '{}'", r),
+            }
+        }
+
         // Only now does the camera look at the chart rather than at 0°N 0°E,
         // and a hook that asks "what is on screen?" — the wind fetch does —
         // must not be answered before that.
@@ -2437,6 +2462,8 @@ impl RenderState {
         self.camera.position.x.to_bits().hash(&mut hasher);
         self.camera.position.y.to_bits().hash(&mut hasher);
         self.camera.zoom.to_bits().hash(&mut hasher);
+        // Declutter is done on the screen, where a turn moves everything.
+        self.camera.rotation.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -2505,6 +2532,7 @@ impl RenderState {
         self.update_route_following();
         self.drain_route_net();
         self.update_mariner_symbols();
+        self.update_chart_up();
 
         // In tile mode, keep the camera near the loaded chart extent.
         // This prevents panning/gesture glitches from throwing the view outside the
@@ -2820,6 +2848,7 @@ impl RenderState {
                     own_ship,
                     ais,
                     mpp,
+                    chart_rotation: self.camera.rotation as f32,
                     routes: routes_display,
                     plan_pins,
                     wind: wind_barbs,
@@ -3037,6 +3066,9 @@ impl RenderState {
                         ui.weather.status = "planning cancelled".into();
                     }
                     self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::ChartUpSet { mode } => {
+                    self.set_chart_up(mode);
                 }
                 crate::render::ui::UiAction::FollowSet { on } => {
                     self.set_follow(on);
@@ -3543,7 +3575,8 @@ impl RenderState {
                     (origin.x - anchor.x) as f32,
                     (origin.y - anchor.y) as f32,
                 ],
-                _pad: [0.0; 2],
+                view_rotation: self.camera.rotation as f32,
+                _pad: 0.0,
             };
             bytes[i * stride..i * stride + size].copy_from_slice(bytemuck::bytes_of(&u));
         }
@@ -3727,19 +3760,35 @@ impl RenderState {
                 &|x, y| cam.ground_mpp_at(x, y),
                 &|b| {
                     // Behind the eye is not "far away", it is off the chart:
-                    // it would project back onto the screen mirrored. The
-                    // view direction is (0, sin t, -cos t) from an eye at
-                    // height d cos t, so a ground point is in front when
-                    // (y - eye.y) sin t + d cos^2 t > 0.
+                    // it would project back onto the screen mirrored. With
+                    // `f` the ground direction up the screen, the view
+                    // direction is (f sin t, -cos t) from an eye at height
+                    // d cos t, so a ground point p is in front when
+                    // (p - eye)·f sin t + d cos^2 t > 0. The tile's corner
+                    // furthest along f decides.
                     let tilt = cam.tilt as f64;
                     let (st, ct) = (tilt.sin(), tilt.cos());
                     let d = cam.eye_distance();
-                    if (b.max_y - eye.y) * st + d * ct * ct <= 0.0 {
+                    let f = cam.forward();
+                    let ahead = [b.min_x, b.max_x]
+                        .into_iter()
+                        .flat_map(|x| [b.min_y, b.max_y].map(|y| (x - eye.x) * f.x + (y - eye.y) * f.y))
+                        .fold(f64::MIN, f64::max);
+                    if ahead * st + d * ct * ct <= 0.0 {
                         return false;
                     }
                     tile_meets_footprint(b, &footprint)
                 },
             )
+        } else if self.camera.rotation != 0.0 {
+            // Turned, the box around the view is up to twice its area; keep
+            // only the tiles the (equally padded) turned rectangle touches.
+            let c = self.camera.position;
+            let footprint = self.camera.ground_footprint().map(|p| c + (p - c) * 1.2);
+            visible_tiles(&view_bounds, z, 1.2)
+                .into_iter()
+                .filter(|t| tile_meets_footprint(&t.bounds(), &footprint))
+                .collect()
         } else {
             visible_tiles(&view_bounds, z, 1.2)
         };
@@ -4881,9 +4930,14 @@ impl RenderState {
             #[serde(default)]
             display: crate::render::ui::DisplayView,
         }
-        serde_json::from_str::<Persisted>(&text)
+        let mut display = serde_json::from_str::<Persisted>(&text)
             .map(|p| p.display)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The angle a twist left is not kept, so neither is the mode.
+        if display.chart_up == crate::render::ui::ChartUp::Free {
+            display.chart_up = crate::render::ui::ChartUp::North;
+        }
+        display
     }
 
     /// Put the Display window's choices into effect: the palette at once,
@@ -4945,6 +4999,7 @@ impl RenderState {
         let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
         let screen = self.camera.world_to_screen(wx, wy);
         let ppp = self.scale_factor.max(0.01);
+        let turn = self.camera.rotation;
 
         // The fix, not the heading, decides staleness: a boat that has lost
         // its GPS must not keep drawing itself somewhere plausible.
@@ -4957,12 +5012,14 @@ impl RenderState {
 
         Some(crate::render::ui_ownship::OwnShip {
             screen: [screen.x / ppp, screen.y / ppp],
-            heading: self.fleet.own.heading_true().map(|h| h as f32),
+            // The overlay draws from screen-up, which is not north once the
+            // chart is turned.
+            heading: self.fleet.own.heading_true().map(|h| (h - turn) as f32),
             cog: self
                 .fleet
                 .own
                 .number("navigation.courseOverGroundTrue")
-                .map(|c| c as f32),
+                .map(|c| (c - turn) as f32),
             sog: self
                 .fleet
                 .own
@@ -5240,6 +5297,7 @@ impl RenderState {
 
         let ppp = self.scale_factor.max(0.01);
         let own = self.own_motion();
+        let turn = self.camera.rotation;
 
         self.fleet
             .targets()
@@ -5260,8 +5318,8 @@ impl RenderState {
 
                 Some(crate::render::ui_ais::AisTarget {
                     screen: [screen.x / ppp, screen.y / ppp],
-                    heading: target.heading().map(|h| h as f32),
-                    cog: target.course().map(|c| c as f32),
+                    heading: target.heading().map(|h| (h - turn) as f32),
+                    cog: target.course().map(|c| (c - turn) as f32),
                     sog: target.speed().map(|s| s as f32),
                     label: target.label().map(str::to_string),
                     under_way: target.under_way(),
@@ -5347,6 +5405,78 @@ impl RenderState {
         }
         self.save_settings();
         self.needs_redraw = true;
+    }
+
+    /// Which way up the chart is drawn, from the button on the chart or `H`.
+    pub fn set_chart_up(&mut self, mode: crate::render::ui::ChartUp) {
+        if let Some(ref mut ui) = self.ui {
+            ui.display.chart_up = mode;
+        }
+        self.chart_turn_at = None;
+        self.save_settings();
+        self.needs_redraw = true;
+    }
+
+    pub fn chart_up(&self) -> crate::render::ui::ChartUp {
+        self.ui.as_ref().map(|u| u.display.chart_up).unwrap_or_default()
+    }
+
+    /// Two fingers twisted the chart by `delta` radians clockwise about a
+    /// screen point. The chart stays where it is put: head-up would turn it
+    /// straight back, so a twist leaves it free until the button is pressed.
+    /// Following, the turn is about the boat, which is where she stays.
+    pub fn twist_chart(&mut self, delta: f64, screen_x: f32, screen_y: f32) {
+        if let Some(ref mut ui) = self.ui {
+            ui.display.chart_up = crate::render::ui::ChartUp::Free;
+        }
+        if self.follow_on() {
+            let (w, h) = (self.camera.viewport_width, self.camera.viewport_height);
+            self.camera.rotate_at(delta, w * 0.5, h * 0.5);
+        } else {
+            self.camera.rotate_at(delta, screen_x, screen_y);
+        }
+        self.chart_turning = false;
+        self.needs_redraw = true;
+    }
+
+    /// Turn the chart towards the way up it should be: north, the boat's
+    /// heading (her course over ground without one), or — twisted by hand —
+    /// nowhere.
+    ///
+    /// Eased rather than set, with a time constant of a third of a second. A
+    /// compass reports several times a second and wanders a degree or two as
+    /// the boat moves, and a chart that jumps with every report is unreadable;
+    /// eased, it swings with the boat and settles. The turn is about the middle
+    /// of the screen, which is the boat while following.
+    fn update_chart_up(&mut self) {
+        use crate::render::ui::ChartUp;
+        let target = match self.chart_up() {
+            ChartUp::North => Some(0.0),
+            ChartUp::Head => self
+                .fleet
+                .own
+                .heading_true()
+                .or_else(|| self.fleet.own.number("navigation.courseOverGroundTrue")),
+            ChartUp::Free => None,
+        };
+        let now = Instant::now();
+        let dt = self
+            .chart_turn_at
+            .map(|t| now.duration_since(t).as_secs_f64().min(0.1))
+            .unwrap_or(1.0 / 60.0);
+        self.chart_turn_at = Some(now);
+
+        // With no heading and no course, the chart holds where it was.
+        let Some(target) = target else {
+            self.chart_turning = false;
+            return;
+        };
+        let (rotation, turning) = ease_bearing(self.camera.rotation, target, dt);
+        if rotation != self.camera.rotation {
+            self.camera.rotation = rotation;
+            self.needs_redraw = true;
+        }
+        self.chart_turning = turning;
     }
 
     /// Whether the chart is keeping the boat centred.
@@ -5866,7 +5996,8 @@ impl RenderState {
             if let Some((from_deg, kt)) = forecast.sample(lat, lon, time_ms) {
                 barbs.push(crate::render::ui_wind::WindBarb {
                     screen: *screen,
-                    from_deg: from_deg as f32,
+                    // Drawn from screen-up, which a turned chart has moved.
+                    from_deg: (from_deg - self.camera.rotation.to_degrees()) as f32,
                     kt: kt as f32,
                 });
             }
@@ -6051,7 +6182,7 @@ impl RenderState {
             if let Some((to_deg, kt)) = field.sample(lat, lon, time_ms) {
                 out.push(crate::render::ui_weather::CurrentArrow {
                     screen: *screen,
-                    to_deg: to_deg as f32,
+                    to_deg: (to_deg - self.camera.rotation.to_degrees()) as f32,
                     kt: kt as f32,
                 });
             }
@@ -6859,7 +6990,7 @@ impl RenderState {
 
     /// Check if a redraw is needed
     pub fn needs_redraw(&self) -> bool {
-        self.needs_redraw
+        self.needs_redraw || self.chart_turning
     }
 
     /// Check if there are tiles still pending from the worker
@@ -7084,6 +7215,22 @@ fn unique_route_name(store: Option<&crate::nav::RouteStore>) -> String {
         .unwrap_or_else(|| "Route".into())
 }
 
+/// One step of easing a bearing `from` towards `to`, the short way round,
+/// over `dt` seconds. Returns the new bearing (in [0, 2π)) and whether it is
+/// still on its way.
+fn ease_bearing(from: f64, to: f64, dt: f64) -> (f64, bool) {
+    use std::f64::consts::{PI, TAU};
+    const TIME_CONSTANT_S: f64 = 0.33;
+    // Under a tenth of a degree the chart is where it is going.
+    const SETTLED: f64 = 0.1 * PI / 180.0;
+    let diff = (to - from + PI).rem_euclid(TAU) - PI;
+    if diff.abs() < SETTLED {
+        return (to.rem_euclid(TAU), false);
+    }
+    let k = 1.0 - (-dt / TIME_CONSTANT_S).exp();
+    ((from + diff * k).rem_euclid(TAU), true)
+}
+
 fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::DVec2; 4]) -> bool {
     let rect = [
         glam::DVec2::new(b.min_x, b.min_y),
@@ -7120,6 +7267,33 @@ fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::DVec2; 4]) -
         }
     }
     true
+}
+
+#[cfg(test)]
+mod chart_up_tests {
+    use super::ease_bearing;
+    use std::f64::consts::PI;
+
+    #[test]
+    fn a_turn_goes_the_short_way_round_and_settles() {
+        // From 350° to 10° is twenty degrees clockwise through north, not
+        // three hundred and forty back round.
+        let (from, to) = (350f64.to_radians(), 10f64.to_radians());
+        let (next, turning) = ease_bearing(from, to, 1.0 / 60.0);
+        assert!(turning);
+        let moved = (next - from + PI).rem_euclid(2.0 * PI) - PI;
+        assert!(moved > 0.0 && moved < 20f64.to_radians(), "{}", moved.to_degrees());
+
+        let mut b = from;
+        for _ in 0..600 {
+            let (n, t) = ease_bearing(b, to, 1.0 / 60.0);
+            b = n;
+            if !t {
+                break;
+            }
+        }
+        assert_eq!(b, to);
+    }
 }
 
 #[cfg(test)]

@@ -99,9 +99,14 @@ pub fn build(
     // Last, over the chart area the panels have left: what a chart tap will
     // do right now, and the way back to following the boat.
     tap_mode_chip(ctx, plan);
-    if state.own_ship.is_some() {
-        follow_button(ctx, instruments, actions);
-    }
+    chart_buttons(
+        ctx,
+        instruments,
+        display.chart_up,
+        state.chart_rotation,
+        state.own_ship.is_some(),
+        actions,
+    );
 }
 
 /// How the chart is drawn: palette, safety depth, detail.
@@ -257,15 +262,25 @@ fn tap_mode_chip(ctx: &Context, plan: &mut crate::render::ui::PlanView) {
         });
 }
 
-/// Follow the boat, as a button on the chart. Panning by hand turns follow
-/// off, which is right, but the only way back used to be a checkbox in the
-/// Instruments settings — one accidental drag and the chart stopped tracking
-/// the boat for good, with nothing on screen to say so.
-fn follow_button(
+/// The buttons in the chart's corner: which way up, and follow the boat.
+///
+/// Follow is a button because panning by hand turns it off, which is right,
+/// but the only way back used to be a checkbox in the Instruments settings —
+/// one accidental drag and the chart stopped tracking the boat for good, with
+/// nothing on screen to say so. Pressing it recentres at the zoom already
+/// chosen.
+///
+/// The orientation button carries a north arrow that turns with the chart, so
+/// a head-up or twisted chart always says where north went.
+fn chart_buttons(
     ctx: &Context,
     instruments: &crate::render::ui::InstrumentView,
+    chart_up: crate::render::ui::ChartUp,
+    rotation: f32,
+    has_boat: bool,
     actions: &mut Vec<UiAction>,
 ) {
+    use crate::render::ui::ChartUp;
     let area = ctx.available_rect();
     egui::Area::new(egui::Id::new("follow-button"))
         .fixed_pos(egui::pos2(area.right() - 10.0, area.bottom() - 10.0))
@@ -273,20 +288,62 @@ fn follow_button(
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                let on = instruments.follow;
-                if ui
-                    .selectable_label(on, if on { "Following boat" } else { "Follow boat" })
-                    .on_hover_text(if on {
-                        "The chart keeps the boat centred. Drag the chart to look elsewhere."
-                    } else {
-                        "Centre the chart on the boat and keep it there"
-                    })
-                    .clicked()
-                {
-                    actions.push(UiAction::FollowSet { on: !on });
-                }
+                ui.horizontal(|ui| {
+                    let (text, hover) = match chart_up {
+                        ChartUp::North => ("North up", "North is at the top. Tap for head-up."),
+                        ChartUp::Head => {
+                            ("Head up", "The boat's heading is at the top. Tap for north-up.")
+                        }
+                        ChartUp::Free => ("Rotated", "Turned by hand. Tap for north-up."),
+                    };
+                    let (arrow, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+                    north_arrow(ui, arrow.center(), rotation);
+                    if ui
+                        .selectable_label(chart_up != ChartUp::North, text)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        actions.push(UiAction::ChartUpSet { mode: chart_up.next() });
+                    }
+                    if !has_boat {
+                        return;
+                    }
+                    let on = instruments.follow;
+                    if ui
+                        .selectable_label(on, if on { "Following boat" } else { "Follow boat" })
+                        .on_hover_text(if on {
+                            "The chart keeps the boat centred. Drag the chart to look elsewhere."
+                        } else {
+                            "Centre the chart on the boat and keep it there"
+                        })
+                        .clicked()
+                    {
+                        actions.push(UiAction::FollowSet { on: !on });
+                    }
+                });
             });
         });
+}
+
+/// A small north arrow centred on `c`, pointing where north is on the
+/// screen: `rotation` is the true bearing at the top.
+fn north_arrow(ui: &egui::Ui, c: egui::Pos2, rotation: f32) {
+    // North is `-rotation` clockwise from screen-up; screen y runs down.
+    let dir = egui::vec2((-rotation).sin(), -(-rotation).cos());
+    let side = egui::vec2(-dir.y, dir.x);
+    let r = 7.0;
+    let ink = ui.visuals().text_color();
+    let painter = ui.painter();
+    painter.add(egui::Shape::convex_polygon(
+        vec![c + dir * r, c - dir * (r * 0.6) + side * (r * 0.55), c - dir * (r * 0.25)],
+        egui::Color32::from_rgb(200, 50, 50),
+        egui::Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![c + dir * r, c - dir * (r * 0.25), c - dir * (r * 0.6) - side * (r * 0.55)],
+        ink,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// The planner's pins: a classic map pin — a filled head on a stem whose

@@ -88,15 +88,20 @@ pub struct SymbolInstance {
     pub disp_prio: u32,
     /// Scale factor for Soft SCAMIN (1.0 = normal, 0.5 = half size)
     pub scale: f32,
+    /// 1 when `rotation` is a true bearing (S-52's ORIENT, a heading), so the
+    /// symbol turns with the chart when it is not north-up; 0 when the symbol
+    /// simply stands upright on the screen, as S-52 draws an unrotated one.
+    pub true_bearing: u32,
 }
 
 impl SymbolInstance {
-    const ATTRIBS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
         0 => Float32x2,  // position
         1 => Uint32,     // symbol_id
         2 => Float32,    // rotation
         3 => Uint32,     // disp_prio
         4 => Float32,    // scale
+        5 => Uint32,     // true_bearing
     ];
 
     pub fn desc() -> wgpu::VertexBufferLayout<'static> {

@@ -35,6 +35,8 @@ pub enum UiAction {
     PlanCancel,
     /// Keep the boat centred on the chart, or stop.
     FollowSet { on: bool },
+    /// Which way up the chart is drawn.
+    ChartUpSet { mode: ChartUp },
     /// Sign in to the chart shop and list what the account owns.
     ShopSignIn {
         email: String,
@@ -569,6 +571,33 @@ pub struct DisplayView {
     pub deep_contour_m: f32,
     pub show_text: bool,
     pub show_soundings: bool,
+    /// Which way up the chart is drawn.
+    pub chart_up: ChartUp,
+}
+
+/// Which way up the chart is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ChartUp {
+    /// North at the top: the chart as printed.
+    #[default]
+    North,
+    /// The boat's heading at the top (her course over ground when no heading
+    /// is received), so what is ahead of the bow is up the screen.
+    Head,
+    /// Wherever two fingers left it. Not a choice anyone makes from a menu,
+    /// only the state a twist leaves behind.
+    Free,
+}
+
+impl ChartUp {
+    /// What the button does next: north-up and head-up take turns, and a
+    /// chart twisted by hand goes back to north-up.
+    pub fn next(self) -> Self {
+        match self {
+            ChartUp::North => ChartUp::Head,
+            ChartUp::Head | ChartUp::Free => ChartUp::North,
+        }
+    }
 }
 
 impl Default for DisplayView {
@@ -588,6 +617,7 @@ impl Default for DisplayView {
             deep_contour_m: m.deep_contour,
             show_text: m.show_text,
             show_soundings: m.show_soundings,
+            chart_up: ChartUp::North,
         }
     }
 }
@@ -777,6 +807,8 @@ pub struct UiState<'a> {
     pub ais: Vec<super::ui_ais::AisTarget>,
     /// Metres per logical point, so a course vector is a real distance.
     pub mpp: f32,
+    /// The bearing at the top of the screen, radians; 0 when north-up.
+    pub chart_rotation: f32,
     /// Visible routes, projected for the overlay.
     pub routes: Vec<super::ui_routes::RouteDisplay>,
     /// The planner's endpoints, projected, for the pins.

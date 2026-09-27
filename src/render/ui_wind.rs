@@ -95,7 +95,8 @@ pub fn draw_fill(ctx: &Context, fill: &WindFill) {
 pub struct WindBarb {
     /// Logical points, the same space as the route overlay.
     pub screen: [f32; 2],
-    /// Where the wind blows *from*, degrees true.
+    /// Where the wind blows *from*, degrees clockwise from screen-up (true
+    /// when the chart is north-up).
     pub from_deg: f32,
     pub kt: f32,
 }

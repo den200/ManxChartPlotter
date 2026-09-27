@@ -14,7 +14,8 @@ struct CameraUniform {
     pixels_per_meter: f32,
     px_per_point: f32,
     anchor_offset: vec2<f32>,
-    _pad: vec2<f32>,
+    view_rotation: f32,
+    _pad: f32,
 }
 
 // The style, per line batch. Nothing here depends on the camera, so it is

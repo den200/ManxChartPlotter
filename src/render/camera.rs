@@ -13,6 +13,13 @@
 //! right where, since a fixed ground distance covers fewer pixels the further
 //! away it is — see [`Camera::ground_mpp_at`].
 //!
+//! [`rotation`](Camera::rotation) turns the chart about the centre of the
+//! screen: it is the true bearing that points up the screen, so 0 is the
+//! ordinary north-up chart and the boat's heading is head-up. Like tilt it is
+//! a view, not a projection. Text and plain symbols stay upright on the screen;
+//! anything drawn *at a bearing* — a directional light, a heading line — has
+//! to take the rotation off to stay pointing where it points on the ground.
+//!
 //! ## Precision
 //!
 //! The position and every transform are kept in f64. Global Mercator
@@ -68,6 +75,9 @@ pub struct Camera {
     pub max_zoom: f32,
     /// Pitch away from straight down, in radians. 0 is the plan view.
     pub tilt: f32,
+    /// True bearing at the top of the screen, radians clockwise from north.
+    /// 0 is north-up.
+    pub rotation: f64,
 }
 
 impl Camera {
@@ -92,6 +102,7 @@ impl Camera {
             min_zoom: (zoom * 0.001).max(MIN_METRES_PER_PIXEL),
             max_zoom: zoom * 10.0,  // Allow zooming out 10x
             tilt: 0.0,
+            rotation: 0.0,
         }
     }
 
@@ -105,6 +116,7 @@ impl Camera {
             min_zoom: MIN_METRES_PER_PIXEL,
             max_zoom: 1_000_000.0,
             tilt: 0.0,
+            rotation: 0.0,
         }
     }
 
@@ -125,8 +137,8 @@ impl Camera {
         if self.tilt <= 0.0 {
             // Convert screen movement to world movement
             let zoom = self.zoom as f64;
-            self.position.x -= dx * zoom;
-            self.position.y += dy * zoom; // Y is inverted
+            // Screen y is down, the view's y is up.
+            self.position -= self.view_to_world(DVec2::new(dx * zoom, -dy * zoom));
             return;
         }
         // The local ground scale at the middle of the screen, by symmetric
@@ -161,6 +173,19 @@ impl Camera {
         self.position += world_before - world_after;
     }
 
+    /// Turn the chart by `delta` radians clockwise on the screen, about a
+    /// screen point, which keeps the same piece of chart under it — the two
+    /// fingers of a twist, or the middle of the screen.
+    ///
+    /// The chart turning clockwise brings a bearing further anticlockwise to
+    /// the top, so the rotation (the bearing at the top) goes *down*.
+    pub fn rotate_at(&mut self, delta: f64, screen_x: f32, screen_y: f32) {
+        let before = self.screen_to_world(screen_x, screen_y);
+        self.rotation = (self.rotation - delta).rem_euclid(std::f64::consts::TAU);
+        let after = self.screen_to_world(screen_x, screen_y);
+        self.position += before - after;
+    }
+
     /// Zoom in/out by wheel delta (positive = zoom in)
     pub fn zoom_by_wheel(&mut self, delta: f32, screen_x: f32, screen_y: f32) {
         let factor = 1.1_f32.powf(delta);
@@ -179,10 +204,11 @@ impl Camera {
             let half_w = self.viewport_width as f64 / 2.0;
             let half_h = self.viewport_height as f64 / 2.0;
             let zoom = self.zoom as f64;
-            return DVec2::new(
-                self.position.x + (screen_x as f64 - half_w) * zoom,
-                self.position.y + (half_h - screen_y as f64) * zoom, // Y inverted
+            let v = DVec2::new(
+                (screen_x as f64 - half_w) * zoom,
+                (half_h - screen_y as f64) * zoom, // Y inverted
             );
+            return self.position + self.view_to_world(v);
         }
         let ndc = DVec2::new(
             screen_x as f64 / self.viewport_width as f64 * 2.0 - 1.0,
@@ -197,9 +223,10 @@ impl Camera {
             let half_w = self.viewport_width as f64 / 2.0;
             let half_h = self.viewport_height as f64 / 2.0;
             let zoom = self.zoom as f64;
+            let v = self.world_to_view(DVec2::new(world_x, world_y) - self.position);
             return Vec2::new(
-                (half_w + (world_x - self.position.x) / zoom) as f32,
-                (half_h - (world_y - self.position.y) / zoom) as f32, // Y inverted
+                (half_w + v.x / zoom) as f32,
+                (half_h - v.y / zoom) as f32, // Y inverted
             );
         }
         let clip = self.view_projection_f64() * DVec4::new(world_x, world_y, 0.0, 1.0);
@@ -223,14 +250,32 @@ impl Camera {
     }
 
     /// Eye position in world space (metres, chart plane at z = 0).
+    ///
+    /// Tilted, the eye stands back from the target against the direction the
+    /// top of the screen faces, and looks forward along it.
     pub fn eye(&self) -> DVec3 {
         let d = self.eye_distance();
         let tilt = self.tilt as f64;
-        DVec3::new(
-            self.position.x,
-            self.position.y - d * tilt.sin(),
-            d * tilt.cos(),
-        )
+        let back = self.position - self.forward() * (d * tilt.sin());
+        DVec3::new(back.x, back.y, d * tilt.cos())
+    }
+
+    /// The ground direction the top of the screen faces: north when
+    /// north-up, the boat's heading when head-up.
+    pub fn forward(&self) -> DVec2 {
+        DVec2::new(self.rotation.sin(), self.rotation.cos())
+    }
+
+    /// A ground offset turned into the view's axes (x right, y up the screen).
+    fn world_to_view(&self, w: DVec2) -> DVec2 {
+        let (s, c) = self.rotation.sin_cos();
+        DVec2::new(w.x * c - w.y * s, w.x * s + w.y * c)
+    }
+
+    /// The inverse of [`world_to_view`](Self::world_to_view).
+    fn view_to_world(&self, v: DVec2) -> DVec2 {
+        let (s, c) = self.rotation.sin_cos();
+        DVec2::new(v.x * c + v.y * s, -v.x * s + v.y * c)
     }
 
     /// Metres per pixel on the chart plane at a given ground point.
@@ -252,7 +297,10 @@ impl Camera {
     pub fn view_projection_f64(&self) -> DMat4 {
         if self.tilt <= 0.0 {
             // View: translate world so camera is at origin
-            let view = DMat4::from_translation(DVec3::new(-self.position.x, -self.position.y, 0.0));
+            // Rotating anticlockwise by the bearing brings that bearing to
+            // screen-up.
+            let view = DMat4::from_rotation_z(self.rotation)
+                * DMat4::from_translation(DVec3::new(-self.position.x, -self.position.y, 0.0));
 
             // Projection: orthographic, scaled by zoom
             let half_w = self.viewport_width as f64 * self.zoom as f64 / 2.0;
@@ -266,7 +314,8 @@ impl Camera {
         let d = self.eye_distance();
         let tilt = self.tilt as f64;
         let target = DVec3::new(self.position.x, self.position.y, 0.0);
-        let up = DVec3::new(0.0, tilt.cos(), tilt.sin());
+        let f = self.forward();
+        let up = DVec3::new(f.x * tilt.cos(), f.y * tilt.cos(), tilt.sin());
         let view = DMat4::look_at_rh(self.eye(), target, up);
         // The far plane sits beyond the ground the top edge reaches, so the
         // chart is never cut off in mid-water; the near plane is close enough
@@ -316,19 +365,21 @@ impl Camera {
 
     /// The four screen corners cast onto the chart plane, in metres.
     ///
-    /// Untilted this is just the view rectangle. Tilted it is a trapezium,
-    /// narrow at the bottom of the screen and wide at the top.
+    /// Untilted this is just the view rectangle (turned, if the chart is).
+    /// Tilted it is a trapezium, narrow at the bottom of the screen and wide
+    /// at the top. Either way the order is bottom-left, bottom-right,
+    /// top-right, top-left as seen on the screen.
     pub fn ground_footprint(&self) -> [DVec2; 4] {
         if self.tilt <= 0.0 {
             let half_w = self.viewport_width as f64 * self.zoom as f64 / 2.0;
             let half_h = self.viewport_height as f64 * self.zoom as f64 / 2.0;
-            let (x, y) = (self.position.x, self.position.y);
             return [
-                DVec2::new(x - half_w, y - half_h),
-                DVec2::new(x + half_w, y - half_h),
-                DVec2::new(x + half_w, y + half_h),
-                DVec2::new(x - half_w, y + half_h),
-            ];
+                DVec2::new(-half_w, -half_h),
+                DVec2::new(half_w, -half_h),
+                DVec2::new(half_w, half_h),
+                DVec2::new(-half_w, half_h),
+            ]
+            .map(|v| self.position + self.view_to_world(v));
         }
         [
             self.ndc_to_ground(DVec2::new(-1.0, -1.0)),
@@ -441,6 +492,61 @@ mod tests {
         cam.pan(0.0, -40.0);
         let back = cam.screen_to_world(400.0, 300.0);
         assert!((back - before).length() < 1.0, "{before:?} -> {back:?}");
+    }
+
+    #[test]
+    fn rotated_screen_world_roundtrip() {
+        for tilt in [0.0, 0.6] {
+            let mut cam = Camera::new(1000.0, 2000.0, 5.0, 800.0, 600.0);
+            cam.tilt = tilt;
+            cam.rotation = 1.1;
+            for &(sx, sy) in &[(400.0, 300.0), (100.0, 500.0), (700.0, 120.0)] {
+                let w = cam.screen_to_world(sx, sy);
+                let back = cam.world_to_screen(w.x, w.y);
+                assert!((back.x - sx).abs() < 0.5 && (back.y - sy).abs() < 0.5, "{sx},{sy} -> {back:?}");
+            }
+            // The matrix the GPU gets agrees with the CPU mapping.
+            let p = cam.screen_to_world(150.0, 450.0);
+            let got = gpu_screen(&cam, DVec2::ZERO, [p.x as f32, p.y as f32]);
+            assert!((got - Vec2::new(150.0, 450.0)).length() < 0.5, "tilt {tilt}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn head_up_puts_the_heading_at_the_top() {
+        let mut cam = Camera::new(0.0, 0.0, 1.0, 800.0, 600.0);
+        cam.rotation = std::f64::consts::FRAC_PI_2; // heading east
+        // A point due east of the camera is straight up the screen.
+        let s = cam.world_to_screen(100.0, 0.0);
+        assert!((s.x - 400.0).abs() < 0.01 && (s.y - 200.0).abs() < 0.01, "{s:?}");
+        // So north is off to the left.
+        let n = cam.world_to_screen(0.0, 100.0);
+        assert!(n.x < 400.0 && (n.y - 300.0).abs() < 0.01, "{n:?}");
+        // Dragging the chart down the screen moves the view east, ahead.
+        cam.pan(0.0, 50.0);
+        assert!(cam.position.x > 49.0 && cam.position.y.abs() < 0.01, "{:?}", cam.position);
+    }
+
+    #[test]
+    fn rotated_footprint_covers_the_screen_corners() {
+        let mut cam = Camera::new(0.0, 0.0, 2.0, 800.0, 600.0);
+        cam.rotation = 0.5;
+        let f = cam.ground_footprint();
+        let corners = [(0.0, 600.0), (800.0, 600.0), (800.0, 0.0), (0.0, 0.0)];
+        for (p, (sx, sy)) in f.iter().zip(corners) {
+            let w = cam.screen_to_world(sx, sy);
+            assert!((*p - w).length() < 0.01, "{p:?} vs {w:?}");
+        }
+    }
+
+    #[test]
+    fn rotating_about_a_point_keeps_it_still() {
+        let mut cam = Camera::new(1000.0, 2000.0, 3.0, 800.0, 600.0);
+        let under = cam.screen_to_world(600.0, 150.0);
+        cam.rotate_at(0.4, 600.0, 150.0);
+        assert!((cam.screen_to_world(600.0, 150.0) - under).length() < 0.01);
+        // A clockwise twist brings a bearing west of north to the top.
+        assert!(cam.rotation > std::f64::consts::PI, "{}", cam.rotation);
     }
 
     #[test]

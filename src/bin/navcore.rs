@@ -28,6 +28,10 @@ use winit::{
 const CLICK_SLOP: f64 = 4.0;
 /// The same for a finger, which never lifts from quite where it landed.
 const TOUCH_SLOP: f64 = 10.0;
+/// How far two fingers must turn before the chart turns with them. A pinch
+/// always twists a little, and a chart that wobbled with every zoom would be
+/// a chart that was never quite north-up.
+const TWIST_SLOP_DEG: f32 = 12.0;
 
 use navcore2::{CachedDecryptor, ChartDecryptor, KeyStore};
 use navcore2::render::RenderState;
@@ -1916,6 +1920,12 @@ struct App {
     pinch_start_distance: Option<f32>,
     /// Where the two fingers' midpoint was, so a pinch can pan as it zooms.
     pinch_centroid: Option<(f32, f32)>,
+    /// The angle of the line between the two fingers at the last move, so a
+    /// twist can turn the chart.
+    twist_angle: Option<f32>,
+    /// How far the fingers have turned since they landed, until that passes
+    /// [`TWIST_SLOP_DEG`]; `None` once it has and the chart turns with them.
+    twist_pending: Option<f32>,
     /// Shift, Ctrl, Cmd — for the keyboard shortcuts and Ctrl-scroll zoom.
     modifiers: winit::keyboard::ModifiersState,
     // Headless capture (NAVCORE_SHOT=path): render until tiles settle, save PNG, exit.
@@ -1926,6 +1936,25 @@ struct App {
     suspended: bool,
     /// NAVCORE_STRESS=coast: legs of the coastal tour done so far.
     stress_leg: usize,
+}
+
+/// The two fingers on the glass, in a fixed order (by touch id), so the line
+/// between them has a direction that does not flip from one move to the next.
+fn finger_pair(
+    touches: &HashMap<u64, PhysicalPosition<f64>>,
+) -> Option<[PhysicalPosition<f64>; 2]> {
+    if touches.len() != 2 {
+        return None;
+    }
+    let mut ids: Vec<_> = touches.keys().copied().collect();
+    ids.sort_unstable();
+    Some([touches[&ids[0]], touches[&ids[1]]])
+}
+
+/// The screen angle of the line from one finger to the other, clockwise
+/// (screen y runs down).
+fn finger_angle([a, b]: [PhysicalPosition<f64>; 2]) -> f32 {
+    ((b.y - a.y) as f32).atan2((b.x - a.x) as f32)
 }
 
 /// Where a wheel or trackpad zoom should hold still: under the pointer, or
@@ -1957,6 +1986,8 @@ impl App {
             shot_path: std::env::var("NAVCORE_SHOT").ok().filter(|s| !s.is_empty()),
             shot_requested: false,
             pinch_centroid: None,
+            twist_angle: None,
+            twist_pending: Some(0.0),
             modifiers: winit::keyboard::ModifiersState::empty(),
             frame_count: 0,
             suspended: false,
@@ -2294,6 +2325,8 @@ impl ApplicationHandler for App {
                 self.gesture_on_ui = false;
                 self.pinch_start_distance = None;
                 self.pinch_centroid = None;
+                self.twist_angle = None;
+                self.twist_pending = Some(0.0);
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -2344,6 +2377,7 @@ impl ApplicationHandler for App {
             //   arrows         pan            Shift+Up/Down  tilt
             //   + / -          zoom           0              plan view
             //   C              follow boat    Esc            back out
+            //   H              north-up / head-up
             WindowEvent::KeyboardInput {
                 event: KeyEvent { logical_key, state: ElementState::Pressed, .. },
                 ..
@@ -2396,6 +2430,10 @@ impl ApplicationHandler for App {
                     }
                     Key::Character("c" | "C") => {
                         state.set_follow(true);
+                        true
+                    }
+                    Key::Character("h" | "H") => {
+                        state.set_chart_up(state.chart_up().next());
                         true
                     }
                     Key::Named(NamedKey::Escape) => state.escape(),
@@ -2492,6 +2530,13 @@ impl ApplicationHandler for App {
                 state.mark_dirty();
             }
 
+            // Positive is anticlockwise; the chart turns with the fingers.
+            WindowEvent::RotationGesture { delta, .. } => {
+                let (ax, ay) = (self.last_mouse_pos.x as f32, self.last_mouse_pos.y as f32);
+                state.twist_chart(-(delta as f64).to_radians(), ax, ay);
+                state.mark_dirty();
+            }
+
             WindowEvent::PanGesture { delta, .. } => {
                 state.release_follow();
                 state.camera.pan(delta.x, delta.y);
@@ -2524,6 +2569,8 @@ impl ApplicationHandler for App {
                             let dy = positions[0].y - positions[1].y;
                             self.pinch_start_distance = Some(((dx * dx + dy * dy) as f32).sqrt());
                         }
+                        self.twist_angle = finger_pair(&self.touches).map(finger_angle);
+                        self.twist_pending = Some(0.0);
                     }
                     TouchPhase::Moved => {
                         let old_location = self.touches.get(&id).copied();
@@ -2559,6 +2606,26 @@ impl ApplicationHandler for App {
                                     }
                                     state.mark_dirty();
                                 }
+                            }
+                            // Two fingers turning turn the chart, once they
+                            // have turned far enough to mean it.
+                            if let Some(pair) = finger_pair(&self.touches) {
+                                let angle = finger_angle(pair);
+                                if let Some(prev) = self.twist_angle {
+                                    let pi = std::f32::consts::PI;
+                                    let step = (angle - prev + pi).rem_euclid(2.0 * pi) - pi;
+                                    match self.twist_pending {
+                                        Some(sum) if (sum + step).abs() < TWIST_SLOP_DEG.to_radians() => {
+                                            self.twist_pending = Some(sum + step);
+                                        }
+                                        Some(sum) => {
+                                            self.twist_pending = None;
+                                            state.twist_chart((sum + step) as f64, cx, cy);
+                                        }
+                                        None => state.twist_chart(step as f64, cx, cy),
+                                    }
+                                }
+                                self.twist_angle = Some(angle);
                             }
                             self.pinch_start_distance = Some(new_distance);
                             self.pinch_centroid = Some((cx, cy));
@@ -2601,6 +2668,8 @@ impl ApplicationHandler for App {
                         self.touches.remove(&id);
                         self.pinch_start_distance = None;
                         self.pinch_centroid = None;
+                        self.twist_angle = None;
+                        self.twist_pending = Some(0.0);
                         // The finger left behind by a pinch carries on panning
                         // straight away, rather than having to be lifted and
                         // put down again. It can no longer be a tap.

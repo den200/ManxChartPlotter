@@ -23,7 +23,8 @@ use egui::{Align2, Color32, Context, FontId, Pos2, Stroke, Vec2};
 #[derive(Debug, Clone)]
 pub struct AisTarget {
     pub screen: [f32; 2],
-    /// Hull orientation, radians clockwise from north.
+    /// Hull orientation, radians clockwise from screen-up (north, when
+    /// north-up).
     pub heading: Option<f32>,
     /// Course over ground, for the vector.
     pub cog: Option<f32>,

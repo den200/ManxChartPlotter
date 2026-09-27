@@ -1263,7 +1263,8 @@ fn compass(deg: f32) -> &'static str {
 pub struct CurrentArrow {
     /// Logical points, the same space as the barbs and the route overlay.
     pub screen: [f32; 2],
-    /// Where the water sets *towards*, degrees true.
+    /// Where the water sets *towards*, degrees clockwise from screen-up (true
+    /// when the chart is north-up).
     pub to_deg: f32,
     pub kt: f32,
 }

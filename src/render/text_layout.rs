@@ -414,6 +414,7 @@ pub fn layout_sounding_symbols(
                 // symbols proper; priority 6 is where S-52 puts them.
                 disp_prio: 6,
                 scale: s.scale * SOUNDING_SYMBOL_SCALE / 1.8,
+                true_bearing: 0,
             });
         }
     }
