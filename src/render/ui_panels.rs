@@ -289,17 +289,12 @@ fn chart_buttons(
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    let (text, hover) = match chart_up {
-                        ChartUp::North => ("North up", "North is at the top. Tap for head-up."),
-                        ChartUp::Head => {
-                            ("Head up", "The boat's heading is at the top. Tap for north-up.")
-                        }
-                        ChartUp::Free => ("Rotated", "Turned by hand. Tap for north-up."),
+                    let hover = match chart_up {
+                        ChartUp::North => "North up. Tap for head-up.",
+                        ChartUp::Head => "Head up: the boat's heading is at the top. Tap for north-up.",
+                        ChartUp::Free => "Turned by hand. Tap for north-up.",
                     };
-                    let (arrow, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
-                    north_arrow(ui, arrow.center(), rotation);
-                    if ui
-                        .selectable_label(chart_up != ChartUp::North, text)
+                    if compass_button(ui, rotation, chart_up != ChartUp::North)
                         .on_hover_text(hover)
                         .clicked()
                     {
@@ -325,25 +320,52 @@ fn chart_buttons(
         });
 }
 
-/// A small north arrow centred on `c`, pointing where north is on the
-/// screen: `rotation` is the true bearing at the top.
-fn north_arrow(ui: &egui::Ui, c: egui::Pos2, rotation: f32) {
-    // North is `-rotation` clockwise from screen-up; screen y runs down.
-    let dir = egui::vec2((-rotation).sin(), -(-rotation).cos());
-    let side = egui::vec2(-dir.y, dir.x);
-    let r = 7.0;
-    let ink = ui.visuals().text_color();
+/// The orientation button: a round compass whose needle points where north
+/// is on the screen (`rotation` is the true bearing at the top), filled in
+/// when the chart is not north-up. An icon rather than words, because it sits
+/// on the chart and the chart is what the screen is for.
+fn compass_button(ui: &mut egui::Ui, rotation: f32, active: bool) -> egui::Response {
+    let size = ui.spacing().interact_size.y.max(30.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let visuals = ui.style().interact_selectable(&response, active);
     let painter = ui.painter();
+    let c = rect.center();
+    let r = size * 0.5 - 1.0;
+    painter.circle(c, r, visuals.bg_fill, visuals.bg_stroke);
+
+    let ink = visuals.fg_stroke.color;
+    // North is `-rotation` clockwise from screen-up; screen y runs down.
+    let north = egui::vec2((-rotation).sin(), -(-rotation).cos());
+    let east = egui::vec2(-north.y, north.x);
+
+    // A tick at each cardinal point, just inside the rim.
+    for dir in [north, east, -north, -east] {
+        painter.line_segment(
+            [c + dir * (r * 0.78), c + dir * (r * 0.93)],
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.6)),
+        );
+    }
+
+    // The needle: a slim diamond, red to the north.
+    let tip = r * 0.62;
+    let waist = r * 0.2;
+    let red = egui::Color32::from_rgb(210, 45, 45);
     painter.add(egui::Shape::convex_polygon(
-        vec![c + dir * r, c - dir * (r * 0.6) + side * (r * 0.55), c - dir * (r * 0.25)],
-        egui::Color32::from_rgb(200, 50, 50),
+        vec![c + north * tip, c + east * waist, c - east * waist],
+        red,
         egui::Stroke::NONE,
     ));
     painter.add(egui::Shape::convex_polygon(
-        vec![c + dir * r, c - dir * (r * 0.25), c - dir * (r * 0.6) - side * (r * 0.55)],
-        ink,
+        vec![c - north * tip, c - east * waist, c + east * waist],
+        ink.gamma_multiply(0.75),
         egui::Stroke::NONE,
     ));
+    painter.circle_filled(c, r * 0.09, visuals.bg_fill);
+
+    response
 }
 
 /// The planner's pins: a classic map pin — a filled head on a stem whose
