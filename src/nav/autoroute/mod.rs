@@ -116,6 +116,10 @@ pub const CAUTION_AREA_NOTE: &str =
 /// the offing fades in. A mile: the length of a harbour and its approach.
 const ENDPOINT_REACH_NM: f64 = 1.0;
 
+/// How far either side of an opening bridge the offing fades in: the fender
+/// walls and the approach, a couple of cable lengths.
+const GATE_TAPER_NM: f64 = 0.2;
+
 /// Find the corridor. `margin_factor` sizes the search box as a fraction of
 /// the passage's span on every side; the callers try a small box first and
 /// widen it when the way round lies outside (a peninsula, an island group).
@@ -214,6 +218,8 @@ pub fn corridor(
         offing_soft_m: safety.offing_soft_nm * nm,
         ends: vec![a_free, b_free],
         taper_m: reach,
+        gates: grid.gates.clone(),
+        gate_taper_m: GATE_TAPER_NM * nm,
     };
 
     let path = match grid::find_path(&grid, start_free, goal_free, &params) {
@@ -399,15 +405,34 @@ pub fn build_hazard_grid(
     grid.close_all();
     let mut ordered: Vec<&ChartSource> = sources.iter().collect();
     ordered.sort_by(|x, y| y.info.native_scale.cmp(&x.info.native_scale));
+    let mut gates = Vec::new();
     for source in &ordered {
-        stamp_chart(&mut grid, source, safety);
+        stamp_chart(&mut grid, source, safety, &mut gates);
+    }
+    // Opening bridges last, over every chart: the spans either side of an
+    // opening (and a finer chart's piers and fenders) are stamped over the
+    // cells it shares with them, and a 30 m opening is a single cell. Carved
+    // any earlier, a later chart would stamp it shut again.
+    for span in gates {
+        if let Some(centre) = grid.open_gate(&span) {
+            grid.gates.push(centre);
+        }
     }
     grid.finalize();
     grid
 }
 
 /// Rasterize one chart: erase its own coverage, then stamp what it forbids.
-fn stamp_chart(grid: &mut Grid, source: &ChartSource<'_>, safety: &SafetyConfig) {
+///
+/// Opening bridge spans are not carved here but collected into `gates`, one
+/// list of triangles per span, for the caller to open once every chart is
+/// down.
+fn stamp_chart(
+    grid: &mut Grid,
+    source: &ChartSource<'_>,
+    safety: &SafetyConfig,
+    gates: &mut Vec<Vec<[[f64; 2]; 3]>>,
+) {
     let info = source.info;
     let data = source.data;
     let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
@@ -458,6 +483,13 @@ fn stamp_chart(grid: &mut Grid, source: &ChartSource<'_>, safety: &SafetyConfig)
             continue;
         };
         let hard = severity == Severity::Hard;
+        if hazards::is_gate(feature, safety) {
+            if let Some(geom) = &feature.area_geometry {
+                let mut span = Vec::new();
+                geom.for_each_triangle_global(info.ref_lat, info.ref_lon, |tri| span.push(tri));
+                gates.push(span);
+            }
+        }
         if let Some(geom) = &feature.area_geometry {
             geom.for_each_triangle_global(info.ref_lat, info.ref_lon, |tri| {
                 grid.stamp_triangle(tri, hard);

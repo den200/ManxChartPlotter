@@ -30,8 +30,12 @@ pub struct SafetyConfig {
     /// room when it is free.
     pub offing_soft_nm: f64,
     /// Grid cell size. The spec says match the finest channel to transit.
-    /// 30 m: at 60 m Svendborgsund was one or two cells wide and closed.
-    /// Long passages coarsen the grid themselves to fit its cell budget.
+    /// 20 m: at 60 m Svendborgsund was one or two cells wide and closed, and
+    /// at 30 m the dredged channel east of Aalborg — about 100 m, running
+    /// diagonally across the grid — came out a one-cell staircase joined
+    /// only at its corners, open or shut depending on where the box put the
+    /// cell boundaries. Long passages coarsen the grid themselves to fit its
+    /// cell budget.
     pub grid_res_m: f64,
     /// Unsurveyed areas: unsafe by default (decision §10.4).
     pub unsare_navigable: bool,
@@ -53,7 +57,7 @@ impl Default for SafetyConfig {
             offing_hard_nm: 0.01,
             offing_min_nm: 0.2,
             offing_soft_nm: 0.5,
-            grid_res_m: 30.0,
+            grid_res_m: 20.0,
             unsare_navigable: false,
             tide_height_min_m: 0.0,
         }
@@ -119,6 +123,16 @@ fn opening_bridge(feature: &Feature) -> bool {
         || feature
             .attribute_str("CATBRG")
             .is_some_and(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).any(opens))
+}
+
+/// An opening bridge the boat cannot get under closed: a way through, but
+/// only through its opening span. The grid carves these open after every
+/// chart is stamped — see `build_hazard_grid` — because a bascule opening is
+/// typically 30 m wide, a single grid cell, and the fixed spans and piers
+/// either side of it are stamped over every cell they touch.
+pub fn is_gate(feature: &Feature, safety: &SafetyConfig) -> bool {
+    s57_code_to_acronym(feature.type_code) == "BRIDGE"
+        && classify(feature, safety) == Some(Severity::Soft)
 }
 
 /// Classify one feature against the boat. `None` means the router does not
@@ -321,6 +335,10 @@ mod tests {
         assert_eq!(classify(&bascule, &cfg()), Some(Severity::Soft));
         let listed = feature("BRIDGE", &[("CATBRG", AttributeValue::String("1,3".into()))]);
         assert_eq!(classify(&listed, &cfg()), Some(Severity::Soft));
+        // Only the opening span is a gate; fixed spans and high bridges are not.
+        assert!(is_gate(&bascule, &cfg()));
+        assert!(!is_gate(&low, &cfg()));
+        assert!(!is_gate(&high, &cfg()));
 
         assert_eq!(classify(&feature("UNSARE", &[]), &cfg()), Some(Severity::Hard));
         let mut relaxed = cfg();

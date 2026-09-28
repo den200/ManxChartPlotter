@@ -33,6 +33,10 @@ pub struct Grid {
     /// grid is closed, and saying *why* an end cannot be reached ("outside
     /// your charts") needs to tell that apart from land.
     covered: Vec<bool>,
+    /// Centres of the opening bridge spans carved open by
+    /// [`Grid::open_gate`], Mercator. A search fades its offing near them,
+    /// as near its ends: a 30 m opening has no room for one.
+    pub gates: Vec<[f64; 2]>,
 }
 
 /// Cap on total cells: past this the grid coarsens itself rather than eating
@@ -64,6 +68,7 @@ impl Grid {
                     soft: vec![0; w * h],
                     dist: Vec::new(),
                     covered: vec![false; w * h],
+                    gates: Vec::new(),
                 };
             }
             res *= 1.5;
@@ -120,6 +125,72 @@ impl Grid {
         } else {
             self.soft[i] = self.soft[i].saturating_add(128);
         }
+    }
+
+    /// Open an opening bridge span (its triangles, Mercator): the cells it
+    /// covers become water again, at a soft cost — the bridge opens on its
+    /// own schedule — whatever the fixed spans and piers either side
+    /// stamped over them.
+    ///
+    /// A 30 m opening is about a cell, and the fixed spans' and fenders'
+    /// cells crowd it from every side, so the span alone would join the water
+    /// either side only corner to corner, which no hull (and no search step)
+    /// squeezes through. The opening is carved as the span's own box,
+    /// stretched a cell and a half up and down the channel — the channel runs
+    /// across the span's short side — which always leaves a straight way
+    /// through. Returns the span's centre.
+    pub fn open_gate(&mut self, span: &[[[f64; 2]; 3]]) -> Option<[f64; 2]> {
+        let pts: Vec<[f64; 2]> = span.iter().flatten().copied().collect();
+        if pts.is_empty() {
+            return None;
+        }
+        let n = pts.len() as f64;
+        let c = [
+            pts.iter().map(|p| p[0]).sum::<f64>() / n,
+            pts.iter().map(|p| p[1]).sum::<f64>() / n,
+        ];
+        // The span's axes: the long one along the deck (the opening's
+        // width), the short one along the channel.
+        let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+        for p in &pts {
+            let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+            sxx += dx * dx;
+            syy += dy * dy;
+            sxy += dx * dy;
+        }
+        let angle = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let along = [angle.cos(), angle.sin()];
+        let across = [-along[1], along[0]];
+        let extent = |axis: [f64; 2]| {
+            pts.iter()
+                .map(|p| ((p[0] - c[0]) * axis[0] + (p[1] - c[1]) * axis[1]).abs())
+                .fold(0.0, f64::max)
+        };
+        let half_deck = extent(along);
+        let half_channel = extent(across) + 1.5 * self.res;
+        let corner = |u: f64, v: f64| {
+            [
+                c[0] + along[0] * u + across[0] * v,
+                c[1] + along[1] * u + across[1] * v,
+            ]
+        };
+        let quad = [
+            corner(-half_deck, -half_channel),
+            corner(half_deck, -half_channel),
+            corner(half_deck, half_channel),
+            corner(-half_deck, half_channel),
+        ];
+        let open = |g: &mut Self, x: i64, y: i64| {
+            g.clear_cell(x, y);
+            g.mark(x, y, false);
+        };
+        for t in [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]] {
+            self.triangle_cells(t, open);
+        }
+        for i in 0..4 {
+            self.walk_segment(quad[i], quad[(i + 1) % 4], open);
+        }
+        Some(c)
     }
 
     /// Clear a cell back to open water — the quilting eraser a finer chart
@@ -529,6 +600,10 @@ pub struct SearchParams {
     /// The start and finish, Mercator.
     pub ends: Vec<[f64; 2]>,
     pub taper_m: f64,
+    /// Opening bridges ([`Grid::gates`]): the floor and penalties fade near
+    /// them too, over `gate_taper_m`, so the route can pass the opening.
+    pub gates: Vec<[f64; 2]>,
+    pub gate_taper_m: f64,
 }
 
 impl SearchParams {
@@ -541,18 +616,24 @@ impl SearchParams {
             offing_soft_m,
             ends: Vec::new(),
             taper_m: 0.0,
+            gates: Vec::new(),
+            gate_taper_m: 0.0,
         }
     }
 
-    /// 0 at an endpoint, rising to 1 at `taper_m` from it.
+    /// 0 at an endpoint or a gate, rising to 1 at `taper_m` (`gate_taper_m`)
+    /// from it.
     pub fn fade(&self, p: [f64; 2]) -> f64 {
-        if self.taper_m <= 0.0 {
-            return 1.0;
-        }
-        self.ends
-            .iter()
-            .map(|e| ((p[0] - e[0]).hypot(p[1] - e[1]) / self.taper_m).min(1.0))
-            .fold(1.0, f64::min)
+        let near = |points: &[[f64; 2]], taper: f64| {
+            if taper <= 0.0 {
+                return 1.0;
+            }
+            points
+                .iter()
+                .map(|e| ((p[0] - e[0]).hypot(p[1] - e[1]) / taper).min(1.0))
+                .fold(1.0, f64::min)
+        };
+        near(&self.ends, self.taper_m).min(near(&self.gates, self.gate_taper_m))
     }
 
     /// The hard offing at a place.
@@ -890,6 +971,46 @@ mod tests {
         }
     }
 
+    /// A bridge across the water at an angle to the grid: fixed spans the
+    /// boat cannot pass, and a 30 m bascule opening in the middle — under a
+    /// cell wide, crowded by the spans either side. Carved as a gate, it is a
+    /// way through even with an offing far wider than the opening.
+    #[test]
+    fn an_opening_bridge_narrower_than_a_cell_is_a_way_through() {
+        let mut grid = open();
+        let c = [5_000.0, 5_000.0];
+        let deck = [0.5f64, 0.866]; // the bridge runs 30° off north
+        let channel = [deck[1], -deck[0]];
+        let at = |u: f64, v: f64| [c[0] + deck[0] * u + channel[0] * v, c[1] + deck[1] * u + channel[1] * v];
+        let rect = |u0: f64, u1: f64| {
+            let q = [at(u0, -10.0), at(u1, -10.0), at(u1, 10.0), at(u0, 10.0)];
+            [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+        };
+        // Fixed spans from shore to shore, either side of the opening.
+        for t in rect(-8_000.0, -15.0).into_iter().chain(rect(15.0, 8_000.0)) {
+            grid.stamp_triangle(t, true);
+        }
+        let opening = rect(-15.0, 15.0);
+        for t in opening {
+            grid.stamp_triangle(t, false);
+        }
+        let west = grid.cell_of([2_000.0, 5_000.0]).unwrap();
+        let east = grid.cell_of([8_000.0, 5_000.0]).unwrap();
+        grid.finalize();
+        assert!(!grid.component(west)[east.1 * grid.w + east.0], "the spans bleed over the opening");
+
+        assert!(grid.open_gate(&opening).is_some());
+        grid.gates.push(c);
+        grid.finalize();
+        assert!(grid.component(west)[east.1 * grid.w + east.0], "the carved opening joins the water");
+        let mut p = params();
+        p.gates = grid.gates.clone();
+        p.gate_taper_m = 400.0;
+        find_path(&grid, west, east, &p).expect("through the opening");
+        // And without the fade, the offing alone closes it again.
+        assert!(find_path(&grid, west, east, &params()).is_err());
+    }
+
     #[test]
     fn nudging_finds_the_water_beside_a_marina() {
         let mut grid = open();
@@ -937,6 +1058,8 @@ mod tests {
             offing_soft_m: 900.0,
             ends: vec![a, b],
             taper_m: 1_850.0,
+            gates: Vec::new(),
+            gate_taper_m: 0.0,
         };
         let path = find_path(&grid, start, goal, &params).expect("out through the entrance");
         let pulled = string_pull(&grid, &path, &params);
@@ -969,6 +1092,8 @@ mod tests {
             offing_soft_m: 900.0,
             ends: vec![a, b],
             taper_m: 1_850.0,
+            gates: Vec::new(),
+            gate_taper_m: 0.0,
         };
         let path = find_path(&grid, grid.cell_of(a).unwrap(), grid.cell_of(b).unwrap(), &params)
             .expect("through the channel");
