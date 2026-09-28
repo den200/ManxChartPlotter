@@ -27,13 +27,13 @@ pub mod follow;
 pub mod gpx;
 pub mod grib;
 pub mod isochrone;
+pub mod logbook;
 pub mod orc;
 pub mod pointfx;
 pub mod polar;
 pub mod wxroute;
 pub mod model;
 pub mod store;
-pub mod track;
 
 pub use model::{Leg, LegKind, LegPlan, Route, RouteProvenance, RoutingConfig, Waypoint, WaypointSet};
 pub use follow::{FollowConfig, Following, Guidance};

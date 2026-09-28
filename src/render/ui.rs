@@ -31,8 +31,16 @@ pub enum UiAction {
     AnchorDrop,
     /// Stop the anchor watch.
     AnchorUp,
-    /// Close the track so far and start another.
-    TrackNew,
+    /// A note in the logbook: today's (stamped now, with the position) or,
+    /// with `day`, a remark on a past day.
+    LogNoteAdd { day: Option<chrono::NaiveDate>, text: String },
+    LogNoteDelete(crate::nav::logbook::Note),
+    /// Open a day in the logbook, or go back to the list.
+    LogSelect { day: Option<chrono::NaiveDate> },
+    /// Fit the open day's track on the screen.
+    LogFit,
+    LogExport { day: chrono::NaiveDate, csv: bool },
+    LogDelete(chrono::NaiveDate),
     /// Close the object-query bubble.
     DismissPick,
     /// The display settings changed: re-apply them and save.
@@ -91,6 +99,8 @@ pub enum UiAction {
     RouteDeactivate,
     /// PUT this route to the Signal K server's resources.
     RoutePublish { route_id: uuid::Uuid },
+    /// Save a route as a GPX file in Downloads, for another plotter.
+    RouteExport { route_id: uuid::Uuid },
     /// Read the server's route resources into the store.
     RoutesFetchSignalK,
     /// Start a new, empty route and open it for editing.
@@ -840,9 +850,16 @@ pub struct UiState<'a> {
     pub alarms: Vec<super::ui_safety::AlarmLine>,
     pub mob: Option<super::ui_safety::MobView>,
     pub anchor: Option<super::ui_safety::AnchorView>,
+    /// Today's track, as the logbook records it.
     pub track: super::ui_safety::TrackView,
+    /// The logbook day open in its window, when it is shown on the chart,
+    /// and its notes that have a position.
+    pub log_track: super::ui_safety::TrackView,
+    pub log_notes: Vec<([f32; 2], String)>,
     /// Depth under the boat now, if the sounder is heard.
     pub depth_m: Option<f64>,
+    /// The logbook window's rows, when it is open.
+    pub logbook: super::ui_logbook::LogbookState,
 }
 
 pub struct Ui {
@@ -874,8 +891,9 @@ pub struct Ui {
     pub sheet: super::ui_weather::SheetView,
     pub display: DisplayView,
     pub free: FreeChartsView,
-    /// The notice, alarms, man overboard, anchor watch and track.
+    /// The notice, alarms, man overboard and anchor watch.
     pub safety: super::ui_safety::SafetyView,
+    pub logbook: super::ui_logbook::LogView,
 }
 
 impl Ui {
@@ -917,6 +935,7 @@ impl Ui {
             display: crate::render::state::RenderState::load_display_settings(),
             free: FreeChartsView::default(),
             safety: crate::render::state::RenderState::load_safety_settings(),
+            logbook: crate::render::state::RenderState::load_logbook_settings(),
         }
     }
 
@@ -1037,10 +1056,11 @@ impl Ui {
         let display = &mut self.display;
         let free = &mut self.free;
         let safety = &mut self.safety;
+        let logbook = &mut self.logbook;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
                 ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
-                display, free, safety, fleet, actions,
+                display, free, safety, logbook, fleet, actions,
             );
         });
         #[cfg(target_os = "android")]

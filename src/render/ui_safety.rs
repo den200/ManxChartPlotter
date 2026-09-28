@@ -28,7 +28,6 @@ pub struct SafetyView {
     /// the boat sends that, else below the transducer).
     pub depth_alarm_m: f32,
     pub anchor_radius_m: f32,
-    pub record_track: bool,
 
     #[serde(skip)]
     pub open: bool,
@@ -50,7 +49,6 @@ impl Default for SafetyView {
             depth_alarm: false,
             depth_alarm_m: 2.0,
             anchor_radius_m: 40.0,
-            record_track: true,
             open: false,
             guide_open: false,
             notice_open: false,
@@ -87,13 +85,10 @@ pub struct AnchorView {
     pub distance_m: Option<f64>,
 }
 
-/// The track so far.
+/// A track on the screen, logical points.
 #[derive(Debug, Clone, Default)]
 pub struct TrackView {
     pub screen: Vec<[f32; 2]>,
-    pub points: usize,
-    pub distance_nm: f64,
-    pub file: Option<String>,
 }
 
 /// The one-time notice. Nothing else can be used until it is accepted.
@@ -289,15 +284,30 @@ pub fn mob_panel(ctx: &Context, mob: &MobView, safety: &mut SafetyView, actions:
         });
 }
 
-/// On the chart: the track, the anchor circle, the MOB mark and the line
-/// back to it. Under the interface, over the chart.
+/// On the chart: today's track, a logbook day's track and notes, the
+/// anchor circle, the MOB mark and the line back to it. Under the
+/// interface, over the chart.
 pub fn draw_on_chart(
     ctx: &Context,
     track: &TrackView,
+    log_track: &TrackView,
+    log_notes: &[([f32; 2], String)],
     anchor: Option<&AnchorView>,
     mob: Option<&MobView>,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::background());
+    let log_colour = Color32::from_rgb(130, 60, 170);
+    if log_track.screen.len() >= 2 {
+        let pts: Vec<Pos2> = log_track.screen.iter().map(|p| Pos2::new(p[0], p[1])).collect();
+        painter.add(egui::Shape::line(pts, Stroke::new(2.5_f32, log_colour)));
+    }
+    for (p, text) in log_notes {
+        let at = Pos2::new(p[0], p[1]);
+        painter.circle(at, 5.0, log_colour, Stroke::new(1.5_f32, Color32::WHITE));
+        let short: String = text.chars().take(28).collect();
+        let short = if short.len() < text.len() { format!("{short}…") } else { short };
+        painter.text(at + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, short, FontId::proportional(12.0), log_colour);
+    }
     if track.screen.len() >= 2 {
         let pts: Vec<Pos2> = track.screen.iter().map(|p| Pos2::new(p[0], p[1])).collect();
         painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, Color32::from_rgb(160, 70, 30))));
@@ -343,10 +353,9 @@ pub struct WatchState<'a> {
     pub anchor: Option<&'a AnchorView>,
     pub has_fix: bool,
     pub depth_m: Option<f64>,
-    pub track: &'a TrackView,
 }
 
-/// The Safety window: alarms, anchor watch, track, the guide, the notice.
+/// The Safety window: alarms, anchor watch, the guide, the notice.
 pub fn window(
     ctx: &Context,
     safety: &mut SafetyView,
@@ -417,25 +426,6 @@ pub fn window(
             }
             ui.separator();
 
-            ui.label(RichText::new("Track").strong());
-            ui.checkbox(&mut safety.record_track, "Record where the boat goes");
-            let t = watch.track;
-            ui.label(format!(
-                "{} point{}, {:.1} NM",
-                t.points,
-                if t.points == 1 { "" } else { "s" },
-                t.distance_nm
-            ));
-            if let Some(ref f) = t.file {
-                let path = std::path::Path::new(f);
-                let name = path.file_name().map_or(f.clone(), |n| n.to_string_lossy().into_owned());
-                ui.label(RichText::new(format!("Saved as {name}")).weak().small())
-                    .on_hover_text(format!("GPX, in {}", path.parent().map_or(String::new(), |p| p.display().to_string())));
-            }
-            if ui.button("Start a new track").clicked() {
-                actions.push(UiAction::TrackNew);
-            }
-            ui.separator();
             if ui.link("About navcore beta — not for navigation").clicked() {
                 safety.notice_open = true;
             }

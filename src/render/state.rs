@@ -605,8 +605,14 @@ pub struct RenderState {
     mob: Option<(Option<crate::geo::LatLon>, Instant)>,
     /// The anchor watch: the anchor's position and the circle, metres.
     anchor_watch: Option<(crate::geo::LatLon, f64)>,
-    /// The track being recorded.
-    track: Option<crate::nav::track::Track>,
+    /// The logbook recorder; today's samples are its track.
+    logbook: crate::nav::logbook::Recorder,
+    /// The logbook window's rows, read from disk when it opens or changes.
+    log_state: crate::render::ui_logbook::LogbookState,
+    /// The open day's samples, for its track on the chart.
+    log_samples: Vec<crate::nav::logbook::Sample>,
+    /// The rows need reading again.
+    log_dirty: bool,
     /// Incremental key for visible-tile text layout inputs
     last_text_layout_key: u64,
     /// Cached unique visible line styles for the current visible tile set
@@ -1469,7 +1475,10 @@ impl RenderState {
             alarms: Default::default(),
             mob: None,
             anchor_watch: None,
-            track: None,
+            logbook: crate::nav::logbook::Recorder::new(crate::nav::logbook::dir()),
+            log_state: Default::default(),
+            log_samples: Vec::new(),
+            log_dirty: true,
             last_text_layout_key: 0,
             cached_visible_line_styles: Vec::new(),
             cached_visible_line_styles_key: 0,
@@ -2838,6 +2847,8 @@ impl RenderState {
         let fill_drawn = wind_fill.kt.iter().filter(|k| k.is_some()).count();
         self.refresh_wind_coverage(wind_barbs.len() + fill_drawn);
         let weather_anchor = self.weather_anchor_screen();
+        // Before the UI is taken out to be drawn: it reads the window's state.
+        let (log_track, log_notes, logbook) = self.logbook_view();
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
@@ -2874,7 +2885,10 @@ impl RenderState {
                     mob,
                     anchor: anchor_view,
                     track: track_view,
+                    log_track,
+                    log_notes,
                     depth_m,
+                    logbook,
                 },
                 &self.fleet,
             );
@@ -3020,6 +3034,36 @@ impl RenderState {
                         ui.routes.status = "Following stopped".into();
                     }
                 }
+                crate::render::ui::UiAction::RouteExport { route_id } => {
+                    self.ensure_route_store();
+                    let dir = crate::nav::logbook::export_dir();
+                    let name = self
+                        .route_store
+                        .as_ref()
+                        .and_then(|s| s.route(route_id))
+                        .map(|r| r.name.clone())
+                        .unwrap_or_else(|| "route".into());
+                    let file: String = name
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
+                        .collect();
+                    let path = dir.join(format!("{file}.gpx"));
+                    let result = std::fs::create_dir_all(&dir)
+                        .map_err(|e| e.to_string())
+                        .and_then(|_| {
+                            self.route_store
+                                .as_ref()
+                                .ok_or_else(|| "no route store".to_string())?
+                                .export_route(route_id, &path)
+                                .map_err(|e| e.to_string())
+                        });
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.status = match result {
+                            Ok(()) => format!("Saved {}", path.display()),
+                            Err(e) => format!("Could not save {}: {e}", path.display()),
+                        };
+                    }
+                }
                 crate::render::ui::UiAction::RoutePublish { route_id } => {
                     self.ensure_route_store();
                     let base = self
@@ -3105,11 +3149,38 @@ impl RenderState {
                     self.anchor_watch = None;
                     self.alarms.set(crate::nav::alarms::AlarmKey::Anchor, None, Instant::now());
                 }
-                crate::render::ui::UiAction::TrackNew => {
-                    if let Some(ref mut t) = self.track {
-                        t.save_if_due(Instant::now(), true);
+                crate::render::ui::UiAction::LogNoteAdd { day, text } => self.log_note(day, text),
+                crate::render::ui::UiAction::LogNoteDelete(note) => {
+                    if let Err(e) = crate::nav::logbook::delete_note(self.logbook.dir(), &note) {
+                        self.log_state.message = Some(format!("Could not delete the note: {e}"));
                     }
-                    self.track = None;
+                    self.log_dirty = true;
+                }
+                crate::render::ui::UiAction::LogSelect { day } => {
+                    self.log_samples = day
+                        .map(|d| {
+                            if Some(d) == self.logbook.day {
+                                self.logbook.today.clone()
+                            } else {
+                                crate::nav::logbook::read_day(self.logbook.dir(), d)
+                            }
+                        })
+                        .unwrap_or_default();
+                    self.log_state.message = None;
+                    self.log_dirty = true;
+                }
+                crate::render::ui::UiAction::LogFit => self.log_fit(),
+                crate::render::ui::UiAction::LogExport { day, csv } => self.log_export(day, csv),
+                crate::render::ui::UiAction::LogDelete(day) => {
+                    if Some(day) == self.logbook.day {
+                        // Today's recorder must not append to a file that
+                        // is gone as if it were still whole.
+                        self.logbook = crate::nav::logbook::Recorder::new(crate::nav::logbook::dir());
+                    }
+                    crate::nav::logbook::delete_day(self.logbook.dir(), day);
+                    self.log_samples.clear();
+                    self.log_state.message = Some(format!("Deleted {day}"));
+                    self.log_dirty = true;
                 }
                 crate::render::ui::UiAction::ChartUpSet { mode } => {
                     self.set_chart_up(mode);
@@ -4620,6 +4691,15 @@ impl RenderState {
                 // change triggers — wrote it over the address the user had
                 // actually configured. The real one is kept here and put
                 // back at save time.
+                // `NAVCORE_LOG_OPEN=list|YYYY-MM-DD` opens the logbook on its
+                // list or on a day, for captures.
+                if let Ok(v) = std::env::var("NAVCORE_LOG_OPEN") {
+                    ui.logbook.open = true;
+                    if let Ok(day) = chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d") {
+                        ui.logbook.selected = Some(day);
+                        self.log_samples = crate::nav::logbook::read_day(self.logbook.dir(), day);
+                    }
+                }
                 // `NAVCORE_SAFETY=window|guide` opens the Safety window or
                 // the man overboard guide, for captures.
                 match std::env::var("NAVCORE_SAFETY").as_deref() {
@@ -4903,6 +4983,7 @@ impl RenderState {
             charts: &'a crate::render::ui::ChartFolderView,
             display: &'a crate::render::ui::DisplayView,
             safety: &'a crate::render::ui_safety::SafetyView,
+            logbook: &'a crate::render::ui_logbook::LogView,
         }
         // An env override is for this run; the file keeps what the user set.
         let mut instruments = ui.instruments.clone();
@@ -4916,6 +4997,7 @@ impl RenderState {
             charts: &ui.charts,
             display: &ui.display,
             safety: &ui.safety,
+            logbook: &ui.logbook,
         }) else {
             return;
         };
@@ -5025,6 +5107,213 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
+    pub(crate) fn load_logbook_settings() -> crate::render::ui_logbook::LogView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            logbook: crate::render::ui_logbook::LogView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.logbook)
+            .unwrap_or_default()
+    }
+
+    /// The boat now, as one logbook sample: whatever it sends fresh.
+    fn log_sample(&self) -> Option<crate::nav::logbook::Sample> {
+        use crate::nav::logbook::{Field, Sample};
+        let own = &self.fleet.own;
+        let fresh = |path: &str| own.get(path).filter(|r| !r.is_stale()).and_then(|r| r.number());
+        const KN: f64 = 3600.0 / 1852.0;
+        let mut s = Sample::new(chrono::Utc::now().timestamp());
+        if let Some((at, true)) = self.own_fix() {
+            s.set(Field::Lat, Some(at.lat));
+            s.set(Field::Lon, Some(at.lon));
+        }
+        s.set(Field::Sog, fresh("navigation.speedOverGround").map(|v| v * KN));
+        s.set(Field::Cog, fresh("navigation.courseOverGroundTrue").map(f64::to_degrees));
+        s.set(Field::Heading, fresh("navigation.headingTrue").map(f64::to_degrees));
+        s.set(Field::Stw, fresh("navigation.speedThroughWater").map(|v| v * KN));
+        s.set(Field::Depth, self.depth_under_boat());
+        s.set(Field::Aws, fresh("environment.wind.speedApparent").map(|v| v * KN));
+        s.set(Field::Awa, fresh("environment.wind.angleApparent").map(f64::to_degrees));
+        s.set(Field::Tws, fresh("environment.wind.speedTrue").map(|v| v * KN));
+        s.set(Field::Twd, fresh("environment.wind.directionTrue").map(f64::to_degrees));
+        s.set(Field::Baro, fresh("environment.outside.pressure").map(|v| v / 100.0));
+        s.set(Field::WaterTemp, fresh("environment.water.temperature").map(|v| v - 273.15));
+        // Nothing heard at all is not a sample.
+        (s != Sample::new(s.t)).then_some(s)
+    }
+
+    /// A note in the logbook: today's stamped now with the position, a past
+    /// day's at that day's last sample, without one.
+    fn log_note(&mut self, day: Option<chrono::NaiveDate>, text: String) {
+        use crate::nav::logbook::{self, Note};
+        let note = match day {
+            None => {
+                let at = self.own_fix().map(|(p, _)| p);
+                Note { t: chrono::Utc::now().timestamp(), lat: at.map(|p| p.lat), lon: at.map(|p| p.lon), text }
+            }
+            Some(d) => {
+                let end = logbook::read_day(self.logbook.dir(), d).last().map(|s| s.t).unwrap_or_else(|| {
+                    d.and_hms_opt(12, 0, 0).map(|t| t.and_utc().timestamp()).unwrap_or_default()
+                });
+                Note { t: end, lat: None, lon: None, text }
+            }
+        };
+        match logbook::add_note(self.logbook.dir(), &note) {
+            Ok(()) => self.log_state.message = None,
+            Err(e) => self.log_state.message = Some(format!("Could not save the note: {e}")),
+        }
+        self.log_dirty = true;
+    }
+
+    /// Put the open day's track on the screen.
+    fn log_fit(&mut self) {
+        let pts: Vec<[f64; 2]> = self
+            .log_samples
+            .iter()
+            .filter_map(|s| s.position())
+            .map(|p| {
+                let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+                [x, y]
+            })
+            .collect();
+        if pts.is_empty() {
+            return;
+        }
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for p in &pts {
+            for i in 0..2 {
+                lo[i] = lo[i].min(p[i]);
+                hi[i] = hi[i].max(p[i]);
+            }
+        }
+        self.release_follow();
+        self.camera.position = glam::DVec2::new((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0);
+        let (w, h) = (self.camera.viewport_width as f64, self.camera.viewport_height as f64);
+        let zoom = ((hi[0] - lo[0]) / w).max((hi[1] - lo[1]) / h) * 1.3;
+        self.camera.zoom = (zoom as f32).clamp(crate::render::camera::MIN_METRES_PER_PIXEL * 20.0, self.camera.max_zoom);
+        self.needs_redraw = true;
+    }
+
+    fn log_export(&mut self, day: chrono::NaiveDate, csv: bool) {
+        use crate::nav::logbook;
+        self.logbook.flush();
+        let dir = self.logbook.dir().to_path_buf();
+        let samples = logbook::read_day(&dir, day);
+        let (text, ext) = if csv {
+            (logbook::to_csv(&samples), "csv")
+        } else {
+            (logbook::to_gpx(day, &samples, &logbook::read_notes(&dir, day)), "gpx")
+        };
+        let out_dir = logbook::export_dir();
+        let path = out_dir.join(format!("navcore-log-{day}.{ext}"));
+        let written = std::fs::create_dir_all(&out_dir).and_then(|_| std::fs::write(&path, text));
+        self.log_state.message = Some(match written {
+            Ok(()) => format!("Saved {}", path.display()),
+            Err(e) => format!("Could not save {}: {e}", path.display()),
+        });
+    }
+
+    /// The logbook for the UI: the open day's track and notes on the chart,
+    /// and the window's rows. The files are read only when the window opens
+    /// or something changed; today's row is live.
+    fn logbook_view(
+        &mut self,
+    ) -> (
+        crate::render::ui_safety::TrackView,
+        Vec<([f32; 2], String)>,
+        crate::render::ui_logbook::LogbookState,
+    ) {
+        use crate::nav::logbook;
+        use crate::render::ui_logbook::{DayDetail, DayRow};
+        let Some(view) = self.ui.as_ref().map(|u| u.logbook.clone()) else {
+            return Default::default();
+        };
+        let dir = self.logbook.dir().to_path_buf();
+        let today = self.logbook.day;
+        let row = |day: chrono::NaiveDate, samples: &[logbook::Sample]| DayRow {
+            day,
+            summary: logbook::summarize(samples),
+            notes: logbook::read_notes(&dir, day).len(),
+            bytes: logbook::day_bytes(&dir, day),
+        };
+        // Closed, the rows are not read; the open day stays on the chart.
+        if !view.open {
+            self.log_dirty = true;
+        } else if self.log_dirty {
+            self.log_dirty = false;
+            self.log_state.days = logbook::days(&dir)
+                .into_iter()
+                .map(|d| {
+                    if Some(d) == today {
+                        row(d, &self.logbook.today)
+                    } else {
+                        row(d, &logbook::read_day(&dir, d))
+                    }
+                })
+                .collect();
+            self.log_state.detail = view.selected.map(|d| DayDetail {
+                row: if Some(d) == today { row(d, &self.logbook.today) } else { row(d, &self.log_samples) },
+                notes: logbook::read_notes(&dir, d),
+            });
+        }
+        // Today changes under the window: its numbers are summed afresh
+        // (a few thousand samples at most).
+        self.log_state.today = today.map(|d| DayRow {
+            day: d,
+            summary: logbook::summarize(&self.logbook.today),
+            notes: 0,
+            bytes: 0,
+        });
+        if let (Some(t), Some(first)) = (&self.log_state.today, self.log_state.days.first_mut()) {
+            if first.day == t.day {
+                first.summary = t.summary.clone();
+            }
+        }
+        if let (Some(t), Some(detail)) = (&self.log_state.today, self.log_state.detail.as_mut()) {
+            if detail.row.day == t.day {
+                detail.row.summary = t.summary.clone();
+                self.log_samples = self.logbook.today.clone();
+            }
+        }
+        self.log_state.has_fix = self.own_fix().is_some_and(|(_, f)| f);
+
+        let ppp = self.scale_factor.max(0.01);
+        let project = |p: crate::geo::LatLon| {
+            let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+            let s = self.camera.world_to_screen(x, y);
+            [s.x / ppp, s.y / ppp]
+        };
+        let shown = view.show_on_chart && view.selected.is_some();
+        let track = if shown {
+            crate::render::ui_safety::TrackView {
+                screen: self.log_samples.iter().filter_map(|s| s.position()).map(project).collect(),
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
+        let notes = if shown {
+            self.log_state
+                .detail
+                .as_ref()
+                .map(|d| {
+                    d.notes.iter().filter_map(|n| Some((project(n.position()?), n.text.clone()))).collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (track, notes, self.log_state.clone())
+    }
+
     pub(crate) fn load_safety_settings() -> crate::render::ui_safety::SafetyView {
         let Some(path) = Self::settings_path() else {
             return Default::default();
@@ -5099,7 +5388,7 @@ impl RenderState {
             ui.safety.sound,
             ui.safety.depth_alarm,
             ui.safety.depth_alarm_m as f64,
-            ui.safety.record_track,
+            ui.logbook.record,
         );
         let cpa = crate::render::ui_ais::CpaAlarm {
             distance_m: ui.instruments.cpa_alarm_nm * 1852.0,
@@ -5143,25 +5432,15 @@ impl RenderState {
             crate::sound::alarm();
         }
 
-        // The track.
+        // The logbook.
         if record {
-            if let Some((at, true)) = fix {
-                let track = self.track.get_or_insert_with(|| {
-                    let dir = std::env::var("NAVCORE_TRACKS")
-                        .map(std::path::PathBuf::from)
-                        .ok()
-                        .or_else(crate::nav::track::default_dir)
-                        .unwrap_or_else(|| std::path::PathBuf::from("tracks"));
-                    crate::nav::track::Track::new(&dir, chrono::Utc::now())
-                });
-                if track.offer(at, chrono::Utc::now(), now) {
+            if let Some(sample) = self.log_sample() {
+                if self.logbook.offer(sample, now) {
                     self.needs_redraw = true;
                 }
             }
-        }
-        if let Some(ref mut t) = self.track {
-            // Turned off: the file is brought up to date at once.
-            t.save_if_due(now, !record);
+        } else {
+            self.logbook.flush();
         }
     }
 
@@ -5208,16 +5487,10 @@ impl RenderState {
                 distance_m: fix.filter(|(_, fresh)| *fresh).map(|(p, _)| crate::geo::distance_m(at, p)),
             }
         });
-        let track = self
-            .track
-            .as_ref()
-            .map(|t| TrackView {
-                screen: t.points.iter().map(|p| project(p.at)).collect(),
-                points: t.points.len(),
-                distance_nm: t.distance_nm(),
-                file: Some(t.file.display().to_string()),
-            })
-            .unwrap_or_default();
+        let track = TrackView {
+            screen: self.logbook.today.iter().filter_map(|s| s.position()).map(project).collect(),
+            ..Default::default()
+        };
         (alarms, mob, anchor, track)
     }
 
@@ -7424,6 +7697,8 @@ const LAKARE: u16 = 69;  // Lake
 
 impl Drop for RenderState {
     fn drop(&mut self) {
+        // The logbook's last minutes.
+        self.logbook.flush();
         // Shut down background tile worker thread cleanly
         if let Some(worker) = self.tile_worker.take() {
             worker.shutdown();

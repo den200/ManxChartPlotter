@@ -26,6 +26,7 @@ pub fn build(
     display: &mut crate::render::ui::DisplayView,
     free: &mut crate::render::ui::FreeChartsView,
     safety: &mut crate::render::ui_safety::SafetyView,
+    logbook: &mut crate::render::ui_logbook::LogView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -49,7 +50,14 @@ pub fn build(
     }
     super::ui_routes::draw_overlay(ctx, &state.routes);
     draw_plan_pins(ctx, &state.plan_pins);
-    super::ui_safety::draw_on_chart(ctx, &state.track, state.anchor.as_ref(), state.mob.as_ref());
+    super::ui_safety::draw_on_chart(
+        ctx,
+        &state.track,
+        &state.log_track,
+        &state.log_notes,
+        state.anchor.as_ref(),
+        state.mob.as_ref(),
+    );
     if instruments.show_ais {
         super::ui_ais::draw(
             ctx,
@@ -65,7 +73,7 @@ pub fn build(
         super::ui_ownship::draw(ctx, ship);
     }
 
-    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, safety, actions);
+    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, safety, logbook, actions);
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
@@ -103,9 +111,11 @@ pub fn build(
             anchor: state.anchor.as_ref(),
             has_fix: state.own_ship.as_ref().is_some_and(|s| !s.stale),
             depth_m: state.depth_m,
-            track: &state.track,
         };
         super::ui_safety::window(ctx, safety, instruments, &watch, actions);
+    }
+    if logbook.open {
+        super::ui_logbook::window(ctx, logbook, &state.logbook, actions);
     }
     // Last, over the chart area the panels have left: what a chart tap will
     // do right now, and the way back to following the boat.
@@ -449,6 +459,7 @@ fn menu_bar(
     sheet: &crate::render::ui_weather::SheetView,
     weather: &mut crate::render::ui::WeatherView,
     safety: &mut crate::render::ui_safety::SafetyView,
+    logbook: &mut crate::render::ui_logbook::LogView,
     actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -497,6 +508,13 @@ fn menu_bar(
                 .clicked()
             {
                 actions.push(UiAction::WeatherSheetToggle);
+            }
+            if ui
+                .selectable_label(logbook.open, "Log")
+                .on_hover_text("The logbook: where the boat went, the numbers, your notes")
+                .clicked()
+            {
+                logbook.open = !logbook.open;
             }
             if ui
                 .selectable_label(safety.open, "Safety")

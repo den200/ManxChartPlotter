@@ -478,6 +478,13 @@ pub fn window(
                                     actions.push(UiAction::RouteActivate { route_id: row.id });
                                 }
                                 if ui
+                                    .button("Export")
+                                    .on_hover_text("Save as a GPX file in Downloads, for another plotter")
+                                    .clicked()
+                                {
+                                    actions.push(UiAction::RouteExport { route_id: row.id });
+                                }
+                                if ui
                                     .add_enabled(!view.net_busy, egui::Button::new("Publish"))
                                     .on_hover_text("Publish this route to the Signal K server")
                                     .clicked()
