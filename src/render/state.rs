@@ -599,6 +599,14 @@ pub struct RenderState {
     /// When the turn last advanced, so it runs at the same speed at any
     /// frame rate.
     chart_turn_at: Option<Instant>,
+    /// Raised alarms and when they last sounded.
+    alarms: crate::nav::alarms::Alarms,
+    /// Man overboard: where (if there was a fix) and when.
+    mob: Option<(Option<crate::geo::LatLon>, Instant)>,
+    /// The anchor watch: the anchor's position and the circle, metres.
+    anchor_watch: Option<(crate::geo::LatLon, f64)>,
+    /// The track being recorded.
+    track: Option<crate::nav::track::Track>,
     /// Incremental key for visible-tile text layout inputs
     last_text_layout_key: u64,
     /// Cached unique visible line styles for the current visible tile set
@@ -1458,6 +1466,10 @@ impl RenderState {
             needs_redraw: true,
             chart_turning: false,
             chart_turn_at: None,
+            alarms: Default::default(),
+            mob: None,
+            anchor_watch: None,
+            track: None,
             last_text_layout_key: 0,
             cached_visible_line_styles: Vec::new(),
             cached_visible_line_styles_key: 0,
@@ -2533,6 +2545,7 @@ impl RenderState {
         self.drain_route_net();
         self.update_mariner_symbols();
         self.update_chart_up();
+        self.update_watch();
 
         // In tile mode, keep the camera near the loaded chart extent.
         // This prevents panning/gesture glitches from throwing the view outside the
@@ -2834,6 +2847,8 @@ impl RenderState {
             let own_ship = self.own_ship_view();
             let ais = self.ais_targets();
             let mpp = self.camera.zoom * self.scale_factor.max(0.01);
+            let (alarms, mob, anchor_view, track_view) = self.watch_views();
+            let depth_m = self.depth_under_boat();
             let actions = ui.run(
                 &self.window.clone(),
                 &self.device,
@@ -2855,6 +2870,11 @@ impl RenderState {
                     wind_fill,
                     current: current_arrows,
                     weather_anchor,
+                    alarms,
+                    mob,
+                    anchor: anchor_view,
+                    track: track_view,
+                    depth_m,
                 },
                 &self.fleet,
             );
@@ -3066,6 +3086,30 @@ impl RenderState {
                         ui.weather.status = "planning cancelled".into();
                     }
                     self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::SafetyChanged => self.save_settings(),
+                crate::render::ui::UiAction::AlarmsSilence => self.alarms.acknowledge(),
+                crate::render::ui::UiAction::MobMark => self.mark_mob(),
+                crate::render::ui::UiAction::MobClear => {
+                    self.mob = None;
+                    self.alarms.set(crate::nav::alarms::AlarmKey::ManOverboard, None, Instant::now());
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::AnchorDrop => {
+                    if let Some((at, true)) = self.own_fix() {
+                        let radius = self.ui.as_ref().map_or(40.0, |u| u.safety.anchor_radius_m as f64);
+                        self.anchor_watch = Some((at, radius));
+                    }
+                }
+                crate::render::ui::UiAction::AnchorUp => {
+                    self.anchor_watch = None;
+                    self.alarms.set(crate::nav::alarms::AlarmKey::Anchor, None, Instant::now());
+                }
+                crate::render::ui::UiAction::TrackNew => {
+                    if let Some(ref mut t) = self.track {
+                        t.save_if_due(Instant::now(), true);
+                    }
+                    self.track = None;
                 }
                 crate::render::ui::UiAction::ChartUpSet { mode } => {
                     self.set_chart_up(mode);
@@ -4576,6 +4620,13 @@ impl RenderState {
                 // change triggers — wrote it over the address the user had
                 // actually configured. The real one is kept here and put
                 // back at save time.
+                // `NAVCORE_SAFETY=window|guide` opens the Safety window or
+                // the man overboard guide, for captures.
+                match std::env::var("NAVCORE_SAFETY").as_deref() {
+                    Ok("window") => ui.safety.open = true,
+                    Ok("guide") => ui.safety.guide_open = true,
+                    _ => {}
+                }
                 if let Ok(url) = std::env::var("NAVCORE_SIGNALK") {
                     if !url.is_empty() {
                         signalk_override_saved = Some(ui.instruments.url.clone());
@@ -4851,6 +4902,7 @@ impl RenderState {
             boat: &'a crate::render::ui::BoatView,
             charts: &'a crate::render::ui::ChartFolderView,
             display: &'a crate::render::ui::DisplayView,
+            safety: &'a crate::render::ui_safety::SafetyView,
         }
         // An env override is for this run; the file keeps what the user set.
         let mut instruments = ui.instruments.clone();
@@ -4863,6 +4915,7 @@ impl RenderState {
             boat: &ui.boat,
             charts: &ui.charts,
             display: &ui.display,
+            safety: &ui.safety,
         }) else {
             return;
         };
@@ -4970,6 +5023,208 @@ impl RenderState {
         self.pending_tiles.clear();
         self.deferred_tile_results.clear();
         self.needs_redraw = true;
+    }
+
+    pub(crate) fn load_safety_settings() -> crate::render::ui_safety::SafetyView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            safety: crate::render::ui_safety::SafetyView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.safety)
+            .unwrap_or_default()
+    }
+
+    /// The boat's position and whether it is fresh.
+    fn own_fix(&self) -> Option<(crate::geo::LatLon, bool)> {
+        let (lat, lon) = self.fleet.own.position()?;
+        let fresh = self
+            .fleet
+            .own
+            .get("navigation.position")
+            .is_some_and(|r| !r.is_stale());
+        Some((crate::geo::LatLon::new(lat, lon), fresh))
+    }
+
+    /// Depth under the boat from the sounder: below the keel when the boat
+    /// sends it, else below the transducer. Stale readings are no reading.
+    fn depth_under_boat(&self) -> Option<f64> {
+        ["environment.depth.belowKeel", "environment.depth.belowTransducer"]
+            .into_iter()
+            .find_map(|p| {
+                let r = self.fleet.own.get(p)?;
+                (!r.is_stale()).then(|| r.number()).flatten()
+            })
+    }
+
+    /// Man overboard: mark where the boat is now (the last known position if
+    /// the fix is stale, nothing if there has never been one), ring, and
+    /// keep the boat on screen.
+    pub fn mark_mob(&mut self) {
+        let at = self.own_fix().map(|(at, _)| at);
+        let now = Instant::now();
+        self.mob = Some((at, now));
+        let when = chrono::Local::now().format("%H:%M:%S");
+        // Marking again is a new man overboard: ring even if the last was
+        // silenced.
+        self.alarms.set(crate::nav::alarms::AlarmKey::ManOverboard, None, now);
+        self.alarms.set(
+            crate::nav::alarms::AlarmKey::ManOverboard,
+            Some(match at {
+                Some(p) => format!("marked at {when}, {}", crate::geo::format_latlon(p.lat, p.lon)),
+                None => format!("marked at {when} — no position fix"),
+            }),
+            now,
+        );
+        if at.is_some() {
+            self.set_follow(true);
+        }
+        self.needs_redraw = true;
+    }
+
+    /// The watch, once a frame: decide every alarm from the boat's state,
+    /// sound the ones ringing, and record the track.
+    fn update_watch(&mut self) {
+        use crate::nav::alarms::{self, AlarmKey};
+        let now = Instant::now();
+        let Some(ui) = self.ui.as_ref() else { return };
+        let (sound, depth_alarm, depth_limit, record) = (
+            ui.safety.sound,
+            ui.safety.depth_alarm,
+            ui.safety.depth_alarm_m as f64,
+            ui.safety.record_track,
+        );
+        let cpa = crate::render::ui_ais::CpaAlarm {
+            distance_m: ui.instruments.cpa_alarm_nm * 1852.0,
+            seconds: ui.instruments.tcpa_alarm_min * 60.0,
+        };
+        let fix = self.own_fix();
+
+        // NAVCORE_MOB=1 presses MOB once the boat has a fix — for captures.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static PRESSED: AtomicBool = AtomicBool::new(false);
+            if fix.is_some()
+                && std::env::var_os("NAVCORE_MOB").is_some()
+                && !PRESSED.swap(true, Ordering::Relaxed)
+            {
+                self.mark_mob();
+            }
+        }
+
+        if let Some((anchor, radius)) = self.anchor_watch {
+            self.alarms.set(AlarmKey::Anchor, alarms::anchor_check(anchor, radius, fix), now);
+        }
+        let depth = if depth_alarm { alarms::depth_check(self.depth_under_boat(), depth_limit) } else { None };
+        self.alarms.set(AlarmKey::Depth, depth, now);
+
+        // Collision: every target the CPA rule calls dangerous, whether or
+        // not AIS is drawn — hiding the targets must not hide the danger.
+        let dangerous = self
+            .ais_targets()
+            .into_iter()
+            .filter(|t| !t.lost && cpa.triggered_by(t.cpa))
+            .map(|t| {
+                let (d, s) = t.cpa.unwrap_or_default();
+                let name = t.label.clone().unwrap_or_else(|| "unnamed vessel".into());
+                (t.id, format!("{name} — {:.2} NM in {:.0} min", d / 1852.0, s / 60.0))
+            })
+            .collect();
+        self.alarms.set_collisions(dangerous, now);
+
+        if sound && self.alarms.due(now) {
+            crate::sound::alarm();
+        }
+
+        // The track.
+        if record {
+            if let Some((at, true)) = fix {
+                let track = self.track.get_or_insert_with(|| {
+                    let dir = std::env::var("NAVCORE_TRACKS")
+                        .map(std::path::PathBuf::from)
+                        .ok()
+                        .or_else(crate::nav::track::default_dir)
+                        .unwrap_or_else(|| std::path::PathBuf::from("tracks"));
+                    crate::nav::track::Track::new(&dir, chrono::Utc::now())
+                });
+                if track.offer(at, chrono::Utc::now(), now) {
+                    self.needs_redraw = true;
+                }
+            }
+        }
+        if let Some(ref mut t) = self.track {
+            // Turned off: the file is brought up to date at once.
+            t.save_if_due(now, !record);
+        }
+    }
+
+    /// The watch as the UI draws it.
+    fn watch_views(
+        &self,
+    ) -> (
+        Vec<crate::render::ui_safety::AlarmLine>,
+        Option<crate::render::ui_safety::MobView>,
+        Option<crate::render::ui_safety::AnchorView>,
+        crate::render::ui_safety::TrackView,
+    ) {
+        use crate::render::ui_safety::{AlarmLine, AnchorView, MobView, TrackView};
+        let ppp = self.scale_factor.max(0.01);
+        let project = |p: crate::geo::LatLon| {
+            let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+            let s = self.camera.world_to_screen(x, y);
+            [s.x / ppp, s.y / ppp]
+        };
+        let alarms = self
+            .alarms
+            .iter()
+            .map(|(k, a)| AlarmLine { title: k.title(), message: a.message.clone(), acknowledged: a.acknowledged })
+            .collect();
+        let fix = self.own_fix();
+        let mob = self.mob.map(|(at, since)| {
+            let way = at.zip(fix).map(|(m, (own, _))| crate::geo::range_bearing(own, m));
+            MobView {
+                screen: at.map(project),
+                bearing_deg: way.map(|(_, b)| b.to_degrees().rem_euclid(360.0)),
+                distance_m: way.map(|(d, _)| d),
+                elapsed_s: since.elapsed().as_secs(),
+                own_screen: fix.map(|(p, _)| project(p)),
+            }
+        });
+        let anchor = self.anchor_watch.map(|(at, radius)| {
+            // Mercator metres per ground metre, then physical pixels, then
+            // logical points.
+            let stretch = 1.0 / at.lat.to_radians().cos();
+            AnchorView {
+                screen: project(at),
+                radius_px: (radius * stretch / self.camera.zoom as f64 / ppp as f64) as f32,
+                radius_m: radius as f32,
+                distance_m: fix.filter(|(_, fresh)| *fresh).map(|(p, _)| crate::geo::distance_m(at, p)),
+            }
+        });
+        let track = self
+            .track
+            .as_ref()
+            .map(|t| TrackView {
+                screen: t.points.iter().map(|p| project(p.at)).collect(),
+                points: t.points.len(),
+                distance_nm: t.distance_nm(),
+                file: Some(t.file.display().to_string()),
+            })
+            .unwrap_or_default();
+        (alarms, mob, anchor, track)
+    }
+
+    /// Something on watch needs the clock: a ringing alarm, the MOB timer,
+    /// the anchor watch (it must notice the fix going stale).
+    pub fn watch_active(&self) -> bool {
+        !self.alarms.is_empty() || self.mob.is_some() || self.anchor_watch.is_some()
     }
 
     pub(crate) fn load_boat_settings() -> crate::render::ui::BoatView {
@@ -5317,6 +5572,7 @@ impl RenderState {
                 });
 
                 Some(crate::render::ui_ais::AisTarget {
+                    id: target.context.clone(),
                     screen: [screen.x / ppp, screen.y / ppp],
                     heading: target.heading().map(|h| (h - turn) as f32),
                     cog: target.course().map(|c| (c - turn) as f32),

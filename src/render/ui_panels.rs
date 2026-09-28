@@ -25,6 +25,7 @@ pub fn build(
     sheet: &mut crate::render::ui_weather::SheetView,
     display: &mut crate::render::ui::DisplayView,
     free: &mut crate::render::ui::FreeChartsView,
+    safety: &mut crate::render::ui_safety::SafetyView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -48,6 +49,7 @@ pub fn build(
     }
     super::ui_routes::draw_overlay(ctx, &state.routes);
     draw_plan_pins(ctx, &state.plan_pins);
+    super::ui_safety::draw_on_chart(ctx, &state.track, state.anchor.as_ref(), state.mob.as_ref());
     if instruments.show_ais {
         super::ui_ais::draw(
             ctx,
@@ -63,7 +65,7 @@ pub fn build(
         super::ui_ownship::draw(ctx, ship);
     }
 
-    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, actions);
+    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, safety, actions);
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
@@ -96,6 +98,15 @@ pub fn build(
     if display.open {
         display_window(ctx, display, boat.draft_m, actions);
     }
+    if safety.open {
+        let watch = super::ui_safety::WatchState {
+            anchor: state.anchor.as_ref(),
+            has_fix: state.own_ship.as_ref().is_some_and(|s| !s.stale),
+            depth_m: state.depth_m,
+            track: &state.track,
+        };
+        super::ui_safety::window(ctx, safety, instruments, &watch, actions);
+    }
     // Last, over the chart area the panels have left: what a chart tap will
     // do right now, and the way back to following the boat.
     tap_mode_chip(ctx, plan);
@@ -107,6 +118,16 @@ pub fn build(
         state.own_ship.is_some(),
         actions,
     );
+    super::ui_safety::mob_button(ctx, state.mob.is_some(), actions);
+    if let Some(ref mob) = state.mob {
+        super::ui_safety::mob_panel(ctx, mob, safety, actions);
+    } else {
+        safety.mob_clear_armed = false;
+    }
+    super::ui_safety::guide(ctx, safety);
+    super::ui_safety::banner(ctx, &state.alarms, actions);
+    // Over everything, first start: nothing else is usable until it is read.
+    super::ui_safety::notice(ctx, safety, actions);
 }
 
 /// How the chart is drawn: palette, safety depth, detail.
@@ -427,6 +448,7 @@ fn menu_bar(
     display: &mut crate::render::ui::DisplayView,
     sheet: &crate::render::ui_weather::SheetView,
     weather: &mut crate::render::ui::WeatherView,
+    safety: &mut crate::render::ui_safety::SafetyView,
     actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -475,6 +497,13 @@ fn menu_bar(
                 .clicked()
             {
                 actions.push(UiAction::WeatherSheetToggle);
+            }
+            if ui
+                .selectable_label(safety.open, "Safety")
+                .on_hover_text("Alarms, anchor watch, track, and the man overboard guide")
+                .clicked()
+            {
+                safety.open = !safety.open;
             }
             ui.separator();
 

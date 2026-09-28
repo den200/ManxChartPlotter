@@ -22,6 +22,8 @@ use egui::{Align2, Color32, Context, FontId, Pos2, Stroke, Vec2};
 /// One target, resolved by the renderer which owns the camera.
 #[derive(Debug, Clone)]
 pub struct AisTarget {
+    /// Its Signal K context: which vessel, for the collision alarm.
+    pub id: String,
     pub screen: [f32; 2],
     /// Hull orientation, radians clockwise from screen-up (north, when
     /// north-up).
@@ -49,7 +51,7 @@ impl CpaAlarm {
     /// Both conditions, and the approach still ahead of us. Near-but-in-an-hour
     /// is not a threat, and neither is soon-but-a-mile-off; sounding on either
     /// alone is how a warning stops being read.
-    fn triggered_by(&self, cpa: Option<(f32, f32)>) -> bool {
+    pub fn triggered_by(&self, cpa: Option<(f32, f32)>) -> bool {
         cpa.is_some_and(|(d, t)| d < self.distance_m && t < self.seconds && t > 0.0)
     }
 }
@@ -175,6 +177,7 @@ mod tests {
 
     fn target() -> AisTarget {
         AisTarget {
+            id: String::new(),
             screen: [100.0, 100.0],
             heading: Some(0.0),
             cog: Some(0.0),

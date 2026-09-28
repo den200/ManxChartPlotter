@@ -2242,6 +2242,13 @@ impl ApplicationHandler for App {
                     std::time::Instant::now() + std::time::Duration::from_millis(150),
                 ));
                 state.window().request_redraw();
+            } else if state.watch_active() {
+                // An alarm, a man overboard or an anchor watch keeps time
+                // on its own: twice a second, data or no data.
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    std::time::Instant::now() + std::time::Duration::from_millis(500),
+                ));
+                state.window().request_redraw();
             } else if state.signalk_live() {
                 // Live data arrives on its own schedule, not the user's.
                 // Four frames a second is enough for a plotter and cheap.

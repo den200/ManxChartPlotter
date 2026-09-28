@@ -57,6 +57,7 @@ pub mod mariner;
 pub mod ui_ais;
 pub mod ui_boat;
 pub mod ui_ownship;
+pub mod ui_safety;
 mod ui_panels;
 pub mod ui_routes;
 pub mod ui_batch;

@@ -19,6 +19,7 @@
 //! Nothing in here draws. The chart rendering of routes is a separate task
 //! that consumes this data model, which is exactly how the spec scopes it.
 
+pub mod alarms;
 pub mod angles;
 pub mod autoroute;
 pub mod currents;
@@ -32,6 +33,7 @@ pub mod polar;
 pub mod wxroute;
 pub mod model;
 pub mod store;
+pub mod track;
 
 pub use model::{Leg, LegKind, LegPlan, Route, RouteProvenance, RoutingConfig, Waypoint, WaypointSet};
 pub use follow::{FollowConfig, Following, Guidance};

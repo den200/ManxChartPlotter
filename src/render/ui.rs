@@ -19,6 +19,20 @@ use egui_wgpu::ScreenDescriptor;
 /// into the camera or the tile cache.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
+    /// The Safety window's settings (or the notice) changed: save them.
+    SafetyChanged,
+    /// Silence every ringing alarm.
+    AlarmsSilence,
+    /// Man overboard: mark the boat's position now.
+    MobMark,
+    /// The person is back aboard.
+    MobClear,
+    /// Start the anchor watch round the boat's position now.
+    AnchorDrop,
+    /// Stop the anchor watch.
+    AnchorUp,
+    /// Close the track so far and start another.
+    TrackNew,
     /// Close the object-query bubble.
     DismissPick,
     /// The display settings changed: re-apply them and save.
@@ -822,6 +836,13 @@ pub struct UiState<'a> {
     /// Where the sheet's point forecast was taken, projected. `None` when
     /// there is none, or when it has panned off the screen.
     pub weather_anchor: Option<[f32; 2]>,
+    /// Raised alarms, man overboard first.
+    pub alarms: Vec<super::ui_safety::AlarmLine>,
+    pub mob: Option<super::ui_safety::MobView>,
+    pub anchor: Option<super::ui_safety::AnchorView>,
+    pub track: super::ui_safety::TrackView,
+    /// Depth under the boat now, if the sounder is heard.
+    pub depth_m: Option<f64>,
 }
 
 pub struct Ui {
@@ -853,6 +874,8 @@ pub struct Ui {
     pub sheet: super::ui_weather::SheetView,
     pub display: DisplayView,
     pub free: FreeChartsView,
+    /// The notice, alarms, man overboard, anchor watch and track.
+    pub safety: super::ui_safety::SafetyView,
 }
 
 impl Ui {
@@ -893,6 +916,7 @@ impl Ui {
             sheet: Default::default(),
             display: crate::render::state::RenderState::load_display_settings(),
             free: FreeChartsView::default(),
+            safety: crate::render::state::RenderState::load_safety_settings(),
         }
     }
 
@@ -1012,10 +1036,11 @@ impl Ui {
         let sheet = &mut self.sheet;
         let display = &mut self.display;
         let free = &mut self.free;
+        let safety = &mut self.safety;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
                 ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
-                display, free, fleet, actions,
+                display, free, safety, fleet, actions,
             );
         });
         #[cfg(target_os = "android")]

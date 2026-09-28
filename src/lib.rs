@@ -32,6 +32,7 @@ pub mod pick;
 pub mod render;
 pub mod shop;
 pub mod signalk;
+pub mod sound;
 pub mod s52;
 pub mod s57;
 pub mod senc;
