@@ -177,11 +177,11 @@ pub fn corridor(
     let start_plain =
         grid::nudge(&grid, start_cell, &loose, reach).ok_or(PlanError::EndpointBuried { which: "start" })?;
     let (start_free, goal_free) = {
-        let goal_water = grid.component(goal_plain);
+        let goal_water = grid.component(goal_plain, false);
         match grid::nudge_into(&grid, start_cell, &loose, reach, Some(&goal_water)) {
             Some(s) => (s, goal_plain),
             None => {
-                let start_water = grid.component(start_plain);
+                let start_water = grid.component(start_plain, false);
                 match grid::nudge_into(&grid, goal_cell, &loose, reach, Some(&start_water)) {
                     Some(g) => (start_plain, g),
                     // Neither end reaches the other's water within a mile:
@@ -220,6 +220,7 @@ pub fn corridor(
         taper_m: reach,
         gates: grid.gates.clone(),
         gate_taper_m: GATE_TAPER_NM * nm,
+        loose: false,
     };
 
     let path = match grid::find_path(&grid, start_free, goal_free, &params) {
