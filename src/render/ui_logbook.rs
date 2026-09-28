@@ -339,10 +339,10 @@ fn detail(
     ui.add_space(8.0);
     ui.horizontal(|ui| {
         ui.label("Export");
-        if ui.button("GPX").on_hover_text("The track and the notes, for another plotter").clicked() {
+        if ui.button("GPX").on_hover_text("The track and the notes, for another plotter — saved to Downloads (on Android, then shared)").clicked() {
             actions.push(UiAction::LogExport { day: d.row.day, csv: false });
         }
-        if ui.button("CSV").on_hover_text("Every sample, for a spreadsheet").clicked() {
+        if ui.button("CSV").on_hover_text("Every sample, for a spreadsheet — saved to Downloads (on Android, then shared)").clicked() {
             actions.push(UiAction::LogExport { day: d.row.day, csv: true });
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

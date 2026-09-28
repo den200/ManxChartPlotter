@@ -315,15 +315,19 @@ impl RouteStore {
         Ok((n_routes, doc.loose.len()))
     }
 
-    /// Write one route to an external path, for handing to another program.
-    pub fn export_route(&self, id: Uuid, to: &Path) -> Result<(), StoreError> {
+    /// One route as GPX, exactly as the store keeps it.
+    pub fn route_gpx(&self, id: Uuid) -> Result<String, StoreError> {
         let stored = self
             .routes
             .iter()
             .find(|s| s.route.id == id)
             .ok_or(StoreError::UnknownRoute(id))?;
-        let xml = gpx::write_route(&stored.route, &self.waypoints, &stored.root_attrs);
-        atomic_write(to, xml.as_bytes())?;
+        Ok(gpx::write_route(&stored.route, &self.waypoints, &stored.root_attrs))
+    }
+
+    /// Write one route to an external path, for handing to another program.
+    pub fn export_route(&self, id: Uuid, to: &Path) -> Result<(), StoreError> {
+        atomic_write(to, self.route_gpx(id)?.as_bytes())?;
         Ok(())
     }
 

@@ -479,7 +479,7 @@ pub fn window(
                                 }
                                 if ui
                                     .button("Export")
-                                    .on_hover_text("Save as a GPX file in Downloads, for another plotter")
+                                    .on_hover_text("Save as a GPX file in Downloads, for another plotter (on Android, then share it)")
                                     .clicked()
                                 {
                                     actions.push(UiAction::RouteExport { route_id: row.id });

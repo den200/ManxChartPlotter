@@ -3036,32 +3036,19 @@ impl RenderState {
                 }
                 crate::render::ui::UiAction::RouteExport { route_id } => {
                     self.ensure_route_store();
-                    let dir = crate::nav::logbook::export_dir();
-                    let name = self
-                        .route_store
-                        .as_ref()
+                    let store = self.route_store.as_ref();
+                    let name = store
                         .and_then(|s| s.route(route_id))
-                        .map(|r| r.name.clone())
-                        .unwrap_or_else(|| "route".into());
-                    let file: String = name
-                        .chars()
-                        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' })
-                        .collect();
-                    let path = dir.join(format!("{file}.gpx"));
-                    let result = std::fs::create_dir_all(&dir)
-                        .map_err(|e| e.to_string())
-                        .and_then(|_| {
-                            self.route_store
-                                .as_ref()
-                                .ok_or_else(|| "no route store".to_string())?
-                                .export_route(route_id, &path)
-                                .map_err(|e| e.to_string())
-                        });
+                        .map(|r| crate::export::file_name(&r.name, "gpx"))
+                        .unwrap_or_else(|| "route.gpx".into());
+                    let status = match store.map(|s| s.route_gpx(route_id)) {
+                        Some(Ok(xml)) => crate::export::save(&name, "application/gpx+xml", xml.as_bytes())
+                            .unwrap_or_else(|e| e),
+                        Some(Err(e)) => format!("Could not export {name}: {e}"),
+                        None => "No route store".into(),
+                    };
                     if let Some(ref mut ui) = self.ui {
-                        ui.routes.status = match result {
-                            Ok(()) => format!("Saved {}", path.display()),
-                            Err(e) => format!("Could not save {}: {e}", path.display()),
-                        };
+                        ui.routes.status = status;
                     }
                 }
                 crate::render::ui::UiAction::RoutePublish { route_id } => {
@@ -5212,13 +5199,10 @@ impl RenderState {
         } else {
             (logbook::to_gpx(day, &samples, &logbook::read_notes(&dir, day)), "gpx")
         };
-        let out_dir = logbook::export_dir();
-        let path = out_dir.join(format!("navcore-log-{day}.{ext}"));
-        let written = std::fs::create_dir_all(&out_dir).and_then(|_| std::fs::write(&path, text));
-        self.log_state.message = Some(match written {
-            Ok(()) => format!("Saved {}", path.display()),
-            Err(e) => format!("Could not save {}: {e}", path.display()),
-        });
+        let mime = if csv { "text/csv" } else { "application/gpx+xml" };
+        let name = format!("navcore-log-{day}.{ext}");
+        self.log_state.message =
+            Some(crate::export::save(&name, mime, text.as_bytes()).unwrap_or_else(|e| e));
     }
 
     /// The logbook for the UI: the open day's track and notes on the chart,
