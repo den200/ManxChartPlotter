@@ -4781,6 +4781,9 @@ impl RenderState {
         // settings-level ones.
         if let Some(ref mut ui) = self.ui {
             for open in [
+                &mut ui.safety.guide_open,
+                &mut ui.logbook.open,
+                &mut ui.safety.open,
                 &mut ui.display.open,
                 &mut ui.boat.open,
                 &mut ui.routes.open,
