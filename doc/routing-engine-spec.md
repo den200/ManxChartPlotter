@@ -462,3 +462,19 @@ Each milestone is independently shippable (KISS, no stubs) with a definition of 
 - **Buoyage-based channel following is low-ROI and rarely implemented** by real routers; recommend soft-cost fairway preference over full IALA correctness.
 - **Rule 10 crossing angle is defined through-the-water, not over-ground**; an over-ground router models it approximately — a genuine design compromise to document.
 - **Anisotropic FMM for sailboat polars is materially harder** than the isotropic FMM in the literature; the "under a minute" globally-optimal results cited are for near-isotropic ship-speed models on a workstation, not a Pi with a concave sailing polar — don't assume that performance transfers.
+
+---
+
+## NavCore implementation notes — where the code departs from this spec
+
+*Added 2026-09-28. The spec above is the original hand-off, unedited; these are the deliberate differences, each with its reason. Code: `src/nav/autoroute/`.*
+
+| Spec | NavCore | Why |
+| --- | --- | --- |
+| §4.9 R-tree (`rstar`) over SENC features for segment tests | Not built; segments are tested by supercover traversal of the same raster the charts were stamped onto | A separate feature index would disagree with the quilt (finer charts overwrite coarser inside their coverage) exactly where quilting matters |
+| §4.9 "tiles + adaptive resolution" | Two levels: a 20 m coarse grid over the whole passage box, read *loosely* (only hazard cell centres count) to pick the way; a 10 m fine grid held in 64×64-cell tiles only within 1 nm of that way, read *strictly*, finds the route. Where the fine grid finds no way, the coarse cells along the way that hold no fine water are closed and the coarse pass picks again (up to 6 times) | A strict raster erodes both shores of a channel by up to a cell, so channels narrower than 2–3 cells close; a fine grid over the whole box does not fit on a Pi. The route always comes from the strict fine search, so the two levels never make it less safe than one |
+| §3.1, §6.3 `offing_min = 0.2 nm` hard | 0.005 nm hard floor; 0.2 nm is a steep cost (up to 4×) the route gives up only where the water is narrower; 0.5 nm a gentle one | A dredged channel can be 30–50 m wide (Nibe Bredning, west of Aalborg); a 0.2 nm floor closes every harbour approach and most Danish sounds |
+| §6.6 nudge endpoints offshore | The offing floor and costs fade to nothing within 1 nm of each end | A berth is inside every offing by definition |
+| §4.6 bridges by `VERCLR` only | Opening bridges (`CATBRG` 2, 3, 4, 5, 7) whose closed clearance is too low are *gates*: passable at a soft cost, the opening span carved open after every chart is stamped, as its box stretched 1.5 cells up and down the channel, with the offing faded within 0.2 nm | A 30 m bascule opening is a single cell, and the fixed spans and fenders either side are stamped over it (the Limfjord at Aalborg was unreachable). The carve opens cells that `SLCONS` fenders touched, only inside that box — a deliberate exception to §4.1. Opening *schedules* would fit §5.4's time-window gates; not modelled yet |
+| §4.1 `CTNARE` soft cost | No cost; the route warns when it crosses a caution, restricted or exercise area | Caution areas are notes to the skipper (NOAA wraps whole bays in them) |
+| §6.3 isochrones everywhere | Isochrones on open water only; confined water follows the grid corridor | Π₆: a 5° heading fan at sailing time steps steps straight over a 0.2 nm channel |

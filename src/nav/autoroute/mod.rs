@@ -120,6 +120,16 @@ const ENDPOINT_REACH_NM: f64 = 1.0;
 /// walls and the approach, a couple of cable lengths.
 const GATE_TAPER_NM: f64 = 0.2;
 
+/// Half the width of the fine corridor round the coarse pass's way. A mile:
+/// room for the offing to push the route off a shore the way hugs, and the
+/// tile rounding adds more.
+const CORRIDOR_NM: f64 = 1.0;
+
+/// How many times the coarse pass may be sent round a place the fine grid
+/// found closed, and how many coarse cells round it are closed each time.
+const REPAIRS: usize = 6;
+const REPAIR_RADIUS: i64 = 2;
+
 /// Find the corridor. `margin_factor` sizes the search box as a fraction of
 /// the passage's span on every side; the callers try a small box first and
 /// widen it when the way round lies outside (a peninsula, an island group).
@@ -144,56 +154,185 @@ pub fn corridor(
     let mid_lat = ((start.lat + finish.lat) / 2.0).to_radians();
     let k = 1.0 / mid_lat.cos();
     let (min, max) = passage_box(a, b, k, margin_factor);
-    let grid = build_hazard_grid(sources, min, max, safety, k);
-    // NAVCORE_ROUTE_DEBUG=<file.png>: the grid as the search sees it.
+    let mut coarse = build_hazard_grid(sources, min, max, safety, k);
+    // NAVCORE_ROUTE_DEBUG=<file.png>: the coarse grid as the search sees it.
     let debug_png = std::env::var("NAVCORE_ROUTE_DEBUG").ok();
     if let Some(ref out) = debug_png {
-        grid.debug_png(&[a, b], std::path::Path::new(out), 1600);
+        coarse.debug_png(&[a, b], std::path::Path::new(out), 1600);
     }
 
     let nm = METRES_PER_NM * k;
     let reach = ENDPOINT_REACH_NM * nm;
-    let mut warnings = Vec::new();
 
-    // An end on the hard — a pontoon, a quay, water the chart gives less
-    // depth than the boat needs — moves to the nearest water that is not.
-    // And that water must connect to the other end: the nearest water to a
-    // point on Refshaleøen is an inner basin behind fixed bridges, and a
-    // start snapped into it can never leave. So one end is freed first, its
-    // connected water found, and the other end freed into that.
-    let loose = SearchParams::fixed(0.0, 0.0);
-    let start_cell = grid.cell_of(a).ok_or(PlanError::OffGrid)?;
-    let goal_cell = grid.cell_of(b).ok_or(PlanError::OffGrid)?;
+    let zero = SearchParams::fixed(0.0, 0.0);
+    let start_cell = coarse.cell_of(a).ok_or(PlanError::OffGrid)?;
+    let goal_cell = coarse.cell_of(b).ok_or(PlanError::OffGrid)?;
     for (which, cell) in [("start", start_cell), ("finish", goal_cell)] {
-        if !grid.is_covered(cell.0, cell.1)
-            && grid::nudge(&grid, cell, &loose, reach)
-                .is_none_or(|c| !grid.is_covered(c.0, c.1))
+        if !coarse.is_covered(cell.0, cell.1)
+            && grid::nudge(&coarse, cell, &zero, reach)
+                .is_none_or(|c| !coarse.is_covered(c.0, c.1))
         {
             return Err(PlanError::Uncharted { which });
         }
     }
-    let goal_plain =
-        grid::nudge(&grid, goal_cell, &loose, reach).ok_or(PlanError::EndpointBuried { which: "finish" })?;
-    let start_plain =
-        grid::nudge(&grid, start_cell, &loose, reach).ok_or(PlanError::EndpointBuried { which: "start" })?;
-    let (start_free, goal_free) = {
-        let goal_water = grid.component(goal_plain, false);
-        match grid::nudge_into(&grid, start_cell, &loose, reach, Some(&goal_water)) {
-            Some(s) => (s, goal_plain),
-            None => {
-                let start_water = grid.component(start_plain, false);
-                match grid::nudge_into(&grid, goal_cell, &loose, reach, Some(&start_water)) {
-                    Some(g) => (start_plain, g),
-                    // Neither end reaches the other's water within a mile:
-                    // a wider box may join them round the outside.
-                    None => return Err(PlanError::Disconnected),
+
+    // Two levels (spec §4.9, "tiles + adaptive resolution"). The coarse
+    // grid covers the whole box but, stamped conservatively, closes any
+    // channel narrower than two or three of its cells — and a fine grid over
+    // the whole box would not fit in memory. So the coarse grid's *loose*
+    // raster, where only a hazard's cell centres count, picks the way; a
+    // fine grid held only along that way finds the route, under the strict
+    // rules. Where the fine grid cannot get through, the coarse pass is told
+    // so and picks again.
+    for attempt in 0..=REPAIRS {
+        let (cs, cg) = free_ends(&coarse, start_cell, goal_cell, reach, true)?;
+        let way_params = SearchParams {
+            offing_hard_m: 0.0,
+            offing_min_m: safety.offing_min_nm * nm,
+            offing_soft_m: safety.offing_soft_nm * nm,
+            ends: vec![a, b],
+            taper_m: reach,
+            gates: coarse.gates.clone(),
+            gate_taper_m: GATE_TAPER_NM * nm,
+            loose: true,
+        };
+        let way = match grid::find_path(&coarse, cs, cg, &way_params) {
+            Ok(p) => p,
+            Err(SearchError::Cancelled) => return Err(PlanError::Cancelled),
+            Err(_) => return Err(PlanError::Unreachable),
+        };
+
+        let mut along: Vec<[f64; 2]> = way.iter().map(|&(x, y)| coarse.centre(x, y)).collect();
+        along.extend([a, b]);
+        let mut fine = Grid::corridor(min, max, safety.fine_res_m * k, &along, CORRIDOR_NM * nm);
+        stamp_hazards(&mut fine, sources, safety);
+
+        match fine_route(&fine, a, b, reach, nm, k, safety) {
+            Ok((points, params, mut warnings)) => {
+                if let Some(ref out) = debug_png {
+                    coarse.debug_png(&points, std::path::Path::new(out), 1600);
+                    // NAVCORE_ROUTE_DEBUG_AT=lat,lon: the fine grid there,
+                    // a cell a pixel, beside the whole-box picture.
+                    let at = std::env::var("NAVCORE_ROUTE_DEBUG_AT").ok().and_then(|v| {
+                        let (lat, lon) = v.split_once(',')?;
+                        Some(merc(LatLon::new(lat.trim().parse().ok()?, lon.trim().parse().ok()?)))
+                    });
+                    if let Some(at) = at {
+                        let out = std::path::Path::new(out).with_extension("fine.png");
+                        fine.debug_png_at(&points, at, 200, &out);
+                    }
                 }
+                if points.windows(2).any(|w| fine.segment_touches_soft(w[0], w[1])) {
+                    warnings.push(CAUTION_AREA_NOTE.into());
+                }
+                let to_latlon = |p: [f64; 2]| {
+                    let (lat, lon) = Projection::to_wgs84(p[0], p[1]);
+                    LatLon::new(lat, lon)
+                };
+                let (start_at, finish_at) =
+                    (to_latlon(points[0]), to_latlon(points[points.len() - 1]));
+                return Ok(Corridor {
+                    grid: coarse,
+                    k,
+                    params,
+                    points,
+                    start: start_at,
+                    finish: finish_at,
+                    warnings,
+                });
+            }
+            Err(FineError::Plan(e)) => return Err(e),
+            Err(FineError::Blocked { from }) => {
+                // Teach the coarse pass what the fine grid knows along the
+                // way: a coarse cell holding no fine water at all — a
+                // pontoon, a quay, a wall thinner than a coarse cell — is
+                // closed. Failing that, the first cell of the way the
+                // start's fine water does not reach, and a little round it.
+                let mut closed = 0;
+                for &(x, y) in &way {
+                    if !coarse.is_blocked_loose(x, y) && !holds_fine_water(&coarse, &fine, x, y) {
+                        coarse.block_loose(x, y);
+                        closed += 1;
+                    }
+                }
+                if closed == 0 {
+                    let water = fine.component(from, false);
+                    let near_start =
+                        |p: [f64; 2]| (p[0] - a[0]).hypot(p[1] - a[1]) < 3.0 * coarse.res;
+                    let Some(&(bx, by)) = way.iter().find(|&&(x, y)| {
+                        let p = coarse.centre(x, y);
+                        !near_start(p) && fine.cell_of(p).is_none_or(|(fx, fy)| !water.get(fx, fy))
+                    }) else {
+                        return Err(PlanError::Unreachable);
+                    };
+                    for dy in -REPAIR_RADIUS..=REPAIR_RADIUS {
+                        for dx in -REPAIR_RADIUS..=REPAIR_RADIUS {
+                            let (x, y) = (bx as i64 + dx, by as i64 + dy);
+                            if x >= 0 && y >= 0 && (x as usize) < coarse.w && (y as usize) < coarse.h {
+                                coarse.block_loose(x as usize, y as usize);
+                            }
+                        }
+                    }
+                    closed = ((2 * REPAIR_RADIUS + 1) * (2 * REPAIR_RADIUS + 1)) as usize;
+                }
+                log::info!(
+                    "auto-route: attempt {} — the fine grid found no way along the coarse one; \
+                     {closed} coarse cell(s) closed",
+                    attempt + 1
+                );
             }
         }
+    }
+    Err(PlanError::Unreachable)
+}
+
+/// Does any fine cell inside coarse cell `(x, y)` hold water the strict
+/// rules allow?
+fn holds_fine_water(coarse: &Grid, fine: &Grid, x: usize, y: usize) -> bool {
+    let lo = [coarse.origin[0] + x as f64 * coarse.res, coarse.origin[1] + y as f64 * coarse.res];
+    let hi = [lo[0] + coarse.res, lo[1] + coarse.res];
+    let (Some(f0), Some(f1)) = (fine.cell_of(lo), fine.cell_of([hi[0] - 1e-6, hi[1] - 1e-6])) else {
+        return false;
     };
+    (f0.1..=f1.1).any(|fy| (f0.0..=f1.0).any(|fx| !fine.is_blocked(fx, fy)))
+}
+
+/// Why the fine pass gave no route.
+enum FineError {
+    /// The fine water does not join the ends; `from` is the start's fine
+    /// cell, for finding where it stops.
+    Blocked { from: (usize, usize) },
+    /// Anything else, reported as it is.
+    Plan(PlanError),
+}
+
+/// The route on the fine grid, strict rules: the ends freed into connected
+/// water, A* with the offing, pulled taut, every leg re-checked. Returns the
+/// points, the search's parameters, and what should be said about the ends.
+fn fine_route(
+    fine: &Grid,
+    a: [f64; 2],
+    b: [f64; 2],
+    reach: f64,
+    nm: f64,
+    k: f64,
+    safety: &SafetyConfig,
+) -> Result<(Vec<[f64; 2]>, SearchParams, Vec<String>), FineError> {
+    let start_cell = fine.cell_of(a).ok_or(FineError::Plan(PlanError::OffGrid))?;
+    let goal_cell = fine.cell_of(b).ok_or(FineError::Plan(PlanError::OffGrid))?;
+    let (start_free, goal_free) = match free_ends(fine, start_cell, goal_cell, reach, false) {
+        Ok(ends) => ends,
+        Err(PlanError::Disconnected) => {
+            let zero = SearchParams::fixed(0.0, 0.0);
+            let from = grid::nudge(fine, start_cell, &zero, reach).unwrap_or(start_cell);
+            return Err(FineError::Blocked { from });
+        }
+        Err(e) => return Err(FineError::Plan(e)),
+    };
+    let mut warnings = Vec::new();
     for (which, from, to) in [("start", start_cell, start_free), ("finish", goal_cell, goal_free)] {
         if from != to {
-            let why = if grid.is_blocked(from.0, from.1) {
+            let why = if fine.is_blocked(from.0, from.1) {
                 "is on land or in water charted shallower than the boat needs"
             } else {
                 "is in water that does not connect to the rest of the passage \
@@ -202,12 +341,12 @@ pub fn corridor(
             warnings.push(format!(
                 "the {which} {why}; the route {} the nearest water that does, {:.0} m away",
                 if which == "start" { "leaves from" } else { "ends at" },
-                cell_dist_nm(&grid, from, to) * METRES_PER_NM / k
+                cell_dist_nm(fine, from, to) * METRES_PER_NM / k
             ));
         }
     }
-    let a_free = if start_free == start_cell { a } else { grid.centre(start_free.0, start_free.1) };
-    let b_free = if goal_free == goal_cell { b } else { grid.centre(goal_free.0, goal_free.1) };
+    let a_free = if start_free == start_cell { a } else { fine.centre(start_free.0, start_free.1) };
+    let b_free = if goal_free == goal_cell { b } else { fine.centre(goal_free.0, goal_free.1) };
 
     let params = SearchParams {
         // The least water between the hull and anything the chart calls
@@ -218,31 +357,28 @@ pub fn corridor(
         offing_soft_m: safety.offing_soft_nm * nm,
         ends: vec![a_free, b_free],
         taper_m: reach,
-        gates: grid.gates.clone(),
+        gates: fine.gates.clone(),
         gate_taper_m: GATE_TAPER_NM * nm,
         loose: false,
     };
 
-    let path = match grid::find_path(&grid, start_free, goal_free, &params) {
+    let path = match grid::find_path(fine, start_free, goal_free, &params) {
         Ok(p) => p,
         Err(SearchError::Unreachable) | Err(SearchError::OffGrid) => {
-            return Err(PlanError::Unreachable)
+            return Err(FineError::Blocked { from: start_free })
         }
-        Err(SearchError::Cancelled) => return Err(PlanError::Cancelled),
+        Err(SearchError::Cancelled) => return Err(FineError::Plan(PlanError::Cancelled)),
     };
-    let mut points = grid::string_pull(&grid, &path, &params);
+    let mut points = grid::string_pull(fine, &path, &params);
 
     // The ends the user actually asked for, where they are water: the cell
     // centre is up to half a cell off, and a route should end on its mark.
     // Only where the straight line from the exact point is itself clear.
-    if let (Some(first), Some(second)) = (points.first().copied(), points.get(1).copied()) {
-        let _ = first;
-        if start_free == start_cell && grid.segment_clear_by(a, second, &params) {
-            points[0] = a;
-        }
+    if points.len() >= 2 && start_free == start_cell && fine.segment_clear_by(a, points[1], &params) {
+        points[0] = a;
     }
     let n = points.len();
-    if n >= 2 && goal_free == goal_cell && grid.segment_clear_by(points[n - 2], b, &params) {
+    if n >= 2 && goal_free == goal_cell && fine.segment_clear_by(points[n - 2], b, &params) {
         points[n - 1] = b;
     }
 
@@ -250,32 +386,45 @@ pub fn corridor(
     // pull already guarantees this; the check is the standing guard against
     // a future refactor, cheap enough to keep on.
     for w in points.windows(2) {
-        debug_assert!(grid.segment_clear_by(w[0], w[1], &params));
-        if !grid.segment_clear_by(w[0], w[1], &params) {
-            return Err(PlanError::Unreachable);
+        debug_assert!(fine.segment_clear_by(w[0], w[1], &params));
+        if !fine.segment_clear_by(w[0], w[1], &params) {
+            return Err(FineError::Plan(PlanError::Unreachable));
         }
     }
+    Ok((points, params, warnings))
+}
 
-    if let Some(ref out) = debug_png {
-        grid.debug_png(&points, std::path::Path::new(out), 1600);
+/// Free both ends of a passage: an end on the hard — a pontoon, a quay,
+/// water the chart gives less depth than the boat needs — moves to the
+/// nearest water that is not. And that water must connect to the other
+/// end: the nearest water to a point on Refshaleøen is an inner basin behind
+/// fixed bridges, and a start snapped into it can never leave. So one end is
+/// freed first, its connected water found, and the other end freed into
+/// that. `loose`: in the loose raster, for the coarse pass.
+fn free_ends(
+    grid: &Grid,
+    start_cell: (usize, usize),
+    goal_cell: (usize, usize),
+    reach: f64,
+    loose: bool,
+) -> Result<((usize, usize), (usize, usize)), PlanError> {
+    let mut zero = SearchParams::fixed(0.0, 0.0);
+    zero.loose = loose;
+    let goal_plain = grid::nudge(grid, goal_cell, &zero, reach)
+        .ok_or(PlanError::EndpointBuried { which: "finish" })?;
+    let start_plain = grid::nudge(grid, start_cell, &zero, reach)
+        .ok_or(PlanError::EndpointBuried { which: "start" })?;
+    let goal_water = grid.component(goal_plain, loose);
+    if let Some(s) = grid::nudge_into(grid, start_cell, &zero, reach, Some(&goal_water)) {
+        return Ok((s, goal_plain));
     }
-    if points.windows(2).any(|w| grid.segment_touches_soft(w[0], w[1])) {
-        warnings.push(CAUTION_AREA_NOTE.into());
+    let start_water = grid.component(start_plain, loose);
+    match grid::nudge_into(grid, goal_cell, &zero, reach, Some(&start_water)) {
+        Some(g) => Ok((start_plain, g)),
+        // Neither end reaches the other's water within a mile: a wider box
+        // may join them round the outside.
+        None => Err(PlanError::Disconnected),
     }
-    let to_latlon = |p: [f64; 2]| {
-        let (lat, lon) = Projection::to_wgs84(p[0], p[1]);
-        LatLon::new(lat, lon)
-    };
-    let (start_at, finish_at) = (to_latlon(points[0]), to_latlon(points[points.len() - 1]));
-    Ok(Corridor {
-        grid,
-        k,
-        params,
-        points,
-        start: start_at,
-        finish: finish_at,
-        warnings,
-    })
 }
 
 /// The search box: the passage's bounding box grown by `margin_factor` of
@@ -399,6 +548,13 @@ pub fn build_hazard_grid(
     k: f64,
 ) -> Grid {
     let mut grid = Grid::new(min, max, safety.grid_res_m * k);
+    stamp_hazards(&mut grid, sources, safety);
+    grid
+}
+
+/// Quilt every chart onto `grid` — dense or a sparse corridor alike — and
+/// build its distance field.
+fn stamp_hazards(grid: &mut Grid, sources: &[ChartSource<'_>], safety: &SafetyConfig) {
     // Water no chart covers is not water anyone has vouched for. The grid
     // starts closed and each chart opens only its own coverage — so a gap
     // between surveys, or a chart that failed to load, is a wall, never a
@@ -408,7 +564,7 @@ pub fn build_hazard_grid(
     ordered.sort_by(|x, y| y.info.native_scale.cmp(&x.info.native_scale));
     let mut gates = Vec::new();
     for source in &ordered {
-        stamp_chart(&mut grid, source, safety, &mut gates);
+        stamp_chart(grid, source, safety, &mut gates);
     }
     // Opening bridges last, over every chart: the spans either side of an
     // opening (and a finer chart's piers and fenders) are stamped over the
@@ -420,7 +576,6 @@ pub fn build_hazard_grid(
         }
     }
     grid.finalize();
-    grid
 }
 
 /// Rasterize one chart: erase its own coverage, then stamp what it forbids.

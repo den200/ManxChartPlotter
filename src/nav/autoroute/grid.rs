@@ -125,27 +125,44 @@ impl Grid {
     /// A grid covering `min..max` (Mercator metres) at `res`, every tile
     /// held, coarsened if the area demands it.
     pub fn new(min: [f64; 2], max: [f64; 2], res_m: f64) -> Self {
-        Self::build(min, max, res_m, |_, _| true)
+        Self::build(min, max, res_m, |tw, th, _| vec![true; tw * th])
     }
 
-    /// A grid over `min..max` holding only the tiles `want` accepts (given
-    /// each tile's Mercator south-west and north-east corners). Everything
-    /// else is closed. Coarsened, like [`Grid::new`], if the tiles wanted
-    /// hold more than the cell budget.
-    pub fn sparse(
+    /// A grid over `min..max` holding only the tiles within `radius` of
+    /// `points` (Mercator) — a corridor round a route. Everything else is
+    /// closed. Coarsened, like [`Grid::new`], if the corridor holds more
+    /// than the cell budget. `points` must be closer together than a tile.
+    pub fn corridor(
         min: [f64; 2],
         max: [f64; 2],
         res_m: f64,
-        want: impl Fn([f64; 2], [f64; 2]) -> bool,
+        points: &[[f64; 2]],
+        radius: f64,
     ) -> Self {
-        Self::build(min, max, res_m, want)
+        Self::build(min, max, res_m, |tw, th, side| {
+            let mut wanted = vec![false; tw * th];
+            let tile = |v: f64, lo: f64, n: usize| {
+                (((v - lo) / side).floor().max(0.0) as usize).min(n - 1)
+            };
+            for p in points {
+                let (x0, x1) = (tile(p[0] - radius, min[0], tw), tile(p[0] + radius, min[0], tw));
+                let (y0, y1) = (tile(p[1] - radius, min[1], th), tile(p[1] + radius, min[1], th));
+                for ty in y0..=y1 {
+                    for tx in x0..=x1 {
+                        wanted[ty * tw + tx] = true;
+                    }
+                }
+            }
+            wanted
+        })
     }
 
+    /// `want(tw, th, tile side in metres)` says which tiles to hold.
     fn build(
         min: [f64; 2],
         max: [f64; 2],
         res_m: f64,
-        want: impl Fn([f64; 2], [f64; 2]) -> bool,
+        want: impl Fn(usize, usize, f64) -> Vec<bool>,
     ) -> Self {
         let span = [max[0] - min[0], max[1] - min[1]];
         let mut res = res_m.max(1.0);
@@ -153,14 +170,7 @@ impl Grid {
             let w = (span[0] / res).ceil() as usize + 1;
             let h = (span[1] / res).ceil() as usize + 1;
             let (tw, th) = (w.div_ceil(TILE), h.div_ceil(TILE));
-            let side = TILE as f64 * res;
-            let wanted: Vec<bool> = (0..tw * th)
-                .map(|i| {
-                    let (tx, ty) = ((i % tw) as f64, (i / tw) as f64);
-                    let sw = [min[0] + tx * side, min[1] + ty * side];
-                    want(sw, [sw[0] + side, sw[1] + side])
-                })
-                .collect();
+            let wanted = want(tw, th, TILE as f64 * res);
             let held = wanted.iter().filter(|&&k| k).count() * TILE_CELLS;
             // Cell indices travel as u32 through the search.
             if held <= MAX_CELLS && tw * th * TILE_CELLS < u32::MAX as usize {
@@ -349,17 +359,7 @@ impl Grid {
         for py in 0..ih {
             for px in 0..iw {
                 let (x, y) = (px * step, self.h - 1 - py * step);
-                let c = match self.at(x, y) {
-                    None => [110, 110, 110],
-                    Some((t, i)) if !t.covered[i] && t.blocked[i] != 0 => [110, 110, 110],
-                    Some((t, i)) if t.blocked[i] & STRICT != 0 => [20, 20, 20],
-                    Some((t, i)) if t.soft[i] != 0 => [240, 160, 60],
-                    Some((t, i)) => {
-                        let f = (t.dist[i] as f64 / 2_000.0).min(1.0);
-                        [(230.0 - 150.0 * f) as u8, (240.0 - 110.0 * f) as u8, 255]
-                    }
-                };
-                img.put_pixel(px as u32, py as u32, image::Rgb(c));
+                img.put_pixel(px as u32, py as u32, image::Rgb(self.debug_colour(x, y)));
             }
         }
         for w in path.windows(2) {
@@ -377,6 +377,50 @@ impl Grid {
         }
         if let Err(e) = img.save(out) {
             log::warn!("could not write {}: {e}", out.display());
+        }
+    }
+
+    /// [`debug_png`](Self::debug_png) of a `half`-cell window round
+    /// `centre` (Mercator) at one pixel per cell — for looking at a fine
+    /// corridor, which the whole-grid picture shrinks to a hair.
+    pub fn debug_png_at(&self, path: &[[f64; 2]], centre: [f64; 2], half: usize, out: &std::path::Path) {
+        let Some((cx, cy)) = self.cell_of(centre) else { return };
+        let (x0, y0) = (cx.saturating_sub(half), cy.saturating_sub(half));
+        let (x1, y1) = ((cx + half).min(self.w - 1), (cy + half).min(self.h - 1));
+        let (iw, ih) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut img = image::RgbImage::new(iw as u32, ih as u32);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                img.put_pixel((x - x0) as u32, (y1 - y) as u32, image::Rgb(self.debug_colour(x, y)));
+            }
+        }
+        for w in path.windows(2) {
+            let n = ((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) / (self.res * 0.5)).ceil() as usize + 1;
+            for i in 0..=n {
+                let t = i as f64 / n as f64;
+                let p = [w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t];
+                if let Some((x, y)) = self.cell_of(p) {
+                    if (x0..=x1).contains(&x) && (y0..=y1).contains(&y) {
+                        img.put_pixel((x - x0) as u32, (y1 - y) as u32, image::Rgb([230, 30, 30]));
+                    }
+                }
+            }
+        }
+        if let Err(e) = img.save(out) {
+            log::warn!("could not write {}: {e}", out.display());
+        }
+    }
+
+    fn debug_colour(&self, x: usize, y: usize) -> [u8; 3] {
+        match self.at(x, y) {
+            None => [110, 110, 110],
+            Some((t, i)) if !t.covered[i] && t.blocked[i] != 0 => [110, 110, 110],
+            Some((t, i)) if t.blocked[i] & STRICT != 0 => [20, 20, 20],
+            Some((t, i)) if t.soft[i] != 0 => [240, 160, 60],
+            Some((t, i)) => {
+                let f = (t.dist[i] as f64 / 2_000.0).min(1.0);
+                [(230.0 - 150.0 * f) as u8, (240.0 - 110.0 * f) as u8, 255]
+            }
         }
     }
 
@@ -1179,6 +1223,59 @@ mod tests {
         find_path(&grid, west, east, &p).expect("through the opening");
         // And without the fade, the offing alone closes it again.
         assert!(find_path(&grid, west, east, &params()).is_err());
+    }
+
+    /// A 60 m channel at 30° across a 50 m grid: no cell fits between the
+    /// shores, so the strict raster has no channel at all — the old failure
+    /// east of Aalborg. The loose raster keeps a chain of cell centres in
+    /// it, and a 10 m corridor grid along that chain finds the channel open
+    /// under the strict rules.
+    #[test]
+    fn a_channel_the_strict_raster_closes_is_found_loosely_and_passed_finely() {
+        let (sin, cos) = (30f64.to_radians().sin(), 30f64.to_radians().cos());
+        let along = |t: f64, off: f64| [t * cos - off * sin, 1_000.0 + t * sin + off * cos];
+        let shores = |g: &mut Grid| {
+            for (near, far) in [(30.0, 3_000.0), (-30.0, -3_000.0)] {
+                let q = [along(-500.0, near), along(4_000.0, near), along(4_000.0, far), along(-500.0, far)];
+                g.stamp_triangle([q[0], q[1], q[2]], true);
+                g.stamp_triangle([q[0], q[2], q[3]], true);
+            }
+        };
+        let (west, east) = (along(200.0, 0.0), along(3_000.0, 0.0));
+
+        let mut coarse = Grid::new([0.0, 0.0], [3_000.0, 3_000.0], 50.0);
+        shores(&mut coarse);
+        coarse.finalize();
+        // The ends' own cells may have their centres on a shore: freed into
+        // the loose water, as the planner frees them.
+        let mut way_params = SearchParams::fixed(0.0, 0.0);
+        way_params.loose = true;
+        let w = nudge(&coarse, coarse.cell_of(west).unwrap(), &way_params, 100.0).unwrap();
+        let e = nudge(&coarse, coarse.cell_of(east).unwrap(), &way_params, 100.0).unwrap();
+        assert!(coarse.is_blocked(w.0, w.1), "strictly, the channel is shut");
+        assert!(!coarse.component(w, false).get(e.0, e.1));
+        assert!(coarse.component(w, true).get(e.0, e.1), "loosely, it is open");
+        let way = find_path(&coarse, w, e, &way_params).expect("the loose way");
+
+        let along_way: Vec<[f64; 2]> = way.iter().map(|&(x, y)| coarse.centre(x, y)).collect();
+        let mut fine = Grid::corridor([0.0, 0.0], [3_000.0, 3_000.0], 10.0, &along_way, 300.0);
+        shores(&mut fine);
+        fine.finalize();
+        let (fw, fe) = (fine.cell_of(west).unwrap(), fine.cell_of(east).unwrap());
+        let path = find_path(&fine, fw, fe, &SearchParams::fixed(10.0, 10.0)).expect("the fine route");
+        assert!(path.iter().all(|&(x, y)| !fine.is_blocked(x, y)));
+    }
+
+    /// A corridor grid holds the tiles near its points and nothing else, and
+    /// what it does not hold is closed.
+    #[test]
+    fn a_corridor_grid_holds_only_the_way() {
+        let g = Grid::corridor([0.0, 0.0], [10_000.0, 10_000.0], 10.0, &[[500.0, 500.0]], 100.0);
+        let near = g.cell_of([520.0, 480.0]).unwrap();
+        let far = g.cell_of([9_000.0, 9_000.0]).unwrap();
+        assert!(g.holds(near.0, near.1) && !g.is_blocked(near.0, near.1));
+        assert!(!g.holds(far.0, far.1) && g.is_blocked(far.0, far.1));
+        assert_eq!(g.hazard_distance(far.0, far.1), 0.0);
     }
 
     #[test]

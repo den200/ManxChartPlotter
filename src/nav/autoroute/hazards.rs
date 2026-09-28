@@ -20,8 +20,11 @@ pub struct SafetyConfig {
     /// zero means a dinghy.
     pub air_draft_m: f64,
     /// Never closer than this to unsafe water, away from the ends of the
-    /// passage. Small on purpose: a dredged channel is a few hundred metres
-    /// wide, and a floor any larger closes it.
+    /// passage. Small on purpose: a dredged channel can be a few tens of
+    /// metres wide, and a floor any larger closes it. 0.005 nm (9 m): on
+    /// the 10 m fine grid a cell beside a blocked one qualifies, its centre
+    /// at least half a cell from the hazard. 0.01 nm shut the channel over
+    /// Nibe Bredning, west of Aalborg, once the grid was that fine.
     pub offing_hard_nm: f64,
     /// The offing the route keeps wherever the water allows: closer costs
     /// steeply, so it is given up only where the water is narrower.
@@ -29,7 +32,9 @@ pub struct SafetyConfig {
     /// Below this distance the route pays a gently rising cost — prefer sea
     /// room when it is free.
     pub offing_soft_nm: f64,
-    /// Grid cell size. The spec says match the finest channel to transit.
+    /// The coarse grid's cell size, over the whole passage (the fine grid,
+    /// `fine_res_m`, is held only along the way this one picks). The spec
+    /// says match the finest channel to transit.
     /// 20 m: at 60 m Svendborgsund was one or two cells wide and closed, and
     /// at 30 m the dredged channel east of Aalborg — about 100 m, running
     /// diagonally across the grid — came out a one-cell staircase joined
@@ -37,6 +42,11 @@ pub struct SafetyConfig {
     /// cell boundaries. Long passages coarsen the grid themselves to fit its
     /// cell budget.
     pub grid_res_m: f64,
+    /// The fine grid's cell size, in the corridor a route is finally found
+    /// in (see `autoroute::corridor`). 10 m: a 50 m dredged channel keeps
+    /// three cells after both its shores are stamped over the cells they
+    /// touch.
+    pub fine_res_m: f64,
     /// Unsurveyed areas: unsafe by default (decision §10.4).
     pub unsare_navigable: bool,
     /// The LEAST tide height above chart datum expected during the passage,
@@ -54,10 +64,11 @@ impl Default for SafetyConfig {
             ukc_m: 0.5,
             squat_m: 0.0,
             air_draft_m: 20.0,
-            offing_hard_nm: 0.01,
+            offing_hard_nm: 0.005,
             offing_min_nm: 0.2,
             offing_soft_nm: 0.5,
             grid_res_m: 20.0,
+            fine_res_m: 10.0,
             unsare_navigable: false,
             tide_height_min_m: 0.0,
         }
