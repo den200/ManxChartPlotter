@@ -114,6 +114,6 @@ jobs:
             | `linux-arm64` | Raspberry Pi 5, Odroid and other 64-bit ARM Linux |
             | `linux-x86_64` | Linux PCs |
             | `macos-arm64` | Macs with Apple silicon |
-            | `windows-x86_64` | Windows, experimental: free charts only |
+            | `windows-x86_64` | Windows: free charts for now, o-charts not yet |
 
             Unpack and run `manx`. Setup, o-charts and Android: see `INSTALL.md` inside.
