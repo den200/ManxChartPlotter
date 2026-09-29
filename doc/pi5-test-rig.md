@@ -104,6 +104,9 @@ Two env hooks make a hang reproducible without hands on the mouse:
 - `NAVCORE_STRESS=1` pans in a circle and zooms out ~64× and back, every frame.
   `NAVCORE_STRESS=coast` follows the coast from San Diego Bay to LA harbour and
   back at 0.3–8 m/px. Both redraw at 60 fps (~180 V3D jobs/s in `system.csv`).
+- `NAVCORE_WIND=fill` fetches the wind for the starting view and turns on its
+  colour wash. With `NAVCORE_STRESS=1` the view then runs off the forecast,
+  which is how the empty-mesh UI crash (below) was reproduced.
 - `NAVCORE_SKIP=bg,area,pattern,line,sector,symbol,text,label,mariner,stroke,lc`
   leaves those layers out, to bisect a hang by layer (`stroke` and `lc` split
   `line` into plain strokes and LC() symbol lines).
@@ -118,6 +121,12 @@ loop bounded by a uniform (`i < u.lc_count`) hung V3D within seconds under
 Keep shader loops constant-bounded on this GPU. The `Corrupt prim … huge=true`
 warnings seen at the time were a false alarm from a too-tight check in
 `senc/geometry.rs`.
+
+The second crash (2026-09-23, panning DK with the wind wash on) was not the
+GPU: `Buffer slices can not be empty` in egui-wgpu. Where the view had no
+forecast data, the wash was a mesh of corners with no triangles. egui passes
+that on, and wgpu panics on its empty index range. `ui_batch.rs` now never
+hands egui a mesh without triangles.
 - Screenshot of the Pi's screen: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/s.png' && scp rpi5:/tmp/s.png .`
 - Check the outputs: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 wlr-randr'`
 - GPU: V3D through Mesa Vulkan (`vulkaninfo --summary`).
