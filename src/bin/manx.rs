@@ -78,6 +78,21 @@ fn find_install_dir() {
     log::warn!("assets/ not found beside {}; S-52 symbology will be missing", exe.display());
 }
 
+
+/// A first start, with no folder named and none remembered: Manx's own chart
+/// folder, where Free charts and the chart shop put what they fetch. Empty,
+/// it still shows the world map, which is where a new user should start —
+/// not the GPU test triangle, which is what a fresh download used to open to.
+fn first_run_folder() -> ChartSource {
+    match manx::paths::data_dir().map(|d| d.join("charts")) {
+        Some(dir) if std::fs::create_dir_all(&dir).is_ok() => {
+            println!("No charts yet; opening {}", dir.display());
+            ChartSource::Directory(dir)
+        }
+        _ => ChartSource::TestTriangle,
+    }
+}
+
 fn main() {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
@@ -260,7 +275,7 @@ fn main() {
                 println!("Opening the remembered chart folder: {}", dir.display());
                 ChartSource::Directory(dir)
             }
-            None => ChartSource::TestTriangle,
+            None => first_run_folder(),
         },
     };
 
@@ -333,7 +348,7 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
 
     let source = match RenderState::remembered_chart_folder() {
         Some(dir) => ChartSource::Directory(dir),
-        None => ChartSource::TestTriangle,
+        None => first_run_folder(),
     };
     // A plotter is watched, not touched: without this the screen dims and
     // sleeps between taps, with the chart and the depth on it. Android
@@ -2032,6 +2047,13 @@ impl App {
             Ok(c) => {
                 println!("{}", c.summary());
                 c
+            }
+            // No charts yet — a first start, or a folder emptied by hand.
+            // Still a working plotter: the world map (added when the catalogue
+            // is loaded), and the Charts window to fetch some.
+            Err(manx::senc::CatalogError::EmptyDirectory) => {
+                println!("No charts in {} yet; showing the world map", dir.display());
+                ChartCatalog::new()
             }
             Err(e) => {
                 eprintln!("Failed to build catalog: {}", e);
