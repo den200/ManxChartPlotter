@@ -4,6 +4,14 @@ A fast, light chart plotter for the Raspberry Pi, Linux and Android.
 
 ![Manx on the approach to Copenhagen](doc/img/hero.png)
 
+I'm Denis. I own a boat, and I couldn't stop myself geeking around with AI to see if I could build a brand-new chart plotter that runs smoothly on computers like the Raspberry Pi and Odroid. This is the result of about ten months of trial and error. It wouldn't have been possible without projects like [OpenCPN](https://opencpn.org).
+
+## Download
+
+[Latest release](https://github.com/den200/manx/releases/latest): Raspberry Pi and other 64-bit ARM Linux, Linux PCs, macOS (Apple silicon), Android. Windows is experimental.
+
+Unpack and run `manx`. Setup, o-charts and Android: [deploy/INSTALL.md](deploy/INSTALL.md).
+
 ## Why
 
 OpenCPN was too slow for me. Fixing it looked harder than starting over.
@@ -62,7 +70,8 @@ Measured with `MANX_PROFILE=1 MANX_STRESS=coast` and the rig's sampler ([doc/pi5
 - Raspberry Pi 5 (Raspberry Pi OS, Wayland)
 - Linux (x86_64, arm64)
 - Android (arm64, e.g. ODROID-C5)
-- macOS
+- macOS (Apple silicon)
+- Windows: experimental, free charts only for now
 
 ## Build
 

@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "manx"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -1935,7 +1935,7 @@ dependencies = [
 
 [[package]]
 name = "manx-android"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "dirs",
