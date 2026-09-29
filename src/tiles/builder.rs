@@ -303,9 +303,18 @@ impl TilePacket {
             + bg_pattern_bytes;
     }
 
-    /// Check if packet is empty
+    /// Whether the packet draws nothing at all.
+    ///
+    /// Every buffer counts, the background ones included. A tile whose only
+    /// content is a coarser chart's land (the finer chart in it charting
+    /// nothing there) has all of it in `bg_area_vertices`; leaving those out
+    /// marked the tile known-empty, and it showed as a tile-sized square of
+    /// sea cut into the land.
     pub fn is_empty(&self) -> bool {
         self.area_vertices.is_empty()
+            && self.bg_area_vertices.is_empty()
+            && self.pattern_vertices.is_empty()
+            && self.bg_pattern_vertices.is_empty()
             && self.line_batches.is_empty()
             && self.symbol_instances.is_empty()
             && self.text_instances.is_empty()
@@ -452,6 +461,33 @@ impl TileBuilder<'_> {
                 let (min_y, max_y) = (t[0][1].min(t[1][1]).min(t[2][1]), t[0][1].max(t[1][1]).max(t[2][1]));
                 min_x <= bounds.max_x && max_x >= bounds.min_x && min_y <= bounds.max_y && max_y >= bounds.min_y
             })
+    }
+
+    /// Whether the chart's declared coverage fills `rect`.
+    ///
+    /// Sampled on a 17 × 17 lattice, corners included — 1/16 of the rect
+    /// between samples. Wrong in the safe direction only when it errs: a
+    /// sample outside the coverage keeps a coarser chart under this one,
+    /// which costs overdraw, never a hole. A chart that declares no coverage
+    /// is taken at its extent, as the quilt always did.
+    fn coverage_fills(&self, info: &ChartInfo, rect: &TileBounds) -> bool {
+        if rect.max_x <= rect.min_x || rect.max_y <= rect.min_y {
+            return true;
+        }
+        let Ok(chart) = self.load_chart(info) else { return true };
+        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
+        let coverage = self.coverage_for(info.id, &chart, ref_mx, ref_my);
+        if coverage.is_empty() {
+            return true;
+        }
+        const N: usize = 16;
+        (0..=N).all(|i| {
+            let x = rect.min_x + (rect.max_x - rect.min_x) * i as f64 / N as f64;
+            (0..=N).all(|j| {
+                let y = rect.min_y + (rect.max_y - rect.min_y) * j as f64 / N as f64;
+                point_in_any_triangle([x, y], &coverage)
+            })
+        })
     }
 
     /// The chart's coverage tessellation, computed once per chart.
@@ -952,11 +988,13 @@ impl<'a> TileBuilder<'a> {
         // Select charts appropriate to this tile's display scale so zoomed-out
         // tiles don't aggregate the full detail of every overlapping large-scale
         // chart (see ChartCatalog::charts_for_tile_scaled).
-        let tile_scale_denom =
-            super::meters_per_pixel(tile_id.z) * (self.view_ppmm as f64) * 1000.0;
-        let charts = self.catalog.charts_for_tile_where(&bounds, tile_scale_denom, &|info| {
-            self.has_coverage_in(info, &bounds)
-        });
+        let tile_scale_denom = super::tile_scale_denominator(tile_id, self.view_ppmm as f64);
+        let charts = self.catalog.charts_for_tile_where(
+            &bounds,
+            tile_scale_denom,
+            &|info| self.has_coverage_in(info, &bounds),
+            &|info, part| self.coverage_fills(info, part),
+        );
 
         if log::log_enabled!(log::Level::Debug) {
             log::debug!("=== TILE {:?} ===", tile_id);
@@ -1004,8 +1042,23 @@ impl<'a> TileBuilder<'a> {
         let load_start = profile.then(Instant::now);
 
         // Process charts in scale order (small scale first = background)
-        // Skip charts that fail to load - some may have parsing issues
-        for info in charts.into_iter().take(Self::MAX_CHARTS_PER_TILE) {
+        // Skip charts that fail to load - some may have parsing issues.
+        //
+        // Over the cap, the coarsest go, not the finest: the list is ordered
+        // coarse to fine, and taking its head threw away the very charts the
+        // tile was built for. The world basemap, first of all, stays — it
+        // is a handful of polygons and the only land outside the charts.
+        let charts = if charts.len() > Self::MAX_CHARTS_PER_TILE {
+            let (world, rest): (Vec<_>, Vec<_>) = charts
+                .into_iter()
+                .partition(|c| crate::s57::basemap::is_basemap(&c.path));
+            let keep = Self::MAX_CHARTS_PER_TILE.saturating_sub(world.len());
+            let skip = rest.len().saturating_sub(keep);
+            world.into_iter().chain(rest.into_iter().skip(skip)).collect()
+        } else {
+            charts
+        };
+        for info in charts.into_iter() {
             let chart = match self.load_chart(info) {
                 Ok(chart) => Some(chart),
                 Err(e) => {

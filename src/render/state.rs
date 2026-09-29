@@ -3966,9 +3966,8 @@ impl RenderState {
                 // Must match the builder's selection (charts_for_tile_scaled).
                 if let Some(ref catalog) = self.catalog {
                     let tile_bounds = tile_id.bounds();
-                    let tile_scale_denom = crate::tiles::meters_per_pixel(tile_id.z)
-                        * (self.effective_ppmm as f64)
-                        * 1000.0;
+                    let tile_scale_denom =
+                        crate::tiles::tile_scale_denominator(*tile_id, self.effective_ppmm as f64);
                     if catalog
                         .charts_for_tile_scaled(&tile_bounds, tile_scale_denom)
                         .is_empty()

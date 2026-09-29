@@ -207,15 +207,7 @@ impl TileGpuCache {
         }
 
         // Track empty tiles so we don't re-request them every frame.
-        if packet.area_vertices.is_empty()
-            && packet.line_batches.is_empty()
-            && packet.lc_batches.is_empty()
-            && packet.symbol_instances.is_empty()
-            && packet.text_instances.is_empty()
-            && packet.label_candidates.is_empty()
-            && packet.pattern_vertices.is_empty()
-            && packet.sector_instances.is_empty()
-        {
+        if packet.is_empty() {
             log::debug!("  -> empty packet, marking as known-empty");
             self.mark_empty(&key);
             return;
