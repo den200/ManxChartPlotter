@@ -1125,6 +1125,29 @@ impl<'a> TileBuilder<'a> {
             // A chart is "background" when a finer-scale chart shares the tile.
             let is_background = ctx.info.native_scale > finest_scale;
 
+            // Zoomed in past what a 1:50 000 000 outline can honestly show,
+            // the basemap's land is no longer drawn: off Skåne it put the
+            // Swedish coast kilometres out over open water. What is not
+            // covered by a real chart is uncharted, and S-52 says to show it
+            // as such — NODTA, the "no data" grey — so the basemap lays that
+            // under the whole tile instead, and the charts draw over it.
+            if crate::s57::basemap::is_basemap(&ctx.info.path) && tile_scale_denom < NO_DATA_FINER_THAN {
+                if let Some(nodta) = self.s52_engine.and_then(|e| e.get_color_index("NODTA")) {
+                    let vert_start = packet.area_vertices.len();
+                    let pat_start = packet.pattern_vertices.len();
+                    packet.area_vertices.extend(no_data_quad(&bounds, nodta as u32));
+                    all_area_ranges.push((
+                        0,
+                        is_background,
+                        vert_start,
+                        packet.area_vertices.len(),
+                        pat_start,
+                        pat_start,
+                    ));
+                    continue;
+                }
+            }
+
             // Process area features with spatial prefilter
             let area_stats = self.build_areas(
                     &ctx.chart,
@@ -4115,6 +4138,22 @@ fn priority_offsets(prios: impl Iterator<Item = u8>) -> [u32; 11] {
 
 /// A global Mercator point relative to a tile's centre, the frame every
 /// position in a [`TilePacket`] is stored in.
+/// Finer than this display scale (1:N), the world basemap stops drawing its
+/// land and marks everything outside the real charts as "no data" instead.
+/// Natural Earth's 1:50m outline is roughly right at a few million; at a
+/// harbour scale it is kilometres off, and a wrong coast is worse than none.
+pub const NO_DATA_FINER_THAN: f64 = 2_000_000.0;
+
+/// Two triangles covering the whole tile in the given palette colour, at
+/// the lowest display priority, so any chart drawn in the tile covers them.
+/// A hair larger than the tile so neighbouring tiles leave no seam.
+fn no_data_quad(bounds: &TileBounds, color_index: u32) -> [AreaVertex; 6] {
+    let hw = ((bounds.max_x - bounds.min_x) * 0.5 * 1.001) as f32;
+    let hh = ((bounds.max_y - bounds.min_y) * 0.5 * 1.001) as f32;
+    let v = |x: f32, y: f32| AreaVertex { position: [x, y], color_index, disp_prio: 0, shade: 0.0 };
+    [v(-hw, -hh), v(hw, -hh), v(hw, hh), v(-hw, -hh), v(hw, hh), v(-hw, hh)]
+}
+
 pub fn tile_relative(global: [f64; 2], bounds: &TileBounds) -> [f32; 2] {
     let (ox, oy) = bounds.center();
     [(global[0] - ox) as f32, (global[1] - oy) as f32]
@@ -4330,6 +4369,24 @@ mod tests {
     /// re-bases each tile on `TileId::origin`. The two must agree exactly, and
     /// the offset must survive f32 at Danish latitudes to well under a
     /// millimetre — global Mercator in f32 would be 0.5 m out here.
+    #[test]
+    fn the_no_data_quad_covers_the_whole_tile() {
+        let (mx, my) = crate::tiles::latlon_to_mercator(55.9, 12.7);
+        let tile = TileId::from_mercator(mx, my, 12);
+        let b = tile.bounds();
+        let q = no_data_quad(&b, 7);
+        let (hw, hh) = (((b.max_x - b.min_x) * 0.5) as f32, ((b.max_y - b.min_y) * 0.5) as f32);
+        for corner in [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]] {
+            let reached = q.iter().any(|v| {
+                (v.position[0].abs() >= corner[0].abs()) && (v.position[1].abs() >= corner[1].abs())
+                    && v.position[0].signum() == corner[0].signum()
+                    && v.position[1].signum() == corner[1].signum()
+            });
+            assert!(reached, "corner {corner:?} not covered");
+        }
+        assert!(q.iter().all(|v| v.color_index == 7 && v.disp_prio == 0));
+    }
+
     #[test]
     fn tile_relative_positions_keep_millimetres() {
         let (mx, my) = crate::tiles::latlon_to_mercator(55.70333, 12.61457);
