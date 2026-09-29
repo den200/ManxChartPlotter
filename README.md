@@ -99,4 +99,4 @@ Manx stands on the shoulders of others.
 
 ## License
 
-[GPL-3.0-or-later](LICENSE). Parts are derived from OpenCPN (GPLv2 or later), © David S. Register and the OpenCPN contributors.
+[GPL-3.0-or-later](COPYING). Parts are derived from OpenCPN (GPLv2 or later), © David S. Register and the OpenCPN contributors.

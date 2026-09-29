@@ -3,6 +3,9 @@
 # Push a tag to release:   git tag v0.5.0 && git push origin v0.5.0
 # Or run it by hand from the Actions tab (builds only, no release).
 #
+# The licence is COPYING, not LICENSE: on a Mac, LICENSE is the same name
+# as the gitignored license/ folder that holds the o-charts fingerprint.
+#
 # Each download is the binary plus its assets/ folder; Manx finds assets/
 # beside itself wherever it is unpacked. Not included, on purpose:
 # - o-charts' decryption helper (oexserverd), which is not ours to
@@ -76,7 +79,7 @@ jobs:
             strip "$dir/manx" || true
           fi
           cp -R assets "$dir/"
-          cp README.md LICENSE deploy/INSTALL.md "$dir/"
+          cp README.md COPYING deploy/INSTALL.md "$dir/"
           if [[ "${{ matrix.archive }}" == zip ]]; then
             7z a -tzip "$dir.zip" "$dir" > /dev/null
           else
@@ -90,7 +93,9 @@ jobs:
 
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    # Only when every build succeeded (Windows may fail: it continues on
+    # error), so a broken build never publishes an empty release.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
