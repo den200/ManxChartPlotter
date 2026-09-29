@@ -119,9 +119,9 @@ fn tiles(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, size: Ve
 /// up and is not. With no server asked for, there is nothing to warn of.
 fn status_dot(ui: &mut egui::Ui, view: &mut InstrumentView) {
     let colour = if view.connected {
-        Color32::from_rgb(80, 190, 120)
+        crate::render::theme::current().green
     } else if view.active {
-        Color32::from_rgb(210, 130, 60)
+        crate::render::theme::current().amber
     } else {
         ui.visuals().weak_text_color()
     };
@@ -247,7 +247,7 @@ fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f3
     let dim = ui.visuals().weak_text_color();
     let strong = ui.visuals().strong_text_color();
     let warn = ui.visuals().warn_fg_color;
-    let blue = Color32::from_rgb(70, 150, 230);
+    let blue = crate::render::theme::current().blue;
     let c = rect.center();
     let r = side * 0.5 - 3.0;
     // Angles run clockwise from the bow, starboard positive, as Signal K's do.
@@ -265,8 +265,9 @@ fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f3
             .collect();
         painter.add(egui::Shape::line(points, Stroke::new(4.0_f32, colour)));
     };
-    arc(-60.0, -20.0, Color32::from_rgb(210, 60, 60));
-    arc(20.0, 60.0, Color32::from_rgb(60, 170, 90));
+    // Port red, starboard green, as the sidelights are.
+    arc(-60.0, -20.0, crate::render::theme::current().red);
+    arc(20.0, 60.0, crate::render::theme::current().green);
 
     // A needle points to where the wind comes from, clear of the speeds in
     // the middle, and is named beside its head: two arrows on one dial are
@@ -402,7 +403,7 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
     });
     ui.horizontal(|ui| {
         let colour = if view.connected {
-            Color32::from_rgb(80, 190, 120)
+            crate::render::theme::current().green
         } else {
             ui.visuals().weak_text_color()
         };
@@ -530,7 +531,7 @@ fn picker(
         ui.horizontal(|ui| {
             let live = is_live(path, vessel);
             let dot = if live {
-                Color32::from_rgb(80, 190, 120)
+                crate::render::theme::current().green
             } else {
                 ui.visuals().weak_text_color()
             };

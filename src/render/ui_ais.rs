@@ -17,7 +17,7 @@
 //!   soon. This is the only emphasis on the layer, so it means one thing, and
 //!   it adds to the S-52 symbol rather than replacing it.
 
-use egui::{Align2, Color32, Context, FontId, Pos2, Stroke, Vec2};
+use egui::{Align2, Context, FontId, Pos2, Stroke, Vec2};
 
 /// One target, resolved by the renderer which owns the camera.
 #[derive(Debug, Clone)]
@@ -69,13 +69,10 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
     }
     let painter = ctx.layer_painter(egui::LayerId::background());
     let screen = ctx.screen_rect().expand(SIZE * 4.0);
-    let dark = ctx.style().visuals.dark_mode;
-    // Enough contrast on both palettes without becoming a third colour.
-    let ink = if dark {
-        Color32::from_gray(225)
-    } else {
-        Color32::from_gray(25)
-    };
+    // The palette's own ink: near-black by day, and no brighter than the
+    // chart's text at night.
+    let theme = crate::render::theme::current();
+    let ink = theme.ink;
 
     for target in targets {
         let pos = Pos2::new(target.screen[0], target.screen[1]);
@@ -87,9 +84,9 @@ pub fn draw(ctx: &Context, targets: &[AisTarget], mpp: f32, alarm: CpaAlarm) {
         // it red would contradict the strike-through that says so.
         let dangerous = !target.lost && alarm.triggered_by(target.cpa);
         let colour = if target.lost {
-            Color32::from_gray(140)
+            theme.ink_dim
         } else if dangerous {
-            Color32::from_rgb(200, 40, 40)
+            theme.red
         } else {
             ink
         };

@@ -158,15 +158,14 @@ pub fn sheet(
     if !view.show {
         return;
     }
-    let dark = ctx.style().visuals.dark_mode;
+    let theme = crate::render::theme::current();
     let frame = egui::Frame {
         // Translucent, so the chart still reads through the sheet's edge and
         // the sheet reads as something laid *over* the water rather than a
         // slab of interface bolted to the bottom of the screen.
-        fill: if dark {
-            Color32::from_rgba_unmultiplied(18, 22, 28, 236)
-        } else {
-            Color32::from_rgba_unmultiplied(248, 249, 251, 238)
+        fill: {
+            let p = theme.panel;
+            Color32::from_rgba_unmultiplied(p.r(), p.g(), p.b(), 238)
         },
         inner_margin: egui::Margin::symmetric(10.0, 8.0),
         rounding: egui::Rounding {
@@ -175,14 +174,7 @@ pub fn sheet(
             sw: 0.0,
             se: 0.0,
         },
-        stroke: Stroke::new(
-            1.0_f32,
-            if dark {
-                Color32::from_rgb(52, 60, 70)
-            } else {
-                Color32::from_rgb(206, 212, 220)
-            },
-        ),
+        stroke: Stroke::new(1.0_f32, theme.border),
         ..Default::default()
     };
 
@@ -449,7 +441,7 @@ fn readout(
                 .unwrap_or_default();
             chip(
                 ui,
-                spectrum::WIND_KT.at(kt),
+                spectrum::WIND_KT.paint(kt),
                 &format!("{}{gust} {}", speed(kt, 0), compass(from)),
                 "Wind: mean, gust, and the point it blows from",
             );
@@ -462,7 +454,7 @@ fn readout(
                 .unwrap_or_default();
             chip(
                 ui,
-                spectrum::WAVE_M.at(m),
+                spectrum::WAVE_M.paint(m),
                 &format!("{m:.1} m{period}"),
                 "Sea: significant wave height and period",
             );
@@ -471,7 +463,7 @@ fn readout(
             any = true;
             chip(
                 ui,
-                spectrum::CURRENT_KT.at(kt),
+                spectrum::CURRENT_KT.paint(kt),
                 &format!("{} to {}", speed(kt, 1), compass(to)),
                 "Set and drift: where the water is going, not where it comes from",
             );
@@ -481,7 +473,7 @@ fn readout(
                 any = true;
                 chip(
                     ui,
-                    spectrum::RAIN_MM.at(mm),
+                    spectrum::RAIN_MM.paint(mm),
                     &format!("{mm:.1} mm/h"),
                     "Precipitation in this hour",
                 );
@@ -494,7 +486,7 @@ fn readout(
             let m = if m.abs() < 0.005 { 0.0 } else { m };
             chip(
                 ui,
-                Color32::from_rgb(70, 150, 200),
+                crate::render::theme::current().blue,
                 &format!("{m:+.2} m"),
                 "Sea level against mean sea level — not a height above chart datum",
             );
@@ -552,12 +544,9 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
     let cursor = view.cursor(now);
     let Some(data) = view.data.as_deref() else { return };
 
-    let dark = ui.style().visuals.dark_mode;
-    let ink = if dark {
-        Color32::from_rgb(196, 206, 218)
-    } else {
-        Color32::from_rgb(56, 64, 74)
-    };
+    let theme = crate::render::theme::current();
+    let dark = theme.dark();
+    let ink = theme.ink;
     let faint = ink.gamma_multiply(0.35);
     let plot = Rect::from_min_max(
         Pos2::new(plot_left, block.top()),
@@ -668,16 +657,12 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
                 Pos2::new(x_of(now), block.top()),
                 Pos2::new(x_of(now), lanes_bottom),
             ],
-            Stroke::new(1.0_f32, Color32::from_rgb(120, 190, 130).gamma_multiply(0.8)),
+            Stroke::new(1.0_f32, theme.green),
         );
     }
     if cursor >= t0 && cursor <= t1 {
         let x = x_of(cursor);
-        let accent = if dark {
-            Color32::from_rgb(255, 214, 110)
-        } else {
-            Color32::from_rgb(190, 110, 20)
-        };
+        let accent = theme.amber;
         p.line_segment(
             [Pos2::new(x, block.top()), Pos2::new(x, lanes_bottom)],
             Stroke::new(1.6_f32, accent),
@@ -874,7 +859,7 @@ fn draw_wind(
         }
         let Some(kt) = d.wind_kt.get(i).copied().flatten() else { continue };
         let x = ax.x_of(t);
-        let colour = spectrum::WIND_KT.at(kt);
+        let colour = spectrum::WIND_KT.paint(kt);
         // The gust is drawn first and paler, so the mean column sits inside
         // it: the gap between them *is* the gustiness, at a glance.
         if let Some(g) = d.gust_kt.get(i).copied().flatten() {
@@ -884,7 +869,7 @@ fn draw_wind(
                         Pos2::new(x - bar_w / 2.0, bars.bottom() - h_of(g)),
                         Pos2::new(x + bar_w / 2.0, bars.bottom()),
                     ),
-                    spectrum::WIND_KT.at(g).gamma_multiply(0.38),
+                    spectrum::WIND_KT.paint(g).gamma_multiply(0.55),
                 );
             }
         }
@@ -910,7 +895,24 @@ fn draw_wind(
             Pos2::new(ax.x_of(t), r.top() + 7.0),
             from + 180.0,
             11.0,
-            spectrum::WIND_KT.at(kt),
+            spectrum::WIND_KT.paint(kt),
+        );
+        // The figures, mean and gust, over the columns at the same hours as
+        // the arrows — spaced for them already, so they never collide. A
+        // column a few pixels tall says "light", not "5 gusting 8".
+        // Not over the lane's scale figure in its top-left corner.
+        if ax.x_of(t) - r.left() < 34.0 {
+            continue;
+        }
+        let gust = s.gust_kt;
+        let tallest = gust.map_or(kt, |g| g.max(kt));
+        let y = (bars.bottom() - h_of(tallest) - 1.0).max(bars.top() + 11.0);
+        p.text(
+            Pos2::new(ax.x_of(t), y),
+            Align2::CENTER_BOTTOM,
+            super::ui_wind::label_text(kt, gust),
+            FontId::proportional(10.0),
+            ink,
         );
     }
 
@@ -961,7 +963,7 @@ fn draw_wave(
         };
         let (xa, xb) = (ax.x_of(ta), ax.x_of(tb));
         let (ya, yb) = (y_of(lo), y_of(hi));
-        let colour = spectrum::WAVE_M.at((lo + hi) * 0.5);
+        let colour = spectrum::WAVE_M.paint((lo + hi) * 0.5);
         b.quad(
             Pos2::new(xa, ya),
             Pos2::new(xb, yb),
@@ -982,7 +984,7 @@ fn draw_wave(
             Pos2::new(ax.x_of(t), r.top() + ARROW_STRIP * 0.5),
             from + 180.0,
             9.0,
-            spectrum::WAVE_M.at(m),
+            spectrum::WAVE_M.paint(m),
         );
     }
     b.line(
@@ -1020,7 +1022,7 @@ fn draw_current(b: &mut Batch, r: Rect, d: &PointForecast, ax: Axis) {
                 Pos2::new(left, strip.top()),
                 Pos2::new(right, strip.bottom()),
             ),
-            spectrum::CURRENT_KT.at(kt),
+            spectrum::CURRENT_KT.paint(kt),
         );
     }
     for t in ax.arrow_hours() {
@@ -1034,7 +1036,7 @@ fn draw_current(b: &mut Batch, r: Rect, d: &PointForecast, ax: Axis) {
             Pos2::new(ax.x_of(t), r.top() + 7.0),
             to,
             10.0,
-            spectrum::CURRENT_KT.at(kt),
+            spectrum::CURRENT_KT.paint(kt),
         );
     }
 }
@@ -1067,7 +1069,7 @@ fn draw_rain(b: &mut Batch, r: Rect, d: &PointForecast, ax: Axis) {
                 Pos2::new(x - w / 2.0, r.bottom() - h),
                 Pos2::new(x + w / 2.0, r.bottom()),
             ),
-            spectrum::RAIN_MM.at(mm),
+            spectrum::RAIN_MM.paint(mm),
         );
     }
 }
@@ -1095,7 +1097,7 @@ fn draw_tide(
     faint: Color32,
 ) {
     let Some((lo, hi)) = d.tide_range() else { return };
-    let water = Color32::from_rgb(70, 150, 200);
+    let water = crate::render::theme::current().blue;
 
     // Mean sea level, dashed, so the sign of the number in the readout has
     // something to mean.
@@ -1296,7 +1298,7 @@ pub fn draw_current_field(ctx: &Context, arrows: &[CurrentArrow]) {
             Pos2::new(a.screen[0], a.screen[1]),
             a.to_deg,
             len,
-            spectrum::CURRENT_KT.at(a.kt),
+            spectrum::CURRENT_KT.paint(a.kt),
         );
     }
     batch.paint(&painter);
@@ -1310,11 +1312,8 @@ pub fn draw_current_field(ctx: &Context, arrows: &[CurrentArrow]) {
 pub fn draw_anchor(ctx: &Context, at: [f32; 2], live: bool) {
     let painter = ctx.layer_painter(egui::LayerId::background());
     let p = Pos2::new(at[0], at[1]);
-    let colour = if live {
-        Color32::from_rgb(70, 150, 200)
-    } else {
-        Color32::from_rgb(140, 146, 152)
-    };
+    let theme = crate::render::theme::current();
+    let colour = if live { theme.dim(Color32::from_rgb(0, 110, 220)) } else { theme.ink_dim };
     painter.circle(
         p,
         7.0,

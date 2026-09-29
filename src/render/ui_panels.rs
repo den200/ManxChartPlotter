@@ -174,6 +174,23 @@ fn display_window(
             );
             ui.add_space(8.0);
 
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Weather layer").strong());
+                let mut percent = (display.weather_opacity * 100.0).round();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut percent, 10.0..=90.0)
+                            .step_by(5.0)
+                            .suffix(" %"),
+                    )
+                    .on_hover_text("How strongly the wind colours cover the chart")
+                    .changed()
+                {
+                    display.weather_opacity = percent / 100.0;
+                }
+            });
+            ui.add_space(8.0);
+
             ui.label(RichText::new("Safe water").strong());
             let known_draft = draft_m > 0.0;
             ui.add_enabled_ui(known_draft, |ui| {
@@ -382,7 +399,7 @@ fn compass_button(ui: &mut egui::Ui, rotation: f32, active: bool) -> egui::Respo
     // The needle: a slim diamond, red to the north.
     let tip = r * 0.62;
     let waist = r * 0.2;
-    let red = egui::Color32::from_rgb(210, 45, 45);
+    let red = crate::render::theme::current().red;
     painter.add(egui::Shape::convex_polygon(
         vec![c + north * tip, c + east * waist, c - east * waist],
         red,
@@ -416,11 +433,8 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
     let painter = ctx.layer_painter(egui::LayerId::background());
     for pin in pins {
         let tip = egui::pos2(pin.screen[0], pin.screen[1]);
-        let color = if pin.is_start {
-            egui::Color32::from_rgb(30, 140, 60)
-        } else {
-            egui::Color32::from_rgb(200, 40, 40)
-        };
+        let theme = crate::render::theme::current();
+        let color = if pin.is_start { theme.green } else { theme.red };
         let r = 7.0;
         let head = egui::pos2(tip.x, tip.y - 14.0);
         painter.add(egui::Shape::convex_polygon(
@@ -432,8 +446,8 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
             color,
             egui::Stroke::NONE,
         ));
-        painter.circle(head, r, color, egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
-        painter.circle_filled(head, 2.5, egui::Color32::WHITE);
+        painter.circle(head, r, color, egui::Stroke::new(1.5_f32, theme.on_signal));
+        painter.circle_filled(head, 2.5, theme.on_signal);
     }
 }
 
@@ -480,9 +494,9 @@ fn menu_bar(
                 && !instruments.tiles.is_empty();
             if !bar_shown && instruments.active {
                 let colour = if instruments.connected {
-                    egui::Color32::from_rgb(80, 190, 120)
+                    crate::render::theme::current().green
                 } else {
-                    egui::Color32::from_rgb(210, 130, 60)
+                    crate::render::theme::current().amber
                 };
                 let (rect, response) =
                     ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
@@ -726,7 +740,7 @@ fn free_charts(
                         Some(i) if newer => ui.label(
                             RichText::new(format!("installed {} · update available", day(&i.downloaded)))
                                 .small()
-                                .color(egui::Color32::from_rgb(40, 130, 200)),
+                                .color(crate::render::theme::current().blue),
                         ),
                         Some(i) => ui.label(
                             RichText::new(if row.remote.is_some() {
@@ -742,7 +756,7 @@ fn free_charts(
                                 .label(
                                     RichText::new("download failed")
                                         .small()
-                                        .color(egui::Color32::from_rgb(200, 60, 60)),
+                                        .color(crate::render::theme::current().red),
                                 )
                                 .on_hover_text(why.as_str()),
                             None => ui.label(RichText::new(size).small().weak()),
@@ -770,7 +784,7 @@ fn free_charts(
                         } else if free.confirm_remove.as_deref() == Some(row.code) {
                             ui.label(RichText::new("Remove these charts?").small());
                             if ui
-                                .button(RichText::new("Remove").color(egui::Color32::from_rgb(200, 60, 60)))
+                                .button(RichText::new("Remove").color(crate::render::theme::current().red))
                                 .clicked()
                             {
                                 free.confirm_remove = None;
@@ -818,7 +832,7 @@ fn free_charts(
         ui.add_space(4.0);
         let text = RichText::new(&free.status);
         ui.label(if free.status.starts_with("Download failed") {
-            text.color(egui::Color32::from_rgb(200, 60, 60))
+            text.color(crate::render::theme::current().red)
         } else {
             text
         });
@@ -1249,7 +1263,7 @@ fn chart_shop(
                                  assignment once a chart is requested for it.",
                             )
                             .small()
-                            .color(egui::Color32::from_rgb(180, 120, 40)),
+                            .color(crate::render::theme::current().amber),
                         );
                     }
                 }
@@ -1277,7 +1291,7 @@ fn chart_shop(
                 ui.label(
                     RichText::new(&shop.warning)
                         .small()
-                        .color(egui::Color32::from_rgb(180, 120, 40)),
+                        .color(crate::render::theme::current().amber),
                 );
             }
             if !shop.status.is_empty() {
@@ -1345,7 +1359,7 @@ fn confirm_download(
         // Spending a slot is said first and in colour, whatever else is
         // being asked: it is the one part of this that cannot be undone.
         if let Some(note) = &pending.slot_note {
-            ui.label(RichText::new(note).color(egui::Color32::from_rgb(180, 120, 40)));
+            ui.label(RichText::new(note).color(crate::render::theme::current().amber));
         }
         ui.label(RichText::new(&pending.because).small());
         ui.add_space(4.0);
@@ -1426,7 +1440,7 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                     ui.label(&c.name);
                     ui.label(RichText::new(c.edition.to_string()).monospace().small());
                     let state = if c.expired {
-                        RichText::new("Expired").color(egui::Color32::from_rgb(180, 60, 60))
+                        RichText::new("Expired").color(crate::render::theme::current().red)
                     } else {
                         RichText::new(target.label())
                     };

@@ -65,6 +65,7 @@ pub mod ui_batch;
 pub mod ui_weather;
 pub mod ui_wind;
 pub mod spectrum;
+pub mod theme;
 pub use camera::MAX_TILT;
 pub mod font;
 mod colors;

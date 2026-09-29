@@ -5,7 +5,7 @@
 //! (see `RenderState::logbook_view`); nothing here touches the disk.
 
 use chrono::{Local, NaiveDate, TimeZone};
-use egui::{Color32, Context, RichText, Sense, Stroke};
+use egui::{Context, RichText, Sense, Stroke};
 
 use super::ui::UiAction;
 use crate::nav::logbook::{Note, Summary};
@@ -144,9 +144,9 @@ pub fn window(ctx: &Context, view: &mut LogView, state: &LogbookState, actions: 
 fn header(ui: &mut egui::Ui, view: &mut LogView, state: &LogbookState, actions: &mut Vec<UiAction>) {
     ui.horizontal(|ui| {
         let (dot, text) = if view.record {
-            (Color32::from_rgb(210, 40, 40), "Recording")
+            (crate::render::theme::current().red, "Recording")
         } else {
-            (Color32::GRAY, "Paused")
+            (crate::render::theme::current().ink_dim, "Paused")
         };
         // Drawn, not a "●": the interface font has no such glyph.
         let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), Sense::hover());
@@ -347,7 +347,7 @@ fn detail(
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let text = if view.delete_armed { "Tap again to delete" } else { "Delete day" };
-            if ui.button(RichText::new(text).color(Color32::from_rgb(200, 50, 50))).clicked() {
+            if ui.button(RichText::new(text).color(crate::render::theme::current().red)).clicked() {
                 if view.delete_armed {
                     view.delete_armed = false;
                     view.selected = None;

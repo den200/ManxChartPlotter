@@ -13,7 +13,11 @@ use super::ui::UiAction;
 /// says something new, and everyone sees it again.
 pub const NOTICE_VERSION: u32 = 1;
 
-const MOB_RED: Color32 = Color32::from_rgb(205, 30, 30);
+/// The MOB red: the palette's danger colour, so it is the loudest thing on
+/// screen by day and still the loudest — without glaring — at night.
+fn mob_red() -> Color32 {
+    crate::render::theme::current().red
+}
 
 /// The safety settings, and the window's own state.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -171,13 +175,14 @@ pub fn banner(ctx: &Context, alarms: &[AlarmLine], actions: &mut Vec<UiAction>) 
         .pivot(Align2::CENTER_TOP)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            let fill = if ringing { Color32::from_rgb(170, 20, 20) } else { Color32::from_rgb(150, 95, 20) };
+            let theme = crate::render::theme::current();
+            let fill = if ringing { theme.red } else { theme.amber };
             egui::Frame::popup(ui.style()).fill(fill).show(ui, |ui| {
                 ui.set_max_width(area.width().min(560.0) - 24.0);
                 for a in alarms {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(a.title).strong().color(Color32::WHITE));
-                        ui.label(RichText::new(&a.message).color(Color32::WHITE));
+                        ui.label(RichText::new(a.title).strong().color(theme.on_signal));
+                        ui.label(RichText::new(&a.message).color(theme.on_signal));
                     });
                 }
                 if ringing {
@@ -207,14 +212,15 @@ pub fn mob_button(ctx: &Context, active: bool, actions: &mut Vec<UiAction>) {
         .show(ctx, |ui| {
             let size = Vec2::new(64.0, 44.0);
             let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
-            let fill = if response.hovered() { Color32::from_rgb(230, 45, 45) } else { MOB_RED };
-            ui.painter().rect(rect, 8.0, fill, Stroke::new(2.0_f32, Color32::WHITE));
+            let theme = crate::render::theme::current();
+            let fill = if response.hovered() { theme.red.gamma_multiply(0.85) } else { theme.red };
+            ui.painter().rect(rect, 8.0, fill, Stroke::new(2.0_f32, theme.on_signal));
             ui.painter().text(
                 rect.center(),
                 Align2::CENTER_CENTER,
                 "MOB",
                 FontId::proportional(20.0),
-                Color32::WHITE,
+                theme.on_signal,
             );
             let response = response.on_hover_text(if active {
                 "Man overboard is marked — tap to mark again at the boat's position now"
@@ -235,13 +241,13 @@ pub fn mob_panel(ctx: &Context, mob: &MobView, safety: &mut SafetyView, actions:
         .pivot(Align2::LEFT_BOTTOM)
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).stroke(Stroke::new(2.0_f32, MOB_RED)).show(ui, |ui| {
+            egui::Frame::popup(ui.style()).stroke(Stroke::new(2.0_f32, mob_red())).show(ui, |ui| {
                 let (m, s) = (mob.elapsed_s / 60, mob.elapsed_s % 60);
                 ui.label(
                     RichText::new(format!("MAN OVERBOARD  {m:02}:{s:02}"))
                         .strong()
                         .size(18.0)
-                        .color(MOB_RED),
+                        .color(mob_red()),
                 );
                 match (mob.bearing_deg, mob.distance_m) {
                     (Some(b), Some(d)) => {
@@ -296,26 +302,27 @@ pub fn draw_on_chart(
     mob: Option<&MobView>,
 ) {
     let painter = ctx.layer_painter(egui::LayerId::background());
-    let log_colour = Color32::from_rgb(130, 60, 170);
+    let theme = crate::render::theme::current();
+    let log_colour = theme.magenta;
     if log_track.screen.len() >= 2 {
         let pts: Vec<Pos2> = log_track.screen.iter().map(|p| Pos2::new(p[0], p[1])).collect();
         painter.add(egui::Shape::line(pts, Stroke::new(2.5_f32, log_colour)));
     }
     for (p, text) in log_notes {
         let at = Pos2::new(p[0], p[1]);
-        painter.circle(at, 5.0, log_colour, Stroke::new(1.5_f32, Color32::WHITE));
+        painter.circle(at, 5.0, log_colour, Stroke::new(1.5_f32, theme.on_signal));
         let short: String = text.chars().take(28).collect();
         let short = if short.len() < text.len() { format!("{short}…") } else { short };
         painter.text(at + Vec2::new(8.0, 0.0), Align2::LEFT_CENTER, short, FontId::proportional(12.0), log_colour);
     }
     if track.screen.len() >= 2 {
         let pts: Vec<Pos2> = track.screen.iter().map(|p| Pos2::new(p[0], p[1])).collect();
-        painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, Color32::from_rgb(160, 70, 30))));
+        painter.add(egui::Shape::line(pts, Stroke::new(2.0_f32, theme.dim(Color32::from_rgb(200, 70, 0)))));
     }
     if let Some(a) = anchor {
         let c = Pos2::new(a.screen[0], a.screen[1]);
         let outside = a.distance_m.is_some_and(|d| d > a.radius_m as f64);
-        let colour = if outside { MOB_RED } else { Color32::from_rgb(30, 110, 200) };
+        let colour = if outside { mob_red() } else { theme.blue };
         painter.circle_stroke(c, a.radius_px.max(6.0), Stroke::new(2.0_f32, colour));
         painter.circle_filled(c, 4.0, colour);
         painter.text(c + Vec2::new(0.0, 7.0), Align2::CENTER_TOP, "anchor", FontId::proportional(11.0), colour);
@@ -327,14 +334,14 @@ pub fn draw_on_chart(
                 let from = Pos2::new(o[0], o[1]);
                 painter.add(egui::Shape::dashed_line(
                     &[from, at],
-                    Stroke::new(2.5_f32, MOB_RED),
+                    Stroke::new(2.5_f32, mob_red()),
                     10.0,
                     6.0,
                 ));
             }
-            painter.circle(at, 11.0, Color32::from_rgba_unmultiplied(205, 30, 30, 200), Stroke::new(2.0_f32, Color32::WHITE));
+            painter.circle(at, 11.0, mob_red(), Stroke::new(2.0_f32, theme.on_signal));
             let r = 6.0;
-            let white = Stroke::new(2.5_f32, Color32::WHITE);
+            let white = Stroke::new(2.5_f32, theme.on_signal);
             painter.line_segment([at + Vec2::new(-r, -r), at + Vec2::new(r, r)], white);
             painter.line_segment([at + Vec2::new(-r, r), at + Vec2::new(r, -r)], white);
             painter.text(
@@ -342,7 +349,7 @@ pub fn draw_on_chart(
                 Align2::CENTER_TOP,
                 "MOB",
                 FontId::proportional(13.0),
-                MOB_RED,
+                mob_red(),
             );
         }
     }
@@ -561,7 +568,7 @@ fn draw_diagram(ui: &mut egui::Ui, diagram: Diagram, size: Vec2) {
     let visuals = ui.visuals();
     painter.rect_filled(rect, 6.0, visuals.extreme_bg_color);
     let ink = visuals.text_color();
-    let track = Color32::from_rgb(30, 110, 200);
+    let track = crate::render::theme::current().blue;
     let at = |x: f32, y: f32| rect.min + Vec2::new(x * rect.width(), y * rect.height());
 
     // (the path, the person, labels, wind)
@@ -627,7 +634,7 @@ fn draw_diagram(ui: &mut egui::Ui, diagram: Diagram, size: Vec2) {
     let dir = (curve[n - 1] - curve[n - 3]).normalized();
     painter.arrow(curve[n - 1] - dir * 8.0, dir * 8.0, Stroke::new(2.0_f32, track));
 
-    painter.circle(at(person[0], person[1]), 5.0, MOB_RED, Stroke::new(1.0_f32, Color32::WHITE));
+    painter.circle(at(person[0], person[1]), 5.0, mob_red(), Stroke::new(1.0_f32, crate::render::theme::current().on_signal));
     for (text, p) in labels {
         painter.text(at(p[0], p[1]), Align2::CENTER_CENTER, text, FontId::proportional(11.0), ink);
     }

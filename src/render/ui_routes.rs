@@ -74,7 +74,9 @@ pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
     let screen = ctx.screen_rect().expand(2_000.0);
 
     for route in routes {
-        let colour = if route.is_active { APLRT } else { PLRTE };
+        // S-52's colour, brought down to the palette as the chart's own
+        // PLRTE is (Night's table has it at 66,19,11).
+        let colour = crate::render::theme::current().dim(if route.is_active { APLRT } else { PLRTE });
         for (i, w) in route.points.windows(2).enumerate() {
             let a = egui::pos2(w[0].screen[0], w[0].screen[1]);
             let b = egui::pos2(w[1].screen[0], w[1].screen[1]);
@@ -227,7 +229,8 @@ fn waypoint_editor(
         ui.label(
             RichText::new("tap the chart to add a waypoint")
                 .small()
-                .color(APLRT),
+                // APLRT itself is too pale to read as text on a white panel.
+                .color(crate::render::theme::current().amber),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Two taps, the second on a different word: a planned passage is
@@ -241,7 +244,7 @@ fn waypoint_editor(
                     ui.data_mut(|d| d.remove::<bool>(confirm_id));
                 }
                 if ui
-                    .small_button(RichText::new("Delete it").color(egui::Color32::from_rgb(200, 60, 60)))
+                    .small_button(RichText::new("Delete it").color(crate::render::theme::current().red))
                     .clicked()
                 {
                     ui.data_mut(|d| d.remove::<bool>(confirm_id));
@@ -615,7 +618,7 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance, units: &crate::signalk::UnitP
                 ui.label(RichText::new("▶").weak());
                 ui.label(RichText::new(&g.to_name).strong());
                 if g.arrived {
-                    ui.label(RichText::new("arrived").color(Color32::from_rgb(80, 190, 120)));
+                    ui.label(RichText::new("arrived").color(crate::render::theme::current().green));
                 }
                 ui.separator();
 

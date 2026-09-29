@@ -597,6 +597,10 @@ pub struct DisplayView {
     pub show_soundings: bool,
     /// Which way up the chart is drawn.
     pub chart_up: ChartUp,
+    /// How opaque the weather colour wash is, 0..1. Enough to read the
+    /// colour at a glance, not so much that it hides a rock: where that line
+    /// falls depends on the screen and the light, so it is the user's.
+    pub weather_opacity: f32,
 }
 
 /// Which way up the chart is drawn.
@@ -642,9 +646,15 @@ impl Default for DisplayView {
             show_text: m.show_text,
             show_soundings: m.show_soundings,
             chart_up: ChartUp::North,
+            weather_opacity: DEFAULT_WEATHER_OPACITY,
         }
     }
 }
+
+/// The wash's opacity out of the box. It was a fixed 38 % with pale colours,
+/// which read as a stain; strong colours at a little over half let a depth
+/// contour and a buoy still read straight through.
+pub const DEFAULT_WEATHER_OPACITY: f32 = 0.55;
 
 impl DisplayView {
     /// Apply these choices to `base`. A setting pinned by a `NAVCORE_*`
@@ -903,7 +913,7 @@ impl Ui {
         surface_format: wgpu::TextureFormat,
     ) -> Self {
         let ctx = egui::Context::default();
-        style(&ctx, false);
+        style(&ctx);
         let state = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -982,8 +992,10 @@ impl Ui {
     /// Follow the chart's palette: a light interface over the Day chart, a dark
     /// one over Dusk and Night. A bright panel at night ruins night vision,
     /// which is the whole point of the dark palettes.
-    pub fn set_dark(&mut self, dark: bool) {
-        style(&self.ctx, dark);
+    /// Re-dress the interface for an S-52 palette.
+    pub fn set_palette(&mut self, palette: super::theme::Palette) {
+        super::theme::set(palette);
+        style(&self.ctx);
     }
 
     /// Is the pointer over any part of the interface — a panel, a window, a
@@ -1114,13 +1126,9 @@ impl Ui {
 
 /// navcore's look: bigger than egui's default, because this is read at arm's
 /// length on a boat, often through spray and often through reading glasses.
-fn style(ctx: &egui::Context, dark: bool) {
+fn style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
-    ctx.set_visuals(if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    });
+    ctx.set_visuals(super::theme::current().visuals());
     let mut style = (*ctx.style()).clone();
     // Points, so these track the display's scale factor.
     style.text_styles = [

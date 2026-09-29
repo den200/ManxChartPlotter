@@ -666,6 +666,12 @@ struct SampleGrid {
     screen: Vec<[f32; 2]>,
     /// Where each point is on the earth, in the same order.
     geo: Vec<(f64, f64)>,
+    /// How many octaves up each point survives: 0 for a point only the
+    /// finest lattice has, 1 for one the lattice twice as coarse also has,
+    /// and so on (capped). Same order again.
+    level: Vec<u8>,
+    /// Screen distance between neighbours of the finest lattice, points.
+    gap: f32,
     cols: usize,
     rows: usize,
 }
@@ -674,13 +680,53 @@ impl SampleGrid {
     fn is_empty(&self) -> bool {
         self.cols == 0 || self.rows == 0
     }
+
+    /// How visible point `k` should be when the marks are meant to stand
+    /// about `spacing` points apart, 0..1.
+    ///
+    /// The lattice is octaves of world distance anchored to the world, so
+    /// every coarser lattice is a subset of the finer one. A point of level
+    /// `L` belongs to a lattice whose gap on screen is `gap·2^L`; it shows in
+    /// full once that gap is comfortably wide and fades out as it closes.
+    /// Zooming out, the in-between points fade away before the octave
+    /// changes, and at the change the survivors are exactly the points that
+    /// were showing — so the field thins smoothly instead of halving in one
+    /// frame, which is what made the barbs jump on every other wheel click.
+    fn fade(&self, k: usize, spacing: f32) -> f32 {
+        let level = self.level.get(k).copied().unwrap_or(0) as i32;
+        lod_fade(self.gap * 2f32.powi(level) / spacing.max(1.0))
+    }
+}
+
+/// Visibility for a mark whose lattice is `x` times the wanted spacing
+/// apart: nothing at half the spacing, all of it by about nine-tenths.
+fn lod_fade(x: f32) -> f32 {
+    let t = ((x - 0.55) / 0.35).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 impl RenderState {
     /// Lay a world-anchored lattice over `area`, about `spacing` points apart.
     fn sample_grid(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
-        sample_grid_for(&self.camera, self.scale_factor, spacing, area)
+        sample_grid_for(&self.camera, self.scale_factor, spacing, area, Octave::Nearest)
     }
+
+    /// The same lattice for marks that fade by [`SampleGrid::fade`]: one
+    /// octave finer than [`Self::sample_grid`] would pick, so there are
+    /// points to fade in.
+    fn sample_grid_faded(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
+        sample_grid_for(&self.camera, self.scale_factor, spacing, area, Octave::Finer)
+    }
+}
+
+/// How the wanted spacing is rounded to an octave of world distance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Octave {
+    /// To the nearest: every point drawn, the pattern jumps at each octave.
+    Nearest,
+    /// Down: the lattice is never coarser than asked, and the points past
+    /// the spacing are faded rather than dropped.
+    Finer,
 }
 
 /// The lattice, as arithmetic on a camera alone.
@@ -697,11 +743,14 @@ fn sample_grid_for(
     scale_factor: f32,
     spacing: f32,
     area: egui::Rect,
+    octave: Octave,
 ) -> SampleGrid {
     {
         let empty = SampleGrid {
             screen: Vec::new(),
             geo: Vec::new(),
+            level: Vec::new(),
+            gap: 0.0,
             cols: 0,
             rows: 0,
         };
@@ -716,7 +765,11 @@ fn sample_grid_for(
         if !wanted.is_finite() || wanted <= 0.0 {
             return empty;
         }
-        let step = 2f32.powf(wanted.log2().round());
+        let exponent = match octave {
+            Octave::Nearest => wanted.log2().round(),
+            Octave::Finer => wanted.log2().floor(),
+        };
+        let step = 2f32.powf(exponent);
         if !step.is_finite() || step <= 0.0 {
             return empty;
         }
@@ -757,8 +810,14 @@ fn sample_grid_for(
             return empty;
         }
 
+        let gap = (step / per_point as f64) as f32;
         let mut screen = Vec::with_capacity(cols * rows);
         let mut geo = Vec::with_capacity(cols * rows);
+        let mut level = Vec::with_capacity(cols * rows);
+        // Octaves a world index survives: the powers of two it is a multiple
+        // of. Zero is a multiple of all of them.
+        const TOP: u32 = 6;
+        let octaves = |n: i64| if n == 0 { TOP } else { n.trailing_zeros().min(TOP) };
         // Rows run north to south so the lattice comes out in reading order on
         // screen, which is what the fill's mesh expects.
         for j in (j0..=j1).rev() {
@@ -768,11 +827,14 @@ fn sample_grid_for(
                 screen.push([s.x / ppp, s.y / ppp]);
                 let (lat, lon) = crate::render::projection::Projection::to_wgs84(wx, wy);
                 geo.push((lat, lon));
+                level.push(octaves(i).min(octaves(j)) as u8);
             }
         }
         SampleGrid {
             screen,
             geo,
+            level,
+            gap,
             cols,
             rows,
         }
@@ -1854,7 +1916,7 @@ impl RenderState {
     pub fn switch_palette(&mut self, palette_name: &str) {
         self.palette_name = Some(palette_name.to_string());
         if let Some(ref mut ui) = self.ui {
-            ui.set_dark(matches!(palette_name, "DUSK" | "NIGHT"));
+            ui.set_palette(crate::render::theme::Palette::from_table(palette_name));
         }
         if let Some(ref mut engine) = self.s52_engine {
             engine.tables.set_active_palette(palette_name);
@@ -2200,13 +2262,19 @@ impl RenderState {
         // screen. Like the plan hook it has to wait for a view: at init_ui the
         // camera is still looking at 0°N 0°E, and the fetch would ask for the
         // wind over the Gulf of Guinea.
-        if std::env::var("NAVCORE_WIND").is_ok() {
+        // `NAVCORE_WIND=fill` draws the barbs and the colour wash over the
+        // chart with the sheet shut, which is how the layer itself is seen.
+        if let Ok(mode) = std::env::var("NAVCORE_WIND") {
+            let fill = mode == "fill";
             if let Some(ref mut ui) = self.ui {
                 ui.wind.show = true;
-                ui.sheet.show = true;
+                ui.wind.fill = fill;
+                ui.sheet.show = !fill;
             }
             self.spawn_wind_fetch();
-            self.spawn_point_fetch();
+            if !fill {
+                self.spawn_point_fetch();
+            }
         }
 
         let Ok(spec) = std::env::var("NAVCORE_PLAN") else { return };
@@ -6497,15 +6565,24 @@ impl RenderState {
         let Some(time_ms) = self.field_time_ms(first, last) else {
             return Vec::new();
         };
-        // One barb every ~64 points: dense enough to show a shift across the
+        // One barb every ~72 points: dense enough to show a shift across the
         // screen, sparse enough that the feathers never collide. Anchored to
-        // the water, so the field travels with the chart under a pan.
+        // the water, so the field travels with the chart under a pan, and
+        // faded between octaves so it thins smoothly under a zoom.
+        const BARB_SPACING: f32 = 72.0;
+        // The figures go on every other barb each way: a label is wider than
+        // a barb, and a field of numbers is harder to read than a few.
+        const LABEL_SPACING: f32 = BARB_SPACING * 2.0;
         let area = ui.chart_area();
-        let grid = self.sample_grid(64.0, area);
+        let grid = self.sample_grid_faded(BARB_SPACING, area);
         let mut barbs = Vec::new();
-        for (screen, &(lat, lon)) in grid.screen.iter().zip(grid.geo.iter()) {
+        for (k, (screen, &(lat, lon))) in grid.screen.iter().zip(grid.geo.iter()).enumerate() {
             // A barb whose centre is under a panel is a barb nobody sees.
             if !area.contains(egui::pos2(screen[0], screen[1])) {
+                continue;
+            }
+            let alpha = grid.fade(k, BARB_SPACING);
+            if alpha <= 0.0 {
                 continue;
             }
             if let Some((from_deg, kt)) = forecast.sample(lat, lon, time_ms) {
@@ -6514,6 +6591,9 @@ impl RenderState {
                     // Drawn from screen-up, which a turned chart has moved.
                     from_deg: (from_deg - self.camera.rotation.to_degrees()) as f32,
                     kt: kt as f32,
+                    gust_kt: forecast.gust_kt(lat, lon, time_ms).map(|g| g as f32),
+                    alpha,
+                    label: grid.fade(k, LABEL_SPACING),
                 });
             }
         }
@@ -6549,16 +6629,35 @@ impl RenderState {
         if grid.is_empty() {
             return empty;
         }
+        let inside: Vec<bool> = grid
+            .geo
+            .iter()
+            .map(|&(lat, lon)| forecast.covers(lat, lon))
+            .collect();
+        // A corner past the edge is kept, transparent, only when a covered
+        // corner is next to it — enough for the last cell to fade out, and
+        // no sampling of empty ocean beyond.
+        let near_inside = |k: usize| {
+            let (c, r) = (k % grid.cols, k / grid.cols);
+            (r.saturating_sub(1)..=(r + 1).min(grid.rows - 1)).any(|rr| {
+                (c.saturating_sub(1)..=(c + 1).min(grid.cols - 1)).any(|cc| inside[rr * grid.cols + cc])
+            })
+        };
         let kt = grid
             .geo
             .iter()
-            .map(|&(lat, lon)| forecast.sample(lat, lon, time_ms).map(|(_, kt)| kt as f32))
+            .enumerate()
+            .map(|(k, &(lat, lon))| {
+                (inside[k] || near_inside(k)).then(|| forecast.sample_held(lat, lon, time_ms).1 as f32)
+            })
             .collect();
         crate::render::ui_wind::WindFill {
             screen: grid.screen,
             cols: grid.cols,
             rows: grid.rows,
             kt,
+            outside: inside.iter().map(|i| !i).collect(),
+            opacity: ui.display.weather_opacity,
         }
     }
 
@@ -7889,7 +7988,7 @@ mod sample_grid_tests {
     #[test]
     fn the_field_travels_with_the_chart_under_a_pan() {
         let zoom = 50.0;
-        let a = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
+        let a = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area(), Octave::Nearest);
         // Shift the camera by a whole number of world units.
         let shift_world = 500.0f64;
         let b = sample_grid_for(
@@ -7897,6 +7996,7 @@ mod sample_grid_tests {
             1.0,
             64.0,
             area(),
+            Octave::Nearest,
         );
         assert!(!a.is_empty() && !b.is_empty());
         // Moving the camera east moves the chart west on screen, and the
@@ -7933,8 +8033,8 @@ mod sample_grid_tests {
     #[test]
     fn the_lattice_holds_its_ground_through_a_small_zoom() {
         let here = (1_380_000.0, 7_540_000.0);
-        let a = sample_grid_for(&camera_at(here.0, here.1, 50.0), 1.0, 64.0, area());
-        let b = sample_grid_for(&camera_at(here.0, here.1, 55.0), 1.0, 64.0, area());
+        let a = sample_grid_for(&camera_at(here.0, here.1, 50.0), 1.0, 64.0, area(), Octave::Nearest);
+        let b = sample_grid_for(&camera_at(here.0, here.1, 55.0), 1.0, 64.0, area(), Octave::Nearest);
         // The same latitudes are sampled, because the world step did not change.
         let shared = a
             .geo
@@ -7956,7 +8056,7 @@ mod sample_grid_tests {
     /// far enough apart for their feathers not to collide.
     #[test]
     fn the_samples_land_about_as_far_apart_as_asked() {
-        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area());
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area(), Octave::Nearest);
         let gap = (g.screen[1][0] - g.screen[0][0]).abs();
         assert!(
             (45.0..=91.0).contains(&gap),
@@ -7971,7 +8071,7 @@ mod sample_grid_tests {
     #[test]
     fn the_cost_does_not_run_away_with_the_zoom() {
         for zoom in [0.05f32, 5.0, 500.0, 50_000.0, 5_000_000.0] {
-            let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
+            let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area(), Octave::Nearest);
             assert!(!g.is_empty(), "no lattice at {zoom} m/px");
             let n = g.cols * g.rows;
             assert!(n < 2_000, "{n} samples at {zoom} m/px");
@@ -7988,18 +8088,64 @@ mod sample_grid_tests {
             1.0,
             64.0,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.0, 0.0)),
+            Octave::Nearest,
         );
         assert!(g.is_empty());
         // A zoom of nothing, and a zoom that is not a number.
-        assert!(sample_grid_for(&camera_at(0.0, 0.0, 0.0), 1.0, 64.0, area()).is_empty());
-        assert!(sample_grid_for(&camera_at(0.0, 0.0, f32::NAN), 1.0, 64.0, area()).is_empty());
+        assert!(sample_grid_for(&camera_at(0.0, 0.0, 0.0), 1.0, 64.0, area(), Octave::Nearest).is_empty());
+        assert!(sample_grid_for(&camera_at(0.0, 0.0, f32::NAN), 1.0, 64.0, area(), Octave::Nearest).is_empty());
         // Every point of a good lattice is a real number.
-        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area());
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area(), Octave::Nearest);
         assert!(g
             .screen
             .iter()
             .all(|p| p[0].is_finite() && p[1].is_finite()));
         assert!(g.geo.iter().all(|(la, lo)| la.is_finite() && lo.is_finite()));
+    }
+
+    /// Zooming out through an octave must not make the barbs jump. Just
+    /// before the lattice doubles, what shows (at any strength worth
+    /// counting) must be the same points of sea that show just after.
+    #[test]
+    fn the_faded_field_thins_without_a_jump_at_the_octave() {
+        let here = (1_380_000.0, 7_540_000.0);
+        // 64 points of spacing at 1 m/pt wants 64 m; 64 is an octave, so the
+        // lattice changes between these two zooms.
+        let before = sample_grid_for(&camera_at(here.0, here.1, 0.999), 1.0, 64.0, area(), Octave::Finer);
+        let after = sample_grid_for(&camera_at(here.0, here.1, 1.001), 1.0, 64.0, area(), Octave::Finer);
+        assert!(after.gap > before.gap * 1.9, "the octave did not change");
+        let shown = |g: &SampleGrid| -> Vec<(i64, i64)> {
+            // On screen only: the lattice's one-cell margin is wider after the
+            // octave doubles, and what lies off the glass is drawn for nobody.
+            (0..g.geo.len())
+                .filter(|&k| g.fade(k, 64.0) > 0.05)
+                .filter(|&k| area().shrink(2.0).contains(egui::pos2(g.screen[k][0], g.screen[k][1])))
+                .map(|k| ((g.geo[k].0 * 1e6).round() as i64, (g.geo[k].1 * 1e6).round() as i64))
+                .collect()
+        };
+        let (a, b) = (shown(&before), shown(&after));
+        assert!(!a.is_empty());
+        let missing = a.iter().filter(|p| !b.contains(p)).count();
+        let extra = b.iter().filter(|p| !a.contains(p)).count();
+        // The two views differ by a thousandth of zoom, so only the edges may
+        // gain or lose a point.
+        assert!(missing * 10 < a.len() && extra * 10 < b.len(), "{missing} vanished, {extra} appeared of {}", a.len());
+    }
+
+    /// The finest points fade out as their gap closes, and the ones a coarser
+    /// lattice keeps never fade at all.
+    #[test]
+    fn fine_points_fade_and_coarse_ones_hold() {
+        assert_eq!(lod_fade(0.5), 0.0);
+        assert_eq!(lod_fade(1.0), 1.0);
+        assert!(lod_fade(0.7) > 0.0 && lod_fade(0.7) < 1.0);
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 0.6), 1.0, 64.0, area(), Octave::Finer);
+        // gap ≈ 32/0.6 ≈ 53 points: fine points part-way faded.
+        let fine = (0..g.level.len()).find(|&k| g.level[k] == 0).unwrap();
+        let coarse = (0..g.level.len()).find(|&k| g.level[k] >= 1).unwrap();
+        let f = g.fade(fine, 64.0);
+        assert!(f > 0.0 && f < 1.0, "fine point fade {f}");
+        assert_eq!(g.fade(coarse, 64.0), 1.0);
     }
 }
 
