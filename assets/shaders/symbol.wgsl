@@ -9,6 +9,10 @@ struct CameraUniform {
     // Physical pixels per logical point: 2 on the Retina display the sizes
     // here were calibrated on, 1 on a standard screen such as the Pi's.
     px_per_point: f32,
+    anchor_offset: vec2<f32>,
+    // True bearing at the top of the screen; 0 when north-up.
+    view_rotation: f32,
+    _pad: f32,
 }
 
 struct SymbolMeta {
@@ -30,6 +34,7 @@ struct InstanceInput {
     @location(2) rotation: f32,        // Rotation in radians
     @location(3) disp_prio: u32,       // Display priority for depth sorting
     @location(4) scale: f32,           // Scale factor for Soft SCAMIN
+    @location(5) true_bearing: u32,    // 1: rotation is from true north
 }
 
 struct VertexOutput {
@@ -92,8 +97,16 @@ fn vs_main(
     // ordinary anticlockwise matrix sends a symbol's own "up" to
     // (-sin, cos) — west of north for a positive bearing, i.e. mirrored.
     // This sends it to (sin, cos), which is the bearing itself.
-    let c = cos(instance.rotation);
-    let s = sin(instance.rotation);
+    //
+    // A true bearing is taken relative to the top of the screen, which is
+    // not north once the chart is turned. A symbol with no rotation stands
+    // upright on the screen whichever way the chart faces.
+    var rotation = instance.rotation;
+    if (instance.true_bearing != 0u) {
+        rotation = rotation - camera.view_rotation;
+    }
+    let c = cos(rotation);
+    let s = sin(rotation);
     let rotated_offset = vec2<f32>(
         pixel_offset.x * c + pixel_offset.y * s,
         -pixel_offset.x * s + pixel_offset.y * c

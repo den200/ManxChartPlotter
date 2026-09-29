@@ -19,6 +19,28 @@ use egui_wgpu::ScreenDescriptor;
 /// into the camera or the tile cache.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
+    /// The Safety window's settings (or the notice) changed: save them.
+    SafetyChanged,
+    /// Silence every ringing alarm.
+    AlarmsSilence,
+    /// Man overboard: mark the boat's position now.
+    MobMark,
+    /// The person is back aboard.
+    MobClear,
+    /// Start the anchor watch round the boat's position now.
+    AnchorDrop,
+    /// Stop the anchor watch.
+    AnchorUp,
+    /// A note in the logbook: today's (stamped now, with the position) or,
+    /// with `day`, a remark on a past day.
+    LogNoteAdd { day: Option<chrono::NaiveDate>, text: String },
+    LogNoteDelete(crate::nav::logbook::Note),
+    /// Open a day in the logbook, or go back to the list.
+    LogSelect { day: Option<chrono::NaiveDate> },
+    /// Fit the open day's track on the screen.
+    LogFit,
+    LogExport { day: chrono::NaiveDate, csv: bool },
+    LogDelete(chrono::NaiveDate),
     /// Close the object-query bubble.
     DismissPick,
     /// The display settings changed: re-apply them and save.
@@ -35,8 +57,15 @@ pub enum UiAction {
     PlanCancel,
     /// Keep the boat centred on the chart, or stop.
     FollowSet { on: bool },
+    /// Which way up the chart is drawn.
+    ChartUpSet { mode: ChartUp },
     /// Sign in to the chart shop and list what the account owns.
-    ShopSignIn { email: String, password: String },
+    ShopSignIn {
+        email: String,
+        password: String,
+        /// Keep the session on this device, so the next start is signed in.
+        remember: bool,
+    },
     /// Re-read the entitlement list.
     ShopRefresh,
     /// Forget the session.
@@ -70,6 +99,8 @@ pub enum UiAction {
     RouteDeactivate,
     /// PUT this route to the Signal K server's resources.
     RoutePublish { route_id: uuid::Uuid },
+    /// Save a route as a GPX file in Downloads, for another plotter.
+    RouteExport { route_id: uuid::Uuid },
     /// Read the server's route resources into the store.
     RoutesFetchSignalK,
     /// Start a new, empty route and open it for editing.
@@ -283,7 +314,7 @@ mod chart_folder_tests {
     /// is drawn sixty times a second and a chart set is six hundred entries.
     #[test]
     fn a_folder_is_read_once_and_then_left_alone() {
-        let dir = std::env::temp_dir().join("navcore-chart-folder-test");
+        let dir = std::env::temp_dir().join("manx-chart-folder-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("Denmark")).unwrap();
         std::fs::create_dir_all(dir.join(".hidden")).unwrap();
@@ -507,6 +538,10 @@ pub enum BarPosition {
     /// less often than it covers the top.
     #[default]
     Bottom,
+    /// Down a side, for a wide screen: the chart loses width, which a
+    /// landscape display has to spare, instead of height, which it has not.
+    Left,
+    Right,
     Hidden,
 }
 
@@ -560,6 +595,37 @@ pub struct DisplayView {
     pub deep_contour_m: f32,
     pub show_text: bool,
     pub show_soundings: bool,
+    /// Which way up the chart is drawn.
+    pub chart_up: ChartUp,
+    /// How opaque the weather colour wash is, 0..1. Enough to read the
+    /// colour at a glance, not so much that it hides a rock: where that line
+    /// falls depends on the screen and the light, so it is the user's.
+    pub weather_opacity: f32,
+}
+
+/// Which way up the chart is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum ChartUp {
+    /// North at the top: the chart as printed.
+    #[default]
+    North,
+    /// The boat's heading at the top (her course over ground when no heading
+    /// is received), so what is ahead of the bow is up the screen.
+    Head,
+    /// Wherever two fingers left it. Not a choice anyone makes from a menu,
+    /// only the state a twist leaves behind.
+    Free,
+}
+
+impl ChartUp {
+    /// What the button does next: north-up and head-up take turns, and a
+    /// chart twisted by hand goes back to north-up.
+    pub fn next(self) -> Self {
+        match self {
+            ChartUp::North => ChartUp::Head,
+            ChartUp::Head | ChartUp::Free => ChartUp::North,
+        }
+    }
 }
 
 impl Default for DisplayView {
@@ -579,19 +645,26 @@ impl Default for DisplayView {
             deep_contour_m: m.deep_contour,
             show_text: m.show_text,
             show_soundings: m.show_soundings,
+            chart_up: ChartUp::North,
+            weather_opacity: DEFAULT_WEATHER_OPACITY,
         }
     }
 }
 
+/// The wash's opacity out of the box. It was a fixed 38 % with pale colours,
+/// which read as a stain; strong colours at a little over half let a depth
+/// contour and a buoy still read straight through.
+pub const DEFAULT_WEATHER_OPACITY: f32 = 0.55;
+
 impl DisplayView {
-    /// Apply these choices to `base`. A setting pinned by a `NAVCORE_*`
+    /// Apply these choices to `base`. A setting pinned by a `MANX_*`
     /// variable is left alone, so a capture or a conformance run stays
     /// reproducible whatever the user last chose. `draft_m` is the boat's;
     /// zero means unknown, and then the manual depths are used.
     pub fn apply(&self, base: &crate::s52::MarinerSettings, draft_m: f64) -> crate::s52::MarinerSettings {
         let pinned = |k: &str| std::env::var(k).is_ok();
         let mut s = base.clone();
-        if !pinned("NAVCORE_DISPLAY_CAT") {
+        if !pinned("MANX_DISPLAY_CAT") {
             (s.show_standard, s.show_other) = match self.detail {
                 ChartDetail::Base => (false, false),
                 ChartDetail::Standard => (true, false),
@@ -606,16 +679,16 @@ impl DisplayView {
         } else {
             (self.safety_depth_m, self.safety_contour_m)
         };
-        if !pinned("NAVCORE_SAFETY_DEPTH") {
+        if !pinned("MANX_SAFETY_DEPTH") {
             s.safety_depth = depth;
         }
-        if !pinned("NAVCORE_SAFETY_CONTOUR") {
+        if !pinned("MANX_SAFETY_CONTOUR") {
             s.safety_contour = contour;
         }
-        if !pinned("NAVCORE_SHALLOW_CONTOUR") {
+        if !pinned("MANX_SHALLOW_CONTOUR") {
             s.shallow_contour = self.shallow_contour_m;
         }
-        if !pinned("NAVCORE_DEEP_CONTOUR") {
+        if !pinned("MANX_DEEP_CONTOUR") {
             s.deep_contour = self.deep_contour_m;
         }
         // S-52's order: shallow <= safety <= deep, and a safety contour no
@@ -696,21 +769,25 @@ impl Default for InstrumentView {
 
 /// A download awaiting the user's word.
 ///
-/// A lapsed subscription cannot have the shop's current edition, so navcore
+/// A lapsed subscription cannot have the shop's current edition, so Manx
 /// asks for an older one — a decision worth showing rather than making
 /// silently, because it is the user's licence and the user's money.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingDownload {
     pub chart_id: String,
     pub chart_name: String,
-    /// The edition to ask for, when one could be worked out.
-    pub edition: Option<String>,
-    /// Where that edition came from, in words.
+    /// The subscription has lapsed, so the shop's current edition is not
+    /// covered and an older one has to be named.
+    pub expired: bool,
+    /// Editions the licence is known to have covered, each with where that
+    /// is known from ("as last sent to macbook"), for the user to choose.
+    pub choices: Vec<(String, String)>,
+    /// Why, in words.
     pub because: String,
-    /// The download claims a new licence slot for this machine (a live
-    /// subscription this machine does not hold yet), rather than asking for
-    /// an older edition of a lapsed one.
+    /// The download claims a new licence slot for this machine.
     pub new_slot: bool,
+    /// Said above everything else when a slot will be spent.
+    pub slot_note: Option<String>,
 }
 
 /// What the shop panel is showing.
@@ -723,6 +800,9 @@ pub struct ShopView {
     pub email: String,
     /// Kept only for as long as it takes to send. Never written to disk.
     pub password: String,
+    /// "Remember me": keep the session key — not the password — on this
+    /// device, and sign in with it next time.
+    pub remember: bool,
     pub status: String,
     pub busy: bool,
     pub signed_in: bool,
@@ -737,6 +817,8 @@ pub struct ShopView {
     pub grants: std::collections::HashMap<String, String>,
     /// A download the user has not yet confirmed.
     pub pending: Option<PendingDownload>,
+    /// The step the user went back (or forward) to; `None` follows progress.
+    pub step: Option<u8>,
     /// A standing problem with this machine — no chart licence found — kept
     /// apart from `status`, which every worker event overwrites. Set as a
     /// status, it was gone before anyone could read it.
@@ -759,6 +841,8 @@ pub struct UiState<'a> {
     pub ais: Vec<super::ui_ais::AisTarget>,
     /// Metres per logical point, so a course vector is a real distance.
     pub mpp: f32,
+    /// The bearing at the top of the screen, radians; 0 when north-up.
+    pub chart_rotation: f32,
     /// Visible routes, projected for the overlay.
     pub routes: Vec<super::ui_routes::RouteDisplay>,
     /// The planner's endpoints, projected, for the pins.
@@ -772,6 +856,20 @@ pub struct UiState<'a> {
     /// Where the sheet's point forecast was taken, projected. `None` when
     /// there is none, or when it has panned off the screen.
     pub weather_anchor: Option<[f32; 2]>,
+    /// Raised alarms, man overboard first.
+    pub alarms: Vec<super::ui_safety::AlarmLine>,
+    pub mob: Option<super::ui_safety::MobView>,
+    pub anchor: Option<super::ui_safety::AnchorView>,
+    /// Today's track, as the logbook records it.
+    pub track: super::ui_safety::TrackView,
+    /// The logbook day open in its window, when it is shown on the chart,
+    /// and its notes that have a position.
+    pub log_track: super::ui_safety::TrackView,
+    pub log_notes: Vec<([f32; 2], String)>,
+    /// Depth under the boat now, if the sounder is heard.
+    pub depth_m: Option<f64>,
+    /// The logbook window's rows, when it is open.
+    pub logbook: super::ui_logbook::LogbookState,
 }
 
 pub struct Ui {
@@ -803,6 +901,9 @@ pub struct Ui {
     pub sheet: super::ui_weather::SheetView,
     pub display: DisplayView,
     pub free: FreeChartsView,
+    /// The notice, alarms, man overboard and anchor watch.
+    pub safety: super::ui_safety::SafetyView,
+    pub logbook: super::ui_logbook::LogView,
 }
 
 impl Ui {
@@ -812,7 +913,7 @@ impl Ui {
         surface_format: wgpu::TextureFormat,
     ) -> Self {
         let ctx = egui::Context::default();
-        style(&ctx, false);
+        style(&ctx);
         let state = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -843,13 +944,15 @@ impl Ui {
             sheet: Default::default(),
             display: crate::render::state::RenderState::load_display_settings(),
             free: FreeChartsView::default(),
+            safety: crate::render::state::RenderState::load_safety_settings(),
+            logbook: crate::render::state::RenderState::load_logbook_settings(),
         }
     }
 
     /// Does egui still have work to finish?
     ///
     /// It animates — a window fades in, a hover highlight grows — and it
-    /// reports how soon it wants the next frame. navcore only redraws on
+    /// reports how soon it wants the next frame. Manx only redraws on
     /// demand, so ignoring this froze every animation part-way: a panel that
     /// had faded to a third of its opacity simply stayed there, looking like a
     /// rendering fault rather than an unfinished fade.
@@ -870,14 +973,29 @@ impl Ui {
         window: &winit::window::Window,
         event: &winit::event::WindowEvent,
     ) -> egui_winit::EventResponse {
+        // winit's Android backend leaves a key's `text` empty, and egui types
+        // only from `text`: the soft keyboard's letters would reach no field.
+        // The character is in the logical key, so it is copied across.
+        #[cfg(target_os = "android")]
+        if let winit::event::WindowEvent::KeyboardInput { event: key, .. } = event {
+            if let (None, winit::keyboard::Key::Character(c)) = (&key.text, &key.logical_key) {
+                let mut typed = event.clone();
+                if let winit::event::WindowEvent::KeyboardInput { event: key, .. } = &mut typed {
+                    key.text = Some(c.clone());
+                }
+                return self.state.on_window_event(window, &typed);
+            }
+        }
         self.state.on_window_event(window, event)
     }
 
     /// Follow the chart's palette: a light interface over the Day chart, a dark
     /// one over Dusk and Night. A bright panel at night ruins night vision,
     /// which is the whole point of the dark palettes.
-    pub fn set_dark(&mut self, dark: bool) {
-        style(&self.ctx, dark);
+    /// Re-dress the interface for an S-52 palette.
+    pub fn set_palette(&mut self, palette: super::theme::Palette) {
+        super::theme::set(palette);
+        style(&self.ctx);
     }
 
     /// Is the pointer over any part of the interface — a panel, a window, a
@@ -949,12 +1067,16 @@ impl Ui {
         let sheet = &mut self.sheet;
         let display = &mut self.display;
         let free = &mut self.free;
+        let safety = &mut self.safety;
+        let logbook = &mut self.logbook;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
                 ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
-                display, free, fleet, actions,
+                display, free, safety, logbook, fleet, actions,
             );
         });
+        #[cfg(target_os = "android")]
+        android_keyboard(output.platform_output.ime.is_some());
         self.state
             .handle_platform_output(window, output.platform_output);
         self.repaint_after = output
@@ -1002,15 +1124,11 @@ impl Ui {
     }
 }
 
-/// navcore's look: bigger than egui's default, because this is read at arm's
+/// Manx's look: bigger than egui's default, because this is read at arm's
 /// length on a boat, often through spray and often through reading glasses.
-fn style(ctx: &egui::Context, dark: bool) {
+fn style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
-    ctx.set_visuals(if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    });
+    ctx.set_visuals(super::theme::current().visuals());
     let mut style = (*ctx.style()).clone();
     // Points, so these track the display's scale factor.
     style.text_styles = [
@@ -1059,5 +1177,54 @@ mod display_tests {
         let manual = DisplayView { safety_depth_m: 4.0, safety_contour_m: 5.0, ..d };
         let s = manual.apply(&base, 0.0);
         assert_eq!((s.safety_depth, s.safety_contour), (4.0, 5.0));
+    }
+}
+
+/// Show the soft keyboard while a text field has focus, and hide it after.
+///
+/// egui-winit asks for it through `ANativeActivity_showSoftInput`, which
+/// Android refuses: NativeActivity hands InputMethodManager its content
+/// view, but the view the IME serves is the window's decor view, and the
+/// request fails its "served view" check (the IME tracker in `dumpsys
+/// input_method` logs it as STATUS_FAIL at PHASE_CLIENT_VIEW_SERVED). So
+/// ask InputMethodManager ourselves, for the decor view.
+#[cfg(target_os = "android")]
+fn android_keyboard(show: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if SHOWN.swap(show, Ordering::Relaxed) == show {
+        return;
+    }
+    let result = (|| -> jni::errors::Result<()> {
+        let context = ndk_context::android_context();
+        // SAFETY: android-activity puts the process's JavaVM and the
+        // activity in ndk-context before android_main runs.
+        let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }?;
+        let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
+        let mut env = vm.attach_current_thread()?;
+        // Manx's thread stays attached, so free this call's references.
+        let shown = env.with_local_frame(16, |env| -> jni::errors::Result<()> {
+            let name = env.new_string("input_method")?;
+            let imm = env
+                .call_method(&activity, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;", &[(&name).into()])?
+                .l()?;
+            let window = env.call_method(&activity, "getWindow", "()Landroid/view/Window;", &[])?.l()?;
+            let decor = env.call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?.l()?;
+            if show {
+                env.call_method(&imm, "showSoftInput", "(Landroid/view/View;I)Z", &[(&decor).into(), 0.into()])?;
+            } else {
+                let token = env.call_method(&decor, "getWindowToken", "()Landroid/os/IBinder;", &[])?.l()?;
+                env.call_method(&imm, "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z", &[(&token).into(), 0.into()])?;
+            }
+            Ok(())
+        });
+        // A Java exception left pending would fail every later JNI call.
+        if env.exception_check()? {
+            env.exception_clear()?;
+        }
+        shown
+    })();
+    if let Err(e) = result {
+        log::warn!("soft keyboard: {e}");
     }
 }

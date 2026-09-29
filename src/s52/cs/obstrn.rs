@@ -78,7 +78,7 @@ pub struct Obstrn04Result {
 ///     is shallower than it.
 ///
 /// Condition 2 is what needs the surrounding chart. Testing depth alone — as
-/// navcore did before it had [`CsContext`] — marks every shallow rock inside
+/// Manx did before it had [`CsContext`] — marks every shallow rock inside
 /// shallow water as an isolated danger, scattering ISODGR51 over ground that
 /// OpenCPN symbolises as an ordinary rock with its sounding.
 fn is_isolated_danger(
@@ -292,7 +292,7 @@ fn obstrn04_area(
 /// shade (`AC`), never marked with a point symbol.
 ///
 /// Deviation: where OpenCPN appends SNDFRM02's digit *symbols*
-/// (`SY(SOUNDG21);SY(SOUNDG12)`), navcore emits the sounding as a text
+/// (`SY(SOUNDG21);SY(SOUNDG12)`), Manx emits the sounding as a text
 /// instruction, as it does for soundings everywhere else.
 pub fn obstrn04_instructions(
     feature: &Feature,
@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn test_shallow_obstruction_in_shallow_water_is_not_isolated() {
         // The same obstruction inside a 0-2 m area is part of that shallow
-        // water, not an isolated danger — this is the case navcore used to get
+        // water, not an isolated danger — this is the case Manx used to get
         // wrong, before UDWHAZ03 could see its surroundings.
         let feature = make_obstrn(Some(5.0), Some(3));
         let settings = test_contours();

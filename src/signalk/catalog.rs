@@ -11,7 +11,7 @@
 
 use super::units::Quantity;
 
-/// A path navcore knows how to present.
+/// A path Manx knows how to present.
 pub struct Known {
     pub path: &'static str,
     /// Short enough for a tile on a phone-sized bar.
@@ -77,7 +77,23 @@ known! {
     "navigation.gnss.horizontalDilution"        => "HDOP",     Count;
 }
 
-/// The entry for a path, if navcore knows it.
+/// Not a Signal K path: the tile that draws apparent and true wind on a
+/// dial. It lives in the bar's list of paths so that it is saved, ordered
+/// and removed like any other tile; the `manx.` prefix is one no server
+/// sends.
+pub const WIND_ROSE: &str = "manx.windRose";
+
+/// A tile id as saved by an older build, brought up to date: the wind rose
+/// was saved as `navcore.windRose` before the rename.
+pub fn current_tile(path: String) -> String {
+    if path == "navcore.windRose" {
+        WIND_ROSE.to_string()
+    } else {
+        path
+    }
+}
+
+/// The entry for a path, if Manx knows it.
 pub fn lookup(path: &str) -> Option<&'static Known> {
     KNOWN.iter().find(|k| k.path == path)
 }
@@ -88,6 +104,9 @@ pub fn lookup(path: &str) -> Option<&'static Known> {
 /// quantity's own name — `propulsion.starboard.oilPressure` becomes
 /// `oilPressure`. Ugly, but honest and immediately recognisable.
 pub fn label_for(path: &str) -> &str {
+    if path == WIND_ROSE {
+        return "Wind rose";
+    }
     match lookup(path) {
         Some(k) => k.label,
         None => path.rsplit('.').next().unwrap_or(path),

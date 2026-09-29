@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bake a signed-distance-field glyph atlas for navcore's chart labels.
+"""Bake a signed-distance-field glyph atlas for manx's chart labels.
 
     tools/make_font_atlas.py            # regenerate assets/fonts/labels.{png,json}
 

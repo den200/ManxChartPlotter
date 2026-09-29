@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Diff navcore's S-52 instruction stream against OpenCPN's (tools/s52oracle).
+"""Diff manx's S-52 instruction stream against OpenCPN's (tools/s52oracle).
 
-    navcore --dump-ir <charts> /tmp/run
+    manx --dump-ir <charts> /tmp/run
     tools/s52oracle/build/s52oracle --plib assets/s52/chartsymbols.xml \
         < /tmp/run.features.ndjson > /tmp/run.oracle.ndjson
-    tools/s52diff.py /tmp/run.navcore.ndjson /tmp/run.oracle.ndjson
+    tools/s52diff.py /tmp/run.manx.ndjson /tmp/run.oracle.ndjson
 
 Records are joined on `id`. Every divergence is bucketed by kind and object
 class so the output ranks *what to fix next*, not just what differs.
@@ -51,7 +51,7 @@ SOUND_GLYPH_RE = re.compile(r"^SY\(SOUND[GS][A-Z0-9]{2}\)$")
 
 
 def normalise(toks, side, deviations):
-    """Fold away differences navcore makes on purpose, counting each one.
+    """Fold away differences manx makes on purpose, counting each one.
 
     These are architectural choices, not bugs, and they are numerous enough
     that leaving them in the ranking would bury everything else. Each fold is
@@ -63,14 +63,14 @@ def normalise(toks, side, deviations):
         t = toks[i]
 
         # OpenCPN emits MP() for a multipoint sounding and expands it per point
-        # inside the renderer; navcore has a dedicated multipoint path and
+        # inside the renderer; manx has a dedicated multipoint path and
         # returns nothing from the CS procedure.
         if side == "opencpn" and t == "MP()":
             deviations["multipoint sounding expanded by the renderer, not CS"] += 1
             i += 1
             continue
 
-        # navcore draws soundings as text wherever they appear; OpenCPN
+        # manx draws soundings as text wherever they appear; OpenCPN
         # composes them from per-digit symbols (SY(SOUNDG21);SY(SOUNDG12)).
         if side == "opencpn" and SOUND_GLYPH_RE.match(t):
             while i < len(toks) and SOUND_GLYPH_RE.match(toks[i]):
@@ -78,12 +78,12 @@ def normalise(toks, side, deviations):
             out.append("SOUNDING()")
             deviations["sounding drawn as text, not digit symbols"] += 1
             continue
-        if side == "navcore" and t.replace("'", "").startswith("TE(%4.1lf,VALSOU"):
+        if side == "manx" and t.replace("'", "").startswith("TE(%4.1lf,VALSOU"):
             out.append("SOUNDING()")
             i += 1
             continue
 
-        # navcore builds light descriptions and sector arcs in the tile builder
+        # manx builds light descriptions and sector arcs in the tile builder
         # (litdsn01 / light_sector_info) instead of returning them from the CS
         # procedure, so its IR carries only the bare symbol.
         # LITDSN01's output is a quoted *literal* in display group 23; every
@@ -113,7 +113,7 @@ def norm_num(s):
 
 
 def args_differ(a, b):
-    """Return the index of the first differing arg, or None. '?' is navcore's
+    """Return the index of the first differing arg, or None. '?' is manx's
     marker for a field it does not model — reported separately, not as a value
     mismatch."""
     n = max(len(a), len(b))
@@ -168,8 +168,8 @@ def main():
         # CS procedures whose OpenCPN result depends on chart context the oracle
         # is not given (associated depth areas, floating/rigid ATON arrays).
         # Divergences involving these are suffixed [ctx] — they are suspect, not
-        # proof of a navcore bug.
-        # Once navcore ships the surrounding depth areas with a feature
+        # proof of a manx bug.
+        # Once manx ships the surrounding depth areas with a feature
         # ("assoc_used"), the oracle runs UDWHAZ03 over the same neighbourhood
         # and the result is decidable — no caveat needed.
         ctx_sensitive = not orec.get("assoc_used") and bool(
@@ -191,10 +191,10 @@ def main():
             ntab = nlup.get("tnam", "").upper().replace("_BOUNDARIES", "").replace("_CHART", "")
             otab = olup.get("tnam", "").upper().replace("_BOUNDARIES", "").replace("_CHART", "")
             if ntab != otab:
-                note("SETTINGS_MISMATCH_table", f"navcore={nlup.get('tnam')} opencpn={olup.get('tnam')}")
+                note("SETTINGS_MISMATCH_table", f"manx={nlup.get('tnam')} opencpn={olup.get('tnam')}")
 
         if (nlup is None) != (olup is None):
-            note("lup_missing", f"navcore={'None' if nlup is None else 'ok'} "
+            note("lup_missing", f"manx={'None' if nlup is None else 'ok'} "
                                f"opencpn={'None' if olup is None else 'ok'}")
             continue
         if nlup is None:
@@ -204,13 +204,13 @@ def main():
         ninst = nlup["inst"].replace("\x1f", "").strip()
         oinst = olup["inst"].replace("\x1f", "").strip()
         if ninst != oinst:
-            note("lup_selection", f"navcore={ninst!r} opencpn={oinst!r}")
+            note("lup_selection", f"manx={ninst!r} opencpn={oinst!r}")
         if nlup["dpri"] != olup["dpri"]:
-            note("lup_priority", f"navcore={nlup['dpri']} opencpn={olup['dpri']}")
+            note("lup_priority", f"manx={nlup['dpri']} opencpn={olup['dpri']}")
         ndisc = nlup["disc"].upper()
         odisc = olup["disc"].upper()
         if ndisc[:4] != odisc[:4]:
-            note("lup_category", f"navcore={ndisc} opencpn={odisc}")
+            note("lup_category", f"manx={ndisc} opencpn={odisc}")
 
         # --- visibility: would the feature be drawn at all? ---
         # A third decision layer, independent of symbology: display category,
@@ -223,7 +223,7 @@ def main():
             why = "scale" if not v.get("scale_ok") else "category"
             note(
                 "visibility",
-                f"navcore={'shown' if nvis else 'hidden (' + why + ')'} "
+                f"manx={'shown' if nvis else 'hidden (' + why + ')'} "
                 f"opencpn={'shown' if ovis else 'hidden'}",
             )
 
@@ -236,7 +236,7 @@ def main():
         # no DRVAL2 (s52cnsy.cpp:621-631 — the intended `drval2 = drval1 + 0.01`
         # is commented out), so its depth shade comes from whatever was on the
         # stack. Every AC divergence in the corpus is a feature with no DRVAL2
-        # and none with one, so navcore's reading is the correct one and the
+        # and none with one, so manx's reading is the correct one and the
         # oracle's answer here is not evidence.
         if cls in ("DEPARE", "DRGARE") and fid in feats:
             if "DRVAL2" not in feats[fid].get("attrs", {}):
@@ -255,7 +255,7 @@ def main():
 
         # OpenCPN's LIGHTS06 declares `orientstr` and leaves the assignment
         # commented out, so every directional light comes out as a question
-        # mark whatever its ORIENT. navcore draws the oriented flare the S-52
+        # mark whatever its ORIENT. manx draws the oriented flare the S-52
         # procedure describes; drop both sides of that substitution.
         if "SY(QUESMRK1)" in oraw:
             deviations["directional light (OpenCPN's ORIENT handling is disabled)"] += 1
@@ -264,26 +264,26 @@ def main():
                 if t.startswith("SY("):
                     nraw.pop(k)
                     break
-        ntok = [parse_token(t) for t in normalise(nraw, "navcore", deviations)]
+        ntok = [parse_token(t) for t in normalise(nraw, "manx", deviations)]
         otok = [parse_token(t) for t in normalise(oraw, "opencpn", deviations)]
         if len(ntok) != len(otok):
             def show(toks):
                 return [op + "(" + ",".join(args) + ")" for op, args in toks]
-            note("expand_count", f"navcore={show(ntok)} opencpn={show(otok)}")
+            note("expand_count", f"manx={show(ntok)} opencpn={show(otok)}")
         else:
             for i, ((nop, nargs), (oop, oargs)) in enumerate(zip(ntok, otok)):
                 if nop != oop:
                     note("expand_opcode",
-                         f"#{i} navcore={nrec['expanded'][i].strip()!r} "
+                         f"#{i} manx={nrec['expanded'][i].strip()!r} "
                          f"opencpn={orec['expanded'][i].strip()!r}")
                     break
                 j = args_differ(nargs, oargs)
                 if j is not None:
                     note(f"expand_args_{nop}",
-                         f"#{i} arg{j} navcore={nrec['expanded'][i].strip()!r} "
+                         f"#{i} arg{j} manx={nrec['expanded'][i].strip()!r} "
                          f"opencpn={orec['expanded'][i].strip()!r}")
                     break
-                # navcore modelled fewer args than OpenCPN emitted
+                # manx modelled fewer args than OpenCPN emitted
                 if len(nargs) < len(oargs):
                     unmodeled[f"{nop}:arg{len(nargs)}..{len(oargs)-1}"] += 1
                 for k, a in enumerate(nargs):
@@ -304,11 +304,11 @@ def main():
                 for fid, detail in examples[(kind, cls)]:
                     print(f"                    id={fid} {detail}")
     if deviations:
-        print("\nknown deviations folded out (navcore renders these elsewhere):")
+        print("\nknown deviations folded out (manx renders these elsewhere):")
         for k, c in deviations.most_common():
             print(f"  {c:7d}  {k}")
     if unmodeled:
-        print("\nfields OpenCPN emits that navcore does not model:")
+        print("\nfields OpenCPN emits that manx does not model:")
         for k, c in unmodeled.most_common(15):
             print(f"  {c:7d}  {k}")
     return 0

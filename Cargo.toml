@@ -1,14 +1,19 @@
 [package]
-name = "navcore2"
+name = "manx"
 version = "0.4.0"
 edition = "2021"
+description = "A fast, light chart plotter for the Raspberry Pi, Linux and Android"
+license = "GPL-3.0-or-later"
 # `src/bin/signalk-sim.rs` is auto-discovered, so a bare `cargo run` sees two
 # binaries and refuses to guess. The plotter is the one you mean.
-default-run = "navcore"
+default-run = "manx"
+
+[workspace]
+members = ["android"]
 
 [[bin]]
-name = "navcore"
-path = "src/bin/navcore.rs"
+name = "manx"
+path = "src/bin/manx.rs"
 
 [dependencies]
 # Existing
@@ -50,7 +55,7 @@ earcutr = "0.4"
 rayon = "1.10"
 
 # UI. 0.29 is the release that pairs with wgpu 22.1 and winit 0.30 — the
-# versions navcore already uses — so the chart renderer is untouched by it.
+# versions manx already uses — so the chart renderer is untouched by it.
 # egui draws in its own pass over the resolved surface; it owns no window, no
 # event loop and no part of the chart pipeline.
 egui = "0.29"
@@ -87,3 +92,12 @@ geographiclib-rs = "0.2.7"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 gribberish = "1.6.0"
+
+# Android (ODROID-C5): winit must be told which Android activity it runs in.
+# NativeActivity needs no Java, so the APK is built without Gradle.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30", features = ["android-native-activity"] }
+# The soft keyboard, shown through InputMethodManager (src/render/ui.rs).
+# Both already come in with winit's android-activity.
+jni = "0.21"
+ndk-context = "0.1"

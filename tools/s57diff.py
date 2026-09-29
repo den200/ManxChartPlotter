@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Compare navcore's S-57 path with OpenCPN's reader, feature by feature.
+"""Compare manx's S-57 path with OpenCPN's reader, feature by feature.
 
-    tools/s57diff.py <oracle.ndjson> <navcore.ndjson> [-v]
+    tools/s57diff.py <oracle.ndjson> <manx.ndjson> [-v]
 
 oracle: tools/s57oracle/build/s57oracle cell.000
-navcore: navcore --s57-dump cell.000
+manx: manx --s57-dump cell.000
 
 Features are matched by FRID RCID. Checked: the class, every attribute
 value (numerically where both parse as numbers), point positions, sounding
 counts, positions and depths, line length and area size (in the Mercator
-plane, where navcore draws them). Prints a count of each kind of
+plane, where manx draws them). Prints a count of each kind of
 divergence per object class; -v adds examples.
 """
 import json, math, sys
@@ -81,7 +81,7 @@ def compare(oracle, ours, verbose=False, name=""):
             if nv is None:
                 flag("attr-missing", cls, f"rcid {rcid} {k}={v!r}")
             elif not same_value(v, nv):
-                flag("attr-value", cls, f"rcid {rcid} {k}: oracle {v!r} navcore {nv!r}")
+                flag("attr-value", cls, f"rcid {rcid} {k}: oracle {v!r} manx {nv!r}")
         g, h = o["geom"], n.get("geom") or {}
         t = g["type"]
         if t == "Point":
@@ -105,14 +105,14 @@ def compare(oracle, ours, verbose=False, name=""):
             if h.get("type") != "Lines":
                 flag("geom-type", cls, f"rcid {rcid}: {h.get('type')}")
             elif lo > 1.0 and abs(h["len"] - lo) / lo > 0.01:  # slivers under a metre: noise
-                flag("line-length", cls, f"rcid {rcid}: oracle {lo:.0} navcore {h['len']:.0}")
+                flag("line-length", cls, f"rcid {rcid}: oracle {lo:.0} manx {h['len']:.0}")
         elif t == "Polygon":
             rings = g["rings"]
             ao = ring_area(rings[0]) - sum(ring_area(r) for r in rings[1:]) if rings else 0
             if h.get("type") != "Area":
                 flag("geom-type", cls, f"rcid {rcid}: {h.get('type')}")
             elif ao > 100.0 and abs(h["area"] - ao) / ao > 0.005:  # slivers under 100 m²: noise
-                flag("area", cls, f"rcid {rcid}: oracle {ao:.0f} navcore {h['area']:.0f} ({len(rings)} rings)")
+                flag("area", cls, f"rcid {rcid}: oracle {ao:.0f} manx {h['area']:.0f} ({len(rings)} rings)")
     for rcid, n in nf.items():
         o = of.get(rcid)
         if o is None or o.get("geom") is None:

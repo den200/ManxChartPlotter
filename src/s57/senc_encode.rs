@@ -1,11 +1,11 @@
 //! An S-57 cell written as SENC — the byte stream OpenCPN's `Osenc` builds
-//! from S-57, and the one navcore's SENC reader already understands.
+//! from S-57, and the one Manx's SENC reader already understands.
 //!
 //! Going through SENC rather than straight to `ChartData` keeps one reader
 //! and one chart model for both chart sources, and lets a converted cell be
 //! cached like a decrypted o-charts cell. The layout follows OpenCPN's
 //! `Osenc.cpp` (`createSenc200`, `CreateSENCRecord200`), version 200, with
-//! three deliberate simplifications that navcore's reader does not see:
+//! three deliberate simplifications that Manx's reader does not see:
 //! areas are written as plain triangle lists (no strips or fans), edges are
 //! written whole — their end nodes included — so lines and rings resolve
 //! complete, and no level-of-detail thinning is applied.

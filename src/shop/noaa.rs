@@ -4,7 +4,7 @@
 //! A package is a zip holding an `ENC_ROOT` of S-57 cells. It is unpacked
 //! into `<chart folder>/noaa/<STATE>/`, where the chart catalogue finds S-57
 //! cells in subfolders — so NOAA charts sit beside o-charts cells in the one
-//! folder, with nothing else to manage. A small `navcore-noaa.json` beside
+//! folder, with nothing else to manage. A small `manx-noaa.json` beside
 //! the cells records what was installed and when, which is what "Update
 //! available" is worked out from.
 
@@ -76,7 +76,7 @@ pub struct Installed {
     pub last_modified: String,
 }
 
-const MARKER: &str = "navcore-noaa.json";
+const MARKER: &str = "manx-noaa.json";
 
 /// A HEAD is small: 20 seconds for all of it.
 fn probe_agent() -> ureq::Agent {

@@ -1,0 +1,26 @@
+# The Android build of manx: the same app as src/bin/manx.rs, as the
+# shared library a NativeActivity loads. Built and packaged by
+# deploy/build-apk.sh.
+[package]
+name = "manx-android"
+version = "0.4.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "manx"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+manx = { path = ".." }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+dirs = "5.0"
+env_logger = "0.11"
+glam = "0.29"
+log = "0.4"
+pollster = "0.4"
+serde_json = "1.0"
+wgpu = "22.1"
+winit = { version = "0.30", features = ["android-native-activity"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

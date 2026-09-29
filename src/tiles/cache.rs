@@ -182,7 +182,7 @@ impl TileGpuCache {
 
     /// Upload a tile packet to GPU and cache it
     pub fn upload(&mut self, device: &wgpu::Device, packet: TilePacket, style_hash: u64) {
-        let profile = std::env::var("NAVCORE_PROFILE")
+        let profile = std::env::var("MANX_PROFILE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         let upload_start = profile.then(std::time::Instant::now);
@@ -207,15 +207,7 @@ impl TileGpuCache {
         }
 
         // Track empty tiles so we don't re-request them every frame.
-        if packet.area_vertices.is_empty()
-            && packet.line_batches.is_empty()
-            && packet.lc_batches.is_empty()
-            && packet.symbol_instances.is_empty()
-            && packet.text_instances.is_empty()
-            && packet.label_candidates.is_empty()
-            && packet.pattern_vertices.is_empty()
-            && packet.sector_instances.is_empty()
-        {
+        if packet.is_empty() {
             log::debug!("  -> empty packet, marking as known-empty");
             self.mark_empty(&key);
             return;

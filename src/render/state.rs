@@ -78,7 +78,10 @@ pub struct Uniforms {
     /// This slot's origin minus the frame's pattern anchor (the camera), in
     /// metres. Area patterns are anchored to the world grid through it.
     pub anchor_offset: [f32; 2],
-    pub _pad: [f32; 2],
+    /// The camera's rotation (the true bearing up the screen), in radians.
+    /// A symbol or sector drawn at a true bearing subtracts it.
+    pub view_rotation: f32,
+    pub _pad: f32,
 }
 
 /// Camera slots in the uniform buffer. The first few are fixed; tiles follow.
@@ -86,6 +89,8 @@ pub struct Uniforms {
 /// 2048 slots at a 256-byte stride is 512 KiB — small next to one tile's
 /// vertices, and several times the largest draw list a tilted view makes.
 pub const CAMERA_SLOTS: usize = 2048;
+/// Line styles one frame can draw: one uniform slot each.
+const LINE_STYLE_SLOTS: usize = 128;
 /// Slot for data still in global Mercator (the single-chart debug path).
 pub const SLOT_GLOBAL: usize = 0;
 /// Slot for the globally decluttered soundings and labels.
@@ -365,6 +370,9 @@ impl Drop for JobGuard {
 
 pub struct RenderState {
     pub window: Arc<Window>,
+    /// Kept to make a new surface: Android destroys the window's surface
+    /// whenever the app goes to the background.
+    instance: wgpu::Instance,
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -445,6 +453,10 @@ pub struct RenderState {
     /// The chart shop, on its own thread. Created on first use, because most
     /// sessions never open it.
     shop: Option<crate::shop::service::ShopService>,
+    /// "Remember me" was ticked for the sign-in under way.
+    shop_remember: bool,
+    /// A remembered o-charts session has been tried this run.
+    shop_resume_tried: bool,
     /// The Signal K stream, on its own thread. Also created on first use — a
     /// chart table with no boat around it should not open a socket.
     signalk: Option<crate::signalk::SignalKService>,
@@ -466,12 +478,12 @@ pub struct RenderState {
     mariner_buffer: Option<wgpu::Buffer>,
     mariner_count: u32,
     mariner_symbols: Option<crate::render::mariner::MarinerSymbols>,
-    /// Where chart sets live — the directory navcore was pointed at, which is
+    /// Where chart sets live — the directory Manx was pointed at, which is
     /// also where a downloaded set is unpacked so it sits beside the others.
     chart_root: Option<std::path::PathBuf>,
-    /// The NAVCORE_PLAN capture hook has run (it must fire exactly once).
+    /// The MANX_PLAN capture hook has run (it must fire exactly once).
     env_plan_fired: bool,
-    /// The address the user configured, while `NAVCORE_SIGNALK` overrides it
+    /// The address the user configured, while `MANX_SIGNALK` overrides it
     /// for this run. Written back on save so a test address cannot become
     /// the boat's.
     signalk_override_saved: Option<String>,
@@ -581,6 +593,26 @@ pub struct RenderState {
     s52_engine: Option<S52Engine>,
     /// Dirty flag — set on camera move, tile upload, resize; cleared after render
     needs_redraw: bool,
+    /// The chart is still turning towards the way up it was asked for, and
+    /// wants frames until it gets there.
+    chart_turning: bool,
+    /// When the turn last advanced, so it runs at the same speed at any
+    /// frame rate.
+    chart_turn_at: Option<Instant>,
+    /// Raised alarms and when they last sounded.
+    alarms: crate::nav::alarms::Alarms,
+    /// Man overboard: where (if there was a fix) and when.
+    mob: Option<(Option<crate::geo::LatLon>, Instant)>,
+    /// The anchor watch: the anchor's position and the circle, metres.
+    anchor_watch: Option<(crate::geo::LatLon, f64)>,
+    /// The logbook recorder; today's samples are its track.
+    logbook: crate::nav::logbook::Recorder,
+    /// The logbook window's rows, read from disk when it opens or changes.
+    log_state: crate::render::ui_logbook::LogbookState,
+    /// The open day's samples, for its track on the chart.
+    log_samples: Vec<crate::nav::logbook::Sample>,
+    /// The rows need reading again.
+    log_dirty: bool,
     /// Incremental key for visible-tile text layout inputs
     last_text_layout_key: u64,
     /// Cached unique visible line styles for the current visible tile set
@@ -589,18 +621,18 @@ pub struct RenderState {
     cached_visible_line_styles_key: u64,
     /// Key for the last uploaded line-uniform contents
     last_line_uniforms_key: u64,
-    /// If set, the draw pass records what it issued (NAVCORE_DUMP_DRAW).
+    /// If set, the draw pass records what it issued (MANX_DUMP_DRAW).
     pub draw_log: Option<std::cell::RefCell<Vec<serde_json::Value>>>,
-    /// If set, render() copies the next frame to this PNG path (NAVCORE_SHOT headless capture)
+    /// If set, render() copies the next frame to this PNG path (MANX_SHOT headless capture)
     pending_capture: Option<String>,
 }
 
 /// Per-frame report of which visible tiles are resident, pending or known to
-/// have no chart data. `NAVCORE_TILE_DEBUG=1`.
+/// have no chart data. `MANX_TILE_DEBUG=1`.
 fn tile_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NAVCORE_TILE_DEBUG")
+        std::env::var("MANX_TILE_DEBUG")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     })
@@ -609,10 +641,45 @@ fn tile_debug_enabled() -> bool {
 fn profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NAVCORE_PROFILE")
+        std::env::var("MANX_PROFILE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     })
+}
+
+/// Frame rate, for `MANX_PROFILE=1`: every five seconds, how many frames
+/// were drawn per second and how long the gaps between them were (median and
+/// 95th percentile). Manx draws only when something changes, so this counts
+/// real frames — hold the view still and it rightly falls to nothing; pan, or
+/// run `MANX_STRESS=1`, to measure the renderer.
+fn note_frame() {
+    use std::cell::RefCell;
+    thread_local! {
+        static FRAMES: RefCell<(Option<Instant>, Instant, Vec<f32>)> =
+            RefCell::new((None, Instant::now(), Vec::new()));
+    }
+    FRAMES.with(|f| {
+        let (last, window, gaps) = &mut *f.borrow_mut();
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            gaps.push(now.duration_since(prev).as_secs_f32() * 1000.0);
+        }
+        *last = Some(now);
+        let span = now.duration_since(*window).as_secs_f32();
+        if span >= 5.0 && !gaps.is_empty() {
+            gaps.sort_by(|a, b| a.total_cmp(b));
+            let pct = |p: f32| gaps[((gaps.len() - 1) as f32 * p).round() as usize];
+            log::info!(
+                "profile.fps: {:.1} fps, frame gap p50 {:.1} ms p95 {:.1} ms ({} frames)",
+                gaps.len() as f32 / span,
+                pct(0.5),
+                pct(0.95),
+                gaps.len()
+            );
+            gaps.clear();
+            *window = now;
+        }
+    });
 }
 
 /// A lattice of sample points that belongs to the sea rather than to the
@@ -634,6 +701,12 @@ struct SampleGrid {
     screen: Vec<[f32; 2]>,
     /// Where each point is on the earth, in the same order.
     geo: Vec<(f64, f64)>,
+    /// How many octaves up each point survives: 0 for a point only the
+    /// finest lattice has, 1 for one the lattice twice as coarse also has,
+    /// and so on (capped). Same order again.
+    level: Vec<u8>,
+    /// Screen distance between neighbours of the finest lattice, points.
+    gap: f32,
     cols: usize,
     rows: usize,
 }
@@ -642,13 +715,53 @@ impl SampleGrid {
     fn is_empty(&self) -> bool {
         self.cols == 0 || self.rows == 0
     }
+
+    /// How visible point `k` should be when the marks are meant to stand
+    /// about `spacing` points apart, 0..1.
+    ///
+    /// The lattice is octaves of world distance anchored to the world, so
+    /// every coarser lattice is a subset of the finer one. A point of level
+    /// `L` belongs to a lattice whose gap on screen is `gap·2^L`; it shows in
+    /// full once that gap is comfortably wide and fades out as it closes.
+    /// Zooming out, the in-between points fade away before the octave
+    /// changes, and at the change the survivors are exactly the points that
+    /// were showing — so the field thins smoothly instead of halving in one
+    /// frame, which is what made the barbs jump on every other wheel click.
+    fn fade(&self, k: usize, spacing: f32) -> f32 {
+        let level = self.level.get(k).copied().unwrap_or(0) as i32;
+        lod_fade(self.gap * 2f32.powi(level) / spacing.max(1.0))
+    }
+}
+
+/// Visibility for a mark whose lattice is `x` times the wanted spacing
+/// apart: nothing at half the spacing, all of it by about nine-tenths.
+fn lod_fade(x: f32) -> f32 {
+    let t = ((x - 0.55) / 0.35).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 impl RenderState {
     /// Lay a world-anchored lattice over `area`, about `spacing` points apart.
     fn sample_grid(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
-        sample_grid_for(&self.camera, self.scale_factor, spacing, area)
+        sample_grid_for(&self.camera, self.scale_factor, spacing, area, Octave::Nearest)
     }
+
+    /// The same lattice for marks that fade by [`SampleGrid::fade`]: one
+    /// octave finer than [`Self::sample_grid`] would pick, so there are
+    /// points to fade in.
+    fn sample_grid_faded(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
+        sample_grid_for(&self.camera, self.scale_factor, spacing, area, Octave::Finer)
+    }
+}
+
+/// How the wanted spacing is rounded to an octave of world distance.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Octave {
+    /// To the nearest: every point drawn, the pattern jumps at each octave.
+    Nearest,
+    /// Down: the lattice is never coarser than asked, and the points past
+    /// the spacing are faded rather than dropped.
+    Finer,
 }
 
 /// The lattice, as arithmetic on a camera alone.
@@ -665,11 +778,14 @@ fn sample_grid_for(
     scale_factor: f32,
     spacing: f32,
     area: egui::Rect,
+    octave: Octave,
 ) -> SampleGrid {
     {
         let empty = SampleGrid {
             screen: Vec::new(),
             geo: Vec::new(),
+            level: Vec::new(),
+            gap: 0.0,
             cols: 0,
             rows: 0,
         };
@@ -684,7 +800,11 @@ fn sample_grid_for(
         if !wanted.is_finite() || wanted <= 0.0 {
             return empty;
         }
-        let step = 2f32.powf(wanted.log2().round());
+        let exponent = match octave {
+            Octave::Nearest => wanted.log2().round(),
+            Octave::Finer => wanted.log2().floor(),
+        };
+        let step = 2f32.powf(exponent);
         if !step.is_finite() || step <= 0.0 {
             return empty;
         }
@@ -725,8 +845,14 @@ fn sample_grid_for(
             return empty;
         }
 
+        let gap = (step / per_point as f64) as f32;
         let mut screen = Vec::with_capacity(cols * rows);
         let mut geo = Vec::with_capacity(cols * rows);
+        let mut level = Vec::with_capacity(cols * rows);
+        // Octaves a world index survives: the powers of two it is a multiple
+        // of. Zero is a multiple of all of them.
+        const TOP: u32 = 6;
+        let octaves = |n: i64| if n == 0 { TOP } else { n.trailing_zeros().min(TOP) };
         // Rows run north to south so the lattice comes out in reading order on
         // screen, which is what the fill's mesh expects.
         for j in (j0..=j1).rev() {
@@ -736,11 +862,14 @@ fn sample_grid_for(
                 screen.push([s.x / ppp, s.y / ppp]);
                 let (lat, lon) = crate::render::projection::Projection::to_wgs84(wx, wy);
                 geo.push((lat, lon));
+                level.push(octaves(i).min(octaves(j)) as u8);
             }
         }
         SampleGrid {
             screen,
             geo,
+            level,
+            gap,
             cols,
             rows,
         }
@@ -786,9 +915,9 @@ impl RenderState {
                     // What the adapter actually supports, not wgpu's defaults:
                     // the default asks for 8192 px textures and the Pi 5's
                     // V3D stops at 7680, so device creation panicked there.
-                    // navcore's largest texture is the 4096x512 pattern atlas.
+                    // Manx's largest texture is the 4096x512 pattern atlas.
                     required_limits: adapter.limits(),
-                    label: Some("navcore_device"),
+                    label: Some("manx_device"),
                     memory_hints: Default::default(),
                 },
                 None,
@@ -814,7 +943,7 @@ impl RenderState {
         log::debug!("Available formats: {:?}", surface_caps.formats);
 
         let config = wgpu::SurfaceConfiguration {
-            // COPY_SRC lets NAVCORE_SHOT read the rendered frame back for headless captures.
+            // COPY_SRC lets MANX_SHOT read the rendered frame back for headless captures.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width,
@@ -1005,10 +1134,9 @@ impl RenderState {
 
         let line_uniform_align = device.limits().min_uniform_buffer_offset_alignment;
         let slot_size = (line_uniform_align as usize).max(std::mem::size_of::<LineUniforms>());
-        let max_line_styles = 128;
         let line_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Line Uniform Buffer"),
-            size: (slot_size * max_line_styles) as u64,
+            size: (slot_size * LINE_STYLE_SLOTS) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1072,7 +1200,7 @@ impl RenderState {
                 // Lines carry no usable depth: the per-style uniform writes
                 // disp_prio 0, so line.wgsl puts every line at z = 1.0 (far
                 // plane). Depth-testing them therefore erased any line drawn
-                // over an area of priority >= 1 — invisible until navcore's
+                // over an area of priority >= 1 — invisible until Manx's
                 // priority ladder was one step low and Group 1 also landed on
                 // z = 1.0. Draw order is already sequenced per priority on the
                 // CPU (areas, then lines, then symbols), so the line passes need
@@ -1184,7 +1312,7 @@ impl RenderState {
                 // Lines carry no usable depth: the per-style uniform writes
                 // disp_prio 0, so line.wgsl puts every line at z = 1.0 (far
                 // plane). Depth-testing them therefore erased any line drawn
-                // over an area of priority >= 1 — invisible until navcore's
+                // over an area of priority >= 1 — invisible until Manx's
                 // priority ladder was one step low and Group 1 also landed on
                 // z = 1.0. Draw order is already sequenced per priority on the
                 // CPU (areas, then lines, then symbols), so the line passes need
@@ -1332,12 +1460,13 @@ impl RenderState {
         };
 
         Self {
-            // NAVCORE_DUMP_DRAW=<path> records what the draw pass issued.
-            draw_log: std::env::var("NAVCORE_DUMP_DRAW")
+            // MANX_DUMP_DRAW=<path> records what the draw pass issued.
+            draw_log: std::env::var("MANX_DUMP_DRAW")
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(|_| std::cell::RefCell::new(Vec::new())),
             window,
+            instance,
             surface,
             device,
             queue,
@@ -1377,6 +1506,8 @@ impl RenderState {
             label_renderer,
             ui: None,
             shop: None,
+            shop_remember: false,
+            shop_resume_tried: false,
             signalk: None,
             fleet: Default::default(),
             following: false,
@@ -1436,6 +1567,15 @@ impl RenderState {
             previous_style_hash: 0,
             s52_engine: None,
             needs_redraw: true,
+            chart_turning: false,
+            chart_turn_at: None,
+            alarms: Default::default(),
+            mob: None,
+            anchor_watch: None,
+            logbook: crate::nav::logbook::Recorder::new(crate::nav::logbook::dir()),
+            log_state: Default::default(),
+            log_samples: Vec::new(),
+            log_dirty: true,
             last_text_layout_key: 0,
             cached_visible_line_styles: Vec::new(),
             cached_visible_line_styles_key: 0,
@@ -1811,7 +1951,7 @@ impl RenderState {
     pub fn switch_palette(&mut self, palette_name: &str) {
         self.palette_name = Some(palette_name.to_string());
         if let Some(ref mut ui) = self.ui {
-            ui.set_dark(matches!(palette_name, "DUSK" | "NIGHT"));
+            ui.set_palette(crate::render::theme::Palette::from_table(palette_name));
         }
         if let Some(ref mut engine) = self.s52_engine {
             engine.tables.set_active_palette(palette_name);
@@ -1941,12 +2081,11 @@ impl RenderState {
     }
 
     /// Where free charts go: the chart folder in use, or — before there is
-    /// one — navcore's own, which then becomes the chart folder.
+    /// one — Manx's own, which then becomes the chart folder.
     fn free_root(&self) -> std::path::PathBuf {
         self.chart_root.clone().unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("navcore")
+            crate::paths::data_dir()
+                .unwrap_or_else(|| std::env::temp_dir().join(crate::paths::APP))
                 .join("charts")
         })
     }
@@ -2136,13 +2275,15 @@ impl RenderState {
             charts: crate::render::ui::ChartFolderView,
         }
         let p: Persisted = serde_json::from_str(&text).ok()?;
-        let dir = std::path::PathBuf::from(p.charts.chosen.trim());
+        // A folder remembered from before the rename may have moved with
+        // the rest of Manx's files.
+        let dir = crate::paths::moved(std::path::Path::new(p.charts.chosen.trim()));
         // A folder on a memory stick that is no longer plugged in must not
         // stop the plotter starting.
         dir.is_dir().then_some(dir)
     }
 
-    /// `NAVCORE_PLAN="from;to[;motor]"` types the passage planner's fields
+    /// `MANX_PLAN="from;to[;motor]"` types the passage planner's fields
     /// and presses the button, so the whole flow can be captured without a
     /// keyboard. An empty `from` means the boat. Called from both init_ui
     /// and set_chart_root because the plan needs the pair of them and their
@@ -2153,20 +2294,26 @@ impl RenderState {
         }
         self.env_plan_fired = true;
 
-        // `NAVCORE_WIND=1` opens the weather sheet and fetches for what is on
+        // `MANX_WIND=1` opens the weather sheet and fetches for what is on
         // screen. Like the plan hook it has to wait for a view: at init_ui the
         // camera is still looking at 0°N 0°E, and the fetch would ask for the
         // wind over the Gulf of Guinea.
-        if std::env::var("NAVCORE_WIND").is_ok() {
+        // `MANX_WIND=fill` draws the barbs and the colour wash over the
+        // chart with the sheet shut, which is how the layer itself is seen.
+        if let Ok(mode) = std::env::var("MANX_WIND") {
+            let fill = mode == "fill";
             if let Some(ref mut ui) = self.ui {
                 ui.wind.show = true;
-                ui.sheet.show = true;
+                ui.wind.fill = fill;
+                ui.sheet.show = !fill;
             }
             self.spawn_wind_fetch();
-            self.spawn_point_fetch();
+            if !fill {
+                self.spawn_point_fetch();
+            }
         }
 
-        let Ok(spec) = std::env::var("NAVCORE_PLAN") else { return };
+        let Ok(spec) = std::env::var("MANX_PLAN") else { return };
         let parts: Vec<String> = spec.split(';').map(str::to_string).collect();
         if parts.len() >= 2 {
             let sail = parts.get(2).map(|m| m != "motor").unwrap_or(true);
@@ -2176,7 +2323,7 @@ impl RenderState {
             }
             self.plan_passage(&parts[0], &parts[1], sail);
         } else {
-            log::warn!("NAVCORE_PLAN must be 'from;to[;motor]'; ignoring '{spec}'");
+            log::warn!("MANX_PLAN must be 'from;to[;motor]'; ignoring '{spec}'");
         }
     }
 
@@ -2204,10 +2351,10 @@ impl RenderState {
             self.size.width as f32, self.size.height as f32,
         );
 
-        // Optional override for debugging/screenshots: NAVCORE_VIEW="lat,lon,mpp"
+        // Optional override for debugging/screenshots: MANX_VIEW="lat,lon,mpp"
         // positions the camera at a specific WGS84 point with a given zoom
         // (meters per pixel). Lets us reproduce a reference view exactly.
-        if let Ok(view) = std::env::var("NAVCORE_VIEW") {
+        if let Ok(view) = std::env::var("MANX_VIEW") {
             let parts: Vec<f64> = view
                 .split(',')
                 .filter_map(|s| s.trim().parse::<f64>().ok())
@@ -2219,25 +2366,39 @@ impl RenderState {
                     self.size.width as f32, self.size.height as f32,
                 );
                 log::debug!(
-                    "NAVCORE_VIEW override: lat={} lon={} mpp={} -> Mercator ({:.0},{:.0})",
+                    "MANX_VIEW override: lat={} lon={} mpp={} -> Mercator ({:.0},{:.0})",
                     parts[0], parts[1], parts[2], mx, my
                 );
             } else {
-                log::warn!("NAVCORE_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
+                log::warn!("MANX_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
             }
         }
 
-        // NAVCORE_TILT=<degrees> pitches the camera back. Off by default: a
+        // MANX_TILT=<degrees> pitches the camera back. Off by default: a
         // chart is a plan, and every S-52 measurement — bearing, distance,
         // symbol size in millimetres — is stated on that plan.
-        if let Ok(t) = std::env::var("NAVCORE_TILT") {
+        if let Ok(t) = std::env::var("MANX_TILT") {
             match t.trim().parse::<f32>() {
                 Ok(deg) => {
                     self.camera.tilt =
                         deg.to_radians().clamp(0.0, crate::render::camera::MAX_TILT);
-                    log::debug!("NAVCORE_TILT: {:.1}°", self.camera.tilt.to_degrees());
+                    log::debug!("MANX_TILT: {:.1}°", self.camera.tilt.to_degrees());
                 }
-                Err(_) => log::warn!("NAVCORE_TILT must be a number of degrees; ignoring '{}'", t),
+                Err(_) => log::warn!("MANX_TILT must be a number of degrees; ignoring '{}'", t),
+            }
+        }
+
+        // MANX_ROTATE=<degrees> puts that true bearing at the top of the
+        // screen, as a twist would, so a turned chart can be captured.
+        if let Ok(r) = std::env::var("MANX_ROTATE") {
+            match r.trim().parse::<f64>() {
+                Ok(deg) => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.display.chart_up = crate::render::ui::ChartUp::Free;
+                    }
+                    self.camera.rotation = deg.to_radians().rem_euclid(std::f64::consts::TAU);
+                }
+                Err(_) => log::warn!("MANX_ROTATE must be a number of degrees; ignoring '{}'", r),
             }
         }
 
@@ -2287,17 +2448,17 @@ impl RenderState {
             }
         }
 
-        // NAVCORE_PALETTE=day|dusk|night. `switch_palette` existed and nothing
+        // MANX_PALETTE=day|dusk|night. `switch_palette` existed and nothing
         // ever called it, so Dusk and Night were unreachable — which is how
         // atlas-dusk.png and atlas-dark.png came to be months out of date with
         // the layout atlas.json describes without anyone noticing.
-        if let Ok(p) = std::env::var("NAVCORE_PALETTE") {
+        if let Ok(p) = std::env::var("MANX_PALETTE") {
             let name = match p.to_ascii_lowercase().as_str() {
                 "day" | "day_bright" => Some("DAY_BRIGHT"),
                 "dusk" => Some("DUSK"),
                 "night" | "dark" => Some("NIGHT"),
                 other => {
-                    log::warn!("NAVCORE_PALETTE: unknown value {:?}", other);
+                    log::warn!("MANX_PALETTE: unknown value {:?}", other);
                     None
                 }
             };
@@ -2324,16 +2485,16 @@ impl RenderState {
         self.deferred_tile_results.clear();
         log::debug!("Background tile worker spawned");
 
-        // NAVCORE_PICK=lat,lon opens the info bubble at a position, so a
+        // MANX_PICK=lat,lon opens the info bubble at a position, so a
         // headless capture can show it. This is the second firing of the
         // hook (init_ui runs before the tile worker exists); when the pick
         // was aimed at a planner pin, that firing already consumed it.
         // Any hook that claims the tap has already consumed this pick during
         // init_ui; firing it again here would place a second waypoint or
         // refill a planner field.
-        let pick_env = std::env::var("NAVCORE_PICK").ok().filter(|_| {
-            std::env::var("NAVCORE_PLAN_PICK").is_err()
-                && std::env::var("NAVCORE_ROUTE_NEW").is_err()
+        let pick_env = std::env::var("MANX_PICK").ok().filter(|_| {
+            std::env::var("MANX_PLAN_PICK").is_err()
+                && std::env::var("MANX_ROUTE_NEW").is_err()
         });
         if let Some(spec) = pick_env {
             let parts: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
@@ -2341,7 +2502,7 @@ impl RenderState {
                 let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
                 self.pick_at_world(mx, my);
             } else {
-                log::warn!("NAVCORE_PICK must be 'lat,lon'; ignoring {:?}", spec);
+                log::warn!("MANX_PICK must be 'lat,lon'; ignoring {:?}", spec);
             }
         }
 
@@ -2349,6 +2510,21 @@ impl RenderState {
         self.keys = Some(keys_arc);
         // decryptor is now owned by worker - clear main thread reference
         self.decryptor = None;
+    }
+
+    /// A new surface for the same window, after Android gave the app a new
+    /// native window on resume. Everything else — device, tiles, charts —
+    /// survives.
+    pub fn recreate_surface(&mut self) {
+        match self.instance.create_surface(self.window.clone()) {
+            Ok(surface) => {
+                self.surface = surface;
+                self.resize(self.window.inner_size());
+                self.needs_redraw = true;
+                self.window.request_redraw();
+            }
+            Err(e) => log::error!("could not recreate the surface: {e}"),
+        }
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -2411,6 +2587,8 @@ impl RenderState {
         self.camera.position.x.to_bits().hash(&mut hasher);
         self.camera.position.y.to_bits().hash(&mut hasher);
         self.camera.zoom.to_bits().hash(&mut hasher);
+        // Declutter is done on the screen, where a turn moves everything.
+        self.camera.rotation.to_bits().hash(&mut hasher);
         hasher.finish()
     }
 
@@ -2418,7 +2596,9 @@ impl RenderState {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         self.style_hash.hash(&mut hasher);
         self.tile_cache.revision().hash(&mut hasher);
-        self.visible_tiles_cache.hash(&mut hasher);
+        for (key, _) in &self.tile_draw_list {
+            key.hash(&mut hasher);
+        }
         hasher.finish()
     }
 
@@ -2439,16 +2619,19 @@ impl RenderState {
     /// giving them in millimetres. OpenCPN evaluates them against a
     /// `canvas_pix_per_mm` that stays at the logical 96-dpi figure on a Retina
     /// canvas, which halves every stroke and dash; matching that would make
-    /// navcore's output depend on the display density the same way.
+    /// Manx's output depend on the display density the same way.
     fn line_style_ppmm(&self) -> f32 {
         self.effective_ppmm.max(1.0)
     }
 
+    /// Every line style the draw list will draw, one uniform slot each.
+    ///
+    /// From the draw list, not the visible tiles: a visible tile still loading
+    /// is drawn from a resident ancestor, whose styles need slots too.
     fn collect_visible_line_styles(&self) -> Vec<LineStyleKey> {
         let mut styles = Vec::new();
-        for tile_id in &self.visible_tiles_cache {
-            let key = TileCacheKey::new(*tile_id, self.style_hash);
-            if let Some(buffers) = self.tile_cache.get(&key) {
+        for (key, _) in &self.tile_draw_list {
+            if let Some(buffers) = self.tile_cache.get(key) {
                 for batch in &buffers.line_batches {
                     if batch.vertex_count > 0 {
                         styles.push(batch.key.style.clone());
@@ -2463,6 +2646,9 @@ impl RenderState {
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let render_start = profile_enabled().then(Instant::now);
+        if render_start.is_some() {
+            note_frame();
+        }
 
         // Before anything is drawn: what the boats have said this frame moves
         // the camera (follow) and the mariner symbols, and both must be
@@ -2474,6 +2660,8 @@ impl RenderState {
         self.update_route_following();
         self.drain_route_net();
         self.update_mariner_symbols();
+        self.update_chart_up();
+        self.update_watch();
 
         // In tile mode, keep the camera near the loaded chart extent.
         // This prevents panning/gesture glitches from throwing the view outside the
@@ -2514,6 +2702,16 @@ impl RenderState {
             let styles_key = self.current_visible_line_styles_key();
             if self.cached_visible_line_styles_key != styles_key {
                 self.cached_visible_line_styles = self.collect_visible_line_styles();
+                // Past the buffer's slots a style goes undrawn rather than
+                // overrun the buffer.
+                if self.cached_visible_line_styles.len() > LINE_STYLE_SLOTS {
+                    log::warn!(
+                        "{} line styles in view, {} slots: the rest are not drawn",
+                        self.cached_visible_line_styles.len(),
+                        LINE_STYLE_SLOTS
+                    );
+                    self.cached_visible_line_styles.truncate(LINE_STYLE_SLOTS);
+                }
                 self.cached_visible_line_styles_key = styles_key;
             }
 
@@ -2670,7 +2868,9 @@ impl RenderState {
                 if let Some(start) = draw_start {
                     log::info!("profile.draw_tiles: {} ms", start.elapsed().as_millis());
                 }
-                self.draw_mariner_symbols(&mut render_pass);
+                if !super::debug_skip("mariner") {
+                    self.draw_mariner_symbols(&mut render_pass);
+                }
             } else {
                 // Single chart mode (existing code)
                 // 1. Render areas (land, depth)
@@ -2754,6 +2954,8 @@ impl RenderState {
         let fill_drawn = wind_fill.kt.iter().filter(|k| k.is_some()).count();
         self.refresh_wind_coverage(wind_barbs.len() + fill_drawn);
         let weather_anchor = self.weather_anchor_screen();
+        // Before the UI is taken out to be drawn: it reads the window's state.
+        let (log_track, log_notes, logbook) = self.logbook_view();
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
@@ -2763,6 +2965,8 @@ impl RenderState {
             let own_ship = self.own_ship_view();
             let ais = self.ais_targets();
             let mpp = self.camera.zoom * self.scale_factor.max(0.01);
+            let (alarms, mob, anchor_view, track_view) = self.watch_views();
+            let depth_m = self.depth_under_boat();
             let actions = ui.run(
                 &self.window.clone(),
                 &self.device,
@@ -2777,12 +2981,21 @@ impl RenderState {
                     own_ship,
                     ais,
                     mpp,
+                    chart_rotation: self.camera.rotation as f32,
                     routes: routes_display,
                     plan_pins,
                     wind: wind_barbs,
                     wind_fill,
                     current: current_arrows,
                     weather_anchor,
+                    alarms,
+                    mob,
+                    anchor: anchor_view,
+                    track: track_view,
+                    log_track,
+                    log_notes,
+                    depth_m,
+                    logbook,
                 },
                 &self.fleet,
             );
@@ -2794,13 +3007,23 @@ impl RenderState {
         for action in ui_actions {
             match action {
                 crate::render::ui::UiAction::DismissPick => self.dismiss_pick(),
-                crate::render::ui::UiAction::ShopSignIn { email, password } => {
+                crate::render::ui::UiAction::ShopSignIn {
+                    email,
+                    password,
+                    remember,
+                } => {
+                    self.shop_remember = remember;
+                    // Unticked is a choice too: forget any session kept before.
+                    if !remember {
+                        Self::forget_shop_session();
+                    }
                     self.shop_sign_in(email, password);
                 }
                 crate::render::ui::UiAction::ShopRefresh => {
                     self.shop_send(crate::shop::service::Request::Refresh);
                 }
                 crate::render::ui::UiAction::ShopSignOut => {
+                    Self::forget_shop_session();
                     self.shop_send(crate::shop::service::Request::SignOut);
                 }
                 crate::render::ui::UiAction::ShopRegister { system_name } => {
@@ -2918,6 +3141,23 @@ impl RenderState {
                         ui.routes.status = "Following stopped".into();
                     }
                 }
+                crate::render::ui::UiAction::RouteExport { route_id } => {
+                    self.ensure_route_store();
+                    let store = self.route_store.as_ref();
+                    let name = store
+                        .and_then(|s| s.route(route_id))
+                        .map(|r| crate::export::file_name(&r.name, "gpx"))
+                        .unwrap_or_else(|| "route.gpx".into());
+                    let status = match store.map(|s| s.route_gpx(route_id)) {
+                        Some(Ok(xml)) => crate::export::save(&name, "application/gpx+xml", xml.as_bytes())
+                            .unwrap_or_else(|e| e),
+                        Some(Err(e)) => format!("Could not export {name}: {e}"),
+                        None => "No route store".into(),
+                    };
+                    if let Some(ref mut ui) = self.ui {
+                        ui.routes.status = status;
+                    }
+                }
                 crate::render::ui::UiAction::RoutePublish { route_id } => {
                     self.ensure_route_store();
                     let base = self
@@ -2984,6 +3224,60 @@ impl RenderState {
                         ui.weather.status = "planning cancelled".into();
                     }
                     self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::SafetyChanged => self.save_settings(),
+                crate::render::ui::UiAction::AlarmsSilence => self.alarms.acknowledge(),
+                crate::render::ui::UiAction::MobMark => self.mark_mob(),
+                crate::render::ui::UiAction::MobClear => {
+                    self.mob = None;
+                    self.alarms.set(crate::nav::alarms::AlarmKey::ManOverboard, None, Instant::now());
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::AnchorDrop => {
+                    if let Some((at, true)) = self.own_fix() {
+                        let radius = self.ui.as_ref().map_or(40.0, |u| u.safety.anchor_radius_m as f64);
+                        self.anchor_watch = Some((at, radius));
+                    }
+                }
+                crate::render::ui::UiAction::AnchorUp => {
+                    self.anchor_watch = None;
+                    self.alarms.set(crate::nav::alarms::AlarmKey::Anchor, None, Instant::now());
+                }
+                crate::render::ui::UiAction::LogNoteAdd { day, text } => self.log_note(day, text),
+                crate::render::ui::UiAction::LogNoteDelete(note) => {
+                    if let Err(e) = crate::nav::logbook::delete_note(self.logbook.dir(), &note) {
+                        self.log_state.message = Some(format!("Could not delete the note: {e}"));
+                    }
+                    self.log_dirty = true;
+                }
+                crate::render::ui::UiAction::LogSelect { day } => {
+                    self.log_samples = day
+                        .map(|d| {
+                            if Some(d) == self.logbook.day {
+                                self.logbook.today.clone()
+                            } else {
+                                crate::nav::logbook::read_day(self.logbook.dir(), d)
+                            }
+                        })
+                        .unwrap_or_default();
+                    self.log_state.message = None;
+                    self.log_dirty = true;
+                }
+                crate::render::ui::UiAction::LogFit => self.log_fit(),
+                crate::render::ui::UiAction::LogExport { day, csv } => self.log_export(day, csv),
+                crate::render::ui::UiAction::LogDelete(day) => {
+                    if Some(day) == self.logbook.day {
+                        // Today's recorder must not append to a file that
+                        // is gone as if it were still whole.
+                        self.logbook = crate::nav::logbook::Recorder::new(crate::nav::logbook::dir());
+                    }
+                    crate::nav::logbook::delete_day(self.logbook.dir(), day);
+                    self.log_samples.clear();
+                    self.log_state.message = Some(format!("Deleted {day}"));
+                    self.log_dirty = true;
+                }
+                crate::render::ui::UiAction::ChartUpSet { mode } => {
+                    self.set_chart_up(mode);
                 }
                 crate::render::ui::UiAction::FollowSet { on } => {
                     self.set_follow(on);
@@ -3343,7 +3637,7 @@ impl RenderState {
         // is no range that keeps the screen full of chart. The centre of the
         // screen is then only kept over the charts, not pinned to their
         // middle: pinning it — as this once did, every frame — undid every
-        // pan and every zoom-at-the-cursor at the zoom navcore opens at, and
+        // pan and every zoom-at-the-cursor at the zoom Manx opens at, and
         // snapped the boat away from the middle while following her.
         if min_x.is_finite() && max_x.is_finite() && min_x <= max_x {
             self.camera.position.x = self.camera.position.x.clamp(min_x, max_x);
@@ -3413,6 +3707,9 @@ impl RenderState {
         stroke: &'a wgpu::RenderPipeline,
         lc_bound: &mut Option<bool>,
     ) {
+        if super::debug_skip(if batch.index_buffer.is_some() { "stroke" } else { "lc" }) {
+            return;
+        }
         render_pass.set_vertex_buffer(0, batch.vertex_buffer.slice(..));
         match &batch.index_buffer {
             Some(indices) => {
@@ -3487,7 +3784,8 @@ impl RenderState {
                     (origin.x - anchor.x) as f32,
                     (origin.y - anchor.y) as f32,
                 ],
-                _pad: [0.0; 2],
+                view_rotation: self.camera.rotation as f32,
+                _pad: 0.0,
             };
             bytes[i * stride..i * stride + size].copy_from_slice(bytemuck::bytes_of(&u));
         }
@@ -3671,19 +3969,35 @@ impl RenderState {
                 &|x, y| cam.ground_mpp_at(x, y),
                 &|b| {
                     // Behind the eye is not "far away", it is off the chart:
-                    // it would project back onto the screen mirrored. The
-                    // view direction is (0, sin t, -cos t) from an eye at
-                    // height d cos t, so a ground point is in front when
-                    // (y - eye.y) sin t + d cos^2 t > 0.
+                    // it would project back onto the screen mirrored. With
+                    // `f` the ground direction up the screen, the view
+                    // direction is (f sin t, -cos t) from an eye at height
+                    // d cos t, so a ground point p is in front when
+                    // (p - eye)·f sin t + d cos^2 t > 0. The tile's corner
+                    // furthest along f decides.
                     let tilt = cam.tilt as f64;
                     let (st, ct) = (tilt.sin(), tilt.cos());
                     let d = cam.eye_distance();
-                    if (b.max_y - eye.y) * st + d * ct * ct <= 0.0 {
+                    let f = cam.forward();
+                    let ahead = [b.min_x, b.max_x]
+                        .into_iter()
+                        .flat_map(|x| [b.min_y, b.max_y].map(|y| (x - eye.x) * f.x + (y - eye.y) * f.y))
+                        .fold(f64::MIN, f64::max);
+                    if ahead * st + d * ct * ct <= 0.0 {
                         return false;
                     }
                     tile_meets_footprint(b, &footprint)
                 },
             )
+        } else if self.camera.rotation != 0.0 {
+            // Turned, the box around the view is up to twice its area; keep
+            // only the tiles the (equally padded) turned rectangle touches.
+            let c = self.camera.position;
+            let footprint = self.camera.ground_footprint().map(|p| c + (p - c) * 1.2);
+            visible_tiles(&view_bounds, z, 1.2)
+                .into_iter()
+                .filter(|t| tile_meets_footprint(&t.bounds(), &footprint))
+                .collect()
         } else {
             visible_tiles(&view_bounds, z, 1.2)
         };
@@ -3759,9 +4073,8 @@ impl RenderState {
                 // Must match the builder's selection (charts_for_tile_scaled).
                 if let Some(ref catalog) = self.catalog {
                     let tile_bounds = tile_id.bounds();
-                    let tile_scale_denom = crate::tiles::meters_per_pixel(tile_id.z)
-                        * (self.effective_ppmm as f64)
-                        * 1000.0;
+                    let tile_scale_denom =
+                        crate::tiles::tile_scale_denominator(*tile_id, self.effective_ppmm as f64);
                     if catalog
                         .charts_for_tile_scaled(&tile_bounds, tile_scale_denom)
                         .is_empty()
@@ -3885,7 +4198,7 @@ impl RenderState {
 
         declutter_soundings(&mut all_soundings, &self.camera, origin);
         // S-52 portrays soundings with the presentation library's digit
-        // symbols. navcore can, and does under NAVCORE_SOUNDING_SYMBOLS=1, but
+        // symbols. Manx can, and does under MANX_SOUNDING_SYMBOLS=1, but
         // the raster atlas is too coarse to magnify — see
         // `text_layout::sounding_symbols_enabled`.
         let use_symbols = crate::render::text_layout::sounding_symbols_enabled();
@@ -3940,7 +4253,7 @@ impl RenderState {
 
     /// Record what the draw pass actually issued for a tile.
     ///
-    /// The scene dump (`navcore --dump-scene`) proves what the *builder*
+    /// The scene dump (`manx --dump-scene`) proves what the *builder*
     /// decided; this proves what the *renderer* did with it. Between them sits
     /// upload, cache residency and per-priority slicing — where geometry that
     /// exists in a tile packet can still never reach the screen.
@@ -3954,7 +4267,7 @@ impl RenderState {
         use std::sync::atomic::{AtomicU32, Ordering};
         // The dump is a record of *this* frame. Keeping every frame's records
         // grew without bound in a live session, and buried the captured frame
-        // under a hundred warm-up ones in a NAVCORE_SHOT dump.
+        // under a hundred warm-up ones in a MANX_SHOT dump.
         if let Some(log) = &self.draw_log {
             log.borrow_mut().clear();
         }
@@ -4022,11 +4335,11 @@ impl RenderState {
             }
         }
 
-        // NAVCORE_MAX_PRIO=<n> stops the draw loop after priority n. Bisecting
+        // MANX_MAX_PRIO=<n> stops the draw loop after priority n. Bisecting
         // the priority stack is the fastest way to find which layer is painting
         // over another: the scene dump says what *should* be there, this says
         // which pass removed it.
-        let max_prio: u8 = std::env::var("NAVCORE_MAX_PRIO")
+        let max_prio: u8 = std::env::var("MANX_MAX_PRIO")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(9);
@@ -4047,7 +4360,7 @@ impl RenderState {
                     if let Some(ref bg_buf) = buffers.bg_area_buffer {
                         let start = buffers.bg_area_priority_offsets[p];
                         let end = buffers.bg_area_priority_offsets[p + 1];
-                        if end > start {
+                        if end > start && !super::debug_skip("bg") {
                             render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                             render_pass.set_vertex_buffer(0, bg_buf.slice(..));
                             render_pass.draw(start..end, 0..1);
@@ -4065,7 +4378,7 @@ impl RenderState {
                     self.apply_scissor(render_pass, *scissor);
                     let start = buffers.area_priority_offsets[p];
                     let end = buffers.area_priority_offsets[p + 1];
-                    if end > start {
+                    if end > start && !super::debug_skip("area") {
                         render_pass.set_bind_group(0, &self.uniform_bind_group, &[cam]);
                         render_pass.set_vertex_buffer(0, buffers.area_buffer.slice(..));
                         render_pass.draw(start..end, 0..1);
@@ -4081,8 +4394,8 @@ impl RenderState {
             }
 
             // --- Patterns at this priority (bg then fg) ---
-            if let (Some(ref pattern_renderer), Some(ref pattern_bind_group)) =
-                (&self.pattern_renderer, &self.pattern_camera_bind_group)
+            if let (Some(ref pattern_renderer), Some(ref pattern_bind_group), false) =
+                (&self.pattern_renderer, &self.pattern_camera_bind_group, super::debug_skip("pattern"))
             {
                 let mut bg_pattern_state_set = false;
                 let mut fg_pattern_state_set = false;
@@ -4137,7 +4450,7 @@ impl RenderState {
             // --- Lines at this priority ---
             // Legacy draws are sorted by LineBatchKey which puts bg before fg.
             // Split the range into bg and fg sub-ranges.
-            let (l_start, l_end) = legacy_prio_ranges[p];
+            let (l_start, l_end) = if super::debug_skip("line") { (0, 0) } else { legacy_prio_ranges[p] };
 
             // Find the split point: bg batches (is_background=true) sort first
             let bg_end = legacy_draws[l_start..l_end]
@@ -4153,7 +4466,10 @@ impl RenderState {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
-                    let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    // No slot, no draw: another style's uniforms would draw it
+                    // wrong, and an ordinary stroke's through the LC shader
+                    // would divide by a zero advance.
+                    let Some(&offset) = line_style_offsets.get(style_key) else { continue };
                     self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
@@ -4172,7 +4488,10 @@ impl RenderState {
                         last_style = Some(style_key.clone());
                         uniform_updates += 1;
                     }
-                    let offset = line_style_offsets.get(style_key).copied().unwrap_or(0);
+                    // No slot, no draw: another style's uniforms would draw it
+                    // wrong, and an ordinary stroke's through the LC shader
+                    // would divide by a zero advance.
+                    let Some(&offset) = line_style_offsets.get(style_key) else { continue };
                     self.apply_scissor(render_pass, *scissor);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[*cam]);
                     render_pass.set_bind_group(1, &self.line_bind_group, &[offset]);
@@ -4192,7 +4511,7 @@ impl RenderState {
                 let Some(ref buf) = buffers.sector_buffer else { continue };
                 let start = buffers.sector_priority_offsets[p];
                 let end = buffers.sector_priority_offsets[p + 1];
-                if end > start {
+                if end > start && !super::debug_skip("sector") {
                     if !sector_pipeline_set {
                         self.sector_renderer.set_pipeline(render_pass);
                         sector_pipeline_set = true;
@@ -4214,7 +4533,7 @@ impl RenderState {
                         self.camera_slot_offset(SLOT_GLOBAL),
                     );
                     symbol_draw_calls = 1;
-                } else if debug_mode != 3 {
+                } else if debug_mode != 3 && !super::debug_skip("symbol") {
                     let mut symbol_state_set = false;
                     for (i, (key, scissor)) in self.tile_draw_list.iter().enumerate() {
                         let Some(cam) = self.tile_cam(i) else { continue };
@@ -4276,7 +4595,7 @@ impl RenderState {
             (&self.text_renderer, &self.text_camera_bind_group)
         {
             if let Some(ref text_buffer) = self.global_text_buffer {
-                if self.global_text_count > 0 {
+                if self.global_text_count > 0 && !super::debug_skip("text") {
                     text_renderer.render_with_buffer(
                         render_pass,
                         text_bind_group,
@@ -4301,7 +4620,7 @@ impl RenderState {
             &self.symbol_camera_bind_group,
             &self.global_sounding_buffer,
         ) {
-            if self.global_sounding_count > 0 {
+            if self.global_sounding_count > 0 && !super::debug_skip("text") {
                 symbol_renderer.render_with_buffer(
                     render_pass,
                     symbol_bind_group,
@@ -4317,7 +4636,7 @@ impl RenderState {
             (&self.label_renderer, &self.label_camera_bind_group)
         {
             if let Some(ref label_buffer) = self.global_label_buffer {
-                if self.global_label_count > 0 {
+                if self.global_label_count > 0 && !super::debug_skip("label") {
                     label_renderer.render_with_buffer(
                         render_pass,
                         label_bind_group,
@@ -4336,10 +4655,10 @@ impl RenderState {
 
     /// Create the UI. Separate from `new` because it needs the window.
     ///
-    /// `NAVCORE_UI=0` leaves it out entirely, which is how the parity captures
+    /// `MANX_UI=0` leaves it out entirely, which is how the parity captures
     /// get a frame of chart with no interface over it.
     pub fn init_ui(&mut self) {
-        if std::env::var("NAVCORE_UI").is_ok_and(|v| v == "0") {
+        if std::env::var("MANX_UI").is_ok_and(|v| v == "0") {
             return;
         }
         if self.ui.is_none() {
@@ -4358,10 +4677,10 @@ impl RenderState {
             {
                 ui.charts.chosen = dir.display().to_string();
             }
-            // `NAVCORE_ROUTE_NEW="lat,lon;lat,lon;…"` builds a route by the
+            // `MANX_ROUTE_NEW="lat,lon;lat,lon;…"` builds a route by the
             // same path a tap takes, so the editor can be captured without
             // a pointer.
-            if let Ok(spec) = std::env::var("NAVCORE_ROUTE_NEW") {
+            if let Ok(spec) = std::env::var("MANX_ROUTE_NEW") {
                 self.ensure_route_store();
                 let route = crate::nav::Route::new(unique_route_name(self.route_store.as_ref()));
                 let id = route.id;
@@ -4380,14 +4699,14 @@ impl RenderState {
                                 crate::render::projection::Projection::to_mercator(p.lat, p.lon);
                             self.route_edit_append(x, y);
                         }
-                        None => log::warn!("NAVCORE_ROUTE_NEW: cannot read '{point}'"),
+                        None => log::warn!("MANX_ROUTE_NEW: cannot read '{point}'"),
                     }
                 }
                 self.refresh_route_rows();
             }
-            // `NAVCORE_BOAT="query[;country]"` opens the boat window and
+            // `MANX_BOAT="query[;country]"` opens the boat window and
             // fires the polar search, for captures. "1" just opens it.
-            if let Ok(spec) = std::env::var("NAVCORE_BOAT") {
+            if let Ok(spec) = std::env::var("MANX_BOAT") {
                 if let Some(ref mut ui) = self.ui {
                     ui.boat.open = true;
                 }
@@ -4403,9 +4722,9 @@ impl RenderState {
                     self.spawn_orc_search(query, country);
                 }
             }
-            // `NAVCORE_PLAN_PICK=from|to` arms a planner pin at startup, so
-            // the tap-to-fill path can be driven by NAVCORE_PICK below.
-            if let Ok(which) = std::env::var("NAVCORE_PLAN_PICK") {
+            // `MANX_PLAN_PICK=from|to` arms a planner pin at startup, so
+            // the tap-to-fill path can be driven by MANX_PICK below.
+            if let Ok(which) = std::env::var("MANX_PLAN_PICK") {
                 if let Some(ref mut ui) = self.ui {
                     ui.plan.picking = match which.as_str() {
                         "from" => Some(crate::render::ui::PlanPickTarget::From),
@@ -4414,26 +4733,26 @@ impl RenderState {
                     };
                 }
             }
-            // `NAVCORE_PICK=lat,lon` taps the chart at startup, so the object
+            // `MANX_PICK=lat,lon` taps the chart at startup, so the object
             // bubble can be captured without a click.
-            if let Ok(at) = std::env::var("NAVCORE_PICK") {
+            if let Ok(at) = std::env::var("MANX_PICK") {
                 let parts: Vec<f64> = at.split(',').filter_map(|v| v.trim().parse().ok()).collect();
                 if parts.len() == 2 {
                     let (x, y) = crate::render::projection::Projection::to_mercator(parts[0], parts[1]);
                     self.pick_at_world(x, y);
                 }
             }
-            // `NAVCORE_ROUTES_OPEN=1` opens the routes window at startup.
-            if std::env::var("NAVCORE_ROUTES_OPEN").is_ok_and(|v| v != "0") {
+            // `MANX_ROUTES_OPEN=1` opens the routes window at startup.
+            if std::env::var("MANX_ROUTES_OPEN").is_ok_and(|v| v != "0") {
                 self.ensure_route_store();
                 self.refresh_route_rows();
                 if let Some(ref mut ui) = self.ui {
                     ui.routes.open = true;
                 }
             }
-            // `NAVCORE_FOLLOW=1` activates the first stored route at startup,
+            // `MANX_FOLLOW=1` activates the first stored route at startup,
             // so the guidance strip can be captured without a click.
-            if std::env::var("NAVCORE_FOLLOW").is_ok_and(|v| v != "0") {
+            if std::env::var("MANX_FOLLOW").is_ok_and(|v| v != "0") {
                 self.ensure_route_store();
                 if let Some(id) = self
                     .route_store
@@ -4444,28 +4763,44 @@ impl RenderState {
                     self.activate_route(id);
                 }
             }
-            // `NAVCORE_SHOP=1` opens the chart shop at startup, so it can be
+            // `MANX_SHOP=1` opens the chart shop at startup, so it can be
             // captured without a click.
             let mut signalk_override_saved: Option<String> = None;
             if let Some(ui) = self.ui.as_mut() {
-                if std::env::var("NAVCORE_SHOP").is_ok_and(|v| v != "0") {
+                if std::env::var("MANX_SHOP").is_ok_and(|v| v != "0") {
                     ui.shop.open = true;
-                    ui.shop.email = std::env::var("NAVCORE_SHOP_EMAIL").unwrap_or_default();
-                    // `NAVCORE_SHOP=free` or `=folder` opens that tab.
-                    ui.charts.tab = match std::env::var("NAVCORE_SHOP").as_deref() {
+                    ui.shop.email = std::env::var("MANX_SHOP_EMAIL").unwrap_or_default();
+                    // `MANX_SHOP=free` or `=folder` opens that tab.
+                    ui.charts.tab = match std::env::var("MANX_SHOP").as_deref() {
                         Ok("free") => crate::render::ui::ChartsTab::Free,
                         Ok("folder") => crate::render::ui::ChartsTab::Folder,
                         _ => crate::render::ui::ChartsTab::Shop,
                     };
                 }
-                // `NAVCORE_SIGNALK=<address>` overrides the saved server for
+                // `MANX_SIGNALK=<address>` overrides the saved server for
                 // this run only. It used to claim it did not touch settings
                 // while quietly doing exactly that: the override went into
                 // the live view, and the next save — which any settings
                 // change triggers — wrote it over the address the user had
                 // actually configured. The real one is kept here and put
                 // back at save time.
-                if let Ok(url) = std::env::var("NAVCORE_SIGNALK") {
+                // `MANX_LOG_OPEN=list|YYYY-MM-DD` opens the logbook on its
+                // list or on a day, for captures.
+                if let Ok(v) = std::env::var("MANX_LOG_OPEN") {
+                    ui.logbook.open = true;
+                    if let Ok(day) = chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d") {
+                        ui.logbook.selected = Some(day);
+                        self.log_samples = crate::nav::logbook::read_day(self.logbook.dir(), day);
+                    }
+                }
+                // `MANX_SAFETY=window|guide` opens the Safety window or
+                // the man overboard guide, for captures.
+                match std::env::var("MANX_SAFETY").as_deref() {
+                    Ok("window") => ui.safety.open = true,
+                    Ok("guide") => ui.safety.guide_open = true,
+                    _ => {}
+                }
+                if let Ok(url) = std::env::var("MANX_SIGNALK") {
                     if !url.is_empty() {
                         signalk_override_saved = Some(ui.instruments.url.clone());
                         ui.instruments.url = url;
@@ -4552,6 +4887,9 @@ impl RenderState {
         // settings-level ones.
         if let Some(ref mut ui) = self.ui {
             for open in [
+                &mut ui.safety.guide_open,
+                &mut ui.logbook.open,
+                &mut ui.safety.open,
                 &mut ui.display.open,
                 &mut ui.boat.open,
                 &mut ui.routes.open,
@@ -4600,7 +4938,7 @@ impl RenderState {
     }
 
     /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
-    /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
+    /// Mercator metres. Used by `MANX_PICK` so a capture can show the bubble.
     pub fn pick_at_world(&mut self, x: f64, y: f64) {
         // An armed planner pin claims the tap first — it is a deliberate
         // one-shot — then an open route editor, which is a standing mode.
@@ -4686,8 +5024,47 @@ impl RenderState {
     ///
     /// A dashboard someone arranged at the chart table must still be there
     /// when they start the engine.
+    /// Where "Remember me" keeps the o-charts session: beside the settings,
+    /// readable by this user only. The session key, never the password.
+    fn shop_session_path() -> Option<std::path::PathBuf> {
+        Some(crate::paths::config_dir()?.join("ocharts-session.json"))
+    }
+
+    fn save_shop_session(username: &str, key: &str) {
+        let Some(path) = Self::shop_session_path() else { return };
+        let json = serde_json::json!({ "username": username, "key": key }).to_string();
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| {
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create(true).truncate(true);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+                use std::io::Write;
+                options.open(&path)?.write_all(json.as_bytes())
+            });
+        if let Err(e) = written {
+            log::warn!("could not remember the o-charts session: {e}");
+        }
+    }
+
+    fn load_shop_session() -> Option<(String, String)> {
+        let text = std::fs::read_to_string(Self::shop_session_path()?).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let username = v.get("username")?.as_str()?.to_string();
+        let key = v.get("key")?.as_str()?.to_string();
+        (!username.is_empty() && !key.is_empty()).then_some((username, key))
+    }
+
+    fn forget_shop_session() {
+        if let Some(path) = Self::shop_session_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     fn settings_path() -> Option<std::path::PathBuf> {
-        Some(dirs::config_dir()?.join("navcore").join("settings.json"))
+        Some(crate::paths::config_dir()?.join("settings.json"))
     }
 
     fn save_settings(&self) {
@@ -4701,6 +5078,8 @@ impl RenderState {
             boat: &'a crate::render::ui::BoatView,
             charts: &'a crate::render::ui::ChartFolderView,
             display: &'a crate::render::ui::DisplayView,
+            safety: &'a crate::render::ui_safety::SafetyView,
+            logbook: &'a crate::render::ui_logbook::LogView,
         }
         // An env override is for this run; the file keeps what the user set.
         let mut instruments = ui.instruments.clone();
@@ -4713,6 +5092,8 @@ impl RenderState {
             boat: &ui.boat,
             charts: &ui.charts,
             display: &ui.display,
+            safety: &ui.safety,
+            logbook: &ui.logbook,
         }) else {
             return;
         };
@@ -4737,11 +5118,15 @@ impl RenderState {
         }
         // Current shape first, then the pre-weather file that was the
         // instruments alone — the user keeps their layout across the change.
+        let current = |mut v: crate::render::ui::InstrumentView| {
+            v.tiles = v.tiles.into_iter().map(crate::signalk::catalog::current_tile).collect();
+            v
+        };
         if let Ok(p) = serde_json::from_str::<Persisted>(&text) {
-            return Some(p.instruments);
+            return Some(current(p.instruments));
         }
         match serde_json::from_str(&text) {
-            Ok(v) => Some(v),
+            Ok(v) => Some(current(v)),
             Err(e) => {
                 // A settings file from an older build should cost the user
                 // their layout, not their session.
@@ -4780,9 +5165,14 @@ impl RenderState {
             #[serde(default)]
             display: crate::render::ui::DisplayView,
         }
-        serde_json::from_str::<Persisted>(&text)
+        let mut display = serde_json::from_str::<Persisted>(&text)
             .map(|p| p.display)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // The angle a twist left is not kept, so neither is the mode.
+        if display.chart_up == crate::render::ui::ChartUp::Free {
+            display.chart_up = crate::render::ui::ChartUp::North;
+        }
+        display
     }
 
     /// Put the Display window's choices into effect: the palette at once,
@@ -4793,7 +5183,7 @@ impl RenderState {
         let Some(ref ui) = self.ui else { return };
         let display = ui.display.clone();
         let draft = ui.boat.draft_m;
-        if std::env::var("NAVCORE_PALETTE").is_err()
+        if std::env::var("MANX_PALETTE").is_err()
             && self.palette_name.as_deref() != Some(display.palette.table())
         {
             self.switch_palette(display.palette.table());
@@ -4815,6 +5205,396 @@ impl RenderState {
         self.pending_tiles.clear();
         self.deferred_tile_results.clear();
         self.needs_redraw = true;
+    }
+
+    pub(crate) fn load_logbook_settings() -> crate::render::ui_logbook::LogView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            logbook: crate::render::ui_logbook::LogView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.logbook)
+            .unwrap_or_default()
+    }
+
+    /// The boat now, as one logbook sample: whatever it sends fresh.
+    fn log_sample(&self) -> Option<crate::nav::logbook::Sample> {
+        use crate::nav::logbook::{Field, Sample};
+        let own = &self.fleet.own;
+        let fresh = |path: &str| own.get(path).filter(|r| !r.is_stale()).and_then(|r| r.number());
+        const KN: f64 = 3600.0 / 1852.0;
+        let mut s = Sample::new(chrono::Utc::now().timestamp());
+        if let Some((at, true)) = self.own_fix() {
+            s.set(Field::Lat, Some(at.lat));
+            s.set(Field::Lon, Some(at.lon));
+        }
+        s.set(Field::Sog, fresh("navigation.speedOverGround").map(|v| v * KN));
+        s.set(Field::Cog, fresh("navigation.courseOverGroundTrue").map(f64::to_degrees));
+        s.set(Field::Heading, fresh("navigation.headingTrue").map(f64::to_degrees));
+        s.set(Field::Stw, fresh("navigation.speedThroughWater").map(|v| v * KN));
+        s.set(Field::Depth, self.depth_under_boat());
+        s.set(Field::Aws, fresh("environment.wind.speedApparent").map(|v| v * KN));
+        s.set(Field::Awa, fresh("environment.wind.angleApparent").map(f64::to_degrees));
+        s.set(Field::Tws, fresh("environment.wind.speedTrue").map(|v| v * KN));
+        s.set(Field::Twd, fresh("environment.wind.directionTrue").map(f64::to_degrees));
+        s.set(Field::Baro, fresh("environment.outside.pressure").map(|v| v / 100.0));
+        s.set(Field::WaterTemp, fresh("environment.water.temperature").map(|v| v - 273.15));
+        // Nothing heard at all is not a sample.
+        (s != Sample::new(s.t)).then_some(s)
+    }
+
+    /// A note in the logbook: today's stamped now with the position, a past
+    /// day's at that day's last sample, without one.
+    fn log_note(&mut self, day: Option<chrono::NaiveDate>, text: String) {
+        use crate::nav::logbook::{self, Note};
+        let note = match day {
+            None => {
+                let at = self.own_fix().map(|(p, _)| p);
+                Note { t: chrono::Utc::now().timestamp(), lat: at.map(|p| p.lat), lon: at.map(|p| p.lon), text }
+            }
+            Some(d) => {
+                let end = logbook::read_day(self.logbook.dir(), d).last().map(|s| s.t).unwrap_or_else(|| {
+                    d.and_hms_opt(12, 0, 0).map(|t| t.and_utc().timestamp()).unwrap_or_default()
+                });
+                Note { t: end, lat: None, lon: None, text }
+            }
+        };
+        match logbook::add_note(self.logbook.dir(), &note) {
+            Ok(()) => self.log_state.message = None,
+            Err(e) => self.log_state.message = Some(format!("Could not save the note: {e}")),
+        }
+        self.log_dirty = true;
+    }
+
+    /// Put the open day's track on the screen.
+    fn log_fit(&mut self) {
+        let pts: Vec<[f64; 2]> = self
+            .log_samples
+            .iter()
+            .filter_map(|s| s.position())
+            .map(|p| {
+                let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+                [x, y]
+            })
+            .collect();
+        if pts.is_empty() {
+            return;
+        }
+        let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
+        for p in &pts {
+            for i in 0..2 {
+                lo[i] = lo[i].min(p[i]);
+                hi[i] = hi[i].max(p[i]);
+            }
+        }
+        self.release_follow();
+        self.camera.position = glam::DVec2::new((lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0);
+        let (w, h) = (self.camera.viewport_width as f64, self.camera.viewport_height as f64);
+        let zoom = ((hi[0] - lo[0]) / w).max((hi[1] - lo[1]) / h) * 1.3;
+        self.camera.zoom = (zoom as f32).clamp(crate::render::camera::MIN_METRES_PER_PIXEL * 20.0, self.camera.max_zoom);
+        self.needs_redraw = true;
+    }
+
+    fn log_export(&mut self, day: chrono::NaiveDate, csv: bool) {
+        use crate::nav::logbook;
+        self.logbook.flush();
+        let dir = self.logbook.dir().to_path_buf();
+        let samples = logbook::read_day(&dir, day);
+        let (text, ext) = if csv {
+            (logbook::to_csv(&samples), "csv")
+        } else {
+            (logbook::to_gpx(day, &samples, &logbook::read_notes(&dir, day)), "gpx")
+        };
+        let mime = if csv { "text/csv" } else { "application/gpx+xml" };
+        let name = format!("manx-log-{day}.{ext}");
+        self.log_state.message =
+            Some(crate::export::save(&name, mime, text.as_bytes()).unwrap_or_else(|e| e));
+    }
+
+    /// The logbook for the UI: the open day's track and notes on the chart,
+    /// and the window's rows. The files are read only when the window opens
+    /// or something changed; today's row is live.
+    fn logbook_view(
+        &mut self,
+    ) -> (
+        crate::render::ui_safety::TrackView,
+        Vec<([f32; 2], String)>,
+        crate::render::ui_logbook::LogbookState,
+    ) {
+        use crate::nav::logbook;
+        use crate::render::ui_logbook::{DayDetail, DayRow};
+        let Some(view) = self.ui.as_ref().map(|u| u.logbook.clone()) else {
+            return Default::default();
+        };
+        let dir = self.logbook.dir().to_path_buf();
+        let today = self.logbook.day;
+        let row = |day: chrono::NaiveDate, samples: &[logbook::Sample]| DayRow {
+            day,
+            summary: logbook::summarize(samples),
+            notes: logbook::read_notes(&dir, day).len(),
+            bytes: logbook::day_bytes(&dir, day),
+        };
+        // Closed, the rows are not read; the open day stays on the chart.
+        if !view.open {
+            self.log_dirty = true;
+        } else if self.log_dirty {
+            self.log_dirty = false;
+            self.log_state.days = logbook::days(&dir)
+                .into_iter()
+                .map(|d| {
+                    if Some(d) == today {
+                        row(d, &self.logbook.today)
+                    } else {
+                        row(d, &logbook::read_day(&dir, d))
+                    }
+                })
+                .collect();
+            self.log_state.detail = view.selected.map(|d| DayDetail {
+                row: if Some(d) == today { row(d, &self.logbook.today) } else { row(d, &self.log_samples) },
+                notes: logbook::read_notes(&dir, d),
+            });
+        }
+        // Today changes under the window: its numbers are summed afresh
+        // (a few thousand samples at most).
+        self.log_state.today = today.map(|d| DayRow {
+            day: d,
+            summary: logbook::summarize(&self.logbook.today),
+            notes: 0,
+            bytes: 0,
+        });
+        if let (Some(t), Some(first)) = (&self.log_state.today, self.log_state.days.first_mut()) {
+            if first.day == t.day {
+                first.summary = t.summary.clone();
+            }
+        }
+        if let (Some(t), Some(detail)) = (&self.log_state.today, self.log_state.detail.as_mut()) {
+            if detail.row.day == t.day {
+                detail.row.summary = t.summary.clone();
+                self.log_samples = self.logbook.today.clone();
+            }
+        }
+        self.log_state.has_fix = self.own_fix().is_some_and(|(_, f)| f);
+
+        let ppp = self.scale_factor.max(0.01);
+        let project = |p: crate::geo::LatLon| {
+            let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+            let s = self.camera.world_to_screen(x, y);
+            [s.x / ppp, s.y / ppp]
+        };
+        let shown = view.show_on_chart && view.selected.is_some();
+        let track = if shown {
+            crate::render::ui_safety::TrackView {
+                screen: self.log_samples.iter().filter_map(|s| s.position()).map(project).collect(),
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
+        let notes = if shown {
+            self.log_state
+                .detail
+                .as_ref()
+                .map(|d| {
+                    d.notes.iter().filter_map(|n| Some((project(n.position()?), n.text.clone()))).collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        (track, notes, self.log_state.clone())
+    }
+
+    pub(crate) fn load_safety_settings() -> crate::render::ui_safety::SafetyView {
+        let Some(path) = Self::settings_path() else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Default::default();
+        };
+        #[derive(serde::Deserialize)]
+        struct Persisted {
+            #[serde(default)]
+            safety: crate::render::ui_safety::SafetyView,
+        }
+        serde_json::from_str::<Persisted>(&text)
+            .map(|p| p.safety)
+            .unwrap_or_default()
+    }
+
+    /// The boat's position and whether it is fresh.
+    fn own_fix(&self) -> Option<(crate::geo::LatLon, bool)> {
+        let (lat, lon) = self.fleet.own.position()?;
+        let fresh = self
+            .fleet
+            .own
+            .get("navigation.position")
+            .is_some_and(|r| !r.is_stale());
+        Some((crate::geo::LatLon::new(lat, lon), fresh))
+    }
+
+    /// Depth under the boat from the sounder: below the keel when the boat
+    /// sends it, else below the transducer. Stale readings are no reading.
+    fn depth_under_boat(&self) -> Option<f64> {
+        ["environment.depth.belowKeel", "environment.depth.belowTransducer"]
+            .into_iter()
+            .find_map(|p| {
+                let r = self.fleet.own.get(p)?;
+                (!r.is_stale()).then(|| r.number()).flatten()
+            })
+    }
+
+    /// Man overboard: mark where the boat is now (the last known position if
+    /// the fix is stale, nothing if there has never been one), ring, and
+    /// keep the boat on screen.
+    pub fn mark_mob(&mut self) {
+        let at = self.own_fix().map(|(at, _)| at);
+        let now = Instant::now();
+        self.mob = Some((at, now));
+        let when = chrono::Local::now().format("%H:%M:%S");
+        // Marking again is a new man overboard: ring even if the last was
+        // silenced.
+        self.alarms.set(crate::nav::alarms::AlarmKey::ManOverboard, None, now);
+        self.alarms.set(
+            crate::nav::alarms::AlarmKey::ManOverboard,
+            Some(match at {
+                Some(p) => format!("marked at {when}, {}", crate::geo::format_latlon(p.lat, p.lon)),
+                None => format!("marked at {when} — no position fix"),
+            }),
+            now,
+        );
+        if at.is_some() {
+            self.set_follow(true);
+        }
+        self.needs_redraw = true;
+    }
+
+    /// The watch, once a frame: decide every alarm from the boat's state,
+    /// sound the ones ringing, and record the track.
+    fn update_watch(&mut self) {
+        use crate::nav::alarms::{self, AlarmKey};
+        let now = Instant::now();
+        let Some(ui) = self.ui.as_ref() else { return };
+        let (sound, depth_alarm, depth_limit, record) = (
+            ui.safety.sound,
+            ui.safety.depth_alarm,
+            ui.safety.depth_alarm_m as f64,
+            ui.logbook.record,
+        );
+        let cpa = crate::render::ui_ais::CpaAlarm {
+            distance_m: ui.instruments.cpa_alarm_nm * 1852.0,
+            seconds: ui.instruments.tcpa_alarm_min * 60.0,
+        };
+        let fix = self.own_fix();
+
+        // MANX_MOB=1 presses MOB once the boat has a fix — for captures.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static PRESSED: AtomicBool = AtomicBool::new(false);
+            if fix.is_some()
+                && std::env::var_os("MANX_MOB").is_some()
+                && !PRESSED.swap(true, Ordering::Relaxed)
+            {
+                self.mark_mob();
+            }
+        }
+
+        if let Some((anchor, radius)) = self.anchor_watch {
+            self.alarms.set(AlarmKey::Anchor, alarms::anchor_check(anchor, radius, fix), now);
+        }
+        let depth = if depth_alarm { alarms::depth_check(self.depth_under_boat(), depth_limit) } else { None };
+        self.alarms.set(AlarmKey::Depth, depth, now);
+
+        // Collision: every target the CPA rule calls dangerous, whether or
+        // not AIS is drawn — hiding the targets must not hide the danger.
+        let dangerous = self
+            .ais_targets()
+            .into_iter()
+            .filter(|t| !t.lost && cpa.triggered_by(t.cpa))
+            .map(|t| {
+                let (d, s) = t.cpa.unwrap_or_default();
+                let name = t.label.clone().unwrap_or_else(|| "unnamed vessel".into());
+                (t.id, format!("{name} — {:.2} NM in {:.0} min", d / 1852.0, s / 60.0))
+            })
+            .collect();
+        self.alarms.set_collisions(dangerous, now);
+
+        if sound && self.alarms.due(now) {
+            crate::sound::alarm();
+        }
+
+        // The logbook.
+        if record {
+            if let Some(sample) = self.log_sample() {
+                if self.logbook.offer(sample, now) {
+                    self.needs_redraw = true;
+                }
+            }
+        } else {
+            self.logbook.flush();
+        }
+    }
+
+    /// The watch as the UI draws it.
+    fn watch_views(
+        &self,
+    ) -> (
+        Vec<crate::render::ui_safety::AlarmLine>,
+        Option<crate::render::ui_safety::MobView>,
+        Option<crate::render::ui_safety::AnchorView>,
+        crate::render::ui_safety::TrackView,
+    ) {
+        use crate::render::ui_safety::{AlarmLine, AnchorView, MobView, TrackView};
+        let ppp = self.scale_factor.max(0.01);
+        let project = |p: crate::geo::LatLon| {
+            let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+            let s = self.camera.world_to_screen(x, y);
+            [s.x / ppp, s.y / ppp]
+        };
+        let alarms = self
+            .alarms
+            .iter()
+            .map(|(k, a)| AlarmLine { title: k.title(), message: a.message.clone(), acknowledged: a.acknowledged })
+            .collect();
+        let fix = self.own_fix();
+        let mob = self.mob.map(|(at, since)| {
+            let way = at.zip(fix).map(|(m, (own, _))| crate::geo::range_bearing(own, m));
+            MobView {
+                screen: at.map(project),
+                bearing_deg: way.map(|(_, b)| b.to_degrees().rem_euclid(360.0)),
+                distance_m: way.map(|(d, _)| d),
+                elapsed_s: since.elapsed().as_secs(),
+                own_screen: fix.map(|(p, _)| project(p)),
+            }
+        });
+        let anchor = self.anchor_watch.map(|(at, radius)| {
+            // Mercator metres per ground metre, then physical pixels, then
+            // logical points.
+            let stretch = 1.0 / at.lat.to_radians().cos();
+            AnchorView {
+                screen: project(at),
+                radius_px: (radius * stretch / self.camera.zoom as f64 / ppp as f64) as f32,
+                radius_m: radius as f32,
+                distance_m: fix.filter(|(_, fresh)| *fresh).map(|(p, _)| crate::geo::distance_m(at, p)),
+            }
+        });
+        let track = TrackView {
+            screen: self.logbook.today.iter().filter_map(|s| s.position()).map(project).collect(),
+            ..Default::default()
+        };
+        (alarms, mob, anchor, track)
+    }
+
+    /// Something on watch needs the clock: a ringing alarm, the MOB timer,
+    /// the anchor watch (it must notice the fix going stale).
+    pub fn watch_active(&self) -> bool {
+        !self.alarms.is_empty() || self.mob.is_some() || self.anchor_watch.is_some()
     }
 
     pub(crate) fn load_boat_settings() -> crate::render::ui::BoatView {
@@ -4844,6 +5624,7 @@ impl RenderState {
         let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
         let screen = self.camera.world_to_screen(wx, wy);
         let ppp = self.scale_factor.max(0.01);
+        let turn = self.camera.rotation;
 
         // The fix, not the heading, decides staleness: a boat that has lost
         // its GPS must not keep drawing itself somewhere plausible.
@@ -4856,12 +5637,14 @@ impl RenderState {
 
         Some(crate::render::ui_ownship::OwnShip {
             screen: [screen.x / ppp, screen.y / ppp],
-            heading: self.fleet.own.heading_true().map(|h| h as f32),
+            // The overlay draws from screen-up, which is not north once the
+            // chart is turned.
+            heading: self.fleet.own.heading_true().map(|h| (h - turn) as f32),
             cog: self
                 .fleet
                 .own
                 .number("navigation.courseOverGroundTrue")
-                .map(|c| c as f32),
+                .map(|c| (c - turn) as f32),
             sog: self
                 .fleet
                 .own
@@ -5139,6 +5922,7 @@ impl RenderState {
 
         let ppp = self.scale_factor.max(0.01);
         let own = self.own_motion();
+        let turn = self.camera.rotation;
 
         self.fleet
             .targets()
@@ -5158,9 +5942,10 @@ impl RenderState {
                 });
 
                 Some(crate::render::ui_ais::AisTarget {
+                    id: target.context.clone(),
                     screen: [screen.x / ppp, screen.y / ppp],
-                    heading: target.heading().map(|h| h as f32),
-                    cog: target.course().map(|c| c as f32),
+                    heading: target.heading().map(|h| (h - turn) as f32),
+                    cog: target.course().map(|c| (c - turn) as f32),
                     sog: target.speed().map(|s| s as f32),
                     label: target.label().map(str::to_string),
                     under_way: target.under_way(),
@@ -5248,6 +6033,78 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
+    /// Which way up the chart is drawn, from the button on the chart or `H`.
+    pub fn set_chart_up(&mut self, mode: crate::render::ui::ChartUp) {
+        if let Some(ref mut ui) = self.ui {
+            ui.display.chart_up = mode;
+        }
+        self.chart_turn_at = None;
+        self.save_settings();
+        self.needs_redraw = true;
+    }
+
+    pub fn chart_up(&self) -> crate::render::ui::ChartUp {
+        self.ui.as_ref().map(|u| u.display.chart_up).unwrap_or_default()
+    }
+
+    /// Two fingers twisted the chart by `delta` radians clockwise about a
+    /// screen point. The chart stays where it is put: head-up would turn it
+    /// straight back, so a twist leaves it free until the button is pressed.
+    /// Following, the turn is about the boat, which is where she stays.
+    pub fn twist_chart(&mut self, delta: f64, screen_x: f32, screen_y: f32) {
+        if let Some(ref mut ui) = self.ui {
+            ui.display.chart_up = crate::render::ui::ChartUp::Free;
+        }
+        if self.follow_on() {
+            let (w, h) = (self.camera.viewport_width, self.camera.viewport_height);
+            self.camera.rotate_at(delta, w * 0.5, h * 0.5);
+        } else {
+            self.camera.rotate_at(delta, screen_x, screen_y);
+        }
+        self.chart_turning = false;
+        self.needs_redraw = true;
+    }
+
+    /// Turn the chart towards the way up it should be: north, the boat's
+    /// heading (her course over ground without one), or — twisted by hand —
+    /// nowhere.
+    ///
+    /// Eased rather than set, with a time constant of a third of a second. A
+    /// compass reports several times a second and wanders a degree or two as
+    /// the boat moves, and a chart that jumps with every report is unreadable;
+    /// eased, it swings with the boat and settles. The turn is about the middle
+    /// of the screen, which is the boat while following.
+    fn update_chart_up(&mut self) {
+        use crate::render::ui::ChartUp;
+        let target = match self.chart_up() {
+            ChartUp::North => Some(0.0),
+            ChartUp::Head => self
+                .fleet
+                .own
+                .heading_true()
+                .or_else(|| self.fleet.own.number("navigation.courseOverGroundTrue")),
+            ChartUp::Free => None,
+        };
+        let now = Instant::now();
+        let dt = self
+            .chart_turn_at
+            .map(|t| now.duration_since(t).as_secs_f64().min(0.1))
+            .unwrap_or(1.0 / 60.0);
+        self.chart_turn_at = Some(now);
+
+        // With no heading and no course, the chart holds where it was.
+        let Some(target) = target else {
+            self.chart_turning = false;
+            return;
+        };
+        let (rotation, turning) = ease_bearing(self.camera.rotation, target, dt);
+        if rotation != self.camera.rotation {
+            self.camera.rotation = rotation;
+            self.needs_redraw = true;
+        }
+        self.chart_turning = turning;
+    }
+
     /// Whether the chart is keeping the boat centred.
     pub fn follow_on(&self) -> bool {
         self.ui.as_ref().is_some_and(|u| u.instruments.follow)
@@ -5264,83 +6121,95 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
-    /// This machine's o-charts fingerprint, if it has a licence at all.
-    /// Work out which edition a lapsed licence may still ask for, and put it
-    /// to the user.
+    /// Put a download that needs deciding to the user: one that spends a
+    /// licence slot, or one for a lapsed licence, which cannot have the
+    /// shop's current edition and must name an older one.
     ///
-    /// Two sources, best first: the shop's own record of what this machine's
-    /// slot last received, then the edition installed here. Either is an
-    /// edition the licence demonstrably covered; the shop's current one is
-    /// not, which is why asking for it comes back refused.
+    /// For a lapsed licence every edition it is known to have covered is
+    /// offered — this machine's slot, what is installed here, and what each
+    /// of the account's other machines last received. The shop's current
+    /// edition is not among them, which is why asking for it is refused.
     fn prepare_lapsed_download(&mut self, chart_id: &str) {
         let Some(ref mut ui) = self.ui else { return };
         let Some(chart) = ui.shop.charts.iter().find(|c| c.id == chart_id) else {
             return;
         };
+        let machine = ui.shop.system_name.clone().unwrap_or_default();
 
-        // A live subscription this machine holds no slot for: the download
-        // spends one, for good. Said before, not discovered after.
+        // No slot here yet: the download spends one, for good, whether or
+        // not the subscription is live. Said before, not discovered after.
+        let mine = chart.slot_for(&machine).map(|(_, s)| s.clone());
+        let slot_note = mine.is_none().then(|| {
+            format!(
+                "This assigns 1 of the {} free slot(s) on this licence to \"{machine}\", \
+                 permanently: o-charts cannot move or cancel an assignment once a chart is \
+                 requested for it.",
+                chart.free_slots()
+            )
+        });
+
         if !chart.expired {
-            let machine = ui.shop.system_name.clone().unwrap_or_default();
             ui.shop.pending = Some(crate::render::ui::PendingDownload {
                 chart_id: chart_id.to_string(),
                 chart_name: chart.name.clone(),
-                edition: None,
-                because: format!(
-                    "This assigns one of the {} free slot(s) on this licence to \"{machine}\". \
-                     o-charts cannot move or cancel an assignment once a chart is requested.",
-                    chart.free_slots()
-                ),
-                new_slot: true,
+                expired: false,
+                choices: Vec::new(),
+                because: format!("The shop's current edition, {}.", chart.edition),
+                new_slot: mine.is_none(),
+                slot_note,
             });
             return;
         }
 
-        let from_slot = ui
-            .shop
-            .system_name
-            .as_deref()
-            .and_then(|name| chart.slot_for(name))
-            .map(|(_, s)| s.last_requested.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let from_disk = ui.shop.installed.get(chart_id).map(|e| e.to_string());
+        // Every edition the licence is known to have covered: what this
+        // machine's slot last received, what is installed here, and what the
+        // account's other machines last received. The shop words a slot's
+        // edition its own way, sometimes without the year, so each is echoed
+        // back exactly as sent and labelled with where it came from; ordering
+        // them would mean guessing at a year the shop left out.
+        let mut choices: Vec<(String, String)> = Vec::new();
+        let mut add = |edition: &str, source: String| {
+            let edition = edition.trim();
+            if !edition.is_empty() && !choices.iter().any(|(e, _)| e == edition) {
+                choices.push((edition.to_string(), source));
+            }
+        };
+        if let Some(s) = &mine {
+            add(&s.last_requested, "last sent to this machine".into());
+        }
+        if let Some(e) = ui.shop.installed.get(chart_id) {
+            add(&e.to_string(), "installed here".into());
+        }
+        for q in &chart.quantities {
+            for s in &q.slots {
+                if s.assigned_system != machine {
+                    add(&s.last_requested, format!("as last sent to {}", s.assigned_system));
+                }
+            }
+        }
 
-        let (edition, because) = match (from_slot, from_disk) {
-            (Some(slot), _) => (
-                Some(slot.clone()),
-                format!(
-                    "The shop has {}, published after your licence expired — it will not \
-                     grant that. Edition {slot} is the last one the shop recorded for this \
-                     machine, and your licence covered it.",
-                    chart.edition
-                ),
-            ),
-            (None, Some(disk)) => (
-                Some(disk.clone()),
-                format!(
-                    "The shop has {}, published after your licence expired — it will not \
-                     grant that. Edition {disk} is what is installed here, so your licence \
-                     covered it.",
-                    chart.edition
-                ),
-            ),
-            (None, None) => (
-                None,
-                format!(
-                    "The shop has {}, published after your licence expired. navcore cannot \
-                     tell which edition you last held — nothing for this set is installed \
-                     here and the shop recorded no earlier request.",
-                    chart.edition
-                ),
-            ),
+        let because = if choices.is_empty() {
+            format!(
+                "The shop has {}, published after your licence expired. No machine on the \
+                 account has recorded an earlier edition, so there is none to name.",
+                chart.edition
+            )
+        } else {
+            format!(
+                "The shop has {}, published after your licence expired, and will likely \
+                 refuse it. Your licence did cover the editions below — ask for one of those.",
+                chart.edition
+            )
         };
 
         ui.shop.pending = Some(crate::render::ui::PendingDownload {
             chart_id: chart_id.to_string(),
             chart_name: chart.name.clone(),
-            edition,
+            expired: true,
+            choices,
             because,
-            new_slot: false,
+            new_slot: mine.is_none(),
+            slot_note,
         });
     }
 
@@ -5349,9 +6218,9 @@ impl RenderState {
         if self.route_store.is_some() {
             return;
         }
-        // `NAVCORE_ROUTES=<dir>` points the store elsewhere — captures and
+        // `MANX_ROUTES=<dir>` points the store elsewhere — captures and
         // tests must not write into the user's real route folder.
-        let dir = std::env::var("NAVCORE_ROUTES")
+        let dir = std::env::var("MANX_ROUTES")
             .map(std::path::PathBuf::from)
             .ok()
             .or_else(crate::nav::RouteStore::default_dir)
@@ -5670,8 +6539,8 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
-            let cache = dirs::config_dir()
-                .map(|d| d.join("navcore").join("grib"))
+            let cache = crate::paths::config_dir()
+                .map(|d| d.join("grib"))
                 .unwrap_or_else(|| "grib-cache".into());
             let progress_tx = tx.clone();
             let result = crate::nav::grib::GribForecast::fetch(
@@ -5739,22 +6608,35 @@ impl RenderState {
         let Some(time_ms) = self.field_time_ms(first, last) else {
             return Vec::new();
         };
-        // One barb every ~64 points: dense enough to show a shift across the
+        // One barb every ~72 points: dense enough to show a shift across the
         // screen, sparse enough that the feathers never collide. Anchored to
-        // the water, so the field travels with the chart under a pan.
+        // the water, so the field travels with the chart under a pan, and
+        // faded between octaves so it thins smoothly under a zoom.
+        const BARB_SPACING: f32 = 72.0;
+        // The figures go on every other barb each way: a label is wider than
+        // a barb, and a field of numbers is harder to read than a few.
+        const LABEL_SPACING: f32 = BARB_SPACING * 2.0;
         let area = ui.chart_area();
-        let grid = self.sample_grid(64.0, area);
+        let grid = self.sample_grid_faded(BARB_SPACING, area);
         let mut barbs = Vec::new();
-        for (screen, &(lat, lon)) in grid.screen.iter().zip(grid.geo.iter()) {
+        for (k, (screen, &(lat, lon))) in grid.screen.iter().zip(grid.geo.iter()).enumerate() {
             // A barb whose centre is under a panel is a barb nobody sees.
             if !area.contains(egui::pos2(screen[0], screen[1])) {
+                continue;
+            }
+            let alpha = grid.fade(k, BARB_SPACING);
+            if alpha <= 0.0 {
                 continue;
             }
             if let Some((from_deg, kt)) = forecast.sample(lat, lon, time_ms) {
                 barbs.push(crate::render::ui_wind::WindBarb {
                     screen: *screen,
-                    from_deg: from_deg as f32,
+                    // Drawn from screen-up, which a turned chart has moved.
+                    from_deg: (from_deg - self.camera.rotation.to_degrees()) as f32,
                     kt: kt as f32,
+                    gust_kt: forecast.gust_kt(lat, lon, time_ms).map(|g| g as f32),
+                    alpha,
+                    label: grid.fade(k, LABEL_SPACING),
                 });
             }
         }
@@ -5790,16 +6672,35 @@ impl RenderState {
         if grid.is_empty() {
             return empty;
         }
+        let inside: Vec<bool> = grid
+            .geo
+            .iter()
+            .map(|&(lat, lon)| forecast.covers(lat, lon))
+            .collect();
+        // A corner past the edge is kept, transparent, only when a covered
+        // corner is next to it — enough for the last cell to fade out, and
+        // no sampling of empty ocean beyond.
+        let near_inside = |k: usize| {
+            let (c, r) = (k % grid.cols, k / grid.cols);
+            (r.saturating_sub(1)..=(r + 1).min(grid.rows - 1)).any(|rr| {
+                (c.saturating_sub(1)..=(c + 1).min(grid.cols - 1)).any(|cc| inside[rr * grid.cols + cc])
+            })
+        };
         let kt = grid
             .geo
             .iter()
-            .map(|&(lat, lon)| forecast.sample(lat, lon, time_ms).map(|(_, kt)| kt as f32))
+            .enumerate()
+            .map(|(k, &(lat, lon))| {
+                (inside[k] || near_inside(k)).then(|| forecast.sample_held(lat, lon, time_ms).1 as f32)
+            })
             .collect();
         crate::render::ui_wind::WindFill {
             screen: grid.screen,
             cols: grid.cols,
             rows: grid.rows,
             kt,
+            outside: inside.iter().map(|i| !i).collect(),
+            opacity: ui.display.weather_opacity,
         }
     }
 
@@ -5938,7 +6839,7 @@ impl RenderState {
             if let Some((to_deg, kt)) = field.sample(lat, lon, time_ms) {
                 out.push(crate::render::ui_weather::CurrentArrow {
                     screen: *screen,
-                    to_deg: to_deg as f32,
+                    to_deg: (to_deg - self.camera.rotation.to_degrees()) as f32,
                     kt: kt as f32,
                 });
             }
@@ -5976,8 +6877,8 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
-            let cache = dirs::config_dir()
-                .map(|d| d.join("navcore").join("orc"))
+            let cache = crate::paths::config_dir()
+                .map(|d| d.join("orc"))
                 .unwrap_or_else(|| "orc-cache".into());
             let progress_tx = tx.clone();
             let result = crate::nav::orc::search(&country, &query, &cache, move |m| {
@@ -5997,8 +6898,8 @@ impl RenderState {
     fn adopt_orc_polar(&mut self, index: usize) {
         let Some(ref mut ui) = self.ui else { return };
         let Some(hit) = ui.boat.results.get(index).cloned() else { return };
-        let dir = dirs::config_dir()
-            .map(|d| d.join("navcore").join("polars"))
+        let dir = crate::paths::config_dir()
+            .map(|d| d.join("polars"))
             .unwrap_or_else(|| "polars".into());
         if let Err(e) = std::fs::create_dir_all(&dir) {
             ui.boat.status = format!("could not create {}: {e}", dir.display());
@@ -6131,15 +7032,17 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
-            let cache = dirs::config_dir()
-                .map(|d| d.join("navcore").join("grib"))
+            let cache = crate::paths::config_dir()
+                .map(|d| d.join("grib"))
                 .unwrap_or_else(|| "grib-cache".into());
             let generation = crate::nav::isochrone::begin_cancellable();
             let (polar_text, polar_name) = if polar_path.trim().is_empty() {
                 (crate::nav::wxroute::DEFAULT_POLAR.to_string(),
                  "built-in cruiser".to_string())
             } else {
-                match std::fs::read_to_string(polar_path.trim()) {
+                // A polar saved before the rename may have moved with Manx's
+                // folder.
+                match std::fs::read_to_string(crate::paths::moved(std::path::Path::new(polar_path.trim()))) {
                     Ok(t) => (t, polar_path.trim().to_string()),
                     Err(e) => {
                         let _ = tx.send(RouteNetEvent::WxFailed(format!(
@@ -6614,6 +7517,32 @@ impl RenderState {
 
     /// Drain the shop worker into the panel.
     fn poll_shop(&mut self) {
+        // The first time the shop is opened, carry on with a remembered
+        // session rather than asking for the password again.
+        let open = self.ui.as_ref().is_some_and(|u| u.shop.open);
+        if !open {
+            // Closing the window is how to try again after the shop could not
+            // be reached.
+            self.shop_resume_tried = false;
+        }
+        let signed_in = self.ui.as_ref().is_some_and(|u| u.shop.signed_in || u.shop.busy);
+        if open && !signed_in && !self.shop_resume_tried {
+            self.shop_resume_tried = true;
+            if let Some((username, key)) = Self::load_shop_session() {
+                if let Some(ref mut ui) = self.ui {
+                    ui.shop.email = username.clone();
+                    ui.shop.remember = true;
+                    ui.shop.busy = true;
+                }
+                self.shop_remember = true;
+                let fingerprint = Self::machine_fingerprint();
+                self.shop_send(crate::shop::service::Request::Resume {
+                    username,
+                    key,
+                    fingerprint,
+                });
+            }
+        }
         let mut reload_after_install = false;
         self.poll_shop_events(&mut reload_after_install);
         // The new cells are drawn now, not after a restart; the view stays
@@ -6652,6 +7581,20 @@ impl RenderState {
                     ui.shop.systems = systems;
                     ui.shop.busy = false;
                     ui.shop.status = String::new();
+                }
+                Event::Session { username, key } => {
+                    if self.shop_remember {
+                        Self::save_shop_session(&username, &key);
+                    }
+                }
+                Event::ResumeFailed { why, refused } => {
+                    ui.shop.busy = false;
+                    ui.shop.status = if refused {
+                        Self::forget_shop_session();
+                        format!("Please sign in again ({why}).")
+                    } else {
+                        format!("{why}. Still remembered: close and reopen Charts to try again.")
+                    };
                 }
                 Event::SignedOut => {
                     ui.shop.signed_in = false;
@@ -6706,7 +7649,7 @@ impl RenderState {
 
     /// Check if a redraw is needed
     pub fn needs_redraw(&self) -> bool {
-        self.needs_redraw
+        self.needs_redraw || self.chart_turning
     }
 
     /// Check if there are tiles still pending from the worker
@@ -6777,7 +7720,7 @@ impl RenderState {
         self.pending_capture.is_some()
     }
 
-    /// Copy a rendered surface texture to CPU and write it as a PNG. Used by NAVCORE_SHOT.
+    /// Copy a rendered surface texture to CPU and write it as a PNG. Used by MANX_SHOT.
     fn save_capture(&self, texture: &wgpu::Texture, path: &str) {
         let width = self.config.width;
         let height = self.config.height;
@@ -6822,7 +7765,7 @@ impl RenderState {
         });
         self.device.poll(wgpu::Maintain::Wait);
         if rx.recv().map(|r| r.is_err()).unwrap_or(true) {
-            log::warn!("NAVCORE_SHOT: failed to map readback buffer");
+            log::warn!("MANX_SHOT: failed to map readback buffer");
             return;
         }
 
@@ -6849,9 +7792,9 @@ impl RenderState {
         match image::RgbaImage::from_raw(width, height, pixels) {
             Some(img) => match img.save(path) {
                 Ok(()) => {
-                    log::warn!("NAVCORE_SHOT: wrote {} ({}x{})", path, width, height);
+                    log::warn!("MANX_SHOT: wrote {} ({}x{})", path, width, height);
                     if let (Ok(dump), Some(log)) =
-                        (std::env::var("NAVCORE_DUMP_DRAW"), &self.draw_log)
+                        (std::env::var("MANX_DUMP_DRAW"), &self.draw_log)
                     {
                         let lines: Vec<String> = log
                             .borrow()
@@ -6860,16 +7803,16 @@ impl RenderState {
                             .collect();
                         if std::fs::write(&dump, lines.join("\n") + "\n").is_ok() {
                             log::warn!(
-                                "NAVCORE_DUMP_DRAW: wrote {} draw records to {}",
+                                "MANX_DUMP_DRAW: wrote {} draw records to {}",
                                 lines.len(),
                                 dump
                             );
                         }
                     }
                 }
-                Err(e) => log::warn!("NAVCORE_SHOT: save failed: {}", e),
+                Err(e) => log::warn!("MANX_SHOT: save failed: {}", e),
             },
-            None => log::warn!("NAVCORE_SHOT: bad capture buffer dimensions"),
+            None => log::warn!("MANX_SHOT: bad capture buffer dimensions"),
         }
     }
 }
@@ -6884,6 +7827,8 @@ const LAKARE: u16 = 69;  // Lake
 
 impl Drop for RenderState {
     fn drop(&mut self) {
+        // The logbook's last minutes.
+        self.logbook.flush();
         // Shut down background tile worker thread cleanly
         if let Some(worker) = self.tile_worker.take() {
             worker.shutdown();
@@ -6931,6 +7876,22 @@ fn unique_route_name(store: Option<&crate::nav::RouteStore>) -> String {
         .unwrap_or_else(|| "Route".into())
 }
 
+/// One step of easing a bearing `from` towards `to`, the short way round,
+/// over `dt` seconds. Returns the new bearing (in [0, 2π)) and whether it is
+/// still on its way.
+fn ease_bearing(from: f64, to: f64, dt: f64) -> (f64, bool) {
+    use std::f64::consts::{PI, TAU};
+    const TIME_CONSTANT_S: f64 = 0.33;
+    // Under a tenth of a degree the chart is where it is going.
+    const SETTLED: f64 = 0.1 * PI / 180.0;
+    let diff = (to - from + PI).rem_euclid(TAU) - PI;
+    if diff.abs() < SETTLED {
+        return (to.rem_euclid(TAU), false);
+    }
+    let k = 1.0 - (-dt / TIME_CONSTANT_S).exp();
+    ((from + diff * k).rem_euclid(TAU), true)
+}
+
 fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::DVec2; 4]) -> bool {
     let rect = [
         glam::DVec2::new(b.min_x, b.min_y),
@@ -6967,6 +7928,33 @@ fn tile_meets_footprint(b: &crate::tiles::TileBounds, quad: &[glam::DVec2; 4]) -
         }
     }
     true
+}
+
+#[cfg(test)]
+mod chart_up_tests {
+    use super::ease_bearing;
+    use std::f64::consts::PI;
+
+    #[test]
+    fn a_turn_goes_the_short_way_round_and_settles() {
+        // From 350° to 10° is twenty degrees clockwise through north, not
+        // three hundred and forty back round.
+        let (from, to) = (350f64.to_radians(), 10f64.to_radians());
+        let (next, turning) = ease_bearing(from, to, 1.0 / 60.0);
+        assert!(turning);
+        let moved = (next - from + PI).rem_euclid(2.0 * PI) - PI;
+        assert!(moved > 0.0 && moved < 20f64.to_radians(), "{}", moved.to_degrees());
+
+        let mut b = from;
+        for _ in 0..600 {
+            let (n, t) = ease_bearing(b, to, 1.0 / 60.0);
+            b = n;
+            if !t {
+                break;
+            }
+        }
+        assert_eq!(b, to);
+    }
 }
 
 #[cfg(test)]
@@ -7045,7 +8033,7 @@ mod sample_grid_tests {
     #[test]
     fn the_field_travels_with_the_chart_under_a_pan() {
         let zoom = 50.0;
-        let a = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
+        let a = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area(), Octave::Nearest);
         // Shift the camera by a whole number of world units.
         let shift_world = 500.0f64;
         let b = sample_grid_for(
@@ -7053,6 +8041,7 @@ mod sample_grid_tests {
             1.0,
             64.0,
             area(),
+            Octave::Nearest,
         );
         assert!(!a.is_empty() && !b.is_empty());
         // Moving the camera east moves the chart west on screen, and the
@@ -7089,8 +8078,8 @@ mod sample_grid_tests {
     #[test]
     fn the_lattice_holds_its_ground_through_a_small_zoom() {
         let here = (1_380_000.0, 7_540_000.0);
-        let a = sample_grid_for(&camera_at(here.0, here.1, 50.0), 1.0, 64.0, area());
-        let b = sample_grid_for(&camera_at(here.0, here.1, 55.0), 1.0, 64.0, area());
+        let a = sample_grid_for(&camera_at(here.0, here.1, 50.0), 1.0, 64.0, area(), Octave::Nearest);
+        let b = sample_grid_for(&camera_at(here.0, here.1, 55.0), 1.0, 64.0, area(), Octave::Nearest);
         // The same latitudes are sampled, because the world step did not change.
         let shared = a
             .geo
@@ -7112,7 +8101,7 @@ mod sample_grid_tests {
     /// far enough apart for their feathers not to collide.
     #[test]
     fn the_samples_land_about_as_far_apart_as_asked() {
-        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area());
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area(), Octave::Nearest);
         let gap = (g.screen[1][0] - g.screen[0][0]).abs();
         assert!(
             (45.0..=91.0).contains(&gap),
@@ -7127,7 +8116,7 @@ mod sample_grid_tests {
     #[test]
     fn the_cost_does_not_run_away_with_the_zoom() {
         for zoom in [0.05f32, 5.0, 500.0, 50_000.0, 5_000_000.0] {
-            let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area());
+            let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, zoom), 1.0, 64.0, area(), Octave::Nearest);
             assert!(!g.is_empty(), "no lattice at {zoom} m/px");
             let n = g.cols * g.rows;
             assert!(n < 2_000, "{n} samples at {zoom} m/px");
@@ -7144,18 +8133,64 @@ mod sample_grid_tests {
             1.0,
             64.0,
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(0.0, 0.0)),
+            Octave::Nearest,
         );
         assert!(g.is_empty());
         // A zoom of nothing, and a zoom that is not a number.
-        assert!(sample_grid_for(&camera_at(0.0, 0.0, 0.0), 1.0, 64.0, area()).is_empty());
-        assert!(sample_grid_for(&camera_at(0.0, 0.0, f32::NAN), 1.0, 64.0, area()).is_empty());
+        assert!(sample_grid_for(&camera_at(0.0, 0.0, 0.0), 1.0, 64.0, area(), Octave::Nearest).is_empty());
+        assert!(sample_grid_for(&camera_at(0.0, 0.0, f32::NAN), 1.0, 64.0, area(), Octave::Nearest).is_empty());
         // Every point of a good lattice is a real number.
-        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area());
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 50.0), 1.0, 64.0, area(), Octave::Nearest);
         assert!(g
             .screen
             .iter()
             .all(|p| p[0].is_finite() && p[1].is_finite()));
         assert!(g.geo.iter().all(|(la, lo)| la.is_finite() && lo.is_finite()));
+    }
+
+    /// Zooming out through an octave must not make the barbs jump. Just
+    /// before the lattice doubles, what shows (at any strength worth
+    /// counting) must be the same points of sea that show just after.
+    #[test]
+    fn the_faded_field_thins_without_a_jump_at_the_octave() {
+        let here = (1_380_000.0, 7_540_000.0);
+        // 64 points of spacing at 1 m/pt wants 64 m; 64 is an octave, so the
+        // lattice changes between these two zooms.
+        let before = sample_grid_for(&camera_at(here.0, here.1, 0.999), 1.0, 64.0, area(), Octave::Finer);
+        let after = sample_grid_for(&camera_at(here.0, here.1, 1.001), 1.0, 64.0, area(), Octave::Finer);
+        assert!(after.gap > before.gap * 1.9, "the octave did not change");
+        let shown = |g: &SampleGrid| -> Vec<(i64, i64)> {
+            // On screen only: the lattice's one-cell margin is wider after the
+            // octave doubles, and what lies off the glass is drawn for nobody.
+            (0..g.geo.len())
+                .filter(|&k| g.fade(k, 64.0) > 0.05)
+                .filter(|&k| area().shrink(2.0).contains(egui::pos2(g.screen[k][0], g.screen[k][1])))
+                .map(|k| ((g.geo[k].0 * 1e6).round() as i64, (g.geo[k].1 * 1e6).round() as i64))
+                .collect()
+        };
+        let (a, b) = (shown(&before), shown(&after));
+        assert!(!a.is_empty());
+        let missing = a.iter().filter(|p| !b.contains(p)).count();
+        let extra = b.iter().filter(|p| !a.contains(p)).count();
+        // The two views differ by a thousandth of zoom, so only the edges may
+        // gain or lose a point.
+        assert!(missing * 10 < a.len() && extra * 10 < b.len(), "{missing} vanished, {extra} appeared of {}", a.len());
+    }
+
+    /// The finest points fade out as their gap closes, and the ones a coarser
+    /// lattice keeps never fade at all.
+    #[test]
+    fn fine_points_fade_and_coarse_ones_hold() {
+        assert_eq!(lod_fade(0.5), 0.0);
+        assert_eq!(lod_fade(1.0), 1.0);
+        assert!(lod_fade(0.7) > 0.0 && lod_fade(0.7) < 1.0);
+        let g = sample_grid_for(&camera_at(1_380_000.0, 7_540_000.0, 0.6), 1.0, 64.0, area(), Octave::Finer);
+        // gap ≈ 32/0.6 ≈ 53 points: fine points part-way faded.
+        let fine = (0..g.level.len()).find(|&k| g.level[k] == 0).unwrap();
+        let coarse = (0..g.level.len()).find(|&k| g.level[k] >= 1).unwrap();
+        let f = g.fade(fine, 64.0);
+        assert!(f > 0.0 && f < 1.0, "fine point fade {f}");
+        assert_eq!(g.fade(coarse, 64.0), 1.0);
     }
 }
 

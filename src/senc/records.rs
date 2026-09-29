@@ -1,6 +1,6 @@
 //! SENC TLV record type definitions.
 //!
-//! Based on OpenCPN Osenc.h and the navcore_plan_v2.md documentation.
+//! Based on OpenCPN Osenc.h and the manx_plan_v2.md documentation.
 
 /// SENC record types (from OpenCPN Osenc.h)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

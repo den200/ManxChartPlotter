@@ -1,15 +1,15 @@
 #!/bin/sh
-# S-52 conformance run: diff navcore's symbology resolution against OpenCPN's.
+# S-52 conformance run: diff manx's symbology resolution against OpenCPN's.
 #
 #   tools/s52conformance.sh <chart_dir_or_file> [out_dir] [max_charts]
 #
 # Pipeline:
-#   navcore --dump-ir   -> <out>.features.ndjson  (class/primitive/attributes)
-#                       -> <out>.navcore.ndjson   (navcore's LUP + expanded rules)
+#   manx --dump-ir   -> <out>.features.ndjson  (class/primitive/attributes)
+#                       -> <out>.manx.ndjson   (manx's LUP + expanded rules)
 #   s52oracle           -> <out>.oracle.ndjson    (OpenCPN s52plib, same features)
 #   s52diff.py                                     ranked divergence report
 #
-# Both engines are given the SAME mariner settings (navcore's defaults), so a
+# Both engines are given the SAME mariner settings (manx's defaults), so a
 # divergence is always an engine difference, never a configuration difference.
 
 set -e
@@ -29,29 +29,29 @@ fi
 
 mkdir -p "$(dirname "$OUT")"
 
-# NAVCORE_VIEW_SCALE turns on the third comparison layer: visibility. Both
+# MANX_VIEW_SCALE turns on the third comparison layer: visibility. Both
 # engines are asked whether each feature would be drawn at this view scale,
 # which is a decision neither the instruction diff nor the scene dump covers.
-VIEW_SCALE="${NAVCORE_VIEW_SCALE:-}"
+VIEW_SCALE="${MANX_VIEW_SCALE:-}"
 
 # The ENC display category has to reach both engines, or the OTHER-category
-# classes navcore now draws by default read as thousands of divergences that
-# are really a configuration difference. navcore reads this env var directly
+# classes manx now draws by default read as thousands of divergences that
+# are really a configuration difference. manx reads this env var directly
 # (MarinerSettings::from_env).
-DISPLAY_CAT="${NAVCORE_DISPLAY_CAT:-all}"
+DISPLAY_CAT="${MANX_DISPLAY_CAT:-all}"
 
-# Depth settings, same story: navcore reads these from the environment, so the
+# Depth settings, same story: manx reads these from the environment, so the
 # oracle has to be given whatever the renderer would use. Defaults mirror
 # MarinerSettings::default(), which mirrors s52plib's _MARparamVal.
-SAFETY_DEPTH="${NAVCORE_SAFETY_DEPTH:-3}"
-SAFETY_CONTOUR="${NAVCORE_SAFETY_CONTOUR:-3}"
-SHALLOW_CONTOUR="${NAVCORE_SHALLOW_CONTOUR:-2}"
-DEEP_CONTOUR="${NAVCORE_DEEP_CONTOUR:-6}"
+SAFETY_DEPTH="${MANX_SAFETY_DEPTH:-3}"
+SAFETY_CONTOUR="${MANX_SAFETY_CONTOUR:-3}"
+SHALLOW_CONTOUR="${MANX_SHALLOW_CONTOUR:-2}"
+DEEP_CONTOUR="${MANX_DEEP_CONTOUR:-6}"
 TWO_SHADES=""
-[ "${NAVCORE_DEPTH_SHADES:-4}" = "2" ] && TWO_SHADES="--two-shades"
+[ "${MANX_DEPTH_SHADES:-4}" = "2" ] && TWO_SHADES="--two-shades"
 
-echo "== navcore --dump-ir"
-"$ROOT/target/release/navcore" --dump-ir "$CHARTS" "$OUT" $MAX 2>&1 | tail -1
+echo "== manx --dump-ir"
+"$ROOT/target/release/manx" --dump-ir "$CHARTS" "$OUT" $MAX 2>&1 | tail -1
 
 echo "== s52oracle (OpenCPN s52plib)"
 # Settings mirror MarinerSettings::default() in src/s52/settings.rs, which in
@@ -71,5 +71,5 @@ echo "== s52oracle (OpenCPN s52plib)"
     < "$OUT.features.ndjson" > "$OUT.oracle.ndjson" 2>/dev/null
 
 echo "== diff"
-python3 "$ROOT/tools/s52diff.py" "$OUT.navcore.ndjson" "$OUT.oracle.ndjson" \
+python3 "$ROOT/tools/s52diff.py" "$OUT.manx.ndjson" "$OUT.oracle.ndjson" \
     --features "$OUT.features.ndjson" "$4"

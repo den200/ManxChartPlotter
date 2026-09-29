@@ -14,7 +14,8 @@ struct CameraUniform {
     pixels_per_meter: f32,
     px_per_point: f32,
     anchor_offset: vec2<f32>,
-    _pad: vec2<f32>,
+    view_rotation: f32,
+    _pad: f32,
 }
 
 // The style, per line batch. Nothing here depends on the camera, so it is
@@ -271,7 +272,15 @@ fn fs_lc(in: LcOutput) -> @location(0) vec4<f32> {
         }
         let s = k * adv;
         let p = vec2<f32>(a - s, in.local.y);
-        for (var i = 0u; i < u.lc_count; i++) {
+        // A constant bound, with the count tested inside. `i < u.lc_count`
+        // as the loop condition is the same arithmetic, but on the Pi 5
+        // (V3D 7.1, Mesa 26.2) it hung the GPU within seconds of panning —
+        // `v3d_reset: Resetting GPU for hang`, taking the desktop with it.
+        // 64 is MAX_LC_SEGMENTS in lc_pattern.rs.
+        for (var i = 0u; i < 64u; i++) {
+            if i >= u.lc_count {
+                break;
+            }
             let seg = lc_segments[2u * (u.lc_first + i)];
             let half_stroke = lc_segments[2u * (u.lc_first + i) + 1u].x;
             let dist = segment_distance(p, seg.xy, seg.zw);

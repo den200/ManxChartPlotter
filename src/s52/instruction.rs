@@ -152,7 +152,7 @@ pub enum RenderInstruction {
         bsize: u8,
         /// Character spacing (TX arg 4 / TE arg 5): 1 = fit, 2 = standard,
         /// 3 = wrapped. s52plib parses this into `text->space` and never reads
-        /// it again; navcore at least round-trips it, so the conformance differ
+        /// it again; Manx at least round-trips it, so the conformance differ
         /// can compare the field instead of scoring it as unmodelled.
         space: u8,
         /// Text display group (last TX/TE argument). 21-29, lower = more important.
@@ -292,9 +292,9 @@ impl RenderInstruction {
 
     /// Render back to canonical S-52 instruction text, e.g. "LS(SOLD,1,CSTLN)".
     ///
-    /// Used by the `--dump-ir` conformance harness so navcore's resolved
+    /// Used by the `--dump-ir` conformance harness so Manx's resolved
     /// instruction stream can be diffed token-for-token against OpenCPN's
-    /// (tools/s52oracle). Fields navcore does not model are simply absent from
+    /// (tools/s52oracle). Fields Manx does not model are simply absent from
     /// the output — that asymmetry is the point: the diff reports it.
     pub fn to_s52(&self) -> String {
         match self {

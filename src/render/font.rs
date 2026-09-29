@@ -1,6 +1,6 @@
 //! The label typeface: an SDF glyph atlas baked by `tools/make_font_atlas.py`.
 //!
-//! navcore used to carry a hand-coded 5x7 bitmap table. It had no glyph above
+//! Manx used to carry a hand-coded 5x7 bitmap table. It had no glyph above
 //! U+007F, so Danish chart names came out as "Vallensbak" and "Brondby", and at
 //! the sizes S-52 asks for it read as a dot-matrix printout rather than a chart.
 //!

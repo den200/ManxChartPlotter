@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack Natural Earth's land polygons into navcore's world basemap.
+"""Pack Natural Earth's land polygons into manx's world basemap.
 
     curl -LO https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_50m_land.geojson
     python3 tools/basemap/make_basemap.py ne_50m_land.geojson assets/basemap/land.bin

@@ -128,6 +128,7 @@ pub fn instances(
                 rotation: heading as f32,
                 disp_prio: MARINER_PRIO,
                 scale: 1.0,
+                true_bearing: 1,
             });
         }
     }
@@ -146,6 +147,7 @@ pub fn instances(
             rotation: heading.or(course).unwrap_or(0.0) as f32,
             disp_prio: MARINER_PRIO,
             scale: 1.0,
+            true_bearing: 1,
         });
 
         // The time marks along the vector. Only for a target actually under
@@ -180,6 +182,7 @@ pub fn instances(
                 rotation: course as f32,
                 disp_prio: MARINER_PRIO,
                 scale: 1.0,
+                true_bearing: 1,
             });
         }
     }
@@ -204,7 +207,7 @@ mod tests {
 
     #[test]
     fn the_library_carries_every_symbol_this_layer_needs() {
-        // If this fails the presentation library is not the one navcore ships,
+        // If this fails the presentation library is not the one Manx ships,
         // and mariner objects would silently fall back to nothing.
         assert!(
             MarinerSymbols::resolve().is_some(),

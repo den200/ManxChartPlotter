@@ -2,7 +2,7 @@
 //!
 //! Deliberately separate from [`crate::render::projection`], which is a
 //! *drawing* projection and must stay exactly as it is: OSENC stores its
-//! geometry in OpenCPN's Simple Mercator, and navcore reproduces that to the
+//! geometry in OpenCPN's Simple Mercator, and Manx reproduces that to the
 //! nanometre so chart features land on their own recorded coordinates.
 //! Measuring distance in a Mercator plane, though, is wrong in a way that
 //! grows with latitude — northings are stretched by `1/cos φ`, which is 1.8×
@@ -66,7 +66,7 @@ pub const METRES_PER_NM: f64 = 1852.0;
 /// - degrees and minutes, or degrees, minutes and seconds, with hemisphere
 ///   letters before or after: `56°24.6'N 10°58.8'E`, `N56 24.6 E010 58.8`,
 ///   `56 24 36N 10 58 48E` — including what [`format_latlon`] writes, so a
-///   position shown anywhere in navcore can be typed back in.
+///   position shown anywhere in Manx can be typed back in.
 ///
 /// Anything ambiguous or out of range — one number, three, minutes past 60,
 /// two latitudes — is `None`, never a guess.
@@ -197,7 +197,7 @@ pub fn parse_latlon(s: &str) -> Option<LatLon> {
     (lat.abs() <= 90.0 && lon.abs() <= 180.0).then(|| LatLon::new(lat, lon))
 }
 
-/// A position as navcore shows it: degrees and decimal minutes with
+/// A position as Manx shows it: degrees and decimal minutes with
 /// hemisphere letters, `56°24.62'N 010°58.81'E` — the form on the chart,
 /// and one [`parse_latlon`] reads back. Hundredths of a minute are about
 /// 18 m, fine enough for a waypoint in a harbour.
@@ -426,7 +426,7 @@ mod tests {
         near(parse_latlon("56.41 10.98"), 56.41, 10.98);
         near(parse_latlon("56,41; 10,98"), 56.41, 10.98);
         near(parse_latlon("56 24.6, 10 58.8"), 56.41, 10.98);
-        // What navcore displays reads back in.
+        // What Manx displays reads back in.
         let shown = format_latlon(56.41, -10.98);
         near(parse_latlon(&shown), 56.41, -10.98);
 

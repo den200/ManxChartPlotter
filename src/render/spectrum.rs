@@ -10,9 +10,11 @@
 //! has opinions about — Beaufort for wind, the reefing decisions for waves —
 //! and so that every colour keeps its footing over both the pale Day chart
 //! and the near-black Night one. That rules out anything very light and
-//! anything very dark; what is left is a mid-saturation ramp that runs blue →
-//! green → amber → orange → red → violet, which is also the order a great many
-//! weather products already use, so it needs no explaining.
+//! anything very dark; what is left is a saturated ramp that runs blue →
+//! green → yellow → orange → red → violet, which is also the order a great
+//! many weather products already use, so it needs no explaining. Dusk and
+//! Night dim it with the palette ([`Spectrum::paint`]), never by changing
+//! the hues: a gale is red in every light.
 
 use egui::Color32;
 
@@ -44,6 +46,14 @@ impl Spectrum {
         rgb(stops[stops.len() - 1].1)
     }
 
+    /// The colour to draw a value in on screen: [`Spectrum::at`], brought
+    /// down to the live palette. By day that is the ramp itself; at dusk and
+    /// at night a full-strength red gale would be the brightest thing on the
+    /// bridge, so it falls with the chart (see [`super::theme`]).
+    pub fn paint(&self, v: f32) -> Color32 {
+        super::theme::current().dim(self.at(v))
+    }
+
     /// The value range the ramp spans, for drawing a key.
     pub fn range(&self) -> (f32, f32) {
         match (self.0.first(), self.0.last()) {
@@ -70,46 +80,55 @@ fn mix(a: Color32, b: Color32, f: f32) -> Color32 {
     )
 }
 
-/// Wind, knots. The stops sit on Beaufort: F3 tops out at 10, F4 at 16, F6 at
-/// 27 (the yacht's first real reef), F8 at 40, F10 at 55, F12 begins at 64.
+/// Wind, knots. The stops sit on Beaufort: F3 tops out at 10, F4 at 16, F6
+/// begins at 22 and is the yacht's first real reef, F8 at 34, F10 at 48, F12
+/// at 64.
+///
+/// Saturated on purpose. The first ramp was mid-saturation, chosen to sit
+/// quietly on both the Day and Night charts, and at a third of full opacity
+/// it read as a faint stain. Colour on a chart has to be strong to be seen
+/// at all in sunlight; at night [`Spectrum::paint`] brings it down with the
+/// palette instead. Calm is a deep blue rather than a pale one, so it is not
+/// mistaken for the S-52 shallow-water tint underneath.
 pub const WIND_KT: Spectrum = Spectrum(&[
-    (0.0, [86, 132, 168]),
-    (8.0, [58, 158, 138]),
-    (16.0, [96, 168, 74]),
-    (22.0, [214, 172, 48]),
-    (27.0, [228, 124, 44]),
-    (34.0, [214, 62, 52]),
-    (48.0, [172, 44, 108]),
-    (64.0, [124, 56, 164]),
+    (0.0, [48, 86, 214]),
+    (8.0, [0, 150, 200]),
+    (12.0, [0, 176, 120]),
+    (16.0, [70, 190, 40]),
+    (22.0, [240, 200, 0]),
+    (27.0, [255, 120, 0]),
+    (34.0, [230, 20, 40]),
+    (48.0, [200, 0, 140]),
+    (64.0, [120, 30, 200]),
 ]);
 
 /// Significant wave height, metres. One metre is a pleasant day, two is work,
 /// four is a gale's sea, six is survival for most cruising boats.
 pub const WAVE_M: Spectrum = Spectrum(&[
-    (0.0, [74, 138, 176]),
-    (0.75, [58, 162, 146]),
-    (1.5, [186, 176, 62]),
-    (2.5, [224, 132, 46]),
-    (4.0, [210, 60, 58]),
-    (6.0, [160, 46, 132]),
+    (0.0, [48, 110, 214]),
+    (0.75, [0, 170, 170]),
+    (1.5, [120, 190, 30]),
+    (2.5, [255, 150, 0]),
+    (4.0, [230, 30, 40]),
+    (6.0, [170, 0, 160]),
 ]);
 
 /// Surface current, knots. Half a knot is worth steering for; two is worth
 /// waiting for; four is a gate that opens and shuts.
 pub const CURRENT_KT: Spectrum = Spectrum(&[
-    (0.0, [96, 146, 172]),
-    (0.5, [56, 166, 152]),
-    (1.5, [206, 172, 56]),
-    (2.5, [224, 112, 46]),
-    (4.0, [200, 54, 62]),
+    (0.0, [60, 120, 210]),
+    (0.5, [0, 170, 160]),
+    (1.5, [240, 190, 0]),
+    (2.5, [255, 110, 0]),
+    (4.0, [220, 20, 50]),
 ]);
 
 /// Precipitation, mm in the hour. Drizzle, rain, heavy rain, deluge.
 pub const RAIN_MM: Spectrum = Spectrum(&[
-    (0.0, [120, 168, 208]),
-    (1.0, [64, 132, 214]),
-    (4.0, [42, 88, 196]),
-    (10.0, [142, 66, 200]),
+    (0.0, [110, 170, 230]),
+    (1.0, [30, 120, 240]),
+    (4.0, [20, 60, 200]),
+    (10.0, [150, 40, 210]),
 ]);
 
 #[cfg(test)]

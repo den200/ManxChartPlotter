@@ -143,7 +143,7 @@ impl ChartCatalog {
     /// Scan directory for .oesu files and load headers only
     ///
     /// Uses disk caching to speed up subsequent runs - first run decrypts all charts,
-    /// subsequent runs read from ~/.cache/navcore/senc/
+    /// subsequent runs read from ~/.cache/manx/senc/
     pub fn from_directory(
         dir: &Path,
         keys: &KeyStore,
@@ -351,7 +351,7 @@ impl ChartCatalog {
         tile: &TileBounds,
         tile_scale_denom: f64,
     ) -> Vec<&ChartInfo> {
-        self.charts_for_tile_where(tile, tile_scale_denom, &|_| true)
+        self.charts_for_tile_where(tile, tile_scale_denom, &|_| true, &|_, _| true)
     }
 
     /// [`charts_for_tile_scaled`](Self::charts_for_tile_scaled), leaving
@@ -363,11 +363,20 @@ impl ChartCatalog {
     /// shut out every coarser chart while drawing nothing itself — blank
     /// blocks the size of a tile. The tile builder knows each cell's real
     /// coverage and passes it in here.
+    ///
+    /// `covers(chart, rect)` answers whether the chart's real coverage fills
+    /// `rect` (a part of its extent). Only a chart that does is allowed to
+    /// hide the coarser charts under that part of the tile; one whose
+    /// coverage stops short — a 1:90 000 cell whose M_COVR is a staircase
+    /// inside its extent — is drawn, and the coarser charts are kept under
+    /// it, or the gap between its coverage and its extent is a hole: a
+    /// tile-aligned rectangle of bare background cut into the chart.
     pub fn charts_for_tile_where(
         &self,
         tile: &TileBounds,
         tile_scale_denom: f64,
         has_data: &dyn Fn(&ChartInfo) -> bool,
+        covers: &dyn Fn(&ChartInfo, &TileBounds) -> bool,
     ) -> Vec<&ChartInfo> {
         // A chart overzoomed out by more than this factor relative to the tile
         // scale is dropped (its detail is wasted and bloats the tile). This was
@@ -375,7 +384,14 @@ impl ChartCatalog {
         // coarsest chart; the world basemap does that now, and at 16 the
         // Danish 1:1 500 000 overview still drew every light and track on it
         // as one black knot over a view of all of Europe.
-        const MAX_OVERZOOM_OUT: f64 = 4.0;
+        //
+        // 3, not 4, since the tile scale became a ground scale (it was
+        // Mercator, 1.77x too large at Danish latitudes, so the 4 then
+        // behaved like 2.3 here). 3 puts the switch between neighbouring
+        // bands near their geometric middle — the 1:180 000 cells give way to
+        // the 1:1 500 000 overview at about 1:540 000 — so neither side of
+        // the switch is badly over- or under-zoomed.
+        const MAX_OVERZOOM_OUT: f64 = 3.0;
 
         let intersecting: Vec<&ChartInfo> =
             self.charts.iter().filter(|c| c.intersects(tile) && has_data(c)).collect();
@@ -422,7 +438,22 @@ impl ChartCatalog {
 
         // Iterate most-detailed to least-detailed for quilt selection.
         for chart in intersecting.iter().rev() {
-            let contributes = subtract_rect(&mut uncovered, &chart.extent_mercator, eps);
+            let e = &chart.extent_mercator;
+            let part = TileBounds::new(
+                e.min_x.max(tile.min_x),
+                e.max_x.min(tile.max_x),
+                e.min_y.max(tile.min_y),
+                e.max_y.min(tile.max_y),
+            );
+            let contributes = if covers(chart, &part) {
+                subtract_rect(&mut uncovered, e, eps)
+            } else {
+                // Drawn, but it hides nothing: whatever it leaves out of its
+                // extent still needs a coarser chart beneath.
+                uncovered.iter().any(|r| {
+                    e.min_x < r.max_x && e.max_x > r.min_x && e.min_y < r.max_y && e.max_y > r.min_y
+                })
+            };
             if contributes || selected.is_empty() {
                 selected.push(*chart);
             }
@@ -614,6 +645,44 @@ mod tests {
         let selected = catalog.charts_for_tile(&tile);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].name, "detailed");
+    }
+
+    /// An extent is not a coverage. A detailed cell whose extent spans the
+    /// tile but whose M_COVR does not must leave the coarse chart in place —
+    /// in the Kattegat a 1:90 000 cell did exactly that to the 1:180 000
+    /// one, and a tile-sized rectangle of bare background cut into an island.
+    #[test]
+    fn a_chart_hides_nothing_its_coverage_does_not_reach() {
+        let tile = TileBounds::new(0.0, 1000.0, 0.0, 1000.0);
+        let mut catalog = ChartCatalog::new();
+        catalog.charts.push(chart_at("coarse", 180000, TileBounds::new(-9000.0, 9000.0, -9000.0, 9000.0)));
+        catalog.charts.push(chart_at("detailed", 90000, TileBounds::new(-100.0, 1100.0, -100.0, 1100.0)));
+
+        let short = |c: &ChartInfo, _: &TileBounds| c.name != "detailed";
+        let selected = catalog.charts_for_tile_where(&tile, f64::INFINITY, &|_| true, &short);
+        let names: Vec<&str> = selected.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["coarse", "detailed"]);
+
+        let full = |_: &ChartInfo, _: &TileBounds| true;
+        let selected = catalog.charts_for_tile_where(&tile, f64::INFINITY, &|_| true, &full);
+        let names: Vec<&str> = selected.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["detailed"]);
+    }
+
+    /// The tile's scale is a ground scale: at 55.7°N a tile is shown at a
+    /// scale 1.78x larger than the Mercator metres per pixel alone suggest.
+    #[test]
+    fn a_tile_scale_is_measured_on_the_ground() {
+        use crate::tiles::{latlon_to_mercator, tile_scale_denominator, TileId};
+        let (mx, my) = latlon_to_mercator(55.7, 12.6);
+        let z = 10u8;
+        let size = crate::tiles::meters_per_pixel(z) * 256.0;
+        let x = ((mx + 20_037_508.342789244) / size).floor() as u32;
+        let y = ((20_037_508.342789244 - my) / size).floor() as u32;
+        let ground = tile_scale_denominator(TileId::new(z, x, y), 4.0);
+        let mercator = crate::tiles::meters_per_pixel(z) * 4.0 * 1000.0;
+        let ratio = mercator / ground;
+        assert!((1.7..1.85).contains(&ratio), "Mercator/ground = {ratio}");
     }
 
     #[test]

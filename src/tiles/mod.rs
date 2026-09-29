@@ -293,6 +293,21 @@ pub fn meters_per_pixel(z: u8) -> f64 {
     WORLD_WIDTH / (256.0 * (1u64 << z) as f64)
 }
 
+/// A tile's display scale, the N in 1:N, for `ppmm` pixels per millimetre.
+///
+/// A ground scale, measured at the tile's own latitude. [`meters_per_pixel`]
+/// is Mercator metres, stretched by 1/cos(latitude) — 1.77 at Danish
+/// latitudes — and choosing charts on that made every tile think it was
+/// 1.8x further out than it is: at a real 1:690 000 the 1:180 000 cells were
+/// dropped for the 1:1 500 000 overview, and the chart turned coarse a whole
+/// zoom step before it needed to. SCAMIN already works on ground scale; the
+/// quilt has to agree with it.
+pub fn tile_scale_denominator(tile: TileId, ppmm: f64) -> f64 {
+    let b = tile.bounds();
+    let (lat, _) = mercator_to_latlon((b.min_x + b.max_x) * 0.5, (b.min_y + b.max_y) * 0.5);
+    meters_per_pixel(tile.z) * lat.to_radians().cos().max(0.01) * ppmm * 1000.0
+}
+
 /// Get all tiles visible in viewport (with margin for hysteresis)
 ///
 /// Handles x-wrap when bounds cross ±ORIGIN_SHIFT (dateline)

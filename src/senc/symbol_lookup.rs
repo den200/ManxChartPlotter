@@ -252,6 +252,7 @@ pub fn features_to_instances(
                 rotation: 0.0,
                 disp_prio: 8,
                 scale: 1.0,
+                true_bearing: 0,
             })
         })
         .collect();

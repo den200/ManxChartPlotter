@@ -1,7 +1,9 @@
-# Running navcore on the Raspberry Pi 5
+# Running Manx on the Raspberry Pi 5
 
-This is what gets navcore from the Mac onto the plotter, and what to expect
+This is what gets Manx from the Mac onto the plotter, and what to expect
 the first time.
+
+For Android (e.g. the ODROID-C5), see [ANDROID.md](ANDROID.md).
 
 ## What you need on the Pi
 
@@ -18,7 +20,7 @@ deploy/deploy-to-pi.sh pi@<pi-name>.local
 ```
 
 The first time, this also sets the Pi up (system packages, Rust, and
-starting navcore by itself when the desktop starts) and asks for the Pi's
+starting Manx by itself when the desktop starts) and asks for the Pi's
 password once. The first build takes 10–20 minutes; later ones a minute or
 two.
 
@@ -26,10 +28,10 @@ two.
 
 An o-charts licence belongs to **one machine**. The Pi is a new machine, so:
 
-1. Start navcore on the Pi, open **Charts**, sign in.
+1. Start Manx on the Pi, open **Charts**, sign in.
 2. **Register** the Pi under a new name (e.g. `boat-pi`).
 3. **Download** your chart set. This assigns one of your licence's slots to
-   the Pi, permanently — navcore asks you to confirm first.
+   the Pi, permanently — Manx asks you to confirm first.
 
 The Mac's charts and licence files are deliberately *not* copied: they would
 not decrypt on the Pi.
@@ -37,5 +39,5 @@ not decrypt on the Pi.
 ## Updating
 
 After changes on the Mac: `deploy/deploy-to-pi.sh pi@<pi-name>.local`. It
-builds and restarts navcore on the Pi's screen (`NORUN=1` to only build).
+builds and restarts Manx on the Pi's screen (`NORUN=1` to only build).
 With no argument it deploys to the `rpi5` test rig (`doc/pi5-test-rig.md`).

@@ -25,6 +25,8 @@ pub fn build(
     sheet: &mut crate::render::ui_weather::SheetView,
     display: &mut crate::render::ui::DisplayView,
     free: &mut crate::render::ui::FreeChartsView,
+    safety: &mut crate::render::ui_safety::SafetyView,
+    logbook: &mut crate::render::ui_logbook::LogView,
     fleet: &crate::signalk::Fleet,
     actions: &mut Vec<UiAction>,
 ) {
@@ -48,6 +50,14 @@ pub fn build(
     }
     super::ui_routes::draw_overlay(ctx, &state.routes);
     draw_plan_pins(ctx, &state.plan_pins);
+    super::ui_safety::draw_on_chart(
+        ctx,
+        &state.track,
+        &state.log_track,
+        &state.log_notes,
+        state.anchor.as_ref(),
+        state.mob.as_ref(),
+    );
     if instruments.show_ais {
         super::ui_ais::draw(
             ctx,
@@ -63,7 +73,7 @@ pub fn build(
         super::ui_ownship::draw(ctx, ship);
     }
 
-    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, actions);
+    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, safety, logbook, actions);
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
@@ -96,12 +106,38 @@ pub fn build(
     if display.open {
         display_window(ctx, display, boat.draft_m, actions);
     }
+    if safety.open {
+        let watch = super::ui_safety::WatchState {
+            anchor: state.anchor.as_ref(),
+            has_fix: state.own_ship.as_ref().is_some_and(|s| !s.stale),
+            depth_m: state.depth_m,
+        };
+        super::ui_safety::window(ctx, safety, instruments, &watch, actions);
+    }
+    if logbook.open {
+        super::ui_logbook::window(ctx, logbook, &state.logbook, actions);
+    }
     // Last, over the chart area the panels have left: what a chart tap will
     // do right now, and the way back to following the boat.
     tap_mode_chip(ctx, plan);
-    if state.own_ship.is_some() {
-        follow_button(ctx, instruments, actions);
+    chart_buttons(
+        ctx,
+        instruments,
+        display.chart_up,
+        state.chart_rotation,
+        state.own_ship.is_some(),
+        actions,
+    );
+    super::ui_safety::mob_button(ctx, state.mob.is_some(), actions);
+    if let Some(ref mob) = state.mob {
+        super::ui_safety::mob_panel(ctx, mob, safety, actions);
+    } else {
+        safety.mob_clear_armed = false;
     }
+    super::ui_safety::guide(ctx, safety);
+    super::ui_safety::banner(ctx, &state.alarms, actions);
+    // Over everything, first start: nothing else is usable until it is read.
+    super::ui_safety::notice(ctx, safety, actions);
 }
 
 /// How the chart is drawn: palette, safety depth, detail.
@@ -136,6 +172,23 @@ fn display_window(
                     .small()
                     .weak(),
             );
+            ui.add_space(8.0);
+
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Weather layer").strong());
+                let mut percent = (display.weather_opacity * 100.0).round();
+                if ui
+                    .add(
+                        egui::Slider::new(&mut percent, 10.0..=90.0)
+                            .step_by(5.0)
+                            .suffix(" %"),
+                    )
+                    .on_hover_text("How strongly the wind colours cover the chart")
+                    .changed()
+                {
+                    display.weather_opacity = percent / 100.0;
+                }
+            });
             ui.add_space(8.0);
 
             ui.label(RichText::new("Safe water").strong());
@@ -257,15 +310,25 @@ fn tap_mode_chip(ctx: &Context, plan: &mut crate::render::ui::PlanView) {
         });
 }
 
-/// Follow the boat, as a button on the chart. Panning by hand turns follow
-/// off, which is right, but the only way back used to be a checkbox in the
-/// Instruments settings — one accidental drag and the chart stopped tracking
-/// the boat for good, with nothing on screen to say so.
-fn follow_button(
+/// The buttons in the chart's corner: which way up, and follow the boat.
+///
+/// Follow is a button because panning by hand turns it off, which is right,
+/// but the only way back used to be a checkbox in the Instruments settings —
+/// one accidental drag and the chart stopped tracking the boat for good, with
+/// nothing on screen to say so. Pressing it recentres at the zoom already
+/// chosen.
+///
+/// The orientation button carries a north arrow that turns with the chart, so
+/// a head-up or twisted chart always says where north went.
+fn chart_buttons(
     ctx: &Context,
     instruments: &crate::render::ui::InstrumentView,
+    chart_up: crate::render::ui::ChartUp,
+    rotation: f32,
+    has_boat: bool,
     actions: &mut Vec<UiAction>,
 ) {
+    use crate::render::ui::ChartUp;
     let area = ctx.available_rect();
     egui::Area::new(egui::Id::new("follow-button"))
         .fixed_pos(egui::pos2(area.right() - 10.0, area.bottom() - 10.0))
@@ -273,20 +336,90 @@ fn follow_button(
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                let on = instruments.follow;
-                if ui
-                    .selectable_label(on, if on { "Following boat" } else { "Follow boat" })
-                    .on_hover_text(if on {
-                        "The chart keeps the boat centred. Drag the chart to look elsewhere."
-                    } else {
-                        "Centre the chart on the boat and keep it there"
-                    })
-                    .clicked()
-                {
-                    actions.push(UiAction::FollowSet { on: !on });
-                }
+                ui.horizontal(|ui| {
+                    let hover = match chart_up {
+                        ChartUp::North => "North up. Tap for head-up.",
+                        ChartUp::Head => "Head up: the boat's heading is at the top. Tap for north-up.",
+                        ChartUp::Free => "Turned by hand. Tap for north-up.",
+                    };
+                    if compass_button(ui, rotation, chart_up != ChartUp::North)
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        actions.push(UiAction::ChartUpSet { mode: chart_up.next() });
+                    }
+                    if !has_boat {
+                        return;
+                    }
+                    let on = instruments.follow;
+                    if ui
+                        .selectable_label(on, if on { "Following boat" } else { "Follow boat" })
+                        .on_hover_text(if on {
+                            "The chart keeps the boat centred. Drag the chart to look elsewhere."
+                        } else {
+                            "Centre the chart on the boat and keep it there"
+                        })
+                        .clicked()
+                    {
+                        actions.push(UiAction::FollowSet { on: !on });
+                    }
+                });
             });
         });
+}
+
+/// The orientation button: a round compass whose needle points where north
+/// is on the screen (`rotation` is the true bearing at the top), filled in
+/// when the chart is not north-up. An icon rather than words, because it sits
+/// on the chart and the chart is what the screen is for.
+fn compass_button(ui: &mut egui::Ui, rotation: f32, active: bool) -> egui::Response {
+    let size = ui.spacing().interact_size.y.max(30.0);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let visuals = ui.style().interact_selectable(&response, active);
+    let painter = ui.painter();
+    let c = rect.center();
+    let r = size * 0.5 - 1.0;
+    painter.circle(c, r, visuals.bg_fill, visuals.bg_stroke);
+
+    let ink = visuals.fg_stroke.color;
+    let north = north_on_screen(rotation);
+    let east = egui::vec2(-north.y, north.x);
+
+    // A tick at each cardinal point, just inside the rim.
+    for dir in [north, east, -north, -east] {
+        painter.line_segment(
+            [c + dir * (r * 0.78), c + dir * (r * 0.93)],
+            egui::Stroke::new(1.2_f32, ink.gamma_multiply(0.6)),
+        );
+    }
+
+    // The needle: a slim diamond, red to the north.
+    let tip = r * 0.62;
+    let waist = r * 0.2;
+    let red = crate::render::theme::current().red;
+    painter.add(egui::Shape::convex_polygon(
+        vec![c + north * tip, c + east * waist, c - east * waist],
+        red,
+        egui::Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![c - north * tip, c - east * waist, c + east * waist],
+        ink.gamma_multiply(0.75),
+        egui::Stroke::NONE,
+    ));
+    painter.circle_filled(c, r * 0.09, visuals.bg_fill);
+
+    response
+}
+
+/// Which way north lies on the screen, as a unit vector (screen y runs
+/// down), when `rotation` is the true bearing at the top: straight up when
+/// north-up, and `rotation` anticlockwise from up otherwise.
+fn north_on_screen(rotation: f32) -> egui::Vec2 {
+    egui::vec2(-rotation.sin(), -rotation.cos())
 }
 
 /// The planner's pins: a classic map pin — a filled head on a stem whose
@@ -300,11 +433,8 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
     let painter = ctx.layer_painter(egui::LayerId::background());
     for pin in pins {
         let tip = egui::pos2(pin.screen[0], pin.screen[1]);
-        let color = if pin.is_start {
-            egui::Color32::from_rgb(30, 140, 60)
-        } else {
-            egui::Color32::from_rgb(200, 40, 40)
-        };
+        let theme = crate::render::theme::current();
+        let color = if pin.is_start { theme.green } else { theme.red };
         let r = 7.0;
         let head = egui::pos2(tip.x, tip.y - 14.0);
         painter.add(egui::Shape::convex_polygon(
@@ -316,8 +446,8 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
             color,
             egui::Stroke::NONE,
         ));
-        painter.circle(head, r, color, egui::Stroke::new(1.5_f32, egui::Color32::WHITE));
-        painter.circle_filled(head, 2.5, egui::Color32::WHITE);
+        painter.circle(head, r, color, egui::Stroke::new(1.5_f32, theme.on_signal));
+        painter.circle_filled(head, 2.5, theme.on_signal);
     }
 }
 
@@ -342,6 +472,8 @@ fn menu_bar(
     display: &mut crate::render::ui::DisplayView,
     sheet: &crate::render::ui_weather::SheetView,
     weather: &mut crate::render::ui::WeatherView,
+    safety: &mut crate::render::ui_safety::SafetyView,
+    logbook: &mut crate::render::ui_logbook::LogView,
     actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
@@ -362,9 +494,9 @@ fn menu_bar(
                 && !instruments.tiles.is_empty();
             if !bar_shown && instruments.active {
                 let colour = if instruments.connected {
-                    egui::Color32::from_rgb(80, 190, 120)
+                    crate::render::theme::current().green
                 } else {
-                    egui::Color32::from_rgb(210, 130, 60)
+                    crate::render::theme::current().amber
                 };
                 let (rect, response) =
                     ui.allocate_exact_size(egui::Vec2::splat(12.0), egui::Sense::hover());
@@ -390,6 +522,20 @@ fn menu_bar(
                 .clicked()
             {
                 actions.push(UiAction::WeatherSheetToggle);
+            }
+            if ui
+                .selectable_label(logbook.open, "Log")
+                .on_hover_text("The logbook: where the boat went, the numbers, your notes")
+                .clicked()
+            {
+                logbook.open = !logbook.open;
+            }
+            if ui
+                .selectable_label(safety.open, "Safety")
+                .on_hover_text("Alarms, anchor watch, track, and the man overboard guide")
+                .clicked()
+            {
+                safety.open = !safety.open;
             }
             ui.separator();
 
@@ -594,7 +740,7 @@ fn free_charts(
                         Some(i) if newer => ui.label(
                             RichText::new(format!("installed {} · update available", day(&i.downloaded)))
                                 .small()
-                                .color(egui::Color32::from_rgb(40, 130, 200)),
+                                .color(crate::render::theme::current().blue),
                         ),
                         Some(i) => ui.label(
                             RichText::new(if row.remote.is_some() {
@@ -610,7 +756,7 @@ fn free_charts(
                                 .label(
                                     RichText::new("download failed")
                                         .small()
-                                        .color(egui::Color32::from_rgb(200, 60, 60)),
+                                        .color(crate::render::theme::current().red),
                                 )
                                 .on_hover_text(why.as_str()),
                             None => ui.label(RichText::new(size).small().weak()),
@@ -638,7 +784,7 @@ fn free_charts(
                         } else if free.confirm_remove.as_deref() == Some(row.code) {
                             ui.label(RichText::new("Remove these charts?").small());
                             if ui
-                                .button(RichText::new("Remove").color(egui::Color32::from_rgb(200, 60, 60)))
+                                .button(RichText::new("Remove").color(crate::render::theme::current().red))
                                 .clicked()
                             {
                                 free.confirm_remove = None;
@@ -686,7 +832,7 @@ fn free_charts(
         ui.add_space(4.0);
         let text = RichText::new(&free.status);
         ui.label(if free.status.starts_with("Download failed") {
-            text.color(egui::Color32::from_rgb(200, 60, 60))
+            text.color(crate::render::theme::current().red)
         } else {
             text
         });
@@ -901,69 +1047,18 @@ fn chart_shop(
                 return;
             }
             // Numbered to match o-charts' own instructions — sign in, identify
-            // this system, install the chart — so a user who has read their
-            // page recognises where they are.
-            if !shop.signed_in {
-                ui.label(RichText::new("1. Sign in to o-charts").strong());
-                ui.label(
-                    RichText::new("The same account you bought the charts with.")
-                        .small()
-                        .weak(),
-                );
-                ui.add_space(4.0);
-                ui.add_space(6.0);
-                let mut submitted = false;
-                egui::Grid::new("shop-login")
-                    .num_columns(2)
-                    .spacing([10.0, 8.0])
-                    .show(ui, |ui| {
-                        ui.label("Email");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut shop.email)
-                                .hint_text("you@example.com")
-                                .desired_width(280.0),
-                        );
-                        ui.end_row();
-                        ui.label("Password");
-                        let pw = ui.add(
-                            egui::TextEdit::singleline(&mut shop.password)
-                                .password(true)
-                                .desired_width(280.0),
-                        );
-                        // Enter in a text field presses its window's main
-                        // button, here as in the planner and the boat search.
-                        submitted = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        ui.end_row();
-                    });
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let ready = !shop.email.trim().is_empty() && !shop.password.is_empty();
-                    if (ui
-                        .add_enabled(ready && !shop.busy, egui::Button::new("Sign in"))
-                        .clicked()
-                        || submitted)
-                        && ready
-                        && !shop.busy
-                    {
-                        actions.push(UiAction::ShopSignIn {
-                            email: shop.email.trim().to_string(),
-                            password: std::mem::take(&mut shop.password),
-                        });
-                    }
-                    if shop.busy {
-                        ui.spinner();
-                    }
-                });
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(
-                        "Your password is sent to o-charts over TLS to sign in, and is \
-                         not stored on this computer.",
-                    )
-                    .small()
-                    .weak(),
-                );
+            // this system, install the chart — and walkable both ways: a step
+            // already reached can be revisited without undoing what came after.
+            let auto = if !shop.signed_in {
+                1
+            } else if shop.system_name.is_none() {
+                2
             } else {
+                3
+            };
+            let step = shop.step.filter(|s| (1..=auto).contains(s)).unwrap_or(auto);
+            step_bar(ui, shop, step, auto);
+            if shop.signed_in {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&shop.email).strong());
                     if let Some(name) = &shop.system_name {
@@ -989,10 +1084,96 @@ fn chart_shop(
                         }
                     });
                 });
-                // A machine has to be named before the shop will hand it a
-                // chart: a slot is an assignment to a named computer, not to
-                // an account.
-                if shop.system_name.is_none() {
+            }
+            match step {
+                1 if !shop.signed_in => {
+                    ui.label(RichText::new("1. Sign in to o-charts").strong());
+                    ui.label(
+                        RichText::new("The same account you bought the charts with.")
+                            .small()
+                            .weak(),
+                    );
+                    ui.add_space(4.0);
+                    ui.add_space(6.0);
+                    let mut submitted = false;
+                    egui::Grid::new("shop-login")
+                        .num_columns(2)
+                        .spacing([10.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("Email");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut shop.email)
+                                    .hint_text("you@example.com")
+                                    .desired_width(280.0),
+                            );
+                            ui.end_row();
+                            ui.label("Password");
+                            let pw = ui.add(
+                                egui::TextEdit::singleline(&mut shop.password)
+                                    .password(true)
+                                    .desired_width(280.0),
+                            );
+                            // Enter in a text field presses its window's main
+                            // button, here as in the planner and the boat search.
+                            submitted = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            ui.end_row();
+                            ui.label("");
+                            ui.checkbox(&mut shop.remember, "Remember me on this device")
+                                .on_hover_text(
+                                    "Keeps o-charts' session key, not your password, so \
+                                     Manx starts signed in. Sign out forgets it.",
+                                );
+                            ui.end_row();
+                        });
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ready = !shop.email.trim().is_empty() && !shop.password.is_empty();
+                        if (ui
+                            .add_enabled(ready && !shop.busy, egui::Button::new("Sign in"))
+                            .clicked()
+                            || submitted)
+                            && ready
+                            && !shop.busy
+                        {
+                            actions.push(UiAction::ShopSignIn {
+                                email: shop.email.trim().to_string(),
+                                password: std::mem::take(&mut shop.password),
+                                remember: shop.remember,
+                            });
+                        }
+                        if shop.busy {
+                            ui.spinner();
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Your password is sent to o-charts over TLS to sign in, and is \
+                             not stored on this computer.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+                1 => {
+                    ui.label(RichText::new("1. Sign in to o-charts").strong());
+                    ui.label(format!("Signed in as {}.", shop.email));
+                    ui.label(
+                        RichText::new("Sign out above to use another account.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                2 => {
+                    if let Some(name) = shop.system_name.clone() {
+                        ui.label(
+                            RichText::new(format!(
+                                "This machine is registered as \"{name}\". Registering again \
+                                 re-points a name; it does not free a slot."
+                            ))
+                            .small(),
+                        );
+                    }
                     ui.add_space(6.0);
                     ui.label(RichText::new("2. Identify this system").strong());
                     ui.label(
@@ -1082,17 +1263,27 @@ fn chart_shop(
                                  assignment once a chart is requested for it.",
                             )
                             .small()
-                            .color(egui::Color32::from_rgb(180, 120, 40)),
+                            .color(crate::render::theme::current().amber),
                         );
                     }
                 }
-                ui.add_space(6.0);
-                ui.label(RichText::new("3. Install your charts").strong());
-                ui.separator();
-                chart_table(ui, shop, actions);
-                if let Some(pending) = shop.pending.clone() {
-                    confirm_download(ui, &pending, actions);
+                _ => {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("3. Install your charts").strong());
+                    ui.separator();
+                    chart_table(ui, shop, actions);
+                    if let Some(pending) = shop.pending.clone() {
+                        confirm_download(ui, &pending, actions);
+                    }
                 }
+            }
+            step_nav(ui, shop, step, auto);
+            // Signing in or registering moves the process on; the step shown
+            // goes back to following it.
+            if actions.iter().any(|a| {
+                matches!(a, UiAction::ShopSignIn { .. } | UiAction::ShopRegister { .. })
+            }) {
+                shop.step = None;
             }
 
             if !shop.warning.is_empty() {
@@ -1100,7 +1291,7 @@ fn chart_shop(
                 ui.label(
                     RichText::new(&shop.warning)
                         .small()
-                        .color(egui::Color32::from_rgb(180, 120, 40)),
+                        .color(crate::render::theme::current().amber),
                 );
             }
             if !shop.status.is_empty() {
@@ -1112,10 +1303,44 @@ fn chart_shop(
     shop.open = open;
 }
 
+/// The three steps as a bar: where the user is, and which steps they may go
+/// back to. A step not yet reached is shown but cannot be chosen.
+fn step_bar(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
+    ui.horizontal(|ui| {
+        for (n, name) in [(1, "Sign in"), (2, "This system"), (3, "Charts")] {
+            if n > 1 {
+                ui.label(RichText::new("›").weak());
+            }
+            let label = egui::SelectableLabel::new(step == n, format!("{n}. {name}"));
+            if ui.add_enabled(n <= reached, label).clicked() {
+                shop.step = Some(n);
+            }
+        }
+    });
+    ui.separator();
+}
+
+/// Back and Next under the step, for a touchscreen where the bar's labels
+/// are small targets.
+fn step_nav(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
+    if step == reached && step == 1 {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        if step > 1 && ui.button("◀ Back").clicked() {
+            shop.step = Some(step - 1);
+        }
+        if step < reached && ui.button("Next ▶").clicked() {
+            shop.step = (step + 1 < reached).then_some(step + 1);
+        }
+    });
+}
+
 /// Put a lapsed set's download to the user before sending it.
 ///
 /// The shop will not grant the edition it currently publishes to a licence
-/// that expired before that edition existed. navcore can ask for an older one
+/// that expired before that edition existed. Manx can ask for an older one
 /// — the last this machine actually received — but which edition to claim is
 /// the user's business, so it is shown, named, and confirmed.
 fn confirm_download(
@@ -1131,47 +1356,48 @@ fn confirm_download(
             format!("{} — subscription lapsed", pending.chart_name)
         };
         ui.label(RichText::new(title).strong());
+        // Spending a slot is said first and in colour, whatever else is
+        // being asked: it is the one part of this that cannot be undone.
+        if let Some(note) = &pending.slot_note {
+            ui.label(RichText::new(note).color(crate::render::theme::current().amber));
+        }
         ui.label(RichText::new(&pending.because).small());
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
-            match &pending.edition {
-                None if pending.new_slot => {
-                    if ui.button("Assign and download").clicked() {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: pending.chart_id.clone(),
-                            edition: None,
-                        });
-                    }
+        ui.horizontal_wrapped(|ui| {
+            if !pending.expired {
+                if ui.button("Assign and download").clicked() {
+                    actions.push(UiAction::ShopDownload {
+                        chart_id: pending.chart_id.clone(),
+                        edition: None,
+                    });
                 }
-                Some(edition) => {
-                    if ui
-                        .button(format!("Ask for edition {edition}"))
-                        .clicked()
-                    {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: pending.chart_id.clone(),
-                            edition: Some(edition.clone()),
-                        });
-                    }
+            }
+            // One button per edition the licence demonstrably covered, each
+            // saying where it was seen: which to claim is the user's call.
+            for (edition, source) in &pending.choices {
+                if ui.button(format!("Ask for {edition} ({source})")).clicked() {
+                    actions.push(UiAction::ShopDownload {
+                        chart_id: pending.chart_id.clone(),
+                        edition: Some(edition.clone()),
+                    });
                 }
-                None => {
-                    // Nothing on disk and nothing on the slot: there is no
-                    // older edition to name. Asking for the current one will
-                    // almost certainly be refused, but the shop's answer is
-                    // more use than navcore's guess about it.
-                    if ui
-                        .button("Ask for the current edition anyway")
-                        .on_hover_text(
-                            "Expect a refusal — the licence expired before this edition \
-                             was published. The shop's exact answer is worth having.",
-                        )
-                        .clicked()
-                    {
-                        actions.push(UiAction::ShopDownload {
-                            chart_id: pending.chart_id.clone(),
-                            edition: None,
-                        });
-                    }
+            }
+            if pending.expired {
+                // The shop's current edition was published after the licence
+                // lapsed. Asking will almost certainly be refused, but the
+                // shop's answer is more use than Manx's guess about it.
+                if ui
+                    .button("Ask for the current edition anyway")
+                    .on_hover_text(
+                        "Expect a refusal — the licence expired before this edition \
+                         was published. The shop's exact answer is worth having.",
+                    )
+                    .clicked()
+                {
+                    actions.push(UiAction::ShopDownload {
+                        chart_id: pending.chart_id.clone(),
+                        edition: None,
+                    });
                 }
             }
             if ui.button("Cancel").clicked() {
@@ -1214,7 +1440,7 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                     ui.label(&c.name);
                     ui.label(RichText::new(c.edition.to_string()).monospace().small());
                     let state = if c.expired {
-                        RichText::new("Expired").color(egui::Color32::from_rgb(180, 60, 60))
+                        RichText::new("Expired").color(crate::render::theme::current().red)
                     } else {
                         RichText::new(target.label())
                     };
@@ -1224,13 +1450,13 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                     // real one: saying five are free when three are invites
                     // the user to hand out slots they do not have.
                     let mine = shop.system_name.as_deref().and_then(|n| c.slot_for(n));
-                    let on_key = c.dongle_slot();
-                    let cell = match (mine.is_some(), on_key) {
-                        (true, _) => "assigned here".to_string(),
-                        (false, Some(s)) => format!("on USB key {}", s.assigned_system),
-                        (false, None) => {
-                            format!("{} of {} free", c.free_slots(), c.total_slots())
-                        }
+                    // Which other machines hold the rest — a USB key among
+                    // them — is in the hover, not in place of the count: a
+                    // key's name here read as the machine the download was for.
+                    let cell = if mine.is_some() {
+                        "assigned here".to_string()
+                    } else {
+                        format!("not here yet · {} of {} free", c.free_slots(), c.total_slots())
                     };
                     let holders = c.holders();
                     let cell = ui.label(RichText::new(cell).small().weak());
@@ -1267,7 +1493,7 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                     };
                     if button.clicked() {
                         // A lapsed set cannot have the shop's current edition,
-                        // so navcore must ask for a different one. That is a
+                        // so Manx must ask for a different one. That is a
                         // decision about the user's licence, so it is put to
                         // them rather than made silently.
                         // So is the first download to this machine: it spends
@@ -1353,7 +1579,9 @@ fn object_query(
     // Beside the tap, and never more than half the screen, so the chart stays
     // visible while the panel is up.
     let max_h = (screen.height() * 0.6).max(160.0);
-    let max_w = (screen.width() * 0.45).clamp(260.0, 460.0);
+    // The 260 floor is for readability, but never wider than the window
+    // itself: a narrow window got a bubble running off its edge.
+    let max_w = (screen.width() * 0.45).clamp(260.0, 460.0).min(screen.width() - 16.0);
 
     // `default_pos` only applies to a window egui has not seen before; one
     // id per query is what lets each bubble open beside its own tap.
@@ -1499,7 +1727,10 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
             .show(ui, |ui| {
                 for (k, v) in o.attributes.iter().filter(|(k, _)| crate::pick::is_worth_showing(k)) {
                     ui.label(RichText::new(k).monospace().weak());
-                    ui.label(v);
+                    // Labels in a grid do not wrap by default: one long value
+                    // (a SORIND, an INFORM sentence) widened the whole bubble
+                    // past its max_width and off the window.
+                    ui.add(egui::Label::new(v).wrap());
                     ui.end_row();
                 }
             });
@@ -1560,5 +1791,35 @@ fn geometry_name(kind: FeatureType) -> &'static str {
         FeatureType::Line => "line",
         FeatureType::Area => "area",
         FeatureType::Multipoint => "soundings",
+    }
+}
+
+#[cfg(test)]
+mod compass_tests {
+    use super::north_on_screen;
+    use crate::render::Camera;
+
+    #[test]
+    fn the_needle_points_up_when_north_up() {
+        let n = north_on_screen(0.0);
+        assert!(n.x.abs() < 1e-6 && (n.y + 1.0).abs() < 1e-6, "{n:?}");
+    }
+
+    /// Head-up at any heading: the needle points exactly where the chart
+    /// draws north — at a point due north of the middle of the screen.
+    #[test]
+    fn the_needle_follows_north_as_the_chart_turns() {
+        for heading_deg in [0.0f64, 30.0, 90.0, 135.0, 180.0, 270.0, 359.0] {
+            let mut cam = Camera::new(1_400_000.0, 7_500_000.0, 2.0, 800.0, 600.0);
+            cam.rotation = heading_deg.to_radians();
+            let middle = cam.world_to_screen(cam.position.x, cam.position.y);
+            let ahead = cam.world_to_screen(cam.position.x, cam.position.y + 100.0);
+            let drawn = (ahead - middle).normalize();
+            let needle = north_on_screen(cam.rotation as f32);
+            assert!(
+                (drawn.x - needle.x).abs() < 1e-3 && (drawn.y - needle.y).abs() < 1e-3,
+                "heading {heading_deg}: chart north {drawn:?}, needle {needle:?}"
+            );
+        }
     }
 }

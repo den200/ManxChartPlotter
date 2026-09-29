@@ -1,6 +1,6 @@
 //! Unencrypted S-57 ENCs — the free charts NOAA and others publish.
 //!
-//! navcore draws charts from SENC, the compiled form OpenCPN builds and
+//! Manx draws charts from SENC, the compiled form OpenCPN builds and
 //! o-charts ships encrypted. An S-57 cell is read here and turned into the
 //! same thing, so everything downstream — rendering, picking, routing — is
 //! unchanged.

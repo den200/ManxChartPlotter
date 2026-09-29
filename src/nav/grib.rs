@@ -1,7 +1,7 @@
 //! Forecast wind: GRIB2 download, decode, and interpolation.
 //!
 //! The source is NOAA's NOMADS *filter* endpoint for GFS 0.25° — free, no
-//! key, and it subsets server-side: navcore asks for exactly two fields
+//! key, and it subsets server-side: Manx asks for exactly two fields
 //! (10 m U and V) over exactly the passage box, so a forecast step is
 //! kilobytes, not the 500 MB the full file would be. The source sits behind
 //! an enum so ECMWF open data or DWD ICON can join without touching callers;
@@ -38,7 +38,7 @@ impl GribSource {
     fn cycle_hours(self) -> u32 {
         6
     }
-    /// Forecast step spacing navcore requests.
+    /// Forecast step spacing Manx requests.
     pub fn step_hours(self) -> u32 {
         3
     }
@@ -81,7 +81,7 @@ fn filter_url(source: GribSource, run: DateTime<Utc>, fh: u32, area: GeoBox) -> 
         GribSource::NoaaGfs025 => format!(
             "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?\
              dir=%2Fgfs.{date}%2F{cyc:02}%2Fatmos&file=gfs.t{cyc:02}z.pgrb2.0p25.f{fh:03}\
-             &var_UGRD=on&var_VGRD=on&lev_10_m_above_ground=on\
+             &var_UGRD=on&var_VGRD=on&var_GUST=on&lev_10_m_above_ground=on&lev_surface=on\
              &subregion=&toplat={top}&bottomlat={bottom}&leftlon={left}&rightlon={right}",
             date = run.format("%Y%m%d"),
             cyc = run.hour(),
@@ -123,6 +123,9 @@ pub struct GribForecast {
     /// Per time step, row-major `[lat][lon]`, m/s.
     u: Vec<Vec<f32>>,
     v: Vec<Vec<f32>>,
+    /// Surface gust per step, m/s — `None` for a step whose file had none,
+    /// so a forecast is never refused for lacking the one extra field.
+    gust: Vec<Option<Vec<f32>>>,
 }
 
 #[derive(Debug)]
@@ -189,6 +192,7 @@ impl GribForecast {
             lons: Vec::new(),
             u: Vec::new(),
             v: Vec::new(),
+            gust: Vec::new(),
         };
         forecast.absorb(&first)?;
 
@@ -214,15 +218,17 @@ impl GribForecast {
         Ok(forecast)
     }
 
-    /// Decode one file's UGRD/VGRD pair into the stack.
+    /// Decode one file's UGRD/VGRD pair, and its GUST if it has one, into
+    /// the stack.
     fn absorb(&mut self, bytes: &[u8]) -> Result<(), GribError> {
         let mut u: Option<(i64, Vec<f32>)> = None;
         let mut v: Option<(i64, Vec<f32>)> = None;
+        let mut gust: Option<(i64, Vec<f32>)> = None;
         for message in gribberish::message::read_messages(bytes) {
             let var = message
                 .variable_abbrev()
                 .map_err(|e| GribError::Decode(e.to_string()))?;
-            if var != "UGRD" && var != "VGRD" {
+            if var != "UGRD" && var != "VGRD" && var != "GUST" {
                 continue;
             }
             let when = message
@@ -251,10 +257,10 @@ impl GribForecast {
                     self.lons.len()
                 )));
             }
-            if var == "UGRD" {
-                u = Some((when, data));
-            } else {
-                v = Some((when, data));
+            match var.as_str() {
+                "UGRD" => u = Some((when, data)),
+                "VGRD" => v = Some((when, data)),
+                _ => gust = Some((when, data)),
             }
         }
         match (u, v) {
@@ -262,6 +268,7 @@ impl GribForecast {
                 self.times.push(tu);
                 self.u.push(gu);
                 self.v.push(gv);
+                self.gust.push(gust.filter(|(tg, _)| *tg == tu).map(|(_, g)| g));
                 Ok(())
             }
             _ => Err(GribError::Decode("file lacks a matching UGRD/VGRD pair".into())),
@@ -281,6 +288,7 @@ impl GribForecast {
         Self {
             source: GribSource::NoaaGfs025,
             run: Utc::now(),
+            gust: vec![None; times.len()],
             times,
             lats,
             lons,
@@ -324,6 +332,39 @@ impl GribForecast {
         let kt = (u * u + v * v).sqrt() * MS_TO_KNOTS;
         let from_deg = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
         Some((from_deg, kt))
+    }
+
+    /// Wind at a position and time with no coverage test: the edge's value
+    /// held outward. For a display that fades the field out past its edge,
+    /// which needs a colour to fade *from*.
+    pub fn sample_held(&self, lat: f64, lon: f64, time_ms: i64) -> (f64, f64) {
+        let (u, v) = self.uv(lat, lon, time_ms);
+        let kt = (u * u + v * v).sqrt() * MS_TO_KNOTS;
+        let from_deg = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
+        (from_deg, kt)
+    }
+
+    /// The gust in knots at a position and time, for display: `None` outside
+    /// the box, or when either bracketing step came without a gust field —
+    /// half a gust interpolated against nothing would be a made-up number.
+    pub fn gust_kt(&self, lat: f64, lon: f64, time_ms: i64) -> Option<f64> {
+        if !self.covers(lat, lon) {
+            return None;
+        }
+        let lon = normalize_lon(lon);
+        let (i0, i1, fy) = bracket_axis(&self.lats, lat);
+        let (j0, j1, fx) = bracket_axis(&self.lons, lon);
+        let (t0, t1, ft) = bracket_axis_i64(&self.times, time_ms);
+        let (a, b) = (self.gust.get(t0)?.as_ref()?, self.gust.get(t1)?.as_ref()?);
+        let w = self.lons.len();
+        let sample = |grid: &Vec<f32>| -> f64 {
+            let g = |i: usize, j: usize| grid[i * w + j] as f64;
+            let top = g(i0, j0) + (g(i0, j1) - g(i0, j0)) * fx;
+            let bot = g(i1, j0) + (g(i1, j1) - g(i1, j0)) * fx;
+            top + (bot - top) * fy
+        };
+        let (ga, gb) = (sample(a), sample(b));
+        Some((ga + (gb - ga) * ft) * MS_TO_KNOTS)
     }
 
     /// U/V in m/s at a position and time — bilinear in space, linear in
@@ -578,7 +619,8 @@ fn fetch_step(
     area: GeoBox,
     cache_dir: &std::path::Path,
 ) -> Result<Vec<u8>, GribError> {
-    let path = cache_dir.join(cache_key("gfs", run, fh, area));
+    // "gfsg": files cached before the gust was asked for would lack it.
+    let path = cache_dir.join(cache_key("gfsg", run, fh, area));
     fetch_cached(agent, &filter_url(source, run, fh, area), &path)
 }
 

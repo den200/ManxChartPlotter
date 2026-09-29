@@ -1,6 +1,6 @@
 # s57oracle — OpenCPN's S-57 reader as an oracle
 
-NavCore is getting its own S-57 (ENC) reader. This tool dumps what **OpenCPN's**
+Manx is getting its own S-57 (ENC) reader. This tool dumps what **OpenCPN's**
 reader makes of the same cell, one feature per line, so the two can be diffed
 feature by feature: same classes, same attributes, same geometry, same result
 after the update files are applied.
@@ -8,12 +8,12 @@ after the update files are applied.
 ```
 cell.000 (+ .001 .002 …) ──► s57oracle ──► oracle.ndjson ─┐
                                                           ├─► diff by foid
-cell.000 (+ .001 .002 …) ──► navcore S-57 reader ─────────┘
+cell.000 (+ .001 .002 …) ──► Manx S-57 reader ─────────┘
 ```
 
 **Dev tool only.** It links GPL code from OpenCPN (the ISO 8211 module, the
 S-57 reader, and the GDAL/OGR subset OpenCPN vendors) and must never ship with
-navcore or be linked into it. Read behaviour from it; implement from the spec.
+Manx or be linked into it. Read behaviour from it; implement from the spec.
 
 ## Build
 

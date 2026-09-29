@@ -26,6 +26,9 @@ const TILE_WIDTH: f32 = 108.0;
 const VALUE_SIZE: f32 = 30.0;
 const LABEL_SIZE: f32 = 11.0;
 
+/// Width of the strip when it runs down a side: a tile's width and a margin.
+const SIDE_WIDTH: f32 = 132.0;
+
 /// Draw the strip. Returns nothing; interaction arrives as actions.
 pub fn bar(ctx: &Context, view: &mut InstrumentView, vessel: &Vessel) {
     // Read the edge before the closure borrows `view`, so the panel choice is
@@ -35,54 +38,97 @@ pub fn bar(ctx: &Context, view: &mut InstrumentView, vessel: &Vessel) {
         return;
     }
 
-    let draw = |ui: &mut egui::Ui| {
-        ui.horizontal_centered(|ui| {
-            ui.add_space(6.0);
-            for path in view.tiles.clone() {
-                if tile(ui, &path, vessel, view).clicked() {
-                    // A tile is the shortest route to the thing that
-                    // configures it — no hunting through a menu.
-                    view.open = true;
-                }
-            }
-            // The connection's health belongs on the bar, not buried in a
-            // window: a stale reading and a dropped link look identical
-            // otherwise.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(8.0);
-                // Orange is a warning — a link that should be up and is
-                // not. With no server asked for, there is nothing to warn of.
-                let (colour, tip) = if view.connected {
-                    (Color32::from_rgb(80, 190, 120), view.status.clone())
-                } else if view.active {
-                    (Color32::from_rgb(210, 130, 60), view.status.clone())
-                } else {
-                    (ui.visuals().weak_text_color(), view.status.clone())
-                };
-                let (rect, response) =
-                    ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
-                ui.painter().circle_filled(rect.center(), 5.0, colour);
-                if response.on_hover_text(tip).clicked() {
-                    view.open = true;
-                }
-            });
-        });
-    };
-
     match position {
         BarPosition::Top => {
             egui::TopBottomPanel::top("instrument-bar")
                 .exact_height(BAR_HEIGHT)
                 .show_separator_line(true)
-                .show(ctx, draw);
+                .show(ctx, |ui| strip(ui, view, vessel, false));
         }
         BarPosition::Bottom => {
             egui::TopBottomPanel::bottom("instrument-bar")
                 .exact_height(BAR_HEIGHT)
                 .show_separator_line(true)
-                .show(ctx, draw);
+                .show(ctx, |ui| strip(ui, view, vessel, false));
+        }
+        BarPosition::Left => {
+            egui::SidePanel::left("instrument-bar")
+                .exact_width(SIDE_WIDTH)
+                .resizable(false)
+                .show_separator_line(true)
+                .show(ctx, |ui| strip(ui, view, vessel, true));
+        }
+        BarPosition::Right => {
+            egui::SidePanel::right("instrument-bar")
+                .exact_width(SIDE_WIDTH)
+                .resizable(false)
+                .show_separator_line(true)
+                .show(ctx, |ui| strip(ui, view, vessel, true));
         }
         BarPosition::Hidden => {}
+    }
+}
+
+/// The strip's contents: across the screen, or stacked down a side.
+fn strip(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, down: bool) {
+    if down {
+        // Stacked, and scrolled if there are more than the screen is tall.
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(6.0);
+                let size = Vec2::new(SIDE_WIDTH - 12.0, BAR_HEIGHT - 12.0);
+                tiles(ui, view, vessel, size, size.x);
+                status_dot(ui, view);
+            });
+        });
+        return;
+    }
+    ui.horizontal_centered(|ui| {
+        ui.add_space(6.0);
+        let size = Vec2::new(TILE_WIDTH, BAR_HEIGHT - 12.0);
+        tiles(ui, view, vessel, size, size.y);
+        // The connection's health belongs on the bar, not buried in a
+        // window: a stale reading and a dropped link look identical
+        // otherwise.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(8.0);
+            status_dot(ui, view);
+        });
+    });
+}
+
+/// Every tile on the bar, each `size` — the wind rose excepted, which is a
+/// square `rose` wide: as tall as the bar across the screen, as wide as the
+/// strip down a side.
+fn tiles(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, size: Vec2, rose: f32) {
+    for path in view.tiles.clone() {
+        let response = if path == catalog::WIND_ROSE {
+            wind_rose(ui, vessel, view, rose)
+        } else {
+            tile(ui, &path, vessel, view, size)
+        };
+        if response.clicked() {
+            // A tile is the shortest route to the thing that
+            // configures it — no hunting through a menu.
+            view.open = true;
+        }
+    }
+}
+
+/// The link's health, as a dot. Orange is a warning — a link that should be
+/// up and is not. With no server asked for, there is nothing to warn of.
+fn status_dot(ui: &mut egui::Ui, view: &mut InstrumentView) {
+    let colour = if view.connected {
+        crate::render::theme::current().green
+    } else if view.active {
+        crate::render::theme::current().amber
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::click());
+    ui.painter().circle_filled(rect.center(), 5.0, colour);
+    if response.on_hover_text(view.status.clone()).clicked() {
+        view.open = true;
     }
 }
 
@@ -92,11 +138,9 @@ fn tile(
     path: &str,
     vessel: &Vessel,
     view: &InstrumentView,
+    size: Vec2,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(TILE_WIDTH, BAR_HEIGHT - 12.0),
-        Sense::click(),
-    );
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
     let dim = ui.visuals().weak_text_color();
     let strong = ui.visuals().strong_text_color();
@@ -178,6 +222,122 @@ fn tile(
     response.on_hover_text(path)
 }
 
+/// The wind on a dial, bow up: where the apparent and the true wind come
+/// from, and how hard each blows.
+///
+/// Apparent wind (AW) is drawn in the text colour and true wind (TW) in
+/// blue, each needle labelled beside its head, the
+/// apparent speed large in the middle and the true speed under it in blue.
+/// The red and green arcs are the close-hauled sectors, 20° to 60° either
+/// side of the bow, so a glance says which tack and how high. A stale needle
+/// or speed goes to the warning colour, as a stale number does.
+fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f32) -> egui::Response {
+    const AWA: &str = "environment.wind.angleApparent";
+    const AWS: &str = "environment.wind.speedApparent";
+    const TWS: &str = "environment.wind.speedTrue";
+    // True wind angle relative to the bow; over the ground if that is all
+    // the boat sends.
+    let twa = ["environment.wind.angleTrueWater", "environment.wind.angleTrueGround"]
+        .into_iter()
+        .find(|p| vessel.get(p).is_some())
+        .unwrap_or("environment.wind.angleTrueWater");
+
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
+    let painter = ui.painter();
+    let dim = ui.visuals().weak_text_color();
+    let strong = ui.visuals().strong_text_color();
+    let warn = ui.visuals().warn_fg_color;
+    let blue = crate::render::theme::current().blue;
+    let c = rect.center();
+    let r = side * 0.5 - 3.0;
+    // Angles run clockwise from the bow, starboard positive, as Signal K's do.
+    let at = |angle: f32, radius: f32| c + radius * Vec2::new(angle.sin(), -angle.cos());
+
+    painter.circle_stroke(c, r, Stroke::new(1.0_f32, dim));
+    for i in 0..12 {
+        let a = (i as f32 * 30.0).to_radians();
+        let (inner, width) = if i == 0 { (0.75, 2.0_f32) } else { (0.88, 1.0) };
+        painter.line_segment([at(a, r * inner), at(a, r)], Stroke::new(width, dim));
+    }
+    let arc = |from: f32, to: f32, colour: Color32| {
+        let points = (0..=12)
+            .map(|i| at((from + (to - from) * i as f32 / 12.0).to_radians(), r - 2.5))
+            .collect();
+        painter.add(egui::Shape::line(points, Stroke::new(4.0_f32, colour)));
+    };
+    // Port red, starboard green, as the sidelights are.
+    arc(-60.0, -20.0, crate::render::theme::current().red);
+    arc(20.0, 60.0, crate::render::theme::current().green);
+
+    // A needle points to where the wind comes from, clear of the speeds in
+    // the middle, and is named beside its head: two arrows on one dial are
+    // otherwise told apart only by colour, which sunlight washes out.
+    let needle = |path: &str, name: &str, colour: Color32, width: f32| {
+        let Some(reading) = vessel.get(path) else { return };
+        let Some(a) = reading.number() else { return };
+        let colour = if reading.is_stale() { warn } else { colour };
+        let a = a as f32;
+        let tip = at(a, r - 1.0);
+        painter.line_segment([at(a, r * 0.5), tip], Stroke::new(width, colour));
+        let head = vec![tip, at(a + 0.14, r * 0.74), at(a - 0.14, r * 0.74)];
+        painter.add(egui::Shape::convex_polygon(head, colour, Stroke::NONE));
+        painter.text(
+            at(a + 0.42, r * 0.66),
+            Align2::CENTER_CENTER,
+            name,
+            FontId::proportional((r * 0.24).max(9.0)),
+            colour,
+        );
+    };
+    // True first, so the apparent needle is on top where they overlap.
+    needle(twa, "TW", blue, 2.0);
+    needle(AWA, "AW", strong, 3.0);
+
+    let speed = |path: &str| {
+        let reading = vessel.get(path)?;
+        let n = reading.number()?;
+        Some((catalog::quantity_for(path).format(n, &view.units), reading.is_stale()))
+    };
+    let unit = match (speed(AWS), speed(TWS)) {
+        (None, None) => {
+            painter.text(c, Align2::CENTER_CENTER, "–", FontId::monospace(r * 0.4), dim);
+            ""
+        }
+        (aws, tws) => {
+            let mut unit = "";
+            if let Some((s, stale)) = aws {
+                let colour = if stale { warn } else { strong };
+                painter.text(c - Vec2::new(0.0, r * 0.08), Align2::CENTER_CENTER, s.value, FontId::monospace(r * 0.4), colour);
+                unit = s.unit;
+            }
+            if let Some((s, stale)) = tws {
+                let colour = if stale { warn } else { blue };
+                painter.text(c + Vec2::new(0.0, r * 0.28), Align2::CENTER_CENTER, s.value, FontId::monospace(r * 0.27), colour);
+                unit = s.unit;
+            }
+            unit
+        }
+    };
+    if r > 40.0 {
+        painter.text(c + Vec2::new(0.0, r * 0.52), Align2::CENTER_CENTER, unit, FontId::proportional(LABEL_SIZE), dim);
+    }
+
+    response.on_hover_text(
+        "Wind rose, bow up\nAW, apparent wind: speed in the middle\n\
+         TW, true wind (blue): speed below",
+    )
+}
+
+/// Whether the boat sends what a tile shows.
+fn is_live(path: &str, vessel: &Vessel) -> bool {
+    if path == catalog::WIND_ROSE {
+        return ["environment.wind.angleApparent", "environment.wind.angleTrueWater", "environment.wind.angleTrueGround"]
+            .iter()
+            .any(|p| vessel.get(p).is_some());
+    }
+    vessel.get(path).is_some()
+}
+
 /// The window behind the bar: where the server is, and what to show.
 pub fn settings(
     ctx: &Context,
@@ -211,7 +371,7 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
     ui.label(
         RichText::new(
             "The address of the server on your boat. A host name is enough — \
-             navcore adds the rest.",
+             Manx adds the rest.",
         )
         .small()
         .weak(),
@@ -243,7 +403,7 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
     });
     ui.horizontal(|ui| {
         let colour = if view.connected {
-            Color32::from_rgb(80, 190, 120)
+            crate::render::theme::current().green
         } else {
             ui.visuals().weak_text_color()
         };
@@ -267,6 +427,8 @@ fn layout(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiActi
         ui.label("Bar:");
         ui.selectable_value(&mut view.position, BarPosition::Top, "Top");
         ui.selectable_value(&mut view.position, BarPosition::Bottom, "Bottom");
+        ui.selectable_value(&mut view.position, BarPosition::Left, "Left");
+        ui.selectable_value(&mut view.position, BarPosition::Right, "Right");
         ui.selectable_value(&mut view.position, BarPosition::Hidden, "Hidden");
     });
     ui.horizontal(|ui| {
@@ -367,9 +529,9 @@ fn picker(
 
     for (i, path) in view.tiles.iter().enumerate() {
         ui.horizontal(|ui| {
-            let live = vessel.get(path).is_some();
+            let live = is_live(path, vessel);
             let dot = if live {
-                Color32::from_rgb(80, 190, 120)
+                crate::render::theme::current().green
             } else {
                 ui.visuals().weak_text_color()
             };
@@ -377,7 +539,8 @@ fn picker(
             ui.painter().circle_filled(rect.center(), 3.5, dot);
 
             ui.label(RichText::new(catalog::label_for(path)).strong());
-            ui.label(RichText::new(path).small().weak());
+            let about = if path == catalog::WIND_ROSE { "apparent and true wind" } else { path };
+            ui.label(RichText::new(about).small().weak());
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("✕").on_hover_text("Remove").clicked() {
@@ -416,6 +579,20 @@ fn picker(
     if let Some((from, to)) = move_to {
         view.tiles.swap(from, to);
         changed = true;
+    }
+
+    // The rose is drawn from several paths rather than being one, so it is
+    // offered on its own rather than in the list of what the boat sends.
+    if !view.tiles.iter().any(|t| t == catalog::WIND_ROSE) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("+").clicked() {
+                view.tiles.push(catalog::WIND_ROSE.to_string());
+                changed = true;
+            }
+            ui.label(RichText::new("Wind rose").strong());
+            ui.label(RichText::new("apparent and true wind, angle and speed").small().weak());
+        });
     }
 
     ui.add_space(8.0);

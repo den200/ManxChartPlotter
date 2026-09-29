@@ -14,6 +14,58 @@
 //!
 //! Distances are chamfer 3-4 — the spec says start there and MEASURE; the
 //! build logs its cost so the Felzenszwalb upgrade is a decision, not a hunch.
+//!
+//! ## Tiles
+//!
+//! Cells live in 64×64 tiles (§4.9: "tiles + adaptive resolution"). A dense
+//! grid has every tile; a sparse one ([`Grid::sparse`]) only those a caller
+//! asks for — the fine corridor around a route — and a cell in a missing tile
+//! is closed, uncharted and at distance 0 from a hazard. The search's own
+//! working arrays ([`CellMap`]) are tiled the same way and allocated as the
+//! search reaches them, so memory follows the water searched, not the box.
+//!
+//! ## Strict and loose
+//!
+//! Every hard stamp sets the *strict* flag: interiors by cell centre plus the
+//! supercover of every edge. Only the centre-sampled part (and line and point
+//! features, which are thin real obstacles) also sets the *loose* flag. The
+//! coarse pass of a two-level plan searches the loose raster, where a channel
+//! narrower than a couple of cells survives the erosion of its two shores;
+//! the route itself only ever comes from a strict search.
+
+/// Cells per tile side, and its shift.
+const TILE_SHIFT: usize = 6;
+const TILE: usize = 1 << TILE_SHIFT;
+const TILE_CELLS: usize = TILE * TILE;
+
+/// The strict hard flag: anything touches the cell.
+const STRICT: u8 = 1;
+/// The loose hard flag: a hazard covers the cell's centre.
+const LOOSE: u8 = 2;
+
+struct Tile {
+    /// [`STRICT`] | [`LOOSE`].
+    blocked: Vec<u8>,
+    /// Additive soft-cost units (0..=255) per cell.
+    soft: Vec<u8>,
+    /// Metres to the nearest strictly blocked cell, after [`Grid::finalize`].
+    dist: Vec<f32>,
+    /// Some chart's coverage reaches this cell. Outside every chart the
+    /// grid is closed, and saying *why* an end cannot be reached ("outside
+    /// your charts") needs to tell that apart from land.
+    covered: Vec<bool>,
+}
+
+impl Tile {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            blocked: vec![0; TILE_CELLS],
+            soft: vec![0; TILE_CELLS],
+            dist: vec![0.0; TILE_CELLS],
+            covered: vec![false; TILE_CELLS],
+        })
+    }
+}
 
 /// One routing grid.
 pub struct Grid {
@@ -23,62 +75,147 @@ pub struct Grid {
     pub res: f64,
     pub w: usize,
     pub h: usize,
-    /// 1 = hard obstacle.
-    blocked: Vec<u8>,
-    /// Additive soft-cost units (0..=255) per cell.
-    soft: Vec<u8>,
-    /// Metres to the nearest blocked cell, after [`Grid::finalize`].
-    dist: Vec<f32>,
-    /// Some chart's coverage reaches this cell. Outside every chart the
-    /// grid is closed, and saying *why* an end cannot be reached ("outside
-    /// your charts") needs to tell that apart from land.
-    covered: Vec<bool>,
+    /// Tiles across and up.
+    tw: usize,
+    th: usize,
+    /// Row-major; `None` is a tile the grid does not hold.
+    tiles: Vec<Option<Box<Tile>>>,
+    /// Centres of the opening bridge spans carved open by
+    /// [`Grid::open_gate`], Mercator. A search fades its offing near them,
+    /// as near its ends: a 30 m opening has no room for one.
+    pub gates: Vec<[f64; 2]>,
 }
 
-/// Cap on total cells: past this the grid coarsens itself rather than eating
+/// Cap on held cells: past this the grid coarsens itself rather than eating
 /// gigabytes. 12M cells is about 200 MB with the search's own arrays —
 /// within a Raspberry Pi 5's means, and seconds to fill.
 const MAX_CELLS: usize = 12_000_000;
 
+/// A value per cell, in tiles allocated on first write — the search's
+/// scores, parents and flood marks. Unwritten cells read as `fill`.
+pub struct CellMap<T: Copy> {
+    tw: usize,
+    fill: T,
+    tiles: Vec<Option<Box<[T]>>>,
+}
+
+impl<T: Copy> CellMap<T> {
+    pub fn new(grid: &Grid, fill: T) -> Self {
+        let mut tiles = Vec::new();
+        tiles.resize_with(grid.tw * grid.th, || None);
+        Self { tw: grid.tw, fill, tiles }
+    }
+
+    pub fn get(&self, x: usize, y: usize) -> T {
+        match &self.tiles[(y >> TILE_SHIFT) * self.tw + (x >> TILE_SHIFT)] {
+            Some(t) => t[(y & (TILE - 1)) * TILE + (x & (TILE - 1))],
+            None => self.fill,
+        }
+    }
+
+    pub fn set(&mut self, x: usize, y: usize, v: T) {
+        let fill = self.fill;
+        let t = self.tiles[(y >> TILE_SHIFT) * self.tw + (x >> TILE_SHIFT)]
+            .get_or_insert_with(|| vec![fill; TILE_CELLS].into_boxed_slice());
+        t[(y & (TILE - 1)) * TILE + (x & (TILE - 1))] = v;
+    }
+}
+
 impl Grid {
-    /// A grid covering `min..max` (Mercator metres) at `res`, coarsened if the
-    /// area demands it.
+    /// A grid covering `min..max` (Mercator metres) at `res`, every tile
+    /// held, coarsened if the area demands it.
     pub fn new(min: [f64; 2], max: [f64; 2], res_m: f64) -> Self {
+        Self::build(min, max, res_m, |tw, th, _| vec![true; tw * th])
+    }
+
+    /// A grid over `min..max` holding only the tiles within `radius` of
+    /// `points` (Mercator) — a corridor round a route. Everything else is
+    /// closed. Coarsened, like [`Grid::new`], if the corridor holds more
+    /// than the cell budget. `points` must be closer together than a tile.
+    pub fn corridor(
+        min: [f64; 2],
+        max: [f64; 2],
+        res_m: f64,
+        points: &[[f64; 2]],
+        radius: f64,
+    ) -> Self {
+        Self::build(min, max, res_m, |tw, th, side| {
+            let mut wanted = vec![false; tw * th];
+            let tile = |v: f64, lo: f64, n: usize| {
+                (((v - lo) / side).floor().max(0.0) as usize).min(n - 1)
+            };
+            for p in points {
+                let (x0, x1) = (tile(p[0] - radius, min[0], tw), tile(p[0] + radius, min[0], tw));
+                let (y0, y1) = (tile(p[1] - radius, min[1], th), tile(p[1] + radius, min[1], th));
+                for ty in y0..=y1 {
+                    for tx in x0..=x1 {
+                        wanted[ty * tw + tx] = true;
+                    }
+                }
+            }
+            wanted
+        })
+    }
+
+    /// `want(tw, th, tile side in metres)` says which tiles to hold.
+    fn build(
+        min: [f64; 2],
+        max: [f64; 2],
+        res_m: f64,
+        want: impl Fn(usize, usize, f64) -> Vec<bool>,
+    ) -> Self {
         let span = [max[0] - min[0], max[1] - min[1]];
         let mut res = res_m.max(1.0);
         loop {
             let w = (span[0] / res).ceil() as usize + 1;
             let h = (span[1] / res).ceil() as usize + 1;
-            if w * h <= MAX_CELLS {
+            let (tw, th) = (w.div_ceil(TILE), h.div_ceil(TILE));
+            let wanted = want(tw, th, TILE as f64 * res);
+            let held = wanted.iter().filter(|&&k| k).count() * TILE_CELLS;
+            // Cell indices travel as u32 through the search.
+            if held <= MAX_CELLS && tw * th * TILE_CELLS < u32::MAX as usize {
                 if res != res_m {
                     log::warn!(
                         "routing grid coarsened {res_m:.0} m → {res:.0} m to fit {w}×{h}"
                     );
                 }
-                return Self {
-                    origin: min,
-                    res,
-                    w,
-                    h,
-                    blocked: vec![0; w * h],
-                    soft: vec![0; w * h],
-                    dist: Vec::new(),
-                    covered: vec![false; w * h],
-                };
+                let tiles = wanted.into_iter().map(|k| k.then(Tile::new)).collect();
+                return Self { origin: min, res, w, h, tw, th, tiles, gates: Vec::new() };
             }
             res *= 1.5;
         }
     }
 
-    /// Mark every cell as an obstacle: the start state of a grid on which
-    /// only charted coverage is water.
-    pub fn close_all(&mut self) {
-        self.blocked.fill(1);
+    /// The tile holding a cell, and the cell's index in it.
+    #[inline]
+    fn at(&self, x: usize, y: usize) -> Option<(&Tile, usize)> {
+        self.tiles[(y >> TILE_SHIFT) * self.tw + (x >> TILE_SHIFT)]
+            .as_deref()
+            .map(|t| (t, (y & (TILE - 1)) * TILE + (x & (TILE - 1))))
     }
 
     #[inline]
-    fn idx(&self, x: usize, y: usize) -> usize {
-        y * self.w + x
+    fn at_mut(&mut self, x: i64, y: i64) -> Option<(&mut Tile, usize)> {
+        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
+            return None;
+        }
+        let (x, y) = (x as usize, y as usize);
+        self.tiles[(y >> TILE_SHIFT) * self.tw + (x >> TILE_SHIFT)]
+            .as_deref_mut()
+            .map(|t| (t, (y & (TILE - 1)) * TILE + (x & (TILE - 1))))
+    }
+
+    /// Does the grid hold this cell's tile?
+    pub fn holds(&self, x: usize, y: usize) -> bool {
+        self.at(x, y).is_some()
+    }
+
+    /// Mark every held cell as an obstacle: the start state of a grid on
+    /// which only charted coverage is water.
+    pub fn close_all(&mut self) {
+        for t in self.tiles.iter_mut().flatten() {
+            t.blocked.fill(STRICT | LOOSE);
+        }
     }
 
     /// The cell containing a Mercator position, if it is on the grid.
@@ -97,47 +234,124 @@ impl Grid {
         ]
     }
 
+    /// Strictly blocked: anything the chart forbids touches the cell. A cell
+    /// the grid does not hold is blocked.
     pub fn is_blocked(&self, x: usize, y: usize) -> bool {
-        self.blocked[self.idx(x, y)] != 0
+        self.at(x, y).is_none_or(|(t, i)| t.blocked[i] & STRICT != 0)
+    }
+
+    /// Loosely blocked: a hazard covers the cell's centre.
+    pub fn is_blocked_loose(&self, x: usize, y: usize) -> bool {
+        self.at(x, y).is_none_or(|(t, i)| t.blocked[i] & LOOSE != 0)
+    }
+
+    /// Close a cell in the loose raster too — the coarse pass giving up on
+    /// water the fine one could not get through.
+    pub fn block_loose(&mut self, x: usize, y: usize) {
+        if let Some((t, i)) = self.at_mut(x as i64, y as i64) {
+            t.blocked[i] |= LOOSE;
+        }
     }
 
     /// Metres to the nearest hard obstacle. Valid after [`Grid::finalize`].
     pub fn hazard_distance(&self, x: usize, y: usize) -> f64 {
-        self.dist[self.idx(x, y)] as f64
+        self.at(x, y).map_or(0.0, |(t, i)| t.dist[i] as f64)
     }
 
     pub fn soft_cost(&self, x: usize, y: usize) -> f64 {
-        self.soft[self.idx(x, y)] as f64 / 255.0
+        self.at(x, y).map_or(0.0, |(t, i)| t.soft[i] as f64 / 255.0)
     }
 
-    fn mark(&mut self, x: i64, y: i64, hard: bool) {
-        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
-            return;
-        }
-        let i = self.idx(x as usize, y as usize);
+    /// `loose`: the stamp covers the cell's centre (or is a thin line or
+    /// point feature), so it closes the loose raster as well.
+    fn mark(&mut self, x: i64, y: i64, hard: bool, loose: bool) {
+        let Some((t, i)) = self.at_mut(x, y) else { return };
         if hard {
-            self.blocked[i] = 1;
+            t.blocked[i] |= if loose { STRICT | LOOSE } else { STRICT };
         } else {
-            self.soft[i] = self.soft[i].saturating_add(128);
+            t.soft[i] = t.soft[i].saturating_add(128);
         }
+    }
+
+    /// Open an opening bridge span (its triangles, Mercator): the cells it
+    /// covers become water again, at a soft cost — the bridge opens on its
+    /// own schedule — whatever the fixed spans and piers either side
+    /// stamped over them.
+    ///
+    /// A 30 m opening is about a cell, and the fixed spans' and fenders'
+    /// cells crowd it from every side, so the span alone would join the water
+    /// either side only corner to corner, which no hull (and no search step)
+    /// squeezes through. The opening is carved as the span's own box,
+    /// stretched a cell and a half up and down the channel — the channel runs
+    /// across the span's short side — which always leaves a straight way
+    /// through. Returns the span's centre.
+    pub fn open_gate(&mut self, span: &[[[f64; 2]; 3]]) -> Option<[f64; 2]> {
+        let pts: Vec<[f64; 2]> = span.iter().flatten().copied().collect();
+        if pts.is_empty() {
+            return None;
+        }
+        let n = pts.len() as f64;
+        let c = [
+            pts.iter().map(|p| p[0]).sum::<f64>() / n,
+            pts.iter().map(|p| p[1]).sum::<f64>() / n,
+        ];
+        // The span's axes: the long one along the deck (the opening's
+        // width), the short one along the channel.
+        let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+        for p in &pts {
+            let (dx, dy) = (p[0] - c[0], p[1] - c[1]);
+            sxx += dx * dx;
+            syy += dy * dy;
+            sxy += dx * dy;
+        }
+        let angle = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+        let along = [angle.cos(), angle.sin()];
+        let across = [-along[1], along[0]];
+        let extent = |axis: [f64; 2]| {
+            pts.iter()
+                .map(|p| ((p[0] - c[0]) * axis[0] + (p[1] - c[1]) * axis[1]).abs())
+                .fold(0.0, f64::max)
+        };
+        let half_deck = extent(along);
+        let half_channel = extent(across) + 1.5 * self.res;
+        let corner = |u: f64, v: f64| {
+            [
+                c[0] + along[0] * u + across[0] * v,
+                c[1] + along[1] * u + across[1] * v,
+            ]
+        };
+        let quad = [
+            corner(-half_deck, -half_channel),
+            corner(half_deck, -half_channel),
+            corner(half_deck, half_channel),
+            corner(-half_deck, half_channel),
+        ];
+        let open = |g: &mut Self, x: i64, y: i64| {
+            g.clear_cell(x, y);
+            g.mark(x, y, false, false);
+        };
+        for t in [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]] {
+            self.triangle_cells(t, open);
+        }
+        for i in 0..4 {
+            self.walk_segment(quad[i], quad[(i + 1) % 4], open);
+        }
+        Some(c)
     }
 
     /// Clear a cell back to open water — the quilting eraser a finer chart
     /// runs over its own coverage before stamping its own truth.
     fn clear_cell(&mut self, x: i64, y: i64) {
-        if x < 0 || y < 0 || x as usize >= self.w || y as usize >= self.h {
-            return;
-        }
-        let i = self.idx(x as usize, y as usize);
-        self.blocked[i] = 0;
-        self.soft[i] = 0;
-        self.covered[i] = true;
+        let Some((t, i)) = self.at_mut(x, y) else { return };
+        t.blocked[i] = 0;
+        t.soft[i] = 0;
+        t.covered[i] = true;
     }
 
     /// Draw the grid as a PNG, for seeing why a route goes where it goes:
-    /// grey uncharted, black unsafe, orange soft cost, blue deepening with
-    /// distance from hazards, and `path` (Mercator) in red. Downsampled to
-    /// at most `max_px` on the long side.
+    /// grey uncharted (or not held), black unsafe, orange soft cost, blue
+    /// deepening with distance from hazards, and `path` (Mercator) in red.
+    /// Downsampled to at most `max_px` on the long side.
     pub fn debug_png(&self, path: &[[f64; 2]], out: &std::path::Path, max_px: usize) {
         let step = (self.w.max(self.h) / max_px.max(1)).max(1);
         let (iw, ih) = (self.w / step, self.h / step);
@@ -145,19 +359,7 @@ impl Grid {
         for py in 0..ih {
             for px in 0..iw {
                 let (x, y) = (px * step, self.h - 1 - py * step);
-                let i = self.idx(x, y);
-                let c = if !self.covered[i] && self.blocked[i] != 0 {
-                    [110, 110, 110]
-                } else if self.blocked[i] != 0 {
-                    [20, 20, 20]
-                } else if self.soft[i] != 0 {
-                    [240, 160, 60]
-                } else {
-                    let d = self.dist.get(i).copied().unwrap_or(0.0) as f64;
-                    let f = (d / 2_000.0).min(1.0);
-                    [(230.0 - 150.0 * f) as u8, (240.0 - 110.0 * f) as u8, 255]
-                };
-                img.put_pixel(px as u32, py as u32, image::Rgb(c));
+                img.put_pixel(px as u32, py as u32, image::Rgb(self.debug_colour(x, y)));
             }
         }
         for w in path.windows(2) {
@@ -178,23 +380,71 @@ impl Grid {
         }
     }
 
-    /// Does any chart's coverage reach this cell?
+    /// [`debug_png`](Self::debug_png) of a `half`-cell window round
+    /// `centre` (Mercator) at one pixel per cell — for looking at a fine
+    /// corridor, which the whole-grid picture shrinks to a hair.
+    pub fn debug_png_at(&self, path: &[[f64; 2]], centre: [f64; 2], half: usize, out: &std::path::Path) {
+        let Some((cx, cy)) = self.cell_of(centre) else { return };
+        let (x0, y0) = (cx.saturating_sub(half), cy.saturating_sub(half));
+        let (x1, y1) = ((cx + half).min(self.w - 1), (cy + half).min(self.h - 1));
+        let (iw, ih) = (x1 - x0 + 1, y1 - y0 + 1);
+        let mut img = image::RgbImage::new(iw as u32, ih as u32);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                img.put_pixel((x - x0) as u32, (y1 - y) as u32, image::Rgb(self.debug_colour(x, y)));
+            }
+        }
+        for w in path.windows(2) {
+            let n = ((w[1][0] - w[0][0]).hypot(w[1][1] - w[0][1]) / (self.res * 0.5)).ceil() as usize + 1;
+            for i in 0..=n {
+                let t = i as f64 / n as f64;
+                let p = [w[0][0] + (w[1][0] - w[0][0]) * t, w[0][1] + (w[1][1] - w[0][1]) * t];
+                if let Some((x, y)) = self.cell_of(p) {
+                    if (x0..=x1).contains(&x) && (y0..=y1).contains(&y) {
+                        img.put_pixel((x - x0) as u32, (y1 - y) as u32, image::Rgb([230, 30, 30]));
+                    }
+                }
+            }
+        }
+        if let Err(e) = img.save(out) {
+            log::warn!("could not write {}: {e}", out.display());
+        }
+    }
+
+    fn debug_colour(&self, x: usize, y: usize) -> [u8; 3] {
+        match self.at(x, y) {
+            None => [110, 110, 110],
+            Some((t, i)) if !t.covered[i] && t.blocked[i] != 0 => [110, 110, 110],
+            Some((t, i)) if t.blocked[i] & STRICT != 0 => [20, 20, 20],
+            Some((t, i)) if t.soft[i] != 0 => [240, 160, 60],
+            Some((t, i)) => {
+                let f = (t.dist[i] as f64 / 2_000.0).min(1.0);
+                [(230.0 - 150.0 * f) as u8, (240.0 - 110.0 * f) as u8, 255]
+            }
+        }
+    }
+
+    /// Some chart's coverage reaches this cell.
     pub fn is_covered(&self, x: usize, y: usize) -> bool {
-        self.covered[self.idx(x, y)]
+        self.at(x, y).is_some_and(|(t, i)| t.covered[i])
     }
 
     /// Every cell reachable from `from` through water that is not blocked,
     /// 8-connected without cutting blocked corners — the same moves the
     /// search makes, with no offing at all. A marina basin shut in by fixed
     /// bridges is its own component, and an end snapped into it can never
-    /// be reached from outside.
-    pub fn component(&self, from: (usize, usize)) -> Vec<bool> {
-        let mut seen = vec![false; self.w * self.h];
-        if self.is_blocked(from.0, from.1) {
+    /// be reached from outside. `loose`: in the loose raster, corners cut —
+    /// the coarse pass's moves.
+    pub fn component(&self, from: (usize, usize), loose: bool) -> CellMap<bool> {
+        let blocked = |x: usize, y: usize| {
+            if loose { self.is_blocked_loose(x, y) } else { self.is_blocked(x, y) }
+        };
+        let mut seen = CellMap::new(self, false);
+        if blocked(from.0, from.1) {
             return seen;
         }
         let mut stack = vec![from];
-        seen[self.idx(from.0, from.1)] = true;
+        seen.set(from.0, from.1, true);
         while let Some((x, y)) = stack.pop() {
             for (dx, dy) in [(1i64, 0i64), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)] {
                 let (nx, ny) = (x as i64 + dx, y as i64 + dy);
@@ -202,16 +452,13 @@ impl Grid {
                     continue;
                 }
                 let (nx, ny) = (nx as usize, ny as usize);
-                let i = self.idx(nx, ny);
-                if seen[i] || self.is_blocked(nx, ny) {
+                if seen.get(nx, ny) || blocked(nx, ny) {
                     continue;
                 }
-                if dx != 0 && dy != 0
-                    && (self.is_blocked(nx, y) || self.is_blocked(x, ny))
-                {
+                if !loose && dx != 0 && dy != 0 && (blocked(nx, y) || blocked(x, ny)) {
                     continue;
                 }
-                seen[i] = true;
+                seen.set(nx, ny, true);
                 stack.push((nx, ny));
             }
         }
@@ -219,12 +466,13 @@ impl Grid {
     }
 
     /// Stamp a filled triangle (Mercator metres): interior by cell centre,
-    /// plus all three edges, so slivers cannot slip between centres.
+    /// plus all three edges, so slivers cannot slip between centres. Only
+    /// the interior closes the loose raster.
     pub fn stamp_triangle(&mut self, t: [[f64; 2]; 3], hard: bool) {
-        self.triangle_cells(t, |g, x, y| g.mark(x, y, hard));
-        self.stamp_segment(t[0], t[1], hard);
-        self.stamp_segment(t[1], t[2], hard);
-        self.stamp_segment(t[2], t[0], hard);
+        self.triangle_cells(t, |g, x, y| g.mark(x, y, hard, true));
+        for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            self.walk_segment(a, b, |g, x, y| g.mark(x, y, hard, false));
+        }
     }
 
     /// Erase a filled triangle, edges included.
@@ -243,7 +491,8 @@ impl Grid {
         // Clamped to the grid: an overview chart's land triangle can be
         // hundreds of kilometres across, and walking its whole bounding box
         // cell by cell — almost all of it off the grid — took longer than
-        // everything else in the plan put together.
+        // everything else in the plan put together. Walked a tile at a time,
+        // so the tiles a sparse grid does not hold cost nothing.
         let x0 = (((min_x - self.origin[0]) / self.res).floor() as i64).max(0);
         let x1 = (((max_x - self.origin[0]) / self.res).ceil() as i64).min(self.w as i64 - 1);
         let y0 = (((min_y - self.origin[1]) / self.res).floor() as i64).max(0);
@@ -251,28 +500,41 @@ impl Grid {
         if x0 > x1 || y0 > y1 {
             return;
         }
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                let c = [
-                    self.origin[0] + (x as f64 + 0.5) * self.res,
-                    self.origin[1] + (y as f64 + 0.5) * self.res,
-                ];
-                if point_in_triangle(c, t) {
-                    f(self, x, y);
+        let (tx0, tx1) = (x0 as usize >> TILE_SHIFT, x1 as usize >> TILE_SHIFT);
+        let (ty0, ty1) = (y0 as usize >> TILE_SHIFT, y1 as usize >> TILE_SHIFT);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                if self.tiles[ty * self.tw + tx].is_none() {
+                    continue;
+                }
+                let cy0 = (ty * TILE) as i64;
+                let cx0 = (tx * TILE) as i64;
+                for y in y0.max(cy0)..=y1.min(cy0 + TILE as i64 - 1) {
+                    for x in x0.max(cx0)..=x1.min(cx0 + TILE as i64 - 1) {
+                        let c = [
+                            self.origin[0] + (x as f64 + 0.5) * self.res,
+                            self.origin[1] + (y as f64 + 0.5) * self.res,
+                        ];
+                        if point_in_triangle(c, t) {
+                            f(self, x, y);
+                        }
+                    }
                 }
             }
         }
     }
 
-    /// Stamp a line segment: every cell the segment passes through.
+    /// Stamp a line segment: every cell the segment passes through. A line
+    /// feature is a thin real obstacle — a pier, a breakwater, a fender —
+    /// so it closes the loose raster too.
     pub fn stamp_segment(&mut self, a: [f64; 2], b: [f64; 2], hard: bool) {
-        self.walk_segment(a, b, |g, x, y| g.mark(x, y, hard));
+        self.walk_segment(a, b, |g, x, y| g.mark(x, y, hard, true));
     }
 
     pub fn stamp_point(&mut self, p: [f64; 2], hard: bool) {
         let x = ((p[0] - self.origin[0]) / self.res).floor() as i64;
         let y = ((p[1] - self.origin[1]) / self.res).floor() as i64;
-        self.mark(x, y, hard);
+        self.mark(x, y, hard, true);
     }
 
     /// Supercover walk: visit every cell a segment touches, no diagonal gaps.
@@ -316,64 +578,73 @@ impl Grid {
     }
 
     /// Build the distance-to-hazard field. Chamfer 3-4: two passes, ~2 %
-    /// error, which against a 370 m offing is metres.
+    /// error, which against a 370 m offing is metres. A cell the grid does
+    /// not hold counts as a hazard, so a sparse corridor's edge is kept off
+    /// like a shore — the route stays in the water it was given.
     pub fn finalize(&mut self) {
         let start = std::time::Instant::now();
         let orth = self.res as f32;
         let diag = self.res as f32 * std::f32::consts::SQRT_2;
         let big = f32::MAX / 4.0;
-        self.dist = self
-            .blocked
-            .iter()
-            .map(|&b| if b != 0 { 0.0 } else { big })
-            .collect();
-
-        let (w, h) = (self.w, self.h);
+        for t in self.tiles.iter_mut().flatten() {
+            for (d, &b) in t.dist.iter_mut().zip(&t.blocked) {
+                *d = if b & STRICT != 0 { 0.0 } else { big };
+            }
+        }
+        let (w, h) = (self.w as i64, self.h as i64);
+        // Out of bounds: nothing there. Not held: a hazard.
+        let get = |g: &Self, x: i64, y: i64| -> Option<f32> {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                return None;
+            }
+            Some(g.at(x as usize, y as usize).map_or(0.0, |(t, i)| t.dist[i]))
+        };
+        let held_row = |g: &Self, y: i64, tx: usize| g.tiles[(y as usize >> TILE_SHIFT) * g.tw + tx].is_some();
         // Forward: SW → NE.
         for y in 0..h {
-            for x in 0..w {
-                let i = y * w + x;
-                let mut d = self.dist[i];
-                if x > 0 {
-                    d = d.min(self.dist[i - 1] + orth);
+            for tx in 0..self.tw {
+                if !held_row(self, y, tx) {
+                    continue;
                 }
-                if y > 0 {
-                    d = d.min(self.dist[i - w] + orth);
-                    if x > 0 {
-                        d = d.min(self.dist[i - w - 1] + diag);
+                let xs = (tx * TILE) as i64;
+                for x in xs..(xs + TILE as i64).min(w) {
+                    let mut d = get(self, x, y).unwrap();
+                    for (nx, ny, c) in [(x - 1, y, orth), (x, y - 1, orth), (x - 1, y - 1, diag), (x + 1, y - 1, diag)] {
+                        if let Some(n) = get(self, nx, ny) {
+                            d = d.min(n + c);
+                        }
                     }
-                    if x + 1 < w {
-                        d = d.min(self.dist[i - w + 1] + diag);
-                    }
+                    let (t, i) = self.at_mut(x, y).unwrap();
+                    t.dist[i] = d;
                 }
-                self.dist[i] = d;
             }
         }
         // Backward: NE → SW.
         for y in (0..h).rev() {
-            for x in (0..w).rev() {
-                let i = y * w + x;
-                let mut d = self.dist[i];
-                if x + 1 < w {
-                    d = d.min(self.dist[i + 1] + orth);
+            for tx in (0..self.tw).rev() {
+                if !held_row(self, y, tx) {
+                    continue;
                 }
-                if y + 1 < h {
-                    d = d.min(self.dist[i + w] + orth);
-                    if x + 1 < w {
-                        d = d.min(self.dist[i + w + 1] + diag);
+                let xs = (tx * TILE) as i64;
+                for x in (xs..(xs + TILE as i64).min(w)).rev() {
+                    let mut d = get(self, x, y).unwrap();
+                    for (nx, ny, c) in [(x + 1, y, orth), (x, y + 1, orth), (x + 1, y + 1, diag), (x - 1, y + 1, diag)] {
+                        if let Some(n) = get(self, nx, ny) {
+                            d = d.min(n + c);
+                        }
                     }
-                    if x > 0 {
-                        d = d.min(self.dist[i + w - 1] + diag);
-                    }
+                    let (t, i) = self.at_mut(x, y).unwrap();
+                    t.dist[i] = d;
                 }
-                self.dist[i] = d;
             }
         }
         // The spec says MEASURE this, so it is measured, every build.
+        let held = self.tiles.iter().flatten().count() * TILE_CELLS;
         log::info!(
-            "routing distance field: {}×{} cells in {} ms",
-            w,
-            h,
+            "routing distance field: {}×{} cells ({} held) in {} ms",
+            self.w,
+            self.h,
+            held,
             start.elapsed().as_millis()
         );
     }
@@ -384,8 +655,12 @@ impl Grid {
     }
 
     /// Is this cell somewhere a boat may be, under a search's rules — the
-    /// hard offing, faded near the endpoints?
+    /// hard offing, faded near the endpoints? A loose search asks only that
+    /// the loose raster be open there.
     pub fn passable_by(&self, x: usize, y: usize, params: &SearchParams) -> bool {
+        if params.loose {
+            return !self.is_blocked_loose(x, y);
+        }
         !self.is_blocked(x, y)
             && self.hazard_distance(x, y) >= params.floor_at(self.centre(x, y))
     }
@@ -399,7 +674,7 @@ impl Grid {
     /// restricted area short of prohibition, an exercise area? The route may,
     /// but the skipper should be told.
     pub fn segment_touches_soft(&self, a: [f64; 2], b: [f64; 2]) -> bool {
-        !self.segment_clear_with(a, b, |g, x, y| g.soft[g.idx(x, y)] == 0)
+        !self.segment_clear_with(a, b, |g, x, y| g.soft_cost(x, y) == 0.0)
     }
 
     /// Is the straight segment between two Mercator points clear, offing
@@ -529,6 +804,14 @@ pub struct SearchParams {
     /// The start and finish, Mercator.
     pub ends: Vec<[f64; 2]>,
     pub taper_m: f64,
+    /// Opening bridges ([`Grid::gates`]): the floor and penalties fade near
+    /// them too, over `gate_taper_m`, so the route can pass the opening.
+    pub gates: Vec<[f64; 2]>,
+    pub gate_taper_m: f64,
+    /// Search the loose raster: the coarse pass of a two-level plan. No
+    /// offing floor, and diagonal moves may cut a blocked corner — its path
+    /// only says which way to go; the route comes from a strict search.
+    pub loose: bool,
 }
 
 impl SearchParams {
@@ -541,18 +824,25 @@ impl SearchParams {
             offing_soft_m,
             ends: Vec::new(),
             taper_m: 0.0,
+            gates: Vec::new(),
+            gate_taper_m: 0.0,
+            loose: false,
         }
     }
 
-    /// 0 at an endpoint, rising to 1 at `taper_m` from it.
+    /// 0 at an endpoint or a gate, rising to 1 at `taper_m` (`gate_taper_m`)
+    /// from it.
     pub fn fade(&self, p: [f64; 2]) -> f64 {
-        if self.taper_m <= 0.0 {
-            return 1.0;
-        }
-        self.ends
-            .iter()
-            .map(|e| ((p[0] - e[0]).hypot(p[1] - e[1]) / self.taper_m).min(1.0))
-            .fold(1.0, f64::min)
+        let near = |points: &[[f64; 2]], taper: f64| {
+            if taper <= 0.0 {
+                return 1.0;
+            }
+            points
+                .iter()
+                .map(|e| ((p[0] - e[0]).hypot(p[1] - e[1]) / taper).min(1.0))
+                .fold(1.0, f64::min)
+        };
+        near(&self.ends, self.taper_m).min(near(&self.gates, self.gate_taper_m))
     }
 
     /// The hard offing at a place.
@@ -591,8 +881,8 @@ pub fn find_path(
 
     let (w, h) = (grid.w, grid.h);
     let index = |c: (usize, usize)| c.1 * w + c.0;
-    let mut g_score = vec![f32::MAX; w * h];
-    let mut parent = vec![u32::MAX; w * h];
+    let mut g_score = CellMap::new(grid, f32::MAX);
+    let mut parent = CellMap::new(grid, u32::MAX);
     let mut heap: BinaryHeap<Reverse<(u64, u32)>> = BinaryHeap::new();
 
     let hcost = |c: (usize, usize)| {
@@ -604,7 +894,7 @@ pub fn find_path(
     // quantization is far below anything the grid resolves.
     let key = |f: f32| (f as f64 * 1000.0) as u64;
 
-    g_score[index(start)] = 0.0;
+    g_score.set(start.0, start.1, 0.0);
     heap.push(Reverse((key(hcost(start)), index(start) as u32)));
 
     const NEIGHBOURS: [(i64, i64); 8] = [
@@ -629,21 +919,25 @@ pub fn find_path(
         let c = (current as usize % w, current as usize / w);
         // A node is pushed again each time a cheaper way to it is found; the
         // older entries are stale and would only re-expand it.
-        if f_key != key(g_score[current as usize] + hcost(c)) {
+        if f_key != key(g_score.get(c.0, c.1) + hcost(c)) {
             continue;
         }
         if c == goal {
             // Walk parents back.
             let mut path = vec![c];
             let mut i = current;
-            while parent[i as usize] != u32::MAX {
-                i = parent[i as usize];
+            loop {
+                let p = parent.get(i as usize % w, i as usize / w);
+                if p == u32::MAX {
+                    break;
+                }
+                i = p;
                 path.push((i as usize % w, i as usize / w));
             }
             path.reverse();
             return Ok(path);
         }
-        let g_here = g_score[current as usize];
+        let g_here = g_score.get(c.0, c.1);
         for (dx, dy) in NEIGHBOURS {
             let nx = c.0 as i64 + dx;
             let ny = c.1 as i64 + dy;
@@ -654,8 +948,9 @@ pub fn find_path(
             if !grid.passable_by(n.0, n.1, params) {
                 continue;
             }
-            // Diagonal moves must not cut a blocked corner.
-            if dx != 0 && dy != 0 {
+            // Diagonal moves must not cut a blocked corner (a loose search's
+            // may: it only picks the way).
+            if dx != 0 && dy != 0 && !params.loose {
                 let a = ((c.0 as i64 + dx) as usize, c.1);
                 let b = (c.0, (c.1 as i64 + dy) as usize);
                 if !grid.passable_by(a.0, a.1, params) || !grid.passable_by(b.0, b.1, params) {
@@ -672,9 +967,9 @@ pub fn find_path(
             let mult = params.multiplier(d, fade) + grid.soft_cost(n.0, n.1);
             let tentative = g_here + (step * mult) as f32;
             let ni = index(n);
-            if tentative < g_score[ni] {
-                g_score[ni] = tentative;
-                parent[ni] = current;
+            if tentative < g_score.get(n.0, n.1) {
+                g_score.set(n.0, n.1, tentative);
+                parent.set(n.0, n.1, current);
                 heap.push(Reverse((key(tentative + hcost(n)), ni as u32)));
             }
         }
@@ -701,10 +996,10 @@ pub fn nudge_into(
     from: (usize, usize),
     params: &SearchParams,
     max_m: f64,
-    component: Option<&[bool]>,
+    component: Option<&CellMap<bool>>,
 ) -> Option<(usize, usize)> {
     let ok = |x: usize, y: usize| {
-        grid.passable_by(x, y, params) && component.is_none_or(|c| c[y * grid.w + x])
+        grid.passable_by(x, y, params) && component.is_none_or(|c| c.get(x, y))
     };
     if ok(from.0, from.1) {
         return Some(from);
@@ -890,6 +1185,99 @@ mod tests {
         }
     }
 
+    /// A bridge across the water at an angle to the grid: fixed spans the
+    /// boat cannot pass, and a 30 m bascule opening in the middle — under a
+    /// cell wide, crowded by the spans either side. Carved as a gate, it is a
+    /// way through even with an offing far wider than the opening.
+    #[test]
+    fn an_opening_bridge_narrower_than_a_cell_is_a_way_through() {
+        let mut grid = open();
+        let c = [5_000.0, 5_000.0];
+        let deck = [0.5f64, 0.866]; // the bridge runs 30° off north
+        let channel = [deck[1], -deck[0]];
+        let at = |u: f64, v: f64| [c[0] + deck[0] * u + channel[0] * v, c[1] + deck[1] * u + channel[1] * v];
+        let rect = |u0: f64, u1: f64| {
+            let q = [at(u0, -10.0), at(u1, -10.0), at(u1, 10.0), at(u0, 10.0)];
+            [[q[0], q[1], q[2]], [q[0], q[2], q[3]]]
+        };
+        // Fixed spans from shore to shore, either side of the opening.
+        for t in rect(-8_000.0, -15.0).into_iter().chain(rect(15.0, 8_000.0)) {
+            grid.stamp_triangle(t, true);
+        }
+        let opening = rect(-15.0, 15.0);
+        for t in opening {
+            grid.stamp_triangle(t, false);
+        }
+        let west = grid.cell_of([2_000.0, 5_000.0]).unwrap();
+        let east = grid.cell_of([8_000.0, 5_000.0]).unwrap();
+        grid.finalize();
+        assert!(!grid.component(west, false).get(east.0, east.1), "the spans bleed over the opening");
+
+        assert!(grid.open_gate(&opening).is_some());
+        grid.gates.push(c);
+        grid.finalize();
+        assert!(grid.component(west, false).get(east.0, east.1), "the carved opening joins the water");
+        let mut p = params();
+        p.gates = grid.gates.clone();
+        p.gate_taper_m = 400.0;
+        find_path(&grid, west, east, &p).expect("through the opening");
+        // And without the fade, the offing alone closes it again.
+        assert!(find_path(&grid, west, east, &params()).is_err());
+    }
+
+    /// A 60 m channel at 30° across a 50 m grid: no cell fits between the
+    /// shores, so the strict raster has no channel at all — the old failure
+    /// east of Aalborg. The loose raster keeps a chain of cell centres in
+    /// it, and a 10 m corridor grid along that chain finds the channel open
+    /// under the strict rules.
+    #[test]
+    fn a_channel_the_strict_raster_closes_is_found_loosely_and_passed_finely() {
+        let (sin, cos) = (30f64.to_radians().sin(), 30f64.to_radians().cos());
+        let along = |t: f64, off: f64| [t * cos - off * sin, 1_000.0 + t * sin + off * cos];
+        let shores = |g: &mut Grid| {
+            for (near, far) in [(30.0, 3_000.0), (-30.0, -3_000.0)] {
+                let q = [along(-500.0, near), along(4_000.0, near), along(4_000.0, far), along(-500.0, far)];
+                g.stamp_triangle([q[0], q[1], q[2]], true);
+                g.stamp_triangle([q[0], q[2], q[3]], true);
+            }
+        };
+        let (west, east) = (along(200.0, 0.0), along(3_000.0, 0.0));
+
+        let mut coarse = Grid::new([0.0, 0.0], [3_000.0, 3_000.0], 50.0);
+        shores(&mut coarse);
+        coarse.finalize();
+        // The ends' own cells may have their centres on a shore: freed into
+        // the loose water, as the planner frees them.
+        let mut way_params = SearchParams::fixed(0.0, 0.0);
+        way_params.loose = true;
+        let w = nudge(&coarse, coarse.cell_of(west).unwrap(), &way_params, 100.0).unwrap();
+        let e = nudge(&coarse, coarse.cell_of(east).unwrap(), &way_params, 100.0).unwrap();
+        assert!(coarse.is_blocked(w.0, w.1), "strictly, the channel is shut");
+        assert!(!coarse.component(w, false).get(e.0, e.1));
+        assert!(coarse.component(w, true).get(e.0, e.1), "loosely, it is open");
+        let way = find_path(&coarse, w, e, &way_params).expect("the loose way");
+
+        let along_way: Vec<[f64; 2]> = way.iter().map(|&(x, y)| coarse.centre(x, y)).collect();
+        let mut fine = Grid::corridor([0.0, 0.0], [3_000.0, 3_000.0], 10.0, &along_way, 300.0);
+        shores(&mut fine);
+        fine.finalize();
+        let (fw, fe) = (fine.cell_of(west).unwrap(), fine.cell_of(east).unwrap());
+        let path = find_path(&fine, fw, fe, &SearchParams::fixed(10.0, 10.0)).expect("the fine route");
+        assert!(path.iter().all(|&(x, y)| !fine.is_blocked(x, y)));
+    }
+
+    /// A corridor grid holds the tiles near its points and nothing else, and
+    /// what it does not hold is closed.
+    #[test]
+    fn a_corridor_grid_holds_only_the_way() {
+        let g = Grid::corridor([0.0, 0.0], [10_000.0, 10_000.0], 10.0, &[[500.0, 500.0]], 100.0);
+        let near = g.cell_of([520.0, 480.0]).unwrap();
+        let far = g.cell_of([9_000.0, 9_000.0]).unwrap();
+        assert!(g.holds(near.0, near.1) && !g.is_blocked(near.0, near.1));
+        assert!(!g.holds(far.0, far.1) && g.is_blocked(far.0, far.1));
+        assert_eq!(g.hazard_distance(far.0, far.1), 0.0);
+    }
+
     #[test]
     fn nudging_finds_the_water_beside_a_marina() {
         let mut grid = open();
@@ -937,6 +1325,9 @@ mod tests {
             offing_soft_m: 900.0,
             ends: vec![a, b],
             taper_m: 1_850.0,
+            gates: Vec::new(),
+            gate_taper_m: 0.0,
+            loose: false,
         };
         let path = find_path(&grid, start, goal, &params).expect("out through the entrance");
         let pulled = string_pull(&grid, &path, &params);
@@ -969,6 +1360,9 @@ mod tests {
             offing_soft_m: 900.0,
             ends: vec![a, b],
             taper_m: 1_850.0,
+            gates: Vec::new(),
+            gate_taper_m: 0.0,
+            loose: false,
         };
         let path = find_path(&grid, grid.cell_of(a).unwrap(), grid.cell_of(b).unwrap(), &params)
             .expect("through the channel");
@@ -990,12 +1384,12 @@ mod tests {
         grid.finalize();
         let on_land = grid.cell_of([2150.0, 1500.0]).unwrap();
         let loose = SearchParams::fixed(0.0, 0.0);
-        let sea = grid.component(grid.cell_of([9_000.0, 9_000.0]).unwrap());
+        let sea = grid.component(grid.cell_of([9_000.0, 9_000.0]).unwrap(), false);
         let snapped = nudge_into(&grid, on_land, &loose, 1_000.0, Some(&sea)).expect("the sea");
-        assert!(sea[snapped.1 * grid.w + snapped.0]);
+        assert!(sea.get(snapped.0, snapped.1));
         // The plain nearest water is the closed basin — the old answer.
         let nearest = nudge(&grid, on_land, &loose, 1_000.0).unwrap();
-        assert!(!sea[nearest.1 * grid.w + nearest.0]);
+        assert!(!sea.get(nearest.0, nearest.1));
     }
 
     /// On a grid that starts closed, only charted coverage is water, and

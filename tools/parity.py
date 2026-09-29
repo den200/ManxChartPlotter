@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Compare a navcore capture with an OpenCPN reference screenshot.
+"""Compare a manx capture with an OpenCPN reference screenshot.
 
-    tools/parity.py <reference.png> <navcore.png> [--overlay out.png]
+    tools/parity.py <reference.png> <manx.png> [--overlay out.png]
 
-Reports how much of the reference's land/water boundary navcore reproduces, and
-how much navcore draws that the reference does not. Coastline is the right
+Reports how much of the reference's land/water boundary manx reproduces, and
+how much manx draws that the reference does not. Coastline is the right
 signal for this: it is the one feature class both renderers must agree on
 exactly, it is unaffected by fonts and symbols, and it is visible at every zoom.
 
@@ -14,7 +14,7 @@ S-52 oracle *why*; a number cannot tell you which feature changed.
 Chrome is excluded, because it is not chart content and pretending otherwise
 corrupts the comparison. The chart-outline rectangles OpenCPN draws in green
 break the land mask wherever they cross land, producing "reference coastline"
-along a straight line no chart contains — which quietly rewards any navcore
+along a straight line no chart contains — which quietly rewards any manx
 artefact that happens to run down the same edge.
 """
 
@@ -171,7 +171,7 @@ def color_report(ref, nav, keep):
     for a, b in zip(ri[dis], ni[dis]):
         conf[(names[a], names[b])] += 1
     if conf:
-        print("\n  top disagreements (reference -> navcore, % of classified):\n")
+        print("\n  top disagreements (reference -> manx, % of classified):\n")
         for (a, b), n in conf.most_common(10):
             print(f"    {100.0 * n / total:6.2f}%  {a:<7} -> {b}")
 
@@ -180,9 +180,9 @@ def block_agreement(ref, nav, keep, pal, block=8):
     """Fraction of blocks painted the same S-52 colour by both renderers.
 
     Comparing raw RGB does not work here: the reference screenshots are macOS
-    captures tagged Display P3 while navcore writes raw sRGB, so identical
+    captures tagged Display P3 while manx writes raw sRGB, so identical
     renders differ by up to 23 counts on a channel — DEPVS reads (115,182,239)
-    in navcore and (92,183,243) in the reference from the same table. Fitting
+    in manx and (92,183,243) in the reference from the same table. Fitting
     that transform away is worse than useless (a linear fit in gamma space
     skews whichever colour is not the majority). Naming each pixel's palette
     token absorbs the profile shift exactly, and it is also what the question
@@ -261,7 +261,7 @@ def main():
 
     print(
         f"coastline  recall {recall:.4f}  precision {precision:.4f}  F1 {f1:.4f}"
-        f"   ({int(er.sum())} reference edge px, {int(en.sum())} navcore, "
+        f"   ({int(er.sum())} reference edge px, {int(en.sum())} manx, "
         f"{100.0 * (~keep).mean():.0f}% chrome-masked)"
     )
 
@@ -274,11 +274,11 @@ def main():
         h2, w2 = er.shape[0] * BLOCK, er.shape[1] * BLOCK
         base = (nav[:h2, :w2].astype(float) * 0.35 + 180 * 0.65).astype(np.uint8)
         base[up(dilate(er)) > 0] = [220, 0, 0]        # reference only
-        base[up(dilate(en)) > 0] = [0, 90, 220]       # navcore only
+        base[up(dilate(en)) > 0] = [0, 90, 220]       # manx only
         base[(up(dilate(er)) > 0) & (up(dilate(en)) > 0)] = [0, 0, 0]
         base[up((~keep).astype(np.float32)) > 0] = [225, 225, 225]
         Image.fromarray(base).save(out)
-        print(f"wrote {out}  (red = reference only, blue = navcore only, black = both)")
+        print(f"wrote {out}  (red = reference only, blue = manx only, black = both)")
     return 0
 
 

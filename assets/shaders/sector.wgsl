@@ -11,7 +11,9 @@ struct CameraUniform {
     pixels_per_meter: f32,
     px_per_point: f32,
     anchor_offset: vec2<f32>,
-    _pad: vec2<f32>,
+    // True bearing at the top of the screen; 0 when north-up.
+    view_rotation: f32,
+    _pad: f32,
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -32,7 +34,7 @@ struct Instance {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    // Pixels from the centre, y up (north, untilted).
+    // Pixels from the centre, y up the screen (north, when north-up).
     @location(0) local: vec2<f32>,
     @location(1) @interpolate(flat) shape: vec4<f32>,  // radius, width, start, end
     @location(2) @interpolate(flat) dash: vec2<f32>,
@@ -70,7 +72,10 @@ fn vs_main(@builtin(vertex_index) vi: u32, inst: Instance) -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = clip;
     out.local = local;
-    out.shape = vec4<f32>(inst.radius_px, inst.width_px, inst.bearings.x, inst.bearings.y);
+    // Sector bearings are true; `local` is in screen axes, so take the
+    // chart's turn off them.
+    let turn = camera.view_rotation;
+    out.shape = vec4<f32>(inst.radius_px, inst.width_px, inst.bearings.x - turn, inst.bearings.y - turn);
     out.dash = inst.dash_px;
     out.color_index = inst.color_index;
     out.kind = inst.kind;

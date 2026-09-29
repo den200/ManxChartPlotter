@@ -31,12 +31,13 @@ const OBJL_LNDARE: u16 = 71;
 /// The name the basemap goes by in the catalogue. Not a file: the chart
 /// loader recognises it and takes the bytes from [`senc`].
 pub fn path() -> PathBuf {
-    PathBuf::from("navcore:world-basemap")
+    PathBuf::from("manx:world-basemap")
 }
 
 /// Whether a catalogue entry is the basemap.
 pub fn is_basemap(path: &Path) -> bool {
-    path == Path::new("navcore:world-basemap")
+    // Or the id it had before the rename, in a catalogue cached then.
+    path == Path::new("manx:world-basemap") || path == Path::new("navcore:world-basemap")
 }
 
 /// The basemap as SENC bytes, built on first use (a few tenths of a second)

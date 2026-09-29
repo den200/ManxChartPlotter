@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- manx as a NativeActivity: no Java code, the app is libmanx.so.
+     debuggable so `adb shell run-as` can read its log while it is a test
+     build; extractNativeLibs so a helper shipped as lib*.so is a real file
+     that can be executed (the o-charts helper, later). Fullscreen: the
+     plotter's menu bar sat under the status bar, where taps go to Android. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.navcore.plotter"
+    android:versionCode="1"
+    android:versionName="0.4.0">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-feature android:name="android.hardware.vulkan.level" android:required="false" />
+
+    <application
+        android:label="Manx"
+        android:hasCode="false"
+        android:debuggable="true"
+        android:extractNativeLibs="true">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|keyboard|navigation|touchscreen|uiMode|density">
+            <!-- touchscreen: a USB touch panel that drops off the bus and comes
+                 back flips Configuration.touchscreen, and an activity that does
+                 not declare it is torn down and restarted each time — a black
+                 screen while it rebuilds. Seen on the Odroid C5's eGalax. -->
+            <meta-data android:name="android.app.lib_name" android:value="manx" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

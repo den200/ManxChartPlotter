@@ -46,7 +46,7 @@ pub fn text_width_px(text: &str, scale: f32, bold: bool, space: u8) -> f32 {
 /// Neither 2 nor 3 changes the *pitch* — 3 means the label may break across
 /// lines, and 1 means it is stretched to fit between two positions. qutenav
 /// names them `{Fit = 1, Standard = 2, Wrapped = 3}` and implements 2 and 3
-/// identically, warning on 1. navcore does the same; wrapping is a layout
+/// identically, warning on 1. Manx does the same; wrapping is a layout
 /// feature nothing in the tables needs yet, and s52plib ignores the field
 /// entirely.
 pub const SPACE_STANDARD: u8 = 2;
@@ -371,7 +371,7 @@ const SOUNDING_SYMBOL_SCALE: f32 = 1.16;
 /// Whether to portray soundings with the S-52 digit symbols.
 ///
 /// Off by default, and the reason is the symbol atlas, not the procedure.
-/// navcore's atlas is OpenCPN's `rastersymbols-day.png` copied verbatim: a
+/// Manx's atlas is OpenCPN's `rastersymbols-day.png` copied verbatim: a
 /// sheet of glyphs drawn for 1:1 display at 96 dpi, in which a sounding digit
 /// is 6x10px with an antialiasing halo baked in. The renderer magnifies it 2.5x
 /// to reach chart size, which turns that halo into a pale fringe and blends the
@@ -383,10 +383,10 @@ const SOUNDING_SYMBOL_SCALE: f32 = 1.16;
 /// fixes this for *every* symbol on the chart, not just soundings; the digit
 /// symbols in particular are `<definition>R</definition>` — raster-only — so
 /// they would need upscaling rather than re-rendering. Until then this is
-/// available with `NAVCORE_SOUNDING_SYMBOLS=1` for comparison.
+/// available with `MANX_SOUNDING_SYMBOLS=1` for comparison.
 pub fn sounding_symbols_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("NAVCORE_SOUNDING_SYMBOLS").is_ok_and(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var("MANX_SOUNDING_SYMBOLS").is_ok_and(|v| v != "0"))
 }
 
 /// Turn decluttered soundings into the S-52 digit symbols that portray them.
@@ -414,6 +414,7 @@ pub fn layout_sounding_symbols(
                 // symbols proper; priority 6 is where S-52 puts them.
                 disp_prio: 6,
                 scale: s.scale * SOUNDING_SYMBOL_SCALE / 1.8,
+                true_bearing: 0,
             });
         }
     }

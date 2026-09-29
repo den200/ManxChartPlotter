@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Sample the Pi once a second while navcore runs; one CSV row per sample.
+"""Sample the Pi once a second while manx runs; one CSV row per sample.
 
-Runs on the Pi, started by pi-trace.sh:  pi_sampler.py <navcore-pid> <out.csv>
-Exits when navcore does. Each row is fsync'd, so a GPU hang that takes the
+Runs on the Pi, started by pi-trace.sh:  pi_sampler.py <manx-pid> <out.csv>
+Exits when manx does. Each row is fsync'd, so a GPU hang that takes the
 desktop down (or a hard lock) still leaves everything up to the last second.
 
 GPU busy % comes from the v3d driver's cumulative per-queue runtimes
@@ -23,7 +23,7 @@ PAGE_MB = os.sysconf("SC_PAGE_SIZE") / 1e6
 
 COLUMNS = [
     "time", "cpu_pct", "load1", "mem_avail_mb", "zram_used_mb",
-    "navcore_cpu_pct", "navcore_rss_mb", "navcore_threads",
+    "manx_cpu_pct", "manx_rss_mb", "manx_threads",
     "gpu_render_pct", "gpu_bin_pct", "gpu_jobs_s",
     "temp_c", "arm_mhz", "v3d_mhz", "core_v", "ext5v_v", "throttled",
 ]

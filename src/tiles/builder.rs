@@ -112,7 +112,7 @@ pub fn should_render_at_scale_ex(
     // s52plib.cpp gates this on an exemption list and uses a factor of 4. The
     // exemptions are the classes that describe the water and the land itself —
     // applying the rule to them empties the chart of exactly the features a
-    // mariner needs most. navcore applied it to everything at factor 2, which
+    // mariner needs most. Manx applied it to everything at factor 2, which
     // is what erased the dredged basins inside Brondby Havn: the harbour cell is
     // 1:4000, its DRGAREs carry no SCAMIN, and 2 x 4000 is a closer zoom than
     // the harbour is normally viewed at.
@@ -303,9 +303,18 @@ impl TilePacket {
             + bg_pattern_bytes;
     }
 
-    /// Check if packet is empty
+    /// Whether the packet draws nothing at all.
+    ///
+    /// Every buffer counts, the background ones included. A tile whose only
+    /// content is a coarser chart's land (the finer chart in it charting
+    /// nothing there) has all of it in `bg_area_vertices`; leaving those out
+    /// marked the tile known-empty, and it showed as a tile-sized square of
+    /// sea cut into the land.
     pub fn is_empty(&self) -> bool {
         self.area_vertices.is_empty()
+            && self.bg_area_vertices.is_empty()
+            && self.pattern_vertices.is_empty()
+            && self.bg_pattern_vertices.is_empty()
             && self.line_batches.is_empty()
             && self.symbol_instances.is_empty()
             && self.text_instances.is_empty()
@@ -349,7 +358,7 @@ pub struct TileBuilder<'a> {
     view_center_x: f32,
     /// Camera center in global Mercator meters
     view_center_y: f32,
-    /// Provenance log for `navcore --dump-scene`. `None` in normal rendering,
+    /// Provenance log for `manx --dump-scene`. `None` in normal rendering,
     /// so the instrumentation costs nothing.
     pub scene_log: Option<std::sync::Mutex<super::scene::SceneLog>>,
 }
@@ -452,6 +461,33 @@ impl TileBuilder<'_> {
                 let (min_y, max_y) = (t[0][1].min(t[1][1]).min(t[2][1]), t[0][1].max(t[1][1]).max(t[2][1]));
                 min_x <= bounds.max_x && max_x >= bounds.min_x && min_y <= bounds.max_y && max_y >= bounds.min_y
             })
+    }
+
+    /// Whether the chart's declared coverage fills `rect`.
+    ///
+    /// Sampled on a 17 × 17 lattice, corners included — 1/16 of the rect
+    /// between samples. Wrong in the safe direction only when it errs: a
+    /// sample outside the coverage keeps a coarser chart under this one,
+    /// which costs overdraw, never a hole. A chart that declares no coverage
+    /// is taken at its extent, as the quilt always did.
+    fn coverage_fills(&self, info: &ChartInfo, rect: &TileBounds) -> bool {
+        if rect.max_x <= rect.min_x || rect.max_y <= rect.min_y {
+            return true;
+        }
+        let Ok(chart) = self.load_chart(info) else { return true };
+        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
+        let coverage = self.coverage_for(info.id, &chart, ref_mx, ref_my);
+        if coverage.is_empty() {
+            return true;
+        }
+        const N: usize = 16;
+        (0..=N).all(|i| {
+            let x = rect.min_x + (rect.max_x - rect.min_x) * i as f64 / N as f64;
+            (0..=N).all(|j| {
+                let y = rect.min_y + (rect.max_y - rect.min_y) * j as f64 / N as f64;
+                point_in_any_triangle([x, y], &coverage)
+            })
+        })
     }
 
     /// The chart's coverage tessellation, computed once per chart.
@@ -587,7 +623,7 @@ impl<'a> TileBuilder<'a> {
         }
     }
 
-    /// Collect scene provenance while building (`navcore --dump-scene`).
+    /// Collect scene provenance while building (`manx --dump-scene`).
     pub fn with_scene_log(mut self) -> Self {
         self.scene_log = Some(std::sync::Mutex::new(super::scene::SceneLog::new()));
         self
@@ -944,7 +980,7 @@ impl<'a> TileBuilder<'a> {
         tile_id: TileId,
         include_lines: bool,
     ) -> Result<TilePacket, BuildError> {
-        let profile = std::env::var("NAVCORE_PROFILE")
+        let profile = std::env::var("MANX_PROFILE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         let build_start = profile.then(Instant::now);
@@ -952,11 +988,13 @@ impl<'a> TileBuilder<'a> {
         // Select charts appropriate to this tile's display scale so zoomed-out
         // tiles don't aggregate the full detail of every overlapping large-scale
         // chart (see ChartCatalog::charts_for_tile_scaled).
-        let tile_scale_denom =
-            super::meters_per_pixel(tile_id.z) * (self.view_ppmm as f64) * 1000.0;
-        let charts = self.catalog.charts_for_tile_where(&bounds, tile_scale_denom, &|info| {
-            self.has_coverage_in(info, &bounds)
-        });
+        let tile_scale_denom = super::tile_scale_denominator(tile_id, self.view_ppmm as f64);
+        let charts = self.catalog.charts_for_tile_where(
+            &bounds,
+            tile_scale_denom,
+            &|info| self.has_coverage_in(info, &bounds),
+            &|info, part| self.coverage_fills(info, part),
+        );
 
         if log::log_enabled!(log::Level::Debug) {
             log::debug!("=== TILE {:?} ===", tile_id);
@@ -1004,8 +1042,23 @@ impl<'a> TileBuilder<'a> {
         let load_start = profile.then(Instant::now);
 
         // Process charts in scale order (small scale first = background)
-        // Skip charts that fail to load - some may have parsing issues
-        for info in charts.into_iter().take(Self::MAX_CHARTS_PER_TILE) {
+        // Skip charts that fail to load - some may have parsing issues.
+        //
+        // Over the cap, the coarsest go, not the finest: the list is ordered
+        // coarse to fine, and taking its head threw away the very charts the
+        // tile was built for. The world basemap, first of all, stays — it
+        // is a handful of polygons and the only land outside the charts.
+        let charts = if charts.len() > Self::MAX_CHARTS_PER_TILE {
+            let (world, rest): (Vec<_>, Vec<_>) = charts
+                .into_iter()
+                .partition(|c| crate::s57::basemap::is_basemap(&c.path));
+            let keep = Self::MAX_CHARTS_PER_TILE.saturating_sub(world.len());
+            let skip = rest.len().saturating_sub(keep);
+            world.into_iter().chain(rest.into_iter().skip(skip)).collect()
+        } else {
+            charts
+        };
+        for info in charts.into_iter() {
             let chart = match self.load_chart(info) {
                 Ok(chart) => Some(chart),
                 Err(e) => {
@@ -1071,6 +1124,29 @@ impl<'a> TileBuilder<'a> {
 
             // A chart is "background" when a finer-scale chart shares the tile.
             let is_background = ctx.info.native_scale > finest_scale;
+
+            // Zoomed in past what a 1:50 000 000 outline can honestly show,
+            // the basemap's land is no longer drawn: off Skåne it put the
+            // Swedish coast kilometres out over open water. What is not
+            // covered by a real chart is uncharted, and S-52 says to show it
+            // as such — NODTA, the "no data" grey — so the basemap lays that
+            // under the whole tile instead, and the charts draw over it.
+            if crate::s57::basemap::is_basemap(&ctx.info.path) && tile_scale_denom < NO_DATA_FINER_THAN {
+                if let Some(nodta) = self.s52_engine.and_then(|e| e.get_color_index("NODTA")) {
+                    let vert_start = packet.area_vertices.len();
+                    let pat_start = packet.pattern_vertices.len();
+                    packet.area_vertices.extend(no_data_quad(&bounds, nodta as u32));
+                    all_area_ranges.push((
+                        0,
+                        is_background,
+                        vert_start,
+                        packet.area_vertices.len(),
+                        pat_start,
+                        pat_start,
+                    ));
+                    continue;
+                }
+            }
 
             // Process area features with spatial prefilter
             let area_stats = self.build_areas(
@@ -1664,7 +1740,7 @@ impl<'a> TileBuilder<'a> {
                 // DRGARE (dredged area) and DEPARE share LUP group 1 → priority 0
                 // in S-52. OpenCPN's razRules 2-D table resolves the tie by LUP
                 // load order so DRGARE paints on top of the enclosing DEPARE.
-                // navcore collapses the tie to OSENC feature order, which makes
+                // Manx collapses the tie to OSENC feature order, which makes
                 // marina basins flip to the enclosing-DEPARE colour (DEPDW pale
                 // blue, which reads as "white"). Bump DRGARE by +1 so its shallow
                 // DEPVS shade always paints last.
@@ -3047,11 +3123,12 @@ impl<'a> TileBuilder<'a> {
             let sym_priority = resolved.priority;
 
             for (sym_i, symbol_id) in symbol_ids.into_iter().enumerate() {
-                let rotation = symbol_rotations
+                let rotation_deg = symbol_rotations
                     .get(sym_i)
                     .copied()
                     .flatten()
-                    .or(symbol_rotation_deg)
+                    .or(symbol_rotation_deg);
+                let rotation = rotation_deg
                     .map(|deg| (deg as f32) * (std::f32::consts::PI / 180.0))
                     .unwrap_or(0.0);
                 let sym_idx = packet.symbol_instances.len();
@@ -3061,6 +3138,9 @@ impl<'a> TileBuilder<'a> {
                     rotation,
                     disp_prio: sym_priority as u32,
                     scale: scamin_scale,
+                    // S-52 rotations are all from true north; a symbol given
+                    // none stands upright on the screen.
+                    true_bearing: rotation_deg.is_some() as u32,
                 });
                 all_symbol_priorities.push((sym_priority, sym_idx));
                 stats.instances_added += 1;
@@ -3188,7 +3268,7 @@ impl<'a> TileBuilder<'a> {
                         }
                         // A depth on an obstruction or wreck is a *sounding*.
                         // OBSTRN04 and WRECKS02 hand it to SNDFRM02, which
-                        // emits digit symbols; navcore draws soundings as text,
+                        // emits digit symbols; Manx draws soundings as text,
                         // so route it through the same layout instead of the
                         // label path. Otherwise it came out at label size and
                         // with a decimal point — "9.2" at twice the height of
@@ -3984,7 +4064,7 @@ fn light_sector_instances(
 
     // The arc belongs to the LIGHTS object and draws at that object's LUP
     // priority (Hazards, 8) — not a fixed level. A hardcoded 4 happened to
-    // sit above everything while navcore's priority ladder was shifted one
+    // sit above everything while Manx's priority ladder was shifted one
     // step low; with the correct S-52 numbering it fell under the line
     // symbology and the sector arcs vanished from the chart.
     let bearings = [s1.to_radians() as f32, s2.to_radians() as f32];
@@ -4058,6 +4138,22 @@ fn priority_offsets(prios: impl Iterator<Item = u8>) -> [u32; 11] {
 
 /// A global Mercator point relative to a tile's centre, the frame every
 /// position in a [`TilePacket`] is stored in.
+/// Finer than this display scale (1:N), the world basemap stops drawing its
+/// land and marks everything outside the real charts as "no data" instead.
+/// Natural Earth's 1:50m outline is roughly right at a few million; at a
+/// harbour scale it is kilometres off, and a wrong coast is worse than none.
+pub const NO_DATA_FINER_THAN: f64 = 2_000_000.0;
+
+/// Two triangles covering the whole tile in the given palette colour, at
+/// the lowest display priority, so any chart drawn in the tile covers them.
+/// A hair larger than the tile so neighbouring tiles leave no seam.
+fn no_data_quad(bounds: &TileBounds, color_index: u32) -> [AreaVertex; 6] {
+    let hw = ((bounds.max_x - bounds.min_x) * 0.5 * 1.001) as f32;
+    let hh = ((bounds.max_y - bounds.min_y) * 0.5 * 1.001) as f32;
+    let v = |x: f32, y: f32| AreaVertex { position: [x, y], color_index, disp_prio: 0, shade: 0.0 };
+    [v(-hw, -hh), v(hw, -hh), v(hw, hh), v(-hw, -hh), v(hw, hh), v(-hw, hh)]
+}
+
 pub fn tile_relative(global: [f64; 2], bounds: &TileBounds) -> [f32; 2] {
     let (ox, oy) = bounds.center();
     [(global[0] - ox) as f32, (global[1] - oy) as f32]
@@ -4273,6 +4369,24 @@ mod tests {
     /// re-bases each tile on `TileId::origin`. The two must agree exactly, and
     /// the offset must survive f32 at Danish latitudes to well under a
     /// millimetre — global Mercator in f32 would be 0.5 m out here.
+    #[test]
+    fn the_no_data_quad_covers_the_whole_tile() {
+        let (mx, my) = crate::tiles::latlon_to_mercator(55.9, 12.7);
+        let tile = TileId::from_mercator(mx, my, 12);
+        let b = tile.bounds();
+        let q = no_data_quad(&b, 7);
+        let (hw, hh) = (((b.max_x - b.min_x) * 0.5) as f32, ((b.max_y - b.min_y) * 0.5) as f32);
+        for corner in [[-hw, -hh], [hw, -hh], [hw, hh], [-hw, hh]] {
+            let reached = q.iter().any(|v| {
+                (v.position[0].abs() >= corner[0].abs()) && (v.position[1].abs() >= corner[1].abs())
+                    && v.position[0].signum() == corner[0].signum()
+                    && v.position[1].signum() == corner[1].signum()
+            });
+            assert!(reached, "corner {corner:?} not covered");
+        }
+        assert!(q.iter().all(|v| v.color_index == 7 && v.disp_prio == 0));
+    }
+
     #[test]
     fn tile_relative_positions_keep_millimetres() {
         let (mx, my) = crate::tiles::latlon_to_mercator(55.70333, 12.61457);

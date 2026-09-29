@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Manx (test)
+Comment=Start the latest deployed manx build, traced (~/manx-traces)
+# pi-run.sh restarts any running manx; on a failed start the log tail is
+# shown in a dialog instead of vanishing.
+Exec=bash -c 'out=$(bash ~/manx/deploy/pi-run.sh 2>&1) || zenity --error --title="manx did not start" --no-markup --text="$out"'
+Icon=applications-science
+Terminal=false
+Categories=Development;

@@ -222,7 +222,7 @@ fn worker_loop(
                 view_params,
                 generation: batch_generation,
             } => {
-                let profile = std::env::var("NAVCORE_PROFILE")
+                let profile = std::env::var("MANX_PROFILE")
                     .map(|v| v != "0" && !v.is_empty())
                     .unwrap_or(false);
                 let batch_start = profile.then(Instant::now);
@@ -258,9 +258,8 @@ fn worker_loop(
                     let mut needed: Vec<u64> = Vec::new();
                     let mut seen = std::collections::HashSet::new();
                     for &tile_id in &tiles {
-                        let scale = super::meters_per_pixel(tile_id.z)
-                            * (view_params.ppmm as f64)
-                            * 1000.0;
+                        let scale =
+                            super::tile_scale_denominator(tile_id, view_params.ppmm as f64);
                         for info in catalog.charts_for_tile_scaled(&tile_id.bounds(), scale) {
                             if seen.insert(info.id) {
                                 needed.push(info.id);

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Summarise a navcore trace session pulled from the Pi (deploy/pi-trace.sh).
+"""Summarise a manx trace session pulled from the Pi (deploy/pi-trace.sh).
 
     tools/pi_trace_report.py traces/pi/latest
     tools/pi_trace_report.py traces/pi/20260923-130501
 
 Prints: session info; min/avg/max of every system.csv column; throttle flags
-decoded; kernel errors, each with the navcore log lines and system samples of
-the seconds before it; navcore warnings, errors and panics.
+decoded; kernel errors, each with the manx log lines and system samples of
+the seconds before it; manx warnings, errors and panics.
 """
 import csv
 import math
@@ -80,8 +80,8 @@ def main(d: Path):
             print(f"  {t}  {decode(v)}")
 
     log = []
-    if (d / "navcore.log").exists():
-        for line in open(d / "navcore.log", errors="replace"):
+    if (d / "manx.log").exists():
+        for line in open(d / "manx.log", errors="replace"):
             m = LOG_TS.match(line)
             log.append((parse_ts(m.group(1)) if m else None, m.group(2) if m else None, line.rstrip()))
 
@@ -100,18 +100,18 @@ def main(d: Path):
             continue
         before = [l for (lt, _, l) in log if lt and t - WINDOW <= lt <= t]
         if before:
-            print(f"    navcore log in the {WINDOW.seconds} s before:")
+            print(f"    manx log in the {WINDOW.seconds} s before:")
             for l in before[-15:]:
                 print("     ", l)
         near = [r for r in rows if t - WINDOW <= parse_ts(r["time"]) <= t + timedelta(seconds=1)]
         for r in near:
             print(f"    {r['time'][11:23]} cpu {r['cpu_pct']}% gpu render {r['gpu_render_pct']}% "
                   f"bin {r['gpu_bin_pct']}% jobs/s {r['gpu_jobs_s']} temp {r['temp_c']} "
-                  f"rss {r['navcore_rss_mb']}MB v3d {r['v3d_mhz']}MHz")
+                  f"rss {r['manx_rss_mb']}MB v3d {r['v3d_mhz']}MHz")
 
     bad = [l for (_, lvl, l) in log if lvl in ("WARN", "ERROR")]
     tail = [l for (lt, _, l) in log if lt is None and l.strip()]
-    print(f"\n== navcore: {len(log)} lines, {len(bad)} WARN/ERROR")
+    print(f"\n== manx: {len(log)} lines, {len(bad)} WARN/ERROR")
     # One flood of the same message would bury everything else: group by the
     # message with its numbers blanked out, most frequent first.
     groups = {}

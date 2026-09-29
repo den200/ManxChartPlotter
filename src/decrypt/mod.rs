@@ -4,6 +4,8 @@
 //! ship as encrypted `.oesu` files, `oexserverd` decrypts them into SENC TLV streams, and
 //! the renderer consumes the SENC payload.  This module focuses purely on the first stage.
 
+#[cfg(target_os = "android")]
+mod android_id;
 mod error;
 mod keys;
 
@@ -21,7 +23,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 const PIPE_PATH: &str = "/tmp/OCPN_PIPEX";
-const RETURN_PIPE_PREFIX: &str = "/tmp/navcore_oex_";
+const RETURN_PIPE_PREFIX: &str = "/tmp/manx_oex_";
+/// Android's `oexserverd` has no FIFOs: it listens on this abstract Unix
+/// socket, takes the same 1025-byte request, and answers on the connection.
+#[cfg(target_os = "android")]
+const ANDROID_SOCKET: &str = "com.opencpn.ocharts_pi";
 const CMD_READ_ESENC: u8 = 0;
 const CMD_EXIT: u8 = 2;
 const CMD_READ_OESU: u8 = 8;
@@ -33,7 +39,7 @@ const MAX_REQUESTS_BEFORE_RESTART: u32 = 25;
 /// Typical usage:
 ///
 /// ```no_run
-/// use navcore2::{ChartDecryptor, KeyStore};
+/// use manx::{ChartDecryptor, KeyStore};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut keys = KeyStore::new();
 /// keys.load_keylists_in_dir("charts/oeuSENC-DK-2025-1-20-base-macbook")?;
@@ -166,8 +172,7 @@ impl ChartDecryptor {
     }
 
     fn ensure_running(&mut self) -> DecryptResult<()> {
-        let pipe_ready = Path::new(PIPE_PATH).exists();
-        if self.process.is_some() && pipe_ready {
+        if self.process.is_some() && daemon_ready() {
             return Ok(());
         }
 
@@ -197,7 +202,6 @@ impl ChartDecryptor {
     }
 
     fn request_raw(&mut self, chart_path: &Path, install_key: &str) -> DecryptResult<Vec<u8>> {
-        let return_pipe = create_return_pipe()?;
         let cmd = if chart_path
             .extension()
             .map(|ext| ext.eq_ignore_ascii_case("oesu"))
@@ -208,6 +212,13 @@ impl ChartDecryptor {
             CMD_READ_ESENC
         };
 
+        #[cfg(target_os = "android")]
+        {
+            let message = OexMessage::new(cmd, Path::new(""), chart_path, install_key)?;
+            return android_request(&message);
+        }
+        #[allow(unreachable_code)]
+        let return_pipe = create_return_pipe()?;
         let message = OexMessage::new(cmd, &return_pipe, chart_path, install_key)?;
         write_message(&message)?;
         let data = read_return_pipe(&return_pipe)?;
@@ -267,6 +278,9 @@ fn looks_like_directory(path: &Path) -> bool {
 
 fn generate_fpr_into(binary: &Path, destination: &Path) -> DecryptResult<PathBuf> {
     fs::create_dir_all(destination)?;
+    if cfg!(target_os = "android") {
+        return generate_android_fpr_into(binary, destination);
+    }
     let temp_dir = tempdir()?;
     let temp_path = temp_dir.path();
 
@@ -309,6 +323,54 @@ fn generate_fpr_into(binary: &Path, destination: &Path) -> DecryptResult<PathBuf
     let destination_path = destination.join(file_name);
     move_or_copy(&source, &destination_path)?;
     Ok(destination_path)
+}
+
+/// Android's `oexserverd` writes no file: it prints `timestamp;HEX`, the hex
+/// being the same bytes a desktop `.fpr` holds. Given a Widevine ID (`-y`) it
+/// is asked with `-k` and the file is named `oc04R_<timestamp>.fpr`; given
+/// another ID (`-z`), with `-g` and `oc03R_` — as o-charts' own Android
+/// clients name the two kinds.
+///
+/// Without an ID there is no fingerprint: the helper would make one with an
+/// empty identity, and registering that would spend a licence slot on
+/// nothing that identifies this device.
+fn generate_android_fpr_into(binary: &Path, destination: &Path) -> DecryptResult<PathBuf> {
+    let (flag, id) = android_device_id()?;
+    let (action, prefix) = if flag == "-y" { ("-k", "oc04R_") } else { ("-g", "oc03R_") };
+    let output = run_oex_cli(binary, &[flag.to_string(), id.to_string(), action.to_string()])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (stamp, bytes) = parse_android_fpr(&stdout).ok_or_else(|| {
+        DecryptError::Process(format!(
+            "Fingerprint generation failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    })?;
+    let path = destination.join(format!("{prefix}{stamp}.fpr"));
+    fs::write(&path, bytes)?;
+    Ok(path)
+}
+
+/// The flag and value that identify this device to the Android helper.
+fn android_device_id() -> DecryptResult<(&'static str, &'static str)> {
+    #[cfg(target_os = "android")]
+    return android_id::device_id()
+        .map(|id| (id.flag(), id.value()))
+        .ok_or_else(|| DecryptError::Process("no device ID to give o-charts".into()));
+    #[allow(unreachable_code)]
+    Err(DecryptError::Process("no Android device ID off Android".into()))
+}
+
+fn parse_android_fpr(stdout: &str) -> Option<(&str, Vec<u8>)> {
+    let line = stdout.lines().map(str::trim).find(|l| l.contains(';'))?;
+    let (stamp, hex) = line.split_once(';')?;
+    if stamp.is_empty() || !stamp.bytes().all(|b| b.is_ascii_digit()) || hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    (!bytes.is_empty()).then_some((stamp, bytes))
 }
 
 fn parse_generated_fpr_path(stdout: &str) -> Option<PathBuf> {
@@ -385,7 +447,7 @@ fn run_oex_cli(binary: &Path, args: &[String]) -> DecryptResult<Output> {
             command.env("DYLD_LIBRARY_PATH", dir);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             command.env("LD_LIBRARY_PATH", dir);
         }
@@ -494,7 +556,7 @@ fn wait_for_pipe(child: &mut Child) -> DecryptResult<()> {
     let timeout = Duration::from_secs(5);
 
     while start.elapsed() < timeout {
-        if Path::new(PIPE_PATH).exists() {
+        if daemon_ready() {
             return Ok(());
         }
 
@@ -513,7 +575,51 @@ fn wait_for_pipe(child: &mut Child) -> DecryptResult<()> {
     })
 }
 
+/// Whether the daemon is taking requests: its FIFO exists, or on Android its
+/// socket answers.
+fn daemon_ready() -> bool {
+    #[cfg(target_os = "android")]
+    return android_connect().is_ok();
+    #[allow(unreachable_code)]
+    Path::new(PIPE_PATH).exists()
+}
+
+#[cfg(target_os = "android")]
+fn android_connect() -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::android::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(ANDROID_SOCKET)?;
+    std::os::unix::net::UnixStream::connect_addr(&addr)
+}
+
+/// One request over the socket: the message out, and the reply read until
+/// the daemon closes the connection.
+#[cfg(target_os = "android")]
+fn android_request(message: &OexMessage) -> DecryptResult<Vec<u8>> {
+    let mut stream = android_connect()?;
+    stream.set_read_timeout(Some(RETURN_TIMEOUT))?;
+    stream.write_all(&message.data)?;
+    stream.flush()?;
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).map_err(|e| match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => DecryptError::Timeout {
+            operation: "oexserverd response",
+        },
+        _ => DecryptError::from(e),
+    })?;
+    Ok(reply)
+}
+
 fn send_exit_command() -> DecryptResult<()> {
+    #[cfg(target_os = "android")]
+    {
+        let mut msg = [0u8; 1025];
+        msg[0] = CMD_EXIT;
+        if let Ok(mut stream) = android_connect() {
+            stream.write_all(&msg)?;
+        }
+        return Ok(());
+    }
+    #[allow(unreachable_code)]
     if !Path::new(PIPE_PATH).exists() {
         return Ok(());
     }
@@ -619,7 +725,7 @@ fn resolve_oeserverd_binary() -> DecryptResult<PathBuf> {
     }
 
     if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".navcore/decoder").join(exe_name));
+        candidates.push(PathBuf::from(home).join(".manx/decoder").join(exe_name));
     }
 
     candidates.push(PathBuf::from("/usr/local/bin").join(exe_name));
@@ -657,8 +763,16 @@ fn build_spawn_command(binary: &Path, fpr_path: &Path) -> DecryptResult<Command>
         Command::new(binary)
     };
 
-    command.args(["-d", "-f"]);
-    command.arg(fpr_path);
+    // Android's daemon takes no fingerprint file: it is given the same
+    // device ID the fingerprint was made from. The desktop ones are told
+    // which fingerprint to use.
+    if cfg!(target_os = "android") {
+        let (flag, id) = android_device_id()?;
+        command.args([flag, id]);
+    } else {
+        command.args(["-d", "-f"]);
+        command.arg(fpr_path);
+    }
 
     if let Some(dir) = binary.parent() {
         #[cfg(target_os = "macos")]
@@ -666,7 +780,7 @@ fn build_spawn_command(binary: &Path, fpr_path: &Path) -> DecryptResult<Command>
             command.env("DYLD_LIBRARY_PATH", dir);
         }
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             command.env("LD_LIBRARY_PATH", dir);
         }
@@ -686,6 +800,16 @@ fn format_exit(status: ExitStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_android_fingerprint_line() {
+        let (stamp, bytes) = parse_android_fpr("1790334623;0D626C79\n").unwrap();
+        assert_eq!(stamp, "1790334623");
+        assert_eq!(bytes, vec![0x0D, 0x62, 0x6C, 0x79]);
+        assert!(parse_android_fpr("no fingerprint here").is_none());
+        assert!(parse_android_fpr("1790334623;0D6").is_none());
+        assert!(parse_android_fpr("abc;0D62").is_none());
+    }
 
     #[test]
     fn detects_missing_senc_header() {

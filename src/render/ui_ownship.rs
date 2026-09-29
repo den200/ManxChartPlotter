@@ -16,14 +16,14 @@
 //!   entirely upstream: a boat sitting confidently on a chart while the GPS is
 //!   dead is the worst thing a plotter can draw.
 
-use egui::{Color32, Context, FontId, Pos2, Stroke, Vec2};
+use egui::{Context, FontId, Pos2, Stroke, Vec2};
 
 /// Everything the overlay needs, resolved by the renderer which owns the camera.
 #[derive(Debug, Clone, Copy)]
 pub struct OwnShip {
     /// Where the boat is on screen, in logical points.
     pub screen: [f32; 2],
-    /// Heading, radians clockwise from screen-up (north).
+    /// Heading, radians clockwise from screen-up (north, when north-up).
     pub heading: Option<f32>,
     /// Course over ground, same convention.
     pub cog: Option<f32>,
@@ -53,13 +53,8 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
 
     // Same ink as the AIS overlay: near-black on the day chart would vanish
     // against the dusk and night palettes.
-    let line = if ship.stale {
-        Color32::from_gray(140)
-    } else if ctx.style().visuals.dark_mode {
-        Color32::from_gray(225)
-    } else {
-        Color32::from_rgb(30, 30, 30)
-    };
+    let theme = crate::render::theme::current();
+    let line = if ship.stale { theme.ink_dim } else { theme.ink };
 
     // Course vector first, so the hull sits on top of it.
     if let (Some(cog), Some(sog)) = (ship.cog, ship.sog) {
@@ -107,7 +102,7 @@ pub fn draw(ctx: &Context, ship: &OwnShip) {
             egui::Align2::CENTER_CENTER,
             "NO FIX",
             FontId::proportional(11.0),
-            Color32::from_rgb(210, 130, 60),
+            crate::render::theme::current().amber,
         );
     }
 }

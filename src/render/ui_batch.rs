@@ -59,14 +59,20 @@ impl Batch {
         self.mesh.reserve_triangles(shapes * 6);
     }
 
+    /// Nothing to draw: no triangles. Not egui's `Mesh::is_empty`, which is
+    /// true only when there are no vertices *either* — a wind wash whose
+    /// corners had data but no whole cell did left vertices and no
+    /// triangles, and egui_wgpu panics on the empty index slice ("Buffer
+    /// slices can not be empty"), which took the plotter down on the Pi.
     pub fn is_empty(&self) -> bool {
-        self.mesh.is_empty()
+        self.mesh.indices.is_empty()
     }
 
     /// Hand the batch to egui. Nothing is drawn for an empty one — an empty
-    /// mesh still costs a draw call.
+    /// mesh still costs a draw call, and one with vertices but no triangles
+    /// crashes the renderer.
     pub fn paint(self, painter: &Painter) {
-        if !self.mesh.is_empty() {
+        if !self.is_empty() {
             painter.add(Shape::Mesh(self.mesh));
         }
     }
@@ -86,7 +92,7 @@ impl Batch {
     /// painter — the clip rectangle comes from this call, not from the
     /// booking.
     pub fn paint_at(self, painter: &Painter, idx: ShapeIdx) {
-        if !self.mesh.is_empty() {
+        if !self.is_empty() {
             painter.set(idx, Shape::Mesh(self.mesh));
         }
     }
@@ -341,6 +347,19 @@ mod tests {
     #[test]
     fn an_empty_batch_holds_nothing() {
         assert!(batch().is_empty());
+    }
+
+    /// The Pi crash: a wind wash where corners had data but no whole cell
+    /// did. Vertices, no triangles — which must count as nothing to draw, or
+    /// egui_wgpu panics on an empty index slice.
+    #[test]
+    fn a_grid_with_no_whole_cell_is_nothing_to_draw() {
+        let mut b = batch();
+        let at = [[0.0, 0.0], [10.0, 0.0], [0.0, 10.0], [10.0, 10.0]];
+        let c = Some(Color32::RED);
+        b.grid(&at, 2, 2, &[c, c, c, None]);
+        assert!(!b.mesh.vertices.is_empty());
+        assert!(b.is_empty());
     }
 
     /// A line is three quads across: the feather, the core, the feather.

@@ -1,6 +1,6 @@
 //! The o-charts chart store: sign in, see what the account owns, download it.
 //!
-//! navcore reads o-charts cells, so it should be able to fetch them too rather
+//! Manx reads o-charts cells, so it should be able to fetch them too rather
 //! than sending the user to another program. The account, the entitlements and
 //! the machine assignment all live on o-charts' server; this is a client for
 //! that server, written from the protocol as observed, sharing no code with the
@@ -8,7 +8,7 @@
 //!
 //! What this does **not** do: it does not decrypt anything, and it does not
 //! forge entitlement. Cells arrive encrypted, and opening them still needs the
-//! machine's own licence and the vendor's `oexserverd` — the same path navcore
+//! machine's own licence and the vendor's `oexserverd` — the same path Manx
 //! already uses to read the charts on disk today.
 //!
 //! Sequence, once per machine:
@@ -36,7 +36,7 @@ use std::path::Path;
 /// This machine, as the shop knows it.
 ///
 /// The fingerprint is produced by the vendor's `oexserverd`, which is also what
-/// decrypts the cells — navcore already runs it, so the file usually exists
+/// decrypts the cells — Manx already runs it, so the file usually exists
 /// before the shop is ever opened.
 pub struct Fingerprint {
     pub bytes: Vec<u8>,

@@ -13,12 +13,13 @@
 //! - [`wxroute`] — the weather-routing job: forecast + polar + charts (M5)
 //! - [`angles`] — BAM u16 angles, where wraparound bugs go to die
 //!
-//! Steering data leaves navcore over **Signal K only** — Den's call, no NMEA
+//! Steering data leaves Manx over **Signal K only** — Den's call, no NMEA
 //! double work. The route resources side lives in `signalk::resources`.
 //!
 //! Nothing in here draws. The chart rendering of routes is a separate task
 //! that consumes this data model, which is exactly how the spec scopes it.
 
+pub mod alarms;
 pub mod angles;
 pub mod autoroute;
 pub mod currents;
@@ -26,6 +27,7 @@ pub mod follow;
 pub mod gpx;
 pub mod grib;
 pub mod isochrone;
+pub mod logbook;
 pub mod orc;
 pub mod pointfx;
 pub mod polar;

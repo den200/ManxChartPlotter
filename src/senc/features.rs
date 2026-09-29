@@ -20,12 +20,12 @@ use super::records::{ObjectClass, RecordType, SencHeader};
 /// and go through [`s57_attribute_code`]. The table must stay sorted by code —
 /// a test asserts it, and both lookups binary-search.
 ///
-/// Completeness matters more than it looks. navcore named 51 of these, and 34
+/// Completeness matters more than it looks. Manx named 51 of these, and 34
 /// of the 60 acronyms the lookup tables key on were among the missing: every
 /// LUP row selecting on CATLMK, CATSPM, CATHAF, NATSUR and the rest could
 /// never match, so those features fell through to their class default symbol.
 /// The conformance harness could not see it either, because it feeds the
-/// OpenCPN oracle the attributes navcore parsed — both engines agreed, on the
+/// OpenCPN oracle the attributes Manx parsed — both engines agreed, on the
 /// same incomplete input.
 const S57_ATTRIBUTES: &[(u16, &str)] = &[
     (1, "AGENCY"), // Agency responsible for production
@@ -353,7 +353,7 @@ fn s57_attributes_by_name() -> &'static [(&'static str, u16)] {
     })
 }
 
-/// Acronym for an S-57 attribute code, or `None` if navcore has no name for it.
+/// Acronym for an S-57 attribute code, or `None` if Manx has no name for it.
 pub fn s57_attribute_name(code: u16) -> Option<&'static str> {
     S57_ATTRIBUTES
         .binary_search_by_key(&code, |(c, _)| *c)
@@ -367,7 +367,7 @@ pub fn s57_attribute_name(code: u16) -> Option<&'static str> {
 /// comparisons, no allocation and no hashing, against a `HashMap<String, _>`
 /// that had to allocate the key at parse time and hash it at every lookup.
 ///
-/// Returning `None` is the same answer navcore gave before: an attribute the
+/// Returning `None` is the same answer Manx gave before: an attribute the
 /// table does not name was stored under a placeholder key that no lookup could
 /// match either.
 pub fn s57_attribute_code(name: &str) -> Option<u16> {
@@ -438,7 +438,7 @@ impl Attributes {
         self.0.iter().map(|(c, v)| (*c, v))
     }
 
-    /// Attributes navcore has a name for, as (acronym, value). Anything the
+    /// Attributes Manx has a name for, as (acronym, value). Anything the
     /// table does not name is skipped — it was unreachable by name anyway.
     pub fn iter(&self) -> impl Iterator<Item = (&'static str, &AttributeValue)> {
         self.0
