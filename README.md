@@ -1,6 +1,6 @@
 # Manx
 
-A fast, light chart plotter for the Raspberry Pi, Linux, macOS and Android.
+A fast, light chart plotter for the Raspberry Pi, Linux, macOS, Windows and Android.
 
 **Beta. Not for navigation.** [Download](https://github.com/den200/manx/releases/latest) · [Features](#features) · [Screenshots](#screenshots) · [Performance](#performance)
 
@@ -61,7 +61,7 @@ Measured with `MANX_PROFILE=1 MANX_STRESS=coast` and the rig's sampler ([doc/pi5
 - **Linux** PCs (x86_64)
 - **macOS** (Apple silicon)
 - **Android** (64-bit ARM, like the ODROID-C5)
-- **Windows**: experimental, free charts only for now
+- **Windows** (x86_64): free charts for now; o-charts not yet
 
 Unpack and run `manx`. Setup and o-charts: [deploy/INSTALL.md](deploy/INSTALL.md).
 

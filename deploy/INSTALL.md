@@ -8,7 +8,7 @@ Unpack the download anywhere and run `manx` (`manx.exe` on Windows). Keep the `a
 
 - **Raspberry Pi 5 / Odroid:** Raspberry Pi OS (Bookworm or Trixie) or any 64-bit ARM Linux with a Vulkan driver. The Pi's standard desktop has one.
 - **macOS:** the app is not signed yet. The first time, right-click `manx` and choose Open, or run `xattr -dr com.apple.quarantine .` in the unpacked folder.
-- **Windows:** experimental. Free charts only for now.
+- **Windows:** free charts work; o-charts are not supported on Windows yet.
 
 ## Charts
 
