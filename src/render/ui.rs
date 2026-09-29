@@ -314,7 +314,7 @@ mod chart_folder_tests {
     /// is drawn sixty times a second and a chart set is six hundred entries.
     #[test]
     fn a_folder_is_read_once_and_then_left_alone() {
-        let dir = std::env::temp_dir().join("navcore-chart-folder-test");
+        let dir = std::env::temp_dir().join("manx-chart-folder-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("Denmark")).unwrap();
         std::fs::create_dir_all(dir.join(".hidden")).unwrap();
@@ -657,14 +657,14 @@ impl Default for DisplayView {
 pub const DEFAULT_WEATHER_OPACITY: f32 = 0.55;
 
 impl DisplayView {
-    /// Apply these choices to `base`. A setting pinned by a `NAVCORE_*`
+    /// Apply these choices to `base`. A setting pinned by a `MANX_*`
     /// variable is left alone, so a capture or a conformance run stays
     /// reproducible whatever the user last chose. `draft_m` is the boat's;
     /// zero means unknown, and then the manual depths are used.
     pub fn apply(&self, base: &crate::s52::MarinerSettings, draft_m: f64) -> crate::s52::MarinerSettings {
         let pinned = |k: &str| std::env::var(k).is_ok();
         let mut s = base.clone();
-        if !pinned("NAVCORE_DISPLAY_CAT") {
+        if !pinned("MANX_DISPLAY_CAT") {
             (s.show_standard, s.show_other) = match self.detail {
                 ChartDetail::Base => (false, false),
                 ChartDetail::Standard => (true, false),
@@ -679,16 +679,16 @@ impl DisplayView {
         } else {
             (self.safety_depth_m, self.safety_contour_m)
         };
-        if !pinned("NAVCORE_SAFETY_DEPTH") {
+        if !pinned("MANX_SAFETY_DEPTH") {
             s.safety_depth = depth;
         }
-        if !pinned("NAVCORE_SAFETY_CONTOUR") {
+        if !pinned("MANX_SAFETY_CONTOUR") {
             s.safety_contour = contour;
         }
-        if !pinned("NAVCORE_SHALLOW_CONTOUR") {
+        if !pinned("MANX_SHALLOW_CONTOUR") {
             s.shallow_contour = self.shallow_contour_m;
         }
-        if !pinned("NAVCORE_DEEP_CONTOUR") {
+        if !pinned("MANX_DEEP_CONTOUR") {
             s.deep_contour = self.deep_contour_m;
         }
         // S-52's order: shallow <= safety <= deep, and a safety contour no
@@ -769,7 +769,7 @@ impl Default for InstrumentView {
 
 /// A download awaiting the user's word.
 ///
-/// A lapsed subscription cannot have the shop's current edition, so navcore
+/// A lapsed subscription cannot have the shop's current edition, so Manx
 /// asks for an older one — a decision worth showing rather than making
 /// silently, because it is the user's licence and the user's money.
 #[derive(Debug, Clone, PartialEq)]
@@ -952,7 +952,7 @@ impl Ui {
     /// Does egui still have work to finish?
     ///
     /// It animates — a window fades in, a hover highlight grows — and it
-    /// reports how soon it wants the next frame. navcore only redraws on
+    /// reports how soon it wants the next frame. Manx only redraws on
     /// demand, so ignoring this froze every animation part-way: a panel that
     /// had faded to a third of its opacity simply stayed there, looking like a
     /// rendering fault rather than an unfinished fade.
@@ -1124,7 +1124,7 @@ impl Ui {
     }
 }
 
-/// navcore's look: bigger than egui's default, because this is read at arm's
+/// Manx's look: bigger than egui's default, because this is read at arm's
 /// length on a boat, often through spray and often through reading glasses.
 fn style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
@@ -1202,7 +1202,7 @@ fn android_keyboard(show: bool) {
         let vm = unsafe { jni::JavaVM::from_raw(context.vm().cast()) }?;
         let activity = unsafe { jni::objects::JObject::from_raw(context.context().cast()) };
         let mut env = vm.attach_current_thread()?;
-        // navcore's thread stays attached, so free this call's references.
+        // Manx's thread stays attached, so free this call's references.
         let shown = env.with_local_frame(16, |env| -> jni::errors::Result<()> {
             let name = env.new_string("input_method")?;
             let imm = env

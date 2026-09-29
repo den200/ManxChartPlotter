@@ -1,11 +1,11 @@
-//! Signal K route resources: publish navcore's routes, consume everyone
+//! Signal K route resources: publish Manx's routes, consume everyone
 //! else's.
 //!
 //! The v1 resources API is plain HTTP beside the WebSocket stream:
 //! `GET/PUT /signalk/v1/api/resources/routes[/{id}]`. A route resource is a
-//! GeoJSON `LineString` plus a name — which loses navcore's waypoint
-//! identities, so those ride in `feature.properties.navcore` where the spec
-//! allows arbitrary properties. A navcore route published and consumed again
+//! GeoJSON `LineString` plus a name — which loses Manx's waypoint
+//! identities, so those ride in `feature.properties.manx` where the spec
+//! allows arbitrary properties. A Manx route published and consumed again
 //! comes back with the same waypoint uuids and names; a route drawn by some
 //! other program gets fresh ones, which is all it can ask for.
 
@@ -70,7 +70,7 @@ pub fn route_to_resource(route: &Route, set: &WaypointSet) -> Value {
             "type": "Feature",
             "geometry": { "type": "LineString", "coordinates": coords },
             "properties": {
-                "navcore": { "waypointNames": names, "waypointGuids": guids }
+                "manx": { "waypointNames": names, "waypointGuids": guids }
             }
         }
     })
@@ -87,12 +87,15 @@ pub fn resource_to_route(resource_id: &str, value: &Value) -> Option<(Route, Vec
     if coords.len() < 2 {
         return None;
     }
-    let names = value
-        .pointer("/feature/properties/navcore/waypointNames")
-        .and_then(Value::as_array);
-    let guids = value
-        .pointer("/feature/properties/navcore/waypointGuids")
-        .and_then(Value::as_array);
+    // Under "manx", or "navcore" for routes published before the rename.
+    let ours = |field: &str| {
+        ["manx", "navcore"]
+            .iter()
+            .find_map(|k| value.pointer(&format!("/feature/properties/{k}/{field}")))
+            .and_then(Value::as_array)
+    };
+    let names = ours("waypointNames");
+    let guids = ours("waypointGuids");
 
     let mut route = Route::new(
         value
@@ -242,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_resource_without_navcore_properties_still_loads() {
+    fn a_foreign_resource_without_manx_properties_still_loads() {
         let foreign = serde_json::json!({
             "name": "qtVlm route",
             "feature": { "type": "Feature",

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- navcore as a NativeActivity: no Java code, the app is libnavcore.so.
+<!-- manx as a NativeActivity: no Java code, the app is libmanx.so.
      debuggable so `adb shell run-as` can read its log while it is a test
      build; extractNativeLibs so a helper shipped as lib*.so is a real file
      that can be executed (the o-charts helper, later). Fullscreen: the
@@ -13,7 +13,7 @@
     <uses-feature android:name="android.hardware.vulkan.level" android:required="false" />
 
     <application
-        android:label="navcore"
+        android:label="Manx"
         android:hasCode="false"
         android:debuggable="true"
         android:extractNativeLibs="true">
@@ -27,7 +27,7 @@
                  back flips Configuration.touchscreen, and an activity that does
                  not declare it is torn down and restarted each time — a black
                  screen while it rebuilds. Seen on the Odroid C5's eGalax. -->
-            <meta-data android:name="android.app.lib_name" android:value="navcore" />
+            <meta-data android:name="android.app.lib_name" android:value="manx" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

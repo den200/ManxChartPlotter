@@ -5,9 +5,9 @@
 //
 //     (object class, primitive, attributes)  ->  LUP + expanded rule list
 //
-// Features arrive as NDJSON on stdin (produced by `navcore --dump-features`),
+// Features arrive as NDJSON on stdin (produced by `manx --dump-features`),
 // the resolved instruction stream leaves as NDJSON on stdout. No chart I/O, no
-// OpenGL, no wx frame: the oracle never parses an ENC, so navcore and OpenCPN
+// OpenGL, no wx frame: the oracle never parses an ENC, so Manx and OpenCPN
 // are guaranteed to be resolving *the same* feature.
 //
 // Input line:
@@ -15,7 +15,7 @@
 // Output line:
 //   {"id":1,"obj":"DEPARE","prim":"A","lup":{...},"rules":[...],"expanded":[...]}
 //
-// Dev tool only — it links GPLv2 code and must never be shipped with navcore.
+// Dev tool only — it links GPLv2 code and must never be shipped with manx.
 
 #include <wx/wxprec.h>
 #include <wx/wx.h>
@@ -50,7 +50,7 @@ extern Cond condTable[];
 // UDWHAZ03 decides whether an obstruction/wreck/rock is an *isolated danger*
 // by asking the chart for the depth areas around it, through
 // chart_context::pt2GetAssociatedObjects. s52plib only forward-declares
-// s57chart, so the oracle supplies its own: navcore sends the surrounding
+// s57chart, so the oracle supplies its own: Manx sends the surrounding
 // DRVAL1/DRVAL2 values with each feature and this returns them as synthetic
 // S57Objs. Without it the procedure takes its no-chart branch and can never
 // confirm a danger.
@@ -252,7 +252,7 @@ struct Options {
   int zoom_modifier = 0;
   // OpenCPN config default is 0 (navutil.cpp `Read("bShowMeta", &v, 0)`).
   bool show_meta = false;
-  // ENC display category. navcore defaults to OTHER ("All"), which is what the
+  // ENC display category. Manx defaults to OTHER ("All"), which is what the
   // reference captures are taken with; the two must match or every OTHER-class
   // feature reads as a divergence that is really a configuration difference.
   DisCat display_cat = OTHER;
@@ -417,7 +417,7 @@ int main(int argc, char **argv) {
   }
 
   // Chart context. `chart` points at the association hook above, so UDWHAZ03
-  // sees whatever depth areas navcore reported around each feature. Features
+  // sees whatever depth areas Manx reported around each feature. Features
   // that arrive without an "assoc" block get an empty list, which is the same
   // answer as "this object is not inside any depth area".
   wxArrayPtrVoid floating_atons, rigid_atons;
@@ -447,7 +447,7 @@ int main(int argc, char **argv) {
     const mj::Value *vobj = rec.find("obj");
     const mj::Value *vprim = rec.find("prim");
     if (!vobj || !vprim) continue;
-    // Pass the id through verbatim (navcore emits "<chart>#<index>" strings).
+    // Pass the id through verbatim (Manx emits "<chart>#<index>" strings).
     std::string id_json;
     if (vid && vid->type == mj::Type::Str) {
       mj::esc(id_json, vid->str);
@@ -604,7 +604,7 @@ int main(int argc, char **argv) {
     out += ",\"expanded\":" + mj::strlist(expanded);
     // Which CS procedures ran. The differ uses this to flag results that
     // depend on chart context the oracle does not have (associated depth
-    // areas, floating/rigid ATON lists), so those are not read as navcore bugs.
+    // areas, floating/rigid ATON lists), so those are not read as Manx bugs.
     if (!cs_called.empty()) out += ",\"cs\":" + mj::strlist(cs_called);
     if (assoc_given) out += ",\"assoc_used\":true";
     if (!cs_missing.empty()) out += ",\"cs_missing\":" + mj::strlist(cs_missing);

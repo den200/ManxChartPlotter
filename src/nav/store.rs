@@ -2,12 +2,12 @@
 //!
 //! The files **are** the store — there is no database that the GPX merely
 //! mirrors. That was a decision, not a default: the files are readable by any
-//! other plotter as they sit, they survive navcore, and backup is `cp -r`.
+//! other plotter as they sit, they survive Manx, and backup is `cp -r`.
 //! One route per file, plus `waypoints.gpx` for the standalone marks. The
 //! directory sits beside `settings.json`, so everything a user would want to
-//! keep lives under one `navcore/` folder.
+//! keep lives under one `manx/` folder.
 //!
-//! Files navcore did not write are respected: on open, a foreign multi-route
+//! Files Manx did not write are respected: on open, a foreign multi-route
 //! file is split into store-shaped files and the original renamed aside — its
 //! content preserved across the copies, extensions and all — never rewritten
 //! in place.
@@ -71,14 +71,14 @@ pub struct RouteStore {
 impl RouteStore {
     /// The conventional location: beside `settings.json`.
     pub fn default_dir() -> Option<PathBuf> {
-        Some(dirs::config_dir()?.join("navcore").join("routes"))
+        Some(crate::paths::config_dir()?.join("routes"))
     }
 
     /// Open (creating if absent) the store at `dir` and load everything in it.
     ///
     /// A file that fails to parse is reported and skipped, never deleted or
     /// rewritten: an unreadable file is the user's data in trouble, and the
-    /// worst possible response is to make it navcore's data instead.
+    /// worst possible response is to make it Manx's data instead.
     pub fn open(dir: impl Into<PathBuf>) -> Result<(Self, Vec<StoreError>), StoreError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
@@ -168,7 +168,7 @@ impl RouteStore {
                 problems.push(StoreError::Io(e));
             } else {
                 log::info!(
-                    "route store: split {} into navcore files; original kept at {}",
+                    "route store: split {} into Manx files; original kept at {}",
                     path.display(),
                     aside.display()
                 );

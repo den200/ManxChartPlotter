@@ -5,7 +5,7 @@
 
 /// Multisample count for the main render pass.
 ///
-/// OpenCPN antialiases its line work; navcore's hard-edged strokes came out
+/// OpenCPN antialiases its line work; Manx's hard-edged strokes came out
 /// consistently heavier — a 2px dashed boundary measured 3px against the
 /// reference's 2px, and that surplus ink dominated the picture-level parity gap
 /// once the content differences were fixed. 4x MSAA is the cheapest fix that
@@ -28,12 +28,12 @@ pub fn set_msaa_samples(n: u32) {
 
 /// How much multisampling this GPU can afford.
 ///
-/// `NAVCORE_MSAA` overrides. Otherwise 4x, except on a software rasteriser or
+/// `MANX_MSAA` overrides. Otherwise 4x, except on a software rasteriser or
 /// the low-power parts found in single-board computers, where the fill-rate
 /// cost of 4x is the whole frame budget and a slightly heavier stroke is a much
 /// better trade than a slideshow.
 pub fn choose_msaa_samples(info: &wgpu::AdapterInfo) -> u32 {
-    if let Ok(v) = std::env::var("NAVCORE_MSAA") {
+    if let Ok(v) = std::env::var("MANX_MSAA") {
         if let Ok(n) = v.trim().parse::<u32>() {
             return n.clamp(1, 8);
         }
@@ -101,12 +101,12 @@ static DEBUG_RENDER_MODE: OnceLock<u8> = OnceLock::new();
 
 static DEBUG_SKIP: OnceLock<Vec<String>> = OnceLock::new();
 
-/// NAVCORE_SKIP=bg,area,pattern,line,sector,symbol,text,label,mariner leaves
+/// MANX_SKIP=bg,area,pattern,line,sector,symbol,text,label,mariner leaves
 /// those chart layers out of the frame. For bisecting a GPU hang by layer.
 pub fn debug_skip(kind: &str) -> bool {
     DEBUG_SKIP
         .get_or_init(|| {
-            std::env::var("NAVCORE_SKIP")
+            std::env::var("MANX_SKIP")
                 .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default()
         })
@@ -114,11 +114,11 @@ pub fn debug_skip(kind: &str) -> bool {
         .any(|k| k == kind)
 }
 
-/// NAVCORE_DEBUG_RENDER:
+/// MANX_DEBUG_RENDER:
 /// 1 = solid magenta symbols, 2 = no depth/cull for symbols, 3 = atlas debug quad.
 pub fn debug_render_mode() -> u8 {
     *DEBUG_RENDER_MODE.get_or_init(|| {
-        std::env::var("NAVCORE_DEBUG_RENDER")
+        std::env::var("MANX_DEBUG_RENDER")
             .ok()
             .and_then(|v| v.parse::<u8>().ok())
             .filter(|v| (1..=3).contains(v))

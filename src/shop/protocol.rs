@@ -29,7 +29,7 @@ use super::types::{Chart, DownloadGrant, DownloadTarget, Edition, FileGrant, Qua
 pub const ENDPOINT: &str =
     "https://o-charts.org/shop/index.php?fc=module&module=occharts&controller=apioesu";
 
-/// What navcore calls itself to the shop.
+/// What Manx calls itself to the shop.
 ///
 /// The server refuses a client whose `version` it does not recognise (result
 /// `5`, "plugin version obsolete"), so this has to be a string it accepts. It
@@ -37,10 +37,10 @@ pub const ENDPOINT: &str =
 /// decided server-side from the account, its slots and the machine fingerprint,
 /// and none of that is touched here.
 ///
-/// `NAVCORE_SHOP_VERSION` overrides it, which is how to react to a gate change
+/// `MANX_SHOP_VERSION` overrides it, which is how to react to a gate change
 /// without a release.
 pub fn client_version() -> String {
-    if let Ok(v) = std::env::var("NAVCORE_SHOP_VERSION") {
+    if let Ok(v) = std::env::var("MANX_SHOP_VERSION") {
         if !v.trim().is_empty() {
             return v;
         }

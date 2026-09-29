@@ -2,7 +2,7 @@
 //!
 //! A package is a zip holding one top-level directory — the chart set — with a
 //! `ChartList.XML` and one encrypted cell per chart. The keys arrive separately
-//! and are written beside them; navcore's catalogue reads the pair exactly as
+//! and are written beside them; Manx's catalogue reads the pair exactly as
 //! it reads the sets already installed.
 
 use std::io::{Cursor, Read};
@@ -83,7 +83,7 @@ pub fn install(
     let mut archive =
         zip::ZipArchive::new(Cursor::new(zip_bytes)).map_err(|e| InstallError::Zip(e.to_string()))?;
 
-    // The set's directory is the archive's single top-level entry; navcore's
+    // The set's directory is the archive's single top-level entry; Manx's
     // catalogue keys off that name, and so does the keylist beside it.
     let mut set_name: Option<String> = None;
     for i in 0..archive.len() {
@@ -149,7 +149,7 @@ pub fn install(
         }
     }
 
-    // The keylist. navcore finds it by scanning the set directory for any XML
+    // The keylist. Manx finds it by scanning the set directory for any XML
     // that is not the ChartList, so the name only has to differ from that.
     std::fs::create_dir_all(&set_dir)?;
     std::fs::write(set_dir.join(format!("{set_name}.XML")), keys_xml)?;

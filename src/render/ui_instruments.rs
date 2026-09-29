@@ -371,7 +371,7 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
     ui.label(
         RichText::new(
             "The address of the server on your boat. A host name is enough — \
-             navcore adds the rest.",
+             Manx adds the rest.",
         )
         .small()
         .weak(),

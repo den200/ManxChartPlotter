@@ -1,7 +1,7 @@
 //! The weather sheet: one surface for wind, sea, current, rain and tide.
 //!
 //! The shape is Orca's, and it is worth saying why it is better than what
-//! navcore had. A floating "Wind" window with a step slider asks the reader
+//! Manx had. A floating "Wind" window with a step slider asks the reader
 //! to hold two things in their head — which hour the slider is on, and what
 //! that hour looked like everywhere else. A sheet along the bottom of the
 //! chart holds a *time axis* instead, draws every quantity against it in its

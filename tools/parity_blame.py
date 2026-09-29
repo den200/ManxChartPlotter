@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Attribute a picture-level parity gap to the features that caused it.
 
-    navcore --dump-scene <charts> <lat,lon,mpp> <WxH> /tmp/scene.ndjson
-    tools/parity_blame.py <reference.png> <navcore.png> /tmp/scene.ndjson
+    manx --dump-scene <charts> <lat,lon,mpp> <WxH> /tmp/scene.ndjson
+    tools/parity_blame.py <reference.png> <manx.png> /tmp/scene.ndjson
 
-`tools/parity.py` says *how much* navcore and OpenCPN disagree. This says *who*:
-it takes every pixel where navcore draws a land/water boundary the reference
+`tools/parity.py` says *how much* manx and OpenCPN disagree. This says *who*:
+it takes every pixel where manx draws a land/water boundary the reference
 does not, looks it up in the scene log, and ranks the classes responsible.
 
 That is the step that makes a screenshot actionable. A number tells you the
@@ -13,9 +13,9 @@ picture got worse; this tells you it was CBLARE's boundary, from the 1:22000
 cell, drawn as DASH,2,CHMGD — which is a claim you can check against the S-52
 oracle and then fix.
 
-The reverse direction (reference-only ink) cannot be blamed on navcore records —
-by definition navcore drew nothing there — so it is reported as locations and
-as the classes navcore *skipped* nearby, which is usually the answer.
+The reverse direction (reference-only ink) cannot be blamed on manx records —
+by definition manx drew nothing there — so it is reported as locations and
+as the classes manx *skipped* nearby, which is usually the answer.
 """
 
 import json

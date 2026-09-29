@@ -1,6 +1,6 @@
 //! SENC geometry parsing.
 //!
-//! Key insight from navcore_plan_v2.md:
+//! Key insight from manx_plan_v2.md:
 //! **OSENC areas ALWAYS contain pre-triangulated geometry.**
 //! No runtime tessellation needed - just read triangles from file.
 //!

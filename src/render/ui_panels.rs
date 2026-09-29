@@ -1121,7 +1121,7 @@ fn chart_shop(
                             ui.checkbox(&mut shop.remember, "Remember me on this device")
                                 .on_hover_text(
                                     "Keeps o-charts' session key, not your password, so \
-                                     navcore starts signed in. Sign out forgets it.",
+                                     Manx starts signed in. Sign out forgets it.",
                                 );
                             ui.end_row();
                         });
@@ -1340,7 +1340,7 @@ fn step_nav(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
 /// Put a lapsed set's download to the user before sending it.
 ///
 /// The shop will not grant the edition it currently publishes to a licence
-/// that expired before that edition existed. navcore can ask for an older one
+/// that expired before that edition existed. Manx can ask for an older one
 /// — the last this machine actually received — but which edition to claim is
 /// the user's business, so it is shown, named, and confirmed.
 fn confirm_download(
@@ -1385,7 +1385,7 @@ fn confirm_download(
             if pending.expired {
                 // The shop's current edition was published after the licence
                 // lapsed. Asking will almost certainly be refused, but the
-                // shop's answer is more use than navcore's guess about it.
+                // shop's answer is more use than Manx's guess about it.
                 if ui
                     .button("Ask for the current edition anyway")
                     .on_hover_text(
@@ -1493,7 +1493,7 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                     };
                     if button.clicked() {
                         // A lapsed set cannot have the shop's current edition,
-                        // so navcore must ask for a different one. That is a
+                        // so Manx must ask for a different one. That is a
                         // decision about the user's licence, so it is put to
                         // them rather than made silently.
                         // So is the first download to this machine: it spends

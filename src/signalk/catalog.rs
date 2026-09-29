@@ -11,7 +11,7 @@
 
 use super::units::Quantity;
 
-/// A path navcore knows how to present.
+/// A path Manx knows how to present.
 pub struct Known {
     pub path: &'static str,
     /// Short enough for a tile on a phone-sized bar.
@@ -79,11 +79,21 @@ known! {
 
 /// Not a Signal K path: the tile that draws apparent and true wind on a
 /// dial. It lives in the bar's list of paths so that it is saved, ordered
-/// and removed like any other tile; the `navcore.` prefix is one no server
+/// and removed like any other tile; the `manx.` prefix is one no server
 /// sends.
-pub const WIND_ROSE: &str = "navcore.windRose";
+pub const WIND_ROSE: &str = "manx.windRose";
 
-/// The entry for a path, if navcore knows it.
+/// A tile id as saved by an older build, brought up to date: the wind rose
+/// was saved as `navcore.windRose` before the rename.
+pub fn current_tile(path: String) -> String {
+    if path == "navcore.windRose" {
+        WIND_ROSE.to_string()
+    } else {
+        path
+    }
+}
+
+/// The entry for a path, if Manx knows it.
 pub fn lookup(path: &str) -> Option<&'static Known> {
     KNOWN.iter().find(|k| k.path == path)
 }

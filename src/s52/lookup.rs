@@ -221,7 +221,7 @@ impl LookupEntry {
     /// The list case is the one that matters: a feature with `CATREA="4,5"`
     /// does *not* satisfy a `CATREA4` filter, because OpenCPN compares
     /// `strcmp("4,5", "4")`. Treating the value as a set of integers and
-    /// testing membership — which navcore used to do — picks a more specific
+    /// testing membership — which Manx used to do — picks a more specific
     /// lookup row than OpenCPN ever would.
     pub fn matches_attributes(&self, feature: &crate::senc::Feature) -> bool {
         use crate::senc::AttributeValue;
@@ -257,7 +257,7 @@ impl LookupEntry {
             // E.g. the DEPARE LUP "DRVAL1? DRVAL2?" matches only unsurveyed
             // depth areas that carry no depth attributes. (OpenCPN never
             // matches a '?' row at all — it forgets to count the match — but
-            // the spec reading below is what keeps navcore's water fills.)
+            // the spec reading below is what keeps Manx's water fills.)
             if value_str == "?" {
                 if stored.is_some() {
                     return false;

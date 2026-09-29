@@ -315,12 +315,12 @@ pub fn decode(data: &[u8]) -> Vec<Sample> {
 
 /// Where the logbook lives.
 pub fn default_dir() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("navcore").join("logbook"))
+    Some(crate::paths::config_dir()?.join("logbook"))
 }
 
-/// Tests, captures and the like point this elsewhere: `NAVCORE_LOGBOOK`.
+/// Tests, captures and the like point this elsewhere: `MANX_LOGBOOK`.
 pub fn dir() -> PathBuf {
-    std::env::var("NAVCORE_LOGBOOK")
+    std::env::var("MANX_LOGBOOK")
         .map(PathBuf::from)
         .ok()
         .or_else(default_dir)
@@ -509,7 +509,7 @@ pub fn summarize(samples: &[Sample]) -> Summary {
 pub fn to_gpx(day: NaiveDate, samples: &[Sample], notes: &[Note]) -> String {
     let mut s = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <gpx version=\"1.1\" creator=\"navcore\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n",
+         <gpx version=\"1.1\" creator=\"Manx\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n",
     );
     let esc = |t: &str| quick_xml::escape::escape(t).into_owned();
     for n in notes {
@@ -678,7 +678,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("navcore-logbook-{name}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("manx-logbook-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         d
     }

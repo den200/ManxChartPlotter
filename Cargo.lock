@@ -1895,6 +1895,62 @@ dependencies = [
 ]
 
 [[package]]
+name = "manx"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "byteorder",
+ "chrono",
+ "dirs",
+ "earcutr",
+ "egui",
+ "egui-wgpu",
+ "egui-winit",
+ "env_logger",
+ "geographiclib-rs",
+ "glam",
+ "gribberish",
+ "image",
+ "jni 0.21.1",
+ "log",
+ "ndk-context",
+ "pollster",
+ "quick-xml 0.31.0",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+ "tungstenite",
+ "ureq",
+ "uuid",
+ "wgpu",
+ "winit",
+ "zip",
+]
+
+[[package]]
+name = "manx-android"
+version = "0.4.0"
+dependencies = [
+ "chrono",
+ "dirs",
+ "env_logger",
+ "glam",
+ "log",
+ "manx",
+ "pollster",
+ "serde_json",
+ "wgpu",
+ "winit",
+ "zip",
+]
+
+[[package]]
 name = "mappers"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1985,62 +2041,6 @@ dependencies = [
  "termcolor",
  "thiserror 1.0.69",
  "unicode-xid",
-]
-
-[[package]]
-name = "navcore-android"
-version = "0.4.0"
-dependencies = [
- "chrono",
- "dirs",
- "env_logger",
- "glam",
- "log",
- "navcore2",
- "pollster",
- "serde_json",
- "wgpu",
- "winit",
- "zip",
-]
-
-[[package]]
-name = "navcore2"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "byteorder",
- "chrono",
- "dirs",
- "earcutr",
- "egui",
- "egui-wgpu",
- "egui-winit",
- "env_logger",
- "geographiclib-rs",
- "glam",
- "gribberish",
- "image",
- "jni 0.21.1",
- "log",
- "ndk-context",
- "pollster",
- "quick-xml 0.31.0",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tracing",
- "tracing-subscriber",
- "tungstenite",
- "ureq",
- "uuid",
- "wgpu",
- "winit",
- "zip",
 ]
 
 [[package]]

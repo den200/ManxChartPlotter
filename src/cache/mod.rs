@@ -1,7 +1,7 @@
 //! Disk cache for decrypted SENC files.
 //!
 //! Caches decrypted chart data to avoid re-decrypting on subsequent runs.
-//! Cache location: ~/.cache/navcore/senc/
+//! Cache location: ~/.cache/manx/senc/
 
 mod cached_decryptor;
 
@@ -17,7 +17,7 @@ pub struct SencCache {
 }
 
 impl SencCache {
-    /// Create a new SENC cache with default location (~/.cache/navcore/senc/)
+    /// Create a new SENC cache with default location (~/.cache/manx/senc/)
     pub fn new() -> io::Result<Self> {
         let cache_dir = Self::default_cache_dir()?;
         fs::create_dir_all(&cache_dir)?;
@@ -32,9 +32,9 @@ impl SencCache {
 
     /// Get default cache directory
     fn default_cache_dir() -> io::Result<PathBuf> {
-        let home = dirs::home_dir()
+        let dir = crate::paths::cache_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory not found"))?;
-        Ok(home.join(".cache").join("navcore").join("senc"))
+        Ok(dir.join("senc"))
     }
 
     /// Get cache file path for a chart
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn cache_roundtrip() {
-        let temp_dir = std::env::temp_dir().join("navcore_cache_test");
+        let temp_dir = std::env::temp_dir().join("manx_cache_test");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let cache = SencCache::with_dir(temp_dir.clone()).unwrap();
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn cache_stats() {
-        let temp_dir = std::env::temp_dir().join("navcore_cache_stats_test");
+        let temp_dir = std::env::temp_dir().join("manx_cache_stats_test");
         let _ = fs::remove_dir_all(&temp_dir);
 
         let cache = SencCache::with_dir(temp_dir.clone()).unwrap();

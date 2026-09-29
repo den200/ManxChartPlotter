@@ -97,10 +97,10 @@ pub struct TrackView {
 
 /// The one-time notice. Nothing else can be used until it is accepted.
 pub fn notice(ctx: &Context, safety: &mut SafetyView, actions: &mut Vec<UiAction>) {
-    // Automated captures (NAVCORE_SHOT) are not a first start; one can ask
-    // to see the notice with NAVCORE_SHOW_NOTICE=1.
-    let capture = std::env::var_os("NAVCORE_SHOT").is_some()
-        && std::env::var_os("NAVCORE_SHOW_NOTICE").is_none();
+    // Automated captures (MANX_SHOT) are not a first start; one can ask
+    // to see the notice with MANX_SHOW_NOTICE=1.
+    let capture = std::env::var_os("MANX_SHOT").is_some()
+        && std::env::var_os("MANX_SHOW_NOTICE").is_none();
     let first = safety.notice_accepted < NOTICE_VERSION && !capture;
     if !first && !safety.notice_open {
         return;
@@ -117,7 +117,7 @@ pub fn notice(ctx: &Context, safety: &mut SafetyView, actions: &mut Vec<UiAction
             });
     }
     let mut open = true;
-    let mut window = egui::Window::new("navcore beta — not for navigation")
+    let mut window = egui::Window::new("Manx beta — not for navigation")
         .collapsible(false)
         .resizable(false)
         .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
@@ -128,7 +128,7 @@ pub fn notice(ctx: &Context, safety: &mut SafetyView, actions: &mut Vec<UiAction
     }
     window.show(ctx, |ui| {
         ui.label(
-            "navcore is beta software. It is not a certified navigation system (it is not \
+            "Manx is beta software. It is not a certified navigation system (it is not \
              an ECDIS) and must not be your only means of navigation.",
         );
         ui.add_space(6.0);
@@ -146,7 +146,7 @@ pub fn notice(ctx: &Context, safety: &mut SafetyView, actions: &mut Vec<UiAction
             });
         }
         ui.add_space(6.0);
-        ui.label(RichText::new("You use navcore at your own risk.").strong());
+        ui.label(RichText::new("You use Manx at your own risk.").strong());
         if first {
             ui.add_space(10.0);
             ui.vertical_centered(|ui| {
@@ -433,7 +433,7 @@ pub fn window(
             }
             ui.separator();
 
-            if ui.link("About navcore beta — not for navigation").clicked() {
+            if ui.link("About Manx beta — not for navigation").clicked() {
                 safety.notice_open = true;
             }
         });
@@ -457,8 +457,8 @@ pub fn guide(ctx: &Context, safety: &mut SafetyView) {
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             let mut scroll = egui::ScrollArea::vertical();
-            // NAVCORE_GUIDE_SCROLL=<points> opens it scrolled, for captures.
-            if let Some(y) = std::env::var("NAVCORE_GUIDE_SCROLL").ok().and_then(|v| v.parse().ok()) {
+            // MANX_GUIDE_SCROLL=<points> opens it scrolled, for captures.
+            if let Some(y) = std::env::var("MANX_GUIDE_SCROLL").ok().and_then(|v| v.parse().ok()) {
                 scroll = scroll.vertical_scroll_offset(y);
             }
             scroll.show(ui, |ui| {

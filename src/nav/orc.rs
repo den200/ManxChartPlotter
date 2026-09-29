@@ -290,7 +290,7 @@ mod tests {
         assert!((hit.loa_m - 15.245).abs() < 1e-9);
         assert!((hit.draft_m - 3.33).abs() < 1e-9);
 
-        // The parser navcore ships must accept the converted text.
+        // The parser Manx ships must accept the converted text.
         let polar = crate::nav::polar::Polar::parse(&hit.pol).expect("valid .pol");
         // R90 at 10 kt was 378.5 s/nm → 9.51 kt.
         let v = polar.speed_kt(90.0, 10.0).unwrap();

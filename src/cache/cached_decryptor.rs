@@ -29,7 +29,7 @@ impl CachedDecryptor {
             Err(e) => {
                 log::warn!("Disk cache unavailable: {}. Running uncached.", e);
                 // Create a dummy cache that won't be used
-                (SencCache::with_dir(std::env::temp_dir().join("navcore_dummy_cache"))
+                (SencCache::with_dir(std::env::temp_dir().join("manx_dummy_cache"))
                     .unwrap_or_else(|_| panic!("Failed to create even temp cache")),
                  false)
             }
@@ -64,7 +64,7 @@ impl CachedDecryptor {
     fn uncached_placeholder() -> Self {
         Self {
             decryptor: None,
-            cache: SencCache::with_dir(std::env::temp_dir().join("navcore_dummy"))
+            cache: SencCache::with_dir(std::env::temp_dir().join("manx_dummy"))
                 .expect("temp dir should exist"),
             cache_enabled: false,
         }
@@ -106,7 +106,7 @@ impl CachedDecryptor {
     pub fn uncached(decryptor: ChartDecryptor) -> Self {
         Self {
             decryptor: Some(decryptor),
-            cache: SencCache::with_dir(std::env::temp_dir().join("navcore_dummy"))
+            cache: SencCache::with_dir(std::env::temp_dir().join("manx_dummy"))
                 .expect("temp dir should exist"),
             cache_enabled: false,
         }

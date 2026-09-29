@@ -37,7 +37,7 @@ pub struct MarinerSettings {
     /// Vallensbæk beach), BUISGL, PRDARE and the harbour detail are all
     /// category OTHER. Measured coastline agreement against the four reference
     /// views, STANDARD → ALL: 0.320→0.538, 0.360→0.539, 0.478→0.532,
-    /// 0.212→0.432. Use `NAVCORE_DISPLAY_CAT=standard` for the ECDIS default.
+    /// 0.212→0.432. Use `MANX_DISPLAY_CAT=standard` for the ECDIS default.
     pub show_other: bool,
     /// Safety depth in meters (features shallower are highlighted)
     pub safety_depth: f32,
@@ -72,14 +72,14 @@ pub struct MarinerSettings {
     /// Apply SUPER_SCAMIN: synthesise a SCAMIN from the cell's compilation
     /// scale for features that declare none. OpenCPN reads this from config
     /// with a default of **0** (navutil.cpp: `Read("bUseSUPER_SCAMIN", &v, 0)`),
-    /// so it is off unless the user asks for it. navcore applied it
+    /// so it is off unless the user asks for it. Manx applied it
     /// unconditionally, which hid pier structures, mooring facilities and the
     /// dredged basins inside harbours.
     pub use_super_scamin: bool,
     /// Draw S-57 meta objects (M_NSYS, M_COVR, M_NPUB...). OpenCPN filters every
     /// `M_*` class outside the OTHER display category unless "show meta objects"
     /// is on, and its config default is off (navutil.cpp `Read("bShowMeta",
-    /// &v, 0)`). navcore drew them, which put survey-system boundaries over the
+    /// &v, 0)`). Manx drew them, which put survey-system boundaries over the
     /// chart at every zoom.
     pub show_meta_objects: bool,
     /// Show M_QUAL (zones of confidence / quality of survey) regardless of its
@@ -123,7 +123,7 @@ impl Default for MarinerSettings {
             depth_unit: DepthUnit::default(), // Meters
             depth_shade_mode: DepthShadeMode::default(), // FourShades per spec
             symbolized_boundaries: false, // PLAIN boundaries by default (matches OpenCPN)
-            // Default ON: until navcore has proper LOD / per-feature SCAMIN for
+            // Default ON: until Manx has proper LOD / per-feature SCAMIN for
             // labels, leaving every dis>=20 label visible at overview zooms
             // produces an unreadable text stampede. OpenCPN's default is off,
             // but its labels are also culled by a proper chart-scale filter we
@@ -148,28 +148,28 @@ impl Default for MarinerSettings {
 }
 
 impl MarinerSettings {
-    /// Defaults with the `NAVCORE_*` mariner-setting overrides applied.
+    /// Defaults with the `MANX_*` mariner-setting overrides applied.
     ///
     /// One function for every entry point — the renderer, `--dump-scene` and
     /// `--dump-ir` — because a harness that resolves features under different
     /// settings than the renderer uses reports divergences that do not exist,
     /// and hides the ones that do.
     ///
-    /// - `NAVCORE_DISPLAY_CAT=base|standard|all` — OpenCPN's "ENC display"
-    /// - `NAVCORE_QUALITY_OF_DATA=1` — the M_QUAL survey-quality overlay
-    /// - `NAVCORE_SHOW_META=1` — draw `M_*` meta objects
-    /// - `NAVCORE_SUPER_SCAMIN=1` — synthesise SCAMIN from the cell scale
-    /// - `NAVCORE_SAFETY_DEPTH=<m>` — soundings at or above this print bold
-    /// - `NAVCORE_SAFETY_CONTOUR=<m>` — the safe/unsafe water boundary
-    /// - `NAVCORE_SHALLOW_CONTOUR`, `NAVCORE_DEEP_CONTOUR` — the other two shades
-    /// - `NAVCORE_DEPTH_SHADES=2|4` — two-shade display (safe/unsafe only)
-    /// - `NAVCORE_DEPTH_UNIT=m|ft|fm`
-    /// - `NAVCORE_DEPTH_RELIEF=1` — shade depth-area edges (not S-52)
-    /// - `NAVCORE_SYMBOLS=simplified|paper` — OpenCPN's symbol-style switch
+    /// - `MANX_DISPLAY_CAT=base|standard|all` — OpenCPN's "ENC display"
+    /// - `MANX_QUALITY_OF_DATA=1` — the M_QUAL survey-quality overlay
+    /// - `MANX_SHOW_META=1` — draw `M_*` meta objects
+    /// - `MANX_SUPER_SCAMIN=1` — synthesise SCAMIN from the cell scale
+    /// - `MANX_SAFETY_DEPTH=<m>` — soundings at or above this print bold
+    /// - `MANX_SAFETY_CONTOUR=<m>` — the safe/unsafe water boundary
+    /// - `MANX_SHALLOW_CONTOUR`, `MANX_DEEP_CONTOUR` — the other two shades
+    /// - `MANX_DEPTH_SHADES=2|4` — two-shade display (safe/unsafe only)
+    /// - `MANX_DEPTH_UNIT=m|ft|fm`
+    /// - `MANX_DEPTH_RELIEF=1` — shade depth-area edges (not S-52)
+    /// - `MANX_SYMBOLS=simplified|paper` — OpenCPN's symbol-style switch
     pub fn from_env() -> Self {
         let mut s = Self::default();
         let on = |k: &str| std::env::var(k).is_ok_and(|v| v != "0");
-        if let Ok(cat) = std::env::var("NAVCORE_DISPLAY_CAT") {
+        if let Ok(cat) = std::env::var("MANX_DISPLAY_CAT") {
             match cat.to_ascii_lowercase().as_str() {
                 "base" | "displaybase" => {
                     s.show_standard = false;
@@ -183,26 +183,26 @@ impl MarinerSettings {
                     s.show_standard = true;
                     s.show_other = true;
                 }
-                other => log::warn!("NAVCORE_DISPLAY_CAT: unknown value {:?}", other),
+                other => log::warn!("MANX_DISPLAY_CAT: unknown value {:?}", other),
             }
         }
-        if on("NAVCORE_QUALITY_OF_DATA") {
+        if on("MANX_QUALITY_OF_DATA") {
             s.show_quality_of_data = true;
         }
-        if on("NAVCORE_SHOW_META") {
+        if on("MANX_SHOW_META") {
             s.show_meta_objects = true;
         }
-        if on("NAVCORE_SUPER_SCAMIN") {
+        if on("MANX_SUPER_SCAMIN") {
             s.use_super_scamin = true;
         }
-        if on("NAVCORE_DEPTH_RELIEF") {
+        if on("MANX_DEPTH_RELIEF") {
             s.depth_relief = true;
         }
-        if let Ok(style) = std::env::var("NAVCORE_SYMBOLS") {
+        if let Ok(style) = std::env::var("MANX_SYMBOLS") {
             match style.to_ascii_lowercase().as_str() {
                 "simplified" | "simple" => s.simplified_points = true,
                 "paper" | "paperchart" | "paper_chart" => s.simplified_points = false,
-                other => log::warn!("NAVCORE_SYMBOLS: unknown value {:?}", other),
+                other => log::warn!("MANX_SYMBOLS: unknown value {:?}", other),
             }
         }
 
@@ -219,31 +219,31 @@ impl MarinerSettings {
                 }
             })
         };
-        if let Some(d) = depth("NAVCORE_SAFETY_DEPTH") {
+        if let Some(d) = depth("MANX_SAFETY_DEPTH") {
             s.safety_depth = d;
         }
-        if let Some(d) = depth("NAVCORE_SAFETY_CONTOUR") {
+        if let Some(d) = depth("MANX_SAFETY_CONTOUR") {
             s.safety_contour = d;
         }
-        if let Some(d) = depth("NAVCORE_SHALLOW_CONTOUR") {
+        if let Some(d) = depth("MANX_SHALLOW_CONTOUR") {
             s.shallow_contour = d;
         }
-        if let Some(d) = depth("NAVCORE_DEEP_CONTOUR") {
+        if let Some(d) = depth("MANX_DEEP_CONTOUR") {
             s.deep_contour = d;
         }
-        if let Ok(v) = std::env::var("NAVCORE_DEPTH_SHADES") {
+        if let Ok(v) = std::env::var("MANX_DEPTH_SHADES") {
             match v.as_str() {
                 "2" | "two" => s.depth_shade_mode = DepthShadeMode::TwoShades,
                 "4" | "four" => s.depth_shade_mode = DepthShadeMode::FourShades,
-                other => log::warn!("NAVCORE_DEPTH_SHADES: expected 2 or 4, got {:?}", other),
+                other => log::warn!("MANX_DEPTH_SHADES: expected 2 or 4, got {:?}", other),
             }
         }
-        if let Ok(v) = std::env::var("NAVCORE_DEPTH_UNIT") {
+        if let Ok(v) = std::env::var("MANX_DEPTH_UNIT") {
             match v.to_ascii_lowercase().as_str() {
                 "m" | "metres" | "meters" => s.depth_unit = DepthUnit::Meters,
                 "ft" | "feet" => s.depth_unit = DepthUnit::Feet,
                 "fm" | "fathoms" => s.depth_unit = DepthUnit::Fathoms,
-                other => log::warn!("NAVCORE_DEPTH_UNIT: expected m/ft/fm, got {:?}", other),
+                other => log::warn!("MANX_DEPTH_UNIT: expected m/ft/fm, got {:?}", other),
             }
         }
 

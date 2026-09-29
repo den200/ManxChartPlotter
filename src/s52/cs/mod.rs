@@ -86,7 +86,7 @@ pub fn execute_cs(
             // stream is where that belongs, so the renderer has one source.
             // A light with a valid sector is drawn as a bounded arc, not a
             // symbol: s52cnsy.cpp LIGHTS06 replaces the symbol command with
-            // CA(). navcore builds that arc in tiles/builder.rs from
+            // CA(). Manx builds that arc in tiles/builder.rs from
             // light_sector_info, so the instruction stream carries nothing —
             // emitting the all-round symbol here would leave a ring the
             // renderer then has to throw away.

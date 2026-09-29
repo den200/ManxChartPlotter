@@ -110,7 +110,7 @@ impl S52Engine {
     /// the safety contour and put in DISPLAYBASE." s52plib implements both
     /// halves — `m_DisplayCat = DISPLAYBASE` and `Scamin = 1e8+1` — because the
     /// safety contour is the one line on the chart that must never be dropped.
-    /// navcore did neither, so with a 2 m safety contour three segments of it
+    /// Manx did neither, so with a 2 m safety contour three segments of it
     /// were SCAMIN-filtered out of a 1:11600 view.
     ///
     /// `selected` is the chart's safety contour ([`select_safety_contour`]);
@@ -123,7 +123,7 @@ impl S52Engine {
         selected: Option<f64>,
     ) -> bool {
         // DEPCNT (43). DEPARE's own boundary reaches the same test through
-        // DEPCNT02's "continuation A", but navcore draws that as an area
+        // DEPCNT02's "continuation A", but Manx draws that as an area
         // boundary, which is not SCAMIN-filtered separately.
         feature.type_code == 43 && super::cs::is_safety_contour(feature, &self.settings, selected)
     }
@@ -365,7 +365,7 @@ impl S52Engine {
         resolved
     }
 
-    /// Resolve a feature for the conformance harness (`navcore --dump-ir`).
+    /// Resolve a feature for the conformance harness (`manx --dump-ir`).
     ///
     /// Same pipeline as [`resolve_feature`] but with nothing filtered out: the
     /// chosen lookup entry is returned even when the display category would

@@ -3,7 +3,7 @@
 // Links OpenCPN's S-57 reader (libs/iso8211 + libs/s57-charts + the GDAL/OGR
 // subset in libs/gdal) and dumps, feature by feature, what that reader makes of
 // an ENC cell *after its update files are applied the way OpenCPN applies
-// them*. NavCore's own S-57 reader is diffed against this output.
+// them*. Manx's own S-57 reader is diffed against this output.
 //
 //     s57oracle [--no-updates] [--s57data DIR] <cell.000>   > out.ndjson
 //
@@ -16,7 +16,7 @@
 // / s57chart::GetUpdateFileArray (gui/src/Osenc.cpp, gui/src/s57chart.cpp) —
 // see README.md for the reader options and why.
 //
-// Dev tool only — it links GPL code and must never be shipped with navcore.
+// Dev tool only — it links GPL code and must never be shipped with manx.
 
 #include <algorithm>
 #include <cmath>

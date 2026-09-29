@@ -1,12 +1,12 @@
-//! NavCore Chart Plotter
+//! Manx Chart Plotter
 //!
 //! Usage:
-//!   navcore                         - Test triangle (verify GPU)
-//!   navcore <chart.oesu>            - Render a chart
-//!   navcore <chart_dir/>            - Render all charts from directory
-//!   navcore --info <chart.oesu>     - Show chart info without rendering
-//!   navcore --catalog <chart_dir/>  - Show catalog info for directory
-//!   navcore --tile-debug <chart_dir/> - Build a few tiles headlessly and exit
+//!   Manx                         - Test triangle (verify GPU)
+//!   Manx <chart.oesu>            - Render a chart
+//!   Manx <chart_dir/>            - Render all charts from directory
+//!   manx --info <chart.oesu>     - Show chart info without rendering
+//!   manx --catalog <chart_dir/>  - Show catalog info for directory
+//!   manx --tile-debug <chart_dir/> - Build a few tiles headlessly and exit
 
 use std::collections::HashMap;
 use std::env;
@@ -33,12 +33,12 @@ const TOUCH_SLOP: f64 = 10.0;
 /// a chart that was never quite north-up.
 const TWIST_SLOP_DEG: f32 = 12.0;
 
-use navcore2::{CachedDecryptor, ChartDecryptor, KeyStore};
-use navcore2::render::RenderState;
-use navcore2::s52::S52Engine;
-use navcore2::senc::{ChartData, ChartCatalog, s57_code_to_acronym};
-use navcore2::tiles::{TileId, visible_tiles, zoom_from_camera, TileBounds};
-use navcore2::tiles::builder::TileBuilder;
+use manx::{CachedDecryptor, ChartDecryptor, KeyStore};
+use manx::render::RenderState;
+use manx::s52::S52Engine;
+use manx::senc::{ChartData, ChartCatalog, s57_code_to_acronym};
+use manx::tiles::{TileId, visible_tiles, zoom_from_camera, TileBounds};
+use manx::tiles::builder::TileBuilder;
 
 /// Chart source for rendering
 enum ChartSource {
@@ -57,7 +57,7 @@ enum ChartSource {
 /// so; started by the system at boot (a systemd service on the plotter) the
 /// working directory is `/`, and the chart would come up with no S-52
 /// symbology at all. So when `assets/` is not here, look beside the
-/// executable and up from it — `target/release/navcore` sits two levels
+/// executable and up from it — `target/release/manx` sits two levels
 /// below the project — and move there.
 fn find_install_dir() {
     let marker = std::path::Path::new("assets/s52/chartsymbols.xml");
@@ -115,13 +115,13 @@ fn main() {
     }
 
     // M3 auto-routing: a safe route between two points, from the charts.
-    // navcore --auto-route <chart_dir> lat1,lon1 lat2,lon2 [draft_m]
+    // manx --auto-route <chart_dir> lat1,lon1 lat2,lon2 [draft_m]
     // `--noaa-install <chart folder> <STATE>`: what the Free charts tab's
     // Download button does, from the command line.
     if args.len() >= 4 && args[1] == "--noaa-install" {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let mut last = 0;
-        match navcore2::shop::noaa::install(
+        match manx::shop::noaa::install(
             std::path::Path::new(&args[2]),
             &args[3].to_uppercase(),
             |done, total| {
@@ -161,7 +161,7 @@ fn main() {
     }
 
     // M5 weather routing: forecast + polar + charts.
-    // navcore --weather-route <chart_dir> lat1,lon1 lat2,lon2 [hours]
+    // manx --weather-route <chart_dir> lat1,lon1 lat2,lon2 [hours]
     if args.len() >= 5 && args[1] == "--weather-route" {
         let parse_pos = |s: &str| -> Option<(f64, f64)> {
             let mut it = s.split(',').filter_map(|v| v.trim().parse::<f64>().ok());
@@ -292,7 +292,7 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
     logger
         .filter_module("wgpu_core", log::LevelFilter::Warn)
         .filter_module("wgpu_hal", log::LevelFilter::Warn);
-    if let Ok(f) = std::fs::File::create(files.join("navcore.log")) {
+    if let Ok(f) = std::fs::File::create(files.join("manx.log")) {
         logger.target(env_logger::Target::Pipe(Box::new(f)));
     }
     logger.init();
@@ -337,7 +337,7 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
     };
     // A plotter is watched, not touched: without this the screen dims and
     // sleeps between taps, with the chart and the depth on it. Android
-    // honours the flag only while navcore is in front, so it costs the
+    // honours the flag only while Manx is in front, so it costs the
     // battery nothing once the app is put away.
     use winit::platform::android::activity::WindowManagerFlags;
     android.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
@@ -349,14 +349,14 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
     run(event_loop, source);
 }
 
-/// The directory Android loaded libnavcore.so from: the app's native library
+/// The directory Android loaded libmanx.so from: the app's native library
 /// directory, read from this process's own memory map.
 #[cfg(target_os = "android")]
 fn android_native_library_dir() -> Option<PathBuf> {
     let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
     maps.lines()
         .filter_map(|line| line.split_whitespace().nth(5))
-        .find(|path| path.ends_with("/libnavcore.so"))
+        .find(|path| path.ends_with("/libmanx.so"))
         .and_then(|path| std::path::Path::new(path).parent().map(PathBuf::from))
 }
 
@@ -393,7 +393,7 @@ fn unpack_android_assets(
 /// Dump every area primitive the renderer emits for a viewport, with the
 /// provenance needed to trace a pixel back to a feature and a code path.
 ///
-///   navcore --dump-scene <charts> <lat,lon,mpp> <WxH> <out.ndjson>
+///   manx --dump-scene <charts> <lat,lon,mpp> <WxH> <out.ndjson>
 ///
 /// Coordinates in the output are screen pixels for that viewport, so a pixel
 /// noticed in a capture can be looked up directly (tools/scenecheck.py).
@@ -444,17 +444,17 @@ fn dump_scene_mode(chart_path: &str, view: &str, size: &str, out_path: &str) {
             return;
         }
     };
-    engine.set_settings(navcore2::s52::MarinerSettings::from_env());
+    engine.set_settings(manx::s52::MarinerSettings::from_env());
 
-    let (cx, cy) = navcore2::tiles::latlon_to_mercator(lat, lon);
+    let (cx, cy) = manx::tiles::latlon_to_mercator(lat, lon);
     let z = zoom_from_camera(mpp as f32);
     let half_w = view_w * mpp / 2.0;
     let half_h = view_h * mpp / 2.0;
     let view_bounds = TileBounds::new(cx - half_w, cx + half_w, cy - half_h, cy + half_h);
     let tiles = visible_tiles(&view_bounds, z, 1.0);
 
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let chart_cache: manx::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: manx::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     let mut out = std::io::BufWriter::new(
@@ -492,7 +492,7 @@ fn dump_scene_mode(chart_path: &str, view: &str, size: &str, out_path: &str) {
         };
         // json! cannot take a block, so the corner transform lives here.
         fn cov_extent_px(
-            cov: &navcore2::tiles::scene::SceneCoverage,
+            cov: &manx::tiles::scene::SceneCoverage,
             to_px: &impl Fn([f64; 2]) -> [f64; 2],
         ) -> [f64; 4] {
             let a = to_px([cov.extent[0], cov.extent[3]]);
@@ -576,7 +576,7 @@ fn dump_scene_mode(chart_path: &str, view: &str, size: &str, out_path: &str) {
         }
         for area in log.areas {
             n_areas += 1;
-            if area.source == navcore2::tiles::scene::AreaSource::RingFallback {
+            if area.source == manx::tiles::scene::AreaSource::RingFallback {
                 n_fallback += 1;
             }
             let tris_px: Vec<[[f64; 2]; 3]> = area
@@ -610,7 +610,7 @@ fn dump_scene_mode(chart_path: &str, view: &str, size: &str, out_path: &str) {
     }
 
     eprintln!(
-        "navcore --dump-scene: {} area primitives ({} via ring fallback), {} stroked, {} skipped -> {}",
+        "manx --dump-scene: {} area primitives ({} via ring fallback), {} stroked, {} skipped -> {}",
         n_areas, n_fallback, n_lines, n_skipped, out_path
     );
 }
@@ -621,15 +621,15 @@ fn dump_scene_mode(chart_path: &str, view: &str, size: &str, out_path: &str) {
 /// Writes two files:
 ///   <prefix>.features.ndjson — feature class/primitive/attributes, the input
 ///                              for tools/s52oracle
-///   <prefix>.navcore.ndjson  — navcore's own LUP choice and expanded rules
+///   <prefix>.manx.ndjson  — Manx's own LUP choice and expanded rules
 ///
-/// Records are joined on `id`, so a line-by-line diff of navcore's stream
+/// Records are joined on `id`, so a line-by-line diff of Manx's stream
 /// against the oracle's isolates every symbology divergence, independent of
 /// rendering.
 fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
     use std::io::Write;
-    use navcore2::s52::{DepthAreaIndex, GeometryType, S52Engine};
-    use navcore2::senc::{AttributeValue, FeatureType};
+    use manx::s52::{DepthAreaIndex, GeometryType, S52Engine};
+    use manx::senc::{AttributeValue, FeatureType};
 
     let path = PathBuf::from(chart_path);
     let chart_dir = if path.is_dir() {
@@ -656,7 +656,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
         Ok(mut e) => {
             // Same mariner settings the renderer would use, so a conformance
             // run describes the picture actually being captured.
-            e.set_settings(navcore2::s52::MarinerSettings::from_env());
+            e.set_settings(manx::s52::MarinerSettings::from_env());
             e
         }
         Err(e) => {
@@ -665,8 +665,8 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
         }
     };
 
-    // NAVCORE_VIEW_SCALE=<denominator> turns on the visibility verdict.
-    let view_scale: Option<f64> = std::env::var("NAVCORE_VIEW_SCALE")
+    // MANX_VIEW_SCALE=<denominator> turns on the visibility verdict.
+    let view_scale: Option<f64> = std::env::var("MANX_VIEW_SCALE")
         .ok()
         .and_then(|v| v.parse().ok());
 
@@ -694,7 +694,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
         std::fs::File::create(format!("{}.features.ndjson", out_prefix)).expect("create features file"),
     );
     let mut ir_out = std::io::BufWriter::new(
-        std::fs::File::create(format!("{}.navcore.ndjson", out_prefix)).expect("create ir file"),
+        std::fs::File::create(format!("{}.manx.ndjson", out_prefix)).expect("create ir file"),
     );
 
     let mut total = 0usize;
@@ -760,7 +760,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
             // UDWHAZ03 over the same neighbourhood instead of its no-chart
             // fallback. Emitted only where a CS procedure consults it.
             // Visibility: would this feature be drawn at all? Emitted only when
-            // NAVCORE_VIEW_SCALE is set, so the harness can diff the decision
+            // MANX_VIEW_SCALE is set, so the harness can diff the decision
             // against OpenCPN's ObjectRenderCheckCat. This is a third decision
             // layer, separate from "which symbology" and "which geometry": a
             // feature can resolve perfectly and still never reach the screen.
@@ -770,9 +770,9 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
                 // and clears its SCAMIN; the renderer does the same, so the
                 // harness has to model it or it reports a divergence that is
                 // really the promotion.
-                let bypass = cat == Some(navcore2::s52::DisplayCategory::Displaybase)
+                let bypass = cat == Some(manx::s52::DisplayCategory::Displaybase)
                     || engine.is_promoted_safety_contour(feature, chart_safety);
-                let scale_ok = navcore2::tiles::builder::should_render_at_scale_ex(
+                let scale_ok = manx::tiles::builder::should_render_at_scale_ex(
                     feature,
                     vs,
                     bypass,
@@ -808,7 +808,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
             };
             writeln!(feat_out, "{}", frec).ok();
 
-            // navcore's resolution of the same feature
+            // Manx's resolution of the same feature
             let (entry, expanded) = engine.resolve_ir(feature, geom, &ctx);
             let irec = match entry {
                 Some(e) => {
@@ -850,7 +850,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
     }
 
     eprintln!(
-        "navcore --dump-ir: {} features from {} charts, {} without a LUP",
+        "manx --dump-ir: {} features from {} charts, {} without a LUP",
         total,
         chart_files.len(),
         no_lup
@@ -1069,8 +1069,8 @@ fn tile_debug_mode(dir_path: &str) {
         tiles.len()
     );
 
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let chart_cache: manx::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: manx::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     // Load S-52 engine for display category filtering
@@ -1180,11 +1180,11 @@ fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
 
     let center_lat = info.extent_wgs84.center_lat();
     let center_lon = info.extent_wgs84.center_lon();
-    let (mx, my) = navcore2::tiles::latlon_to_mercator(center_lat, center_lon);
+    let (mx, my) = manx::tiles::latlon_to_mercator(center_lat, center_lon);
     let tile_id = TileId::from_mercator(mx, my, z);
 
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let chart_cache: manx::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: manx::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     let s52_engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
@@ -1213,17 +1213,17 @@ fn inspect_tile_mode(dir_path: &str, chart_stem: &str, z: u8) {
     }
 }
 
-/// `navcore --shop-list <email> [charts_dir]`
+/// `manx --shop-list <email> [charts_dir]`
 ///
 /// Signs in to o-charts and lists what the account owns, marking what is
 /// installed in `charts_dir` and what has a newer edition waiting. The password
-/// comes from `NAVCORE_SHOP_PASSWORD` or, failing that, is read from stdin —
+/// comes from `MANX_SHOP_PASSWORD` or, failing that, is read from stdin —
 /// never from the command line, where it would land in the shell history and in
 /// every process listing on the machine.
 fn shop_list_mode(email: &str, charts_dir: Option<&str>) {
-    use navcore2::shop::{protocol, types::Edition, Fingerprint, ShopClient};
+    use manx::shop::{protocol, types::Edition, Fingerprint, ShopClient};
 
-    let password = match std::env::var("NAVCORE_SHOP_PASSWORD") {
+    let password = match std::env::var("MANX_SHOP_PASSWORD") {
         Ok(p) if !p.is_empty() => p,
         _ => {
             eprint!("o-charts password for {email}: ");
@@ -1306,7 +1306,7 @@ fn shop_list_mode(email: &str, charts_dir: Option<&str>) {
 }
 
 /// Editions already on disk, keyed by chart id, read from each set's ChartList.XML.
-fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::types::Edition> {
+fn installed_editions(dir: &std::path::Path) -> HashMap<String, manx::shop::types::Edition> {
     let mut out = HashMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else { return out };
     for entry in entries.flatten() {
@@ -1323,7 +1323,7 @@ fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::
                     .nth(1)
                     .and_then(|s| s.split("</RE>").next())
                 {
-                    out.insert(id.to_string(), navcore2::shop::types::Edition::parse(ed));
+                    out.insert(id.to_string(), manx::shop::types::Edition::parse(ed));
                 }
             }
         }
@@ -1331,7 +1331,7 @@ fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::
     out
 }
 
-/// `navcore --pick <charts> <lat,lon> [tolerance_m]`
+/// `manx --pick <charts> <lat,lon> [tolerance_m]`
 ///
 /// The same query the info bubble runs, on the command line, so the picking can
 /// be checked against a chart without a window in the way.
@@ -1339,14 +1339,14 @@ fn installed_editions(dir: &std::path::Path) -> HashMap<String, navcore2::shop::
 /// route store, where the Routes window and GPX export pick it up.
 /// M5's surface: fetch real wind, plan a real sailing route, store it.
 fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) {
-    use navcore2::geo::LatLon;
-    use navcore2::nav::autoroute::SafetyConfig;
-    use navcore2::nav::wxroute;
+    use manx::geo::LatLon;
+    use manx::nav::autoroute::SafetyConfig;
+    use manx::nav::wxroute;
 
     let start = LatLon::new(a.0, a.1);
     let finish = LatLon::new(b.0, b.1);
-    let cache = dirs::config_dir()
-        .map(|d| d.join("navcore").join("grib"))
+    let cache = manx::paths::config_dir()
+        .map(|d| d.join("grib"))
         .unwrap_or_else(|| PathBuf::from("grib-cache"));
     let depart = chrono::Utc::now();
     // The same function the app's Sail button runs, so the command line
@@ -1359,7 +1359,7 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
         &cache,
         wxroute::DEFAULT_POLAR,
         "built-in cruiser",
-        &navcore2::nav::RoutingConfig::default(),
+        &manx::nav::RoutingConfig::default(),
         &SafetyConfig::default(),
         true,
         true,
@@ -1402,8 +1402,8 @@ fn weather_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), hours: u32) 
 }
 
 fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f64>) {
-    use navcore2::geo::LatLon;
-    use navcore2::nav::autoroute::SafetyConfig;
+    use manx::geo::LatLon;
+    use manx::nav::autoroute::SafetyConfig;
 
     let mut safety = SafetyConfig::default();
     if let Some(d) = draft {
@@ -1412,11 +1412,11 @@ fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f
     let (start, finish) = (LatLon::new(a.0, a.1), LatLon::new(b.0, b.1));
     println!(
         "Planning {:.1} nm passage, draft {:.1} m…",
-        navcore2::geo::distance_m(start, finish) / 1852.0,
+        manx::geo::distance_m(start, finish) / 1852.0,
         safety.draft_m
     );
     // The same function the app's Motor button runs.
-    let planned = match navcore2::nav::wxroute::motor_plan_from_chart_dir(
+    let planned = match manx::nav::wxroute::motor_plan_from_chart_dir(
         std::path::Path::new(dir_path),
         start,
         finish,
@@ -1449,15 +1449,15 @@ fn auto_route_mode(dir_path: &str, a: (f64, f64), b: (f64, f64), draft: Option<f
     save_cli_route(&planned.route, &planned.waypoints);
 }
 
-/// Into the route store (`NAVCORE_ROUTES`, or the app's own), so the Routes
+/// Into the route store (`MANX_ROUTES`, or the app's own), so the Routes
 /// window sees a command-line plan immediately.
-fn save_cli_route(route: &navcore2::nav::Route, waypoints: &[navcore2::nav::model::Waypoint]) {
-    let store_dir = std::env::var("NAVCORE_ROUTES")
+fn save_cli_route(route: &manx::nav::Route, waypoints: &[manx::nav::model::Waypoint]) {
+    let store_dir = std::env::var("MANX_ROUTES")
         .map(PathBuf::from)
         .ok()
-        .or_else(navcore2::nav::RouteStore::default_dir)
+        .or_else(manx::nav::RouteStore::default_dir)
         .unwrap_or_else(|| PathBuf::from("routes"));
-    match navcore2::nav::RouteStore::open(store_dir) {
+    match manx::nav::RouteStore::open(store_dir) {
         Ok((mut store, _)) => {
             for wp in waypoints {
                 store.waypoints.insert(wp.clone());
@@ -1471,19 +1471,19 @@ fn save_cli_route(route: &navcore2::nav::Route, waypoints: &[navcore2::nav::mode
     }
 }
 
-/// `--s57-dump <cell.000>`: the cell through navcore's whole S-57 path —
+/// `--s57-dump <cell.000>`: the cell through Manx's whole S-57 path —
 /// read, updates applied, encoded as SENC, parsed back — one JSON object per
 /// feature, in the shape tools/s57oracle prints, for tools/s57diff.py.
 fn s57_dump_mode(path: &str) {
-    use navcore2::senc::{AttributeValue, ChartData, FeatureType};
-    let cell = match navcore2::s57::cell::Cell::open(std::path::Path::new(path)) {
+    use manx::senc::{AttributeValue, ChartData, FeatureType};
+    let cell = match manx::s57::cell::Cell::open(std::path::Path::new(path)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    let (bytes, ids) = navcore2::s57::senc_encode::encode_with_ids(&cell);
+    let (bytes, ids) = manx::s57::senc_encode::encode_with_ids(&cell);
     let chart = match ChartData::parse(bytes) {
         Ok(c) => c,
         Err(e) => {
@@ -1492,9 +1492,9 @@ fn s57_dump_mode(path: &str) {
         }
     };
     let (rlat, rlon) = (chart.header.ref_lat, chart.header.ref_lon);
-    let (rx, ry) = navcore2::tiles::latlon_to_mercator(rlat, rlon);
+    let (rx, ry) = manx::tiles::latlon_to_mercator(rlat, rlon);
     let ll = |x: f64, y: f64| {
-        let (lat, lon) = navcore2::tiles::mercator_to_latlon(x, y);
+        let (lat, lon) = manx::tiles::mercator_to_latlon(x, y);
         serde_json::json!([(lon * 1e7).round() / 1e7, (lat * 1e7).round() / 1e7])
     };
     println!(
@@ -1506,7 +1506,7 @@ fn s57_dump_mode(path: &str) {
     for (f, rcid) in chart.features.iter().zip(ids) {
         let mut attrs = serde_json::Map::new();
         for (code, v) in f.attributes.iter_codes() {
-            let name = navcore2::senc::s57_attribute_name(code)
+            let name = manx::senc::s57_attribute_name(code)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("#{code}"));
             let s = match v {
@@ -1556,7 +1556,7 @@ fn s57_dump_mode(path: &str) {
         println!(
             "{}",
             serde_json::json!({"rcid": rcid, "objl": f.type_code,
-                "acronym": navcore2::senc::s57_code_to_acronym(f.type_code),
+                "acronym": manx::senc::s57_code_to_acronym(f.type_code),
                 "attrs": attrs, "geom": geom})
         );
     }
@@ -1581,9 +1581,9 @@ fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
         }
     };
 
-    let (mx, my) = navcore2::tiles::latlon_to_mercator(lat, lon);
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let (mx, my) = manx::tiles::latlon_to_mercator(lat, lon);
+    let chart_cache: manx::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: manx::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
     let builder =
         TileBuilder::with_cache(&catalog, &keys, &decryptor, &chart_cache, &coverage_cache);
@@ -1591,12 +1591,12 @@ fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
     let mut found = Vec::new();
     for info in catalog.charts.iter().filter(|c| c.contains_point(mx, my)) {
         match builder.load_chart(info) {
-            Ok(chart) => found.extend(navcore2::pick::pick_at(&chart, info, [mx, my], tolerance_m)),
+            Ok(chart) => found.extend(manx::pick::pick_at(&chart, info, [mx, my], tolerance_m)),
             Err(e) => eprintln!("  (skipping {}: {})", info.name, e),
         }
     }
-    navcore2::pick::sort_picks(&mut found);
-    let found = navcore2::pick::dedupe_picks(found);
+    manx::pick::sort_picks(&mut found);
+    let found = manx::pick::dedupe_picks(found);
 
     println!("{} object(s) within {:.0} m of {:.5},{:.5}\n", found.len(), tolerance_m, lat, lon);
     for o in &found {
@@ -1609,7 +1609,7 @@ fn pick_mode(dir_path: &str, lat: f64, lon: f64, tolerance_m: f64) {
         if let Some(summary) = &o.summary {
             println!("    {summary}");
         }
-        for (k, v) in o.attributes.iter().filter(|(k, _)| navcore2::pick::is_worth_showing(k)) {
+        for (k, v) in o.attributes.iter().filter(|(k, _)| manx::pick::is_worth_showing(k)) {
             println!("    {:<8} {}", k, v);
         }
         for n in &o.notes {
@@ -1650,11 +1650,11 @@ fn inspect_latlon_mode(dir_path: &str, lat: f64, lon: f64, z: u8) {
         }
     };
 
-    let (mx, my) = navcore2::tiles::latlon_to_mercator(lat, lon);
+    let (mx, my) = manx::tiles::latlon_to_mercator(lat, lon);
     let tile_id = TileId::from_mercator(mx, my, z);
 
-    let chart_cache: navcore2::tiles::builder::ChartCache = Mutex::new(HashMap::new());
-    let coverage_cache: navcore2::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
+    let chart_cache: manx::tiles::builder::ChartCache = Mutex::new(HashMap::new());
+    let coverage_cache: manx::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor = Mutex::new(decryptor);
 
     let s52_engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
@@ -1678,7 +1678,7 @@ fn inspect_latlon_mode(dir_path: &str, lat: f64, lon: f64, z: u8) {
     );
 
     // List every chart whose extent contains this point, finest scale first.
-    let mut covering: Vec<&navcore2::senc::ChartInfo> = catalog
+    let mut covering: Vec<&manx::senc::ChartInfo> = catalog
         .charts
         .iter()
         .filter(|c| c.contains_point(mx, my))
@@ -1928,13 +1928,13 @@ struct App {
     twist_pending: Option<f32>,
     /// Shift, Ctrl, Cmd — for the keyboard shortcuts and Ctrl-scroll zoom.
     modifiers: winit::keyboard::ModifiersState,
-    // Headless capture (NAVCORE_SHOT=path): render until tiles settle, save PNG, exit.
+    // Headless capture (MANX_SHOT=path): render until tiles settle, save PNG, exit.
     shot_path: Option<String>,
     shot_requested: bool,
     frame_count: u32,
     /// Between suspended and resumed (Android): there is no surface.
     suspended: bool,
-    /// NAVCORE_STRESS=coast: legs of the coastal tour done so far.
+    /// MANX_STRESS=coast: legs of the coastal tour done so far.
     stress_leg: usize,
 }
 
@@ -1983,7 +1983,7 @@ impl App {
             touch_start: None,
             touches: HashMap::new(),
             pinch_start_distance: None,
-            shot_path: std::env::var("NAVCORE_SHOT").ok().filter(|s| !s.is_empty()),
+            shot_path: std::env::var("MANX_SHOT").ok().filter(|s| !s.is_empty()),
             shot_requested: false,
             pinch_centroid: None,
             twist_angle: None,
@@ -2136,10 +2136,10 @@ impl ApplicationHandler for App {
                 } else {
                     // Warm-up frames + drained tile queue => view has settled.
                     // Also refuse to capture until the surface actually has the
-                    // size NAVCORE_SIZE asked for: the window can come up at the
+                    // size MANX_SIZE asked for: the window can come up at the
                     // default size and be resized a frame later, and a capture
                     // taken in between is geometrically wrong.
-                    let size_ready = match std::env::var("NAVCORE_SIZE").ok().and_then(|s| {
+                    let size_ready = match std::env::var("MANX_SIZE").ok().and_then(|s| {
                         let (w, h) = s.split_once('x')?;
                         Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
                     }) {
@@ -2149,10 +2149,10 @@ impl ApplicationHandler for App {
                         }
                         None => true,
                     };
-                    // NAVCORE_SHOT_FRAMES lengthens the warm-up, for captures
+                    // MANX_SHOT_FRAMES lengthens the warm-up, for captures
                     // that must wait on something slower than the tiles — a
                     // Signal K connection, say.
-                    let warmup: u32 = std::env::var("NAVCORE_SHOT_FRAMES")
+                    let warmup: u32 = std::env::var("MANX_SHOT_FRAMES")
                         .ok()
                         .and_then(|v| v.parse().ok())
                         .unwrap_or(120);
@@ -2176,11 +2176,11 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // NAVCORE_STRESS=1: pan in a circle and zoom out ~64x and back, every
-        // frame, forever. NAVCORE_STRESS=coast: follow the southern California
+        // MANX_STRESS=1: pan in a circle and zoom out ~64x and back, every
+        // frame, forever. MANX_STRESS=coast: follow the southern California
         // coast, San Diego Bay to LA harbour and back, zooming 0.3-8 m/px.
         // A GPU soak test that needs no hands on the mouse.
-        let stress = std::env::var("NAVCORE_STRESS").unwrap_or_default();
+        let stress = std::env::var("MANX_STRESS").unwrap_or_default();
         if !stress.is_empty() && stress != "0" {
             if let Some(state) = &mut self.state {
                 let t = self.frame_count as f32 / 60.0;
@@ -2197,7 +2197,7 @@ impl ApplicationHandler for App {
                     let n = COAST.len();
                     let leg = self.stress_leg % (2 * (n - 1));
                     let i = if leg < n - 1 { leg + 1 } else { 2 * (n - 1) - leg - 1 };
-                    let (tx, ty) = navcore2::render::Projection::to_mercator(COAST[i].0, COAST[i].1);
+                    let (tx, ty) = manx::render::Projection::to_mercator(COAST[i].0, COAST[i].1);
                     let d = glam::DVec2::new(tx, ty) - state.camera.position;
                     let step = 30.0 * state.camera.zoom as f64;
                     if d.length() <= step {
@@ -2278,15 +2278,15 @@ impl ApplicationHandler for App {
         }
         if self.state.is_none() {
             let title = match &self.source {
-                ChartSource::TestTriangle => "NavCore - Test Triangle (pass chart path to render)",
-                ChartSource::SingleFile(_) => "NavCore - Chart Viewer",
-                ChartSource::Directory(_) => "NavCore - Multi-Chart Viewer",
+                ChartSource::TestTriangle => "Manx - Test Triangle (pass chart path to render)",
+                ChartSource::SingleFile(_) => "Manx - Chart Viewer",
+                ChartSource::Directory(_) => "Manx - Multi-Chart Viewer",
             };
 
-            // NAVCORE_SIZE="WxH" requests an exact physical (pixel) surface size so
+            // MANX_SIZE="WxH" requests an exact physical (pixel) surface size so
             // captures can be compared pixel-for-pixel with a reference screenshot.
             let attrs = Window::default_attributes().with_title(title);
-            let attrs = match std::env::var("NAVCORE_SIZE").ok().and_then(|s| {
+            let attrs = match std::env::var("MANX_SIZE").ok().and_then(|s| {
                 let (w, h) = s.split_once('x')?;
                 Some((w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?))
             }) {
@@ -2400,7 +2400,7 @@ impl ApplicationHandler for App {
                 };
                 let changed = match logical_key.as_ref() {
                     Key::Named(NamedKey::ArrowUp) if shift => {
-                        state.camera.tilt = (state.camera.tilt + STEP).min(navcore2::render::MAX_TILT);
+                        state.camera.tilt = (state.camera.tilt + STEP).min(manx::render::MAX_TILT);
                         true
                     }
                     Key::Named(NamedKey::ArrowDown) if shift => {

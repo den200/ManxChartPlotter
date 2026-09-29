@@ -1,4 +1,4 @@
-//! NavCore - Rust nautical chart plotter for Raspberry Pi and Mac.
+//! Manx - Rust nautical chart plotter for Raspberry Pi and Mac.
 //!
 //! ## Modules
 //!
@@ -8,7 +8,7 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use navcore2::{ChartDecryptor, KeyStore, senc::ChartData};
+//! use manx::{ChartDecryptor, KeyStore, senc::ChartData};
 //!
 //! // Load keys
 //! let mut keys = KeyStore::new();
@@ -29,6 +29,7 @@ pub mod decrypt;
 pub mod export;
 pub mod geo;
 pub mod nav;
+pub mod paths;
 pub mod pick;
 pub mod render;
 pub mod shop;

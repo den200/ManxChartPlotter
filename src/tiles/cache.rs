@@ -182,7 +182,7 @@ impl TileGpuCache {
 
     /// Upload a tile packet to GPU and cache it
     pub fn upload(&mut self, device: &wgpu::Device, packet: TilePacket, style_hash: u64) {
-        let profile = std::env::var("NAVCORE_PROFILE")
+        let profile = std::env::var("MANX_PROFILE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         let upload_start = profile.then(std::time::Instant::now);

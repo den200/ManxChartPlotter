@@ -20,7 +20,7 @@ use super::isochrone::{self, IsochroneInput};
 use super::model::{LegPlan, PointOfSail, Route, RouteProvenance, RoutingConfig, Waypoint};
 use super::polar::Polar;
 
-/// The polar navcore ships: a generic ~10 m performance cruiser, for trying
+/// The polar Manx ships: a generic ~10 m performance cruiser, for trying
 /// the feature before feeding in the real boat's numbers.
 pub const DEFAULT_POLAR: &str = include_str!("../../assets/polars/default.pol");
 
@@ -208,7 +208,7 @@ pub fn plan(job: &WxJob<'_>, name: &str) -> Result<WxPlanned, WxError> {
     {
         warnings.push(autoroute::CAUTION_AREA_NOTE.into());
     }
-    if let Ok(out) = std::env::var("NAVCORE_ROUTE_DEBUG") {
+    if let Ok(out) = std::env::var("MANX_ROUTE_DEBUG") {
         let sailed: Vec<[f64; 2]> = points.iter().map(|p| merc(p.pos)).collect();
         c.grid
             .debug_png(&sailed, std::path::Path::new(&format!("{out}.sailed.png")), 1600);

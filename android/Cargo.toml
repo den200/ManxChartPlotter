@@ -1,19 +1,19 @@
-# The Android build of navcore: the same app as src/bin/navcore.rs, as the
+# The Android build of manx: the same app as src/bin/manx.rs, as the
 # shared library a NativeActivity loads. Built and packaged by
 # deploy/build-apk.sh.
 [package]
-name = "navcore-android"
+name = "manx-android"
 version = "0.4.0"
 edition = "2021"
 publish = false
 
 [lib]
-name = "navcore"
+name = "manx"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-navcore2 = { path = ".." }
+manx = { path = ".." }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 dirs = "5.0"
 env_logger = "0.11"

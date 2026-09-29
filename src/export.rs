@@ -2,7 +2,7 @@
 //!
 //! On a desktop or the Pi it is written to the Downloads folder. On Android
 //! an app cannot write there directly, and a file in its own storage is out
-//! of reach — so the file goes into Download/navcore through MediaStore
+//! of reach — so the file goes into Download/manx through MediaStore
 //! (Android 10+, no permission needed), and the share sheet opens with it,
 //! for mail, Drive, a messenger or another plotter. Cancelling the sheet
 //! leaves the file in Downloads. On Android 8–9, which have no MediaStore
@@ -71,7 +71,7 @@ mod android {
                     &[(&key).into(), (&uri).into()],
                 )?;
                 env.call_method(&intent, "addFlags", "(I)Landroid/content/Intent;", &[GRANT_READ.into()])?;
-                format!("Saved Download/navcore/{name}")
+                format!("Saved Download/manx/{name}")
             } else {
                 let text = env.new_string(String::from_utf8_lossy(bytes))?;
                 let plain = env.new_string("text/plain")?;
@@ -114,7 +114,7 @@ mod android {
         result.map_err(|e| format!("Could not export {name}: {e}"))
     }
 
-    /// Insert the file into MediaStore's Downloads, under navcore/, and
+    /// Insert the file into MediaStore's Downloads, under manx/, and
     /// write it. Returns its content:// URI.
     fn save_to_downloads<'a>(
         env: &mut JNIEnv<'a>,
@@ -127,7 +127,7 @@ mod android {
             .call_method(activity, "getContentResolver", "()Landroid/content/ContentResolver;", &[])?
             .l()?;
         let values = env.new_object("android/content/ContentValues", "()V", &[])?;
-        for (k, v) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/navcore")] {
+        for (k, v) in [("_display_name", name), ("mime_type", mime), ("relative_path", "Download/manx")] {
             let (k, v) = (env.new_string(k)?, env.new_string(v)?);
             env.call_method(&values, "put", "(Ljava/lang/String;Ljava/lang/String;)V", &[(&k).into(), (&v).into()])?;
         }

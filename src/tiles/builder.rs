@@ -112,7 +112,7 @@ pub fn should_render_at_scale_ex(
     // s52plib.cpp gates this on an exemption list and uses a factor of 4. The
     // exemptions are the classes that describe the water and the land itself —
     // applying the rule to them empties the chart of exactly the features a
-    // mariner needs most. navcore applied it to everything at factor 2, which
+    // mariner needs most. Manx applied it to everything at factor 2, which
     // is what erased the dredged basins inside Brondby Havn: the harbour cell is
     // 1:4000, its DRGAREs carry no SCAMIN, and 2 x 4000 is a closer zoom than
     // the harbour is normally viewed at.
@@ -358,7 +358,7 @@ pub struct TileBuilder<'a> {
     view_center_x: f32,
     /// Camera center in global Mercator meters
     view_center_y: f32,
-    /// Provenance log for `navcore --dump-scene`. `None` in normal rendering,
+    /// Provenance log for `manx --dump-scene`. `None` in normal rendering,
     /// so the instrumentation costs nothing.
     pub scene_log: Option<std::sync::Mutex<super::scene::SceneLog>>,
 }
@@ -623,7 +623,7 @@ impl<'a> TileBuilder<'a> {
         }
     }
 
-    /// Collect scene provenance while building (`navcore --dump-scene`).
+    /// Collect scene provenance while building (`manx --dump-scene`).
     pub fn with_scene_log(mut self) -> Self {
         self.scene_log = Some(std::sync::Mutex::new(super::scene::SceneLog::new()));
         self
@@ -980,7 +980,7 @@ impl<'a> TileBuilder<'a> {
         tile_id: TileId,
         include_lines: bool,
     ) -> Result<TilePacket, BuildError> {
-        let profile = std::env::var("NAVCORE_PROFILE")
+        let profile = std::env::var("MANX_PROFILE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false);
         let build_start = profile.then(Instant::now);
@@ -1740,7 +1740,7 @@ impl<'a> TileBuilder<'a> {
                 // DRGARE (dredged area) and DEPARE share LUP group 1 → priority 0
                 // in S-52. OpenCPN's razRules 2-D table resolves the tie by LUP
                 // load order so DRGARE paints on top of the enclosing DEPARE.
-                // navcore collapses the tie to OSENC feature order, which makes
+                // Manx collapses the tie to OSENC feature order, which makes
                 // marina basins flip to the enclosing-DEPARE colour (DEPDW pale
                 // blue, which reads as "white"). Bump DRGARE by +1 so its shallow
                 // DEPVS shade always paints last.
@@ -3268,7 +3268,7 @@ impl<'a> TileBuilder<'a> {
                         }
                         // A depth on an obstruction or wreck is a *sounding*.
                         // OBSTRN04 and WRECKS02 hand it to SNDFRM02, which
-                        // emits digit symbols; navcore draws soundings as text,
+                        // emits digit symbols; Manx draws soundings as text,
                         // so route it through the same layout instead of the
                         // label path. Otherwise it came out at label size and
                         // with a decimal point — "9.2" at twice the height of
@@ -4064,7 +4064,7 @@ fn light_sector_instances(
 
     // The arc belongs to the LIGHTS object and draws at that object's LUP
     // priority (Hazards, 8) — not a fixed level. A hardcoded 4 happened to
-    // sit above everything while navcore's priority ladder was shifted one
+    // sit above everything while Manx's priority ladder was shifted one
     // step low; with the correct S-52 numbering it fell under the line
     // symbology and the sector arcs vanished from the chart.
     let bearings = [s1.to_radians() as f32, s2.to_radians() as f32];

@@ -1,4 +1,4 @@
-//! Scene provenance — what navcore decided to draw, and where it came from.
+//! Scene provenance — what Manx decided to draw, and where it came from.
 //!
 //! The S-52 oracle answers "which symbology instruction did this feature get".
 //! This answers the next question down: "which polygon, from which chart, by
@@ -6,13 +6,13 @@
 //!
 //! There is no OpenCPN counterpart here and deliberately so. Its rasteriser is
 //! not a linkable pure function the way `s52plib` is, and it does not need to
-//! be: area geometry arrives from the SENC **already tessellated**, so navcore
+//! be: area geometry arrives from the SENC **already tessellated**, so Manx
 //! is reproducing given triangles rather than computing them. That makes the
 //! ground truth checkable by invariant instead of by comparison — an emitted
 //! triangle that lies outside its own feature's polygon is wrong on its face,
 //! with nothing to diff against.
 //!
-//! Enabled by `navcore --dump-scene`; zero cost otherwise (the log is `None`).
+//! Enabled by `manx --dump-scene`; zero cost otherwise (the log is `None`).
 
 use serde::Serialize;
 
@@ -35,7 +35,7 @@ pub enum AreaSource {
 #[derive(Debug, Clone, Serialize)]
 pub struct SceneArea {
     pub chart: String,
-    /// Index of the feature within its chart, matching `navcore --dump-ir` ids.
+    /// Index of the feature within its chart, matching `manx --dump-ir` ids.
     pub feature: usize,
     pub class: String,
     pub source: AreaSource,

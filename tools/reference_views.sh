@@ -1,12 +1,12 @@
 #!/bin/sh
-# Capture the four OpenCPN reference views with navcore, pixel-for-pixel.
+# Capture the four OpenCPN reference views with manx, pixel-for-pixel.
 #
 # The view parameters below were solved from the reference screenshots themselves
 # (chart-outline rectangles + coastline cross-correlation), not from the lat/lon in
 # the OpenCPN status bar — that field shows the *cursor* position, not the view centre.
 #
-# NAVCORE_VIEW = "centre_lat,centre_lon,mpp"  (mpp = Mercator metres per pixel)
-# NAVCORE_SIZE = "WxH" physical pixels, matching the reference screenshot canvas
+# MANX_VIEW = "centre_lat,centre_lon,mpp"  (mpp = Mercator metres per pixel)
+# MANX_SIZE = "WxH" physical pixels, matching the reference screenshot canvas
 #                (canvas = screenshot minus the OpenCPN status bar)
 #
 # Usage: tools/reference_views.sh [chart_dir] [out_dir]
@@ -18,7 +18,7 @@ mkdir -p "$OUT"
 
 shot() { # name view size
     echo "=> $1"
-    NAVCORE_UI=0 NAVCORE_VIEW="$2" NAVCORE_SIZE="$3" NAVCORE_SHOT="$OUT/$1.png" \
+    MANX_UI=0 MANX_VIEW="$2" MANX_SIZE="$3" MANX_SHOT="$OUT/$1.png" \
         cargo run --release -- "$CHARTS" >/dev/null 2>&1
 }
 

@@ -336,7 +336,7 @@ pub fn light_render_info(feature: &Feature, settings: &MarinerSettings) -> Light
     // CATLIT 1 (directional function) or 16 (directional, leading). There is
     // nothing to match against upstream here: LIGHTS06 declares `orientstr` and
     // leaves the assignment commented out, so *every* directional light comes
-    // out of OpenCPN as SY(QUESMRK1) whether or not it has an ORIENT. navcore
+    // out of OpenCPN as SY(QUESMRK1) whether or not it has an ORIENT. Manx
     // draws the oriented flare instead, which is what the S-52 procedure
     // describes; the conformance differ records the difference.
     let is_directional = catlit.contains(&1) || catlit.contains(&16);
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn test_narrow_sector_is_still_a_sector() {
         // A 0.2-degree sector is a real leading sector marking a channel
-        // centreline. LIGHTS06 sets no minimum sweep, and navcore's old
+        // centreline. LIGHTS06 sets no minimum sweep, and Manx's old
         // 1-degree floor turned these into all-round rings.
         let mut feature = make_sector_light(10.0, 10.2);
         feature.attributes.insert("COLOUR",

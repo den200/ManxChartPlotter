@@ -1,6 +1,6 @@
 //! What the boat is doing, as last heard.
 //!
-//! Every path the server sends is kept, whether navcore knows what it means or
+//! Every path the server sends is kept, whether Manx knows what it means or
 //! not: an unrecognised path is still something a user may want on the bar,
 //! and a plotter that silently discards half a boat's instruments is worse
 //! than one that shows them raw.

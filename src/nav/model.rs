@@ -25,7 +25,7 @@ pub struct Waypoint {
     /// Overrides the global arrival circle for this waypoint.
     pub arrival_radius_nm: Option<f64>,
     /// Foreign GPX `<extensions>` children, verbatim — another plotter's
-    /// bookkeeping, preserved so a round-trip loses nothing. Never navcore's
+    /// bookkeeping, preserved so a round-trip loses nothing. Never Manx's
     /// own elements; those are parsed into the fields above and re-emitted.
     pub foreign_extensions: String,
 }

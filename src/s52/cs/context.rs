@@ -9,7 +9,7 @@
 //! promoted to DISPLAYBASE and flagged with ISODGR51.
 //!
 //! s52cnsy.cpp gets those neighbours through
-//! `chart_context::pt2GetAssociatedObjects`. navcore precomputes the same
+//! `chart_context::pt2GetAssociatedObjects`. Manx precomputes the same
 //! information where the chart's features are still in scope (the tile builder)
 //! and passes it down as this struct.
 
@@ -79,7 +79,7 @@ struct DepthArea {
 }
 
 /// Per-chart index of DEPARE/DRGARE areas, used to answer "what depth area is
-/// this danger sitting in?" — navcore's stand-in for OpenCPN's
+/// this danger sitting in?" — Manx's stand-in for OpenCPN's
 /// `s57chart::GetAssociatedObjects`.
 ///
 /// Depth *lines* are not indexed: the S-57 model allows DEPARE as a line

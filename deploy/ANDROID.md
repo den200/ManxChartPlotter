@@ -1,6 +1,6 @@
-# Running navcore on Android
+# Running Manx on Android
 
-navcore runs on 64-bit ARM Android 8 and later. It's tested on an ODROID-C5
+Manx runs on 64-bit ARM Android 8 and later. It's tested on an ODROID-C5
 running Android 14. This page covers getting it onto a device, charts, and
 the one thing that must not be lost: the device's o-charts identity.
 
@@ -9,7 +9,7 @@ the one thing that must not be lost: the device's o-charts identity.
 On the Mac, from the project folder:
 
 ```sh
-deploy/build-apk.sh              # → target/navcore.apk
+deploy/build-apk.sh              # → target/manx.apk
 INSTALL=1 deploy/build-apk.sh    # and adb install it
 ```
 
@@ -20,9 +20,9 @@ run `adb connect <device-ip>:5555` first.
 
 ## The signing key: never change it
 
-Every APK is signed with navcore's own key,
+Every APK is signed with Manx's own key,
 `~/.navcore/signing/navcore-release.jks`, with its password in `password`
-beside it. `NAVCORE_KEYSTORE` points elsewhere. If the key is missing, the
+beside it. `MANX_KEYSTORE` points elsewhere. If the key is missing, the
 script falls back to a throwaway debug key and warns you.
 
 Android installs an update only if it is signed with the same key. That
@@ -43,7 +43,7 @@ recovered.
    `odroid`. This is free and uses no slot. Don't reuse another machine's
    name.
 3. **3. Charts**: Download. The first download assigns one of the licence's
-   slots to this device **permanently**, and navcore asks you to confirm.
+   slots to this device **permanently**, and Manx asks you to confirm.
    For an expired licence, it offers the editions your account's machines
    received while it was paid for.
 
@@ -52,21 +52,21 @@ copying them over.
 
 ## Will the licence survive…?
 
-o-charts licenses a chart to a device's identity. On Android, navcore gives
+o-charts licenses a chart to a device's identity. On Android, Manx gives
 o-charts' helper the device's **Widevine ID**, or, where the device has no
 Widevine (the ODROID-C5 has only ClearKey), its **`ANDROID_ID`**.
 
 | Event | Charts still work? |
 |---|---|
 | System update that keeps your apps and data | **Yes** |
-| navcore update | **Yes**, if signed with the same key |
-| Uninstall and reinstall navcore | **Yes**, if signed with the same key; charts need downloading again |
-| navcore signed with a **different key** | **No** (`ANDROID_ID` changes) |
+| Manx update | **Yes**, if signed with the same key |
+| Uninstall and reinstall Manx | **Yes**, if signed with the same key; charts need downloading again |
+| Manx signed with a **different key** | **No** (`ANDROID_ID` changes) |
 | **Factory reset**, or flashing a fresh image that erases user data | **No**: it's a new device to o-charts and needs a new slot |
 
 The Widevine ID survives even a factory reset. `ANDROID_ID` doesn't.
 **Before re-flashing a device that holds a slot**, check that the update
-keeps user data. After an update, navcore's fingerprint in `files/license/`
+keeps user data. After an update, Manx's fingerprint in `files/license/`
 should be unchanged.
 
 ## How o-charts works on Android (for developers)
@@ -77,7 +77,7 @@ should be unchanged.
   Android 10 an app may only run programs from its native library
   directory.
 - **Identity:** the helper reads none of its own; with no ID the
-  fingerprint's identity is empty. navcore passes `-y <Widevine ID>`
+  fingerprint's identity is empty. Manx passes `-y <Widevine ID>`
   (fingerprint `oc04R_<ts>.fpr`) or `-z <ANDROID_ID>` (`oc03R_<ts>.fpr`),
   and refuses to make a fingerprint without one
   (`src/decrypt/android_id.rs`).

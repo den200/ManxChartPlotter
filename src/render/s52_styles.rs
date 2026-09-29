@@ -99,7 +99,7 @@ const PPMM: f32 = 4.0;
 // slabs, because the unit means "one pixel on a chart display", not "keep this
 // physical thickness whatever the density". qutenav resolves it by compressing
 // the width as density rises — 0.7x at 6.2 px/mm falling to 0.3x at 15.9 — and
-// navcore follows that.
+// Manx follows that.
 //
 // OpenCPN does something different again: `RenderLS` uses w/6 mm (its comment
 // calls the 6 "semi-standard LCD display densities") evaluated against a
@@ -130,7 +130,7 @@ fn line_density_compression(ppmm: f32) -> f32 {
 ///
 /// s52plib cites these figures and then discards them: "reduced from s52 specs
 /// (5.4), 3.6mm dash, 1.8mm space / float width = GetPPMM() * 3; //looks
-/// better". navcore keeps the spec.
+/// better". Manx keeps the spec.
 const DASH_ON_MM: f32 = 3.6;
 const DASH_OFF_MM: f32 = 1.8;
 /// DOTT: 0.4 mm of ink, 0.8 mm of gap — a 1.2 mm period.

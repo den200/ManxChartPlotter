@@ -4,7 +4,7 @@
 //! OpenCPN ships it): enumerated (E) and integer (I) attributes are written
 //! as integers, float (F) ones as doubles. Everything else — lists (L),
 //! free text (A, S) — is a string, lists comma-joined, which is the one
-//! list encoding navcore's SENC reader keeps.
+//! list encoding Manx's SENC reader keeps.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttrType {

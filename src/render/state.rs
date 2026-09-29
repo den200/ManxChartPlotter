@@ -478,12 +478,12 @@ pub struct RenderState {
     mariner_buffer: Option<wgpu::Buffer>,
     mariner_count: u32,
     mariner_symbols: Option<crate::render::mariner::MarinerSymbols>,
-    /// Where chart sets live — the directory navcore was pointed at, which is
+    /// Where chart sets live — the directory Manx was pointed at, which is
     /// also where a downloaded set is unpacked so it sits beside the others.
     chart_root: Option<std::path::PathBuf>,
-    /// The NAVCORE_PLAN capture hook has run (it must fire exactly once).
+    /// The MANX_PLAN capture hook has run (it must fire exactly once).
     env_plan_fired: bool,
-    /// The address the user configured, while `NAVCORE_SIGNALK` overrides it
+    /// The address the user configured, while `MANX_SIGNALK` overrides it
     /// for this run. Written back on save so a test address cannot become
     /// the boat's.
     signalk_override_saved: Option<String>,
@@ -621,18 +621,18 @@ pub struct RenderState {
     cached_visible_line_styles_key: u64,
     /// Key for the last uploaded line-uniform contents
     last_line_uniforms_key: u64,
-    /// If set, the draw pass records what it issued (NAVCORE_DUMP_DRAW).
+    /// If set, the draw pass records what it issued (MANX_DUMP_DRAW).
     pub draw_log: Option<std::cell::RefCell<Vec<serde_json::Value>>>,
-    /// If set, render() copies the next frame to this PNG path (NAVCORE_SHOT headless capture)
+    /// If set, render() copies the next frame to this PNG path (MANX_SHOT headless capture)
     pending_capture: Option<String>,
 }
 
 /// Per-frame report of which visible tiles are resident, pending or known to
-/// have no chart data. `NAVCORE_TILE_DEBUG=1`.
+/// have no chart data. `MANX_TILE_DEBUG=1`.
 fn tile_debug_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NAVCORE_TILE_DEBUG")
+        std::env::var("MANX_TILE_DEBUG")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     })
@@ -641,10 +641,45 @@ fn tile_debug_enabled() -> bool {
 fn profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("NAVCORE_PROFILE")
+        std::env::var("MANX_PROFILE")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     })
+}
+
+/// Frame rate, for `MANX_PROFILE=1`: every five seconds, how many frames
+/// were drawn per second and how long the gaps between them were (median and
+/// 95th percentile). Manx draws only when something changes, so this counts
+/// real frames — hold the view still and it rightly falls to nothing; pan, or
+/// run `MANX_STRESS=1`, to measure the renderer.
+fn note_frame() {
+    use std::cell::RefCell;
+    thread_local! {
+        static FRAMES: RefCell<(Option<Instant>, Instant, Vec<f32>)> =
+            RefCell::new((None, Instant::now(), Vec::new()));
+    }
+    FRAMES.with(|f| {
+        let (last, window, gaps) = &mut *f.borrow_mut();
+        let now = Instant::now();
+        if let Some(prev) = *last {
+            gaps.push(now.duration_since(prev).as_secs_f32() * 1000.0);
+        }
+        *last = Some(now);
+        let span = now.duration_since(*window).as_secs_f32();
+        if span >= 5.0 && !gaps.is_empty() {
+            gaps.sort_by(|a, b| a.total_cmp(b));
+            let pct = |p: f32| gaps[((gaps.len() - 1) as f32 * p).round() as usize];
+            log::info!(
+                "profile.fps: {:.1} fps, frame gap p50 {:.1} ms p95 {:.1} ms ({} frames)",
+                gaps.len() as f32 / span,
+                pct(0.5),
+                pct(0.95),
+                gaps.len()
+            );
+            gaps.clear();
+            *window = now;
+        }
+    });
 }
 
 /// A lattice of sample points that belongs to the sea rather than to the
@@ -880,9 +915,9 @@ impl RenderState {
                     // What the adapter actually supports, not wgpu's defaults:
                     // the default asks for 8192 px textures and the Pi 5's
                     // V3D stops at 7680, so device creation panicked there.
-                    // navcore's largest texture is the 4096x512 pattern atlas.
+                    // Manx's largest texture is the 4096x512 pattern atlas.
                     required_limits: adapter.limits(),
-                    label: Some("navcore_device"),
+                    label: Some("manx_device"),
                     memory_hints: Default::default(),
                 },
                 None,
@@ -908,7 +943,7 @@ impl RenderState {
         log::debug!("Available formats: {:?}", surface_caps.formats);
 
         let config = wgpu::SurfaceConfiguration {
-            // COPY_SRC lets NAVCORE_SHOT read the rendered frame back for headless captures.
+            // COPY_SRC lets MANX_SHOT read the rendered frame back for headless captures.
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width,
@@ -1165,7 +1200,7 @@ impl RenderState {
                 // Lines carry no usable depth: the per-style uniform writes
                 // disp_prio 0, so line.wgsl puts every line at z = 1.0 (far
                 // plane). Depth-testing them therefore erased any line drawn
-                // over an area of priority >= 1 — invisible until navcore's
+                // over an area of priority >= 1 — invisible until Manx's
                 // priority ladder was one step low and Group 1 also landed on
                 // z = 1.0. Draw order is already sequenced per priority on the
                 // CPU (areas, then lines, then symbols), so the line passes need
@@ -1277,7 +1312,7 @@ impl RenderState {
                 // Lines carry no usable depth: the per-style uniform writes
                 // disp_prio 0, so line.wgsl puts every line at z = 1.0 (far
                 // plane). Depth-testing them therefore erased any line drawn
-                // over an area of priority >= 1 — invisible until navcore's
+                // over an area of priority >= 1 — invisible until Manx's
                 // priority ladder was one step low and Group 1 also landed on
                 // z = 1.0. Draw order is already sequenced per priority on the
                 // CPU (areas, then lines, then symbols), so the line passes need
@@ -1425,8 +1460,8 @@ impl RenderState {
         };
 
         Self {
-            // NAVCORE_DUMP_DRAW=<path> records what the draw pass issued.
-            draw_log: std::env::var("NAVCORE_DUMP_DRAW")
+            // MANX_DUMP_DRAW=<path> records what the draw pass issued.
+            draw_log: std::env::var("MANX_DUMP_DRAW")
                 .ok()
                 .filter(|v| !v.is_empty())
                 .map(|_| std::cell::RefCell::new(Vec::new())),
@@ -2046,12 +2081,11 @@ impl RenderState {
     }
 
     /// Where free charts go: the chart folder in use, or — before there is
-    /// one — navcore's own, which then becomes the chart folder.
+    /// one — Manx's own, which then becomes the chart folder.
     fn free_root(&self) -> std::path::PathBuf {
         self.chart_root.clone().unwrap_or_else(|| {
-            dirs::data_dir()
-                .unwrap_or_else(std::env::temp_dir)
-                .join("navcore")
+            crate::paths::data_dir()
+                .unwrap_or_else(|| std::env::temp_dir().join(crate::paths::APP))
                 .join("charts")
         })
     }
@@ -2241,13 +2275,15 @@ impl RenderState {
             charts: crate::render::ui::ChartFolderView,
         }
         let p: Persisted = serde_json::from_str(&text).ok()?;
-        let dir = std::path::PathBuf::from(p.charts.chosen.trim());
+        // A folder remembered from before the rename may have moved with
+        // the rest of Manx's files.
+        let dir = crate::paths::moved(std::path::Path::new(p.charts.chosen.trim()));
         // A folder on a memory stick that is no longer plugged in must not
         // stop the plotter starting.
         dir.is_dir().then_some(dir)
     }
 
-    /// `NAVCORE_PLAN="from;to[;motor]"` types the passage planner's fields
+    /// `MANX_PLAN="from;to[;motor]"` types the passage planner's fields
     /// and presses the button, so the whole flow can be captured without a
     /// keyboard. An empty `from` means the boat. Called from both init_ui
     /// and set_chart_root because the plan needs the pair of them and their
@@ -2258,13 +2294,13 @@ impl RenderState {
         }
         self.env_plan_fired = true;
 
-        // `NAVCORE_WIND=1` opens the weather sheet and fetches for what is on
+        // `MANX_WIND=1` opens the weather sheet and fetches for what is on
         // screen. Like the plan hook it has to wait for a view: at init_ui the
         // camera is still looking at 0°N 0°E, and the fetch would ask for the
         // wind over the Gulf of Guinea.
-        // `NAVCORE_WIND=fill` draws the barbs and the colour wash over the
+        // `MANX_WIND=fill` draws the barbs and the colour wash over the
         // chart with the sheet shut, which is how the layer itself is seen.
-        if let Ok(mode) = std::env::var("NAVCORE_WIND") {
+        if let Ok(mode) = std::env::var("MANX_WIND") {
             let fill = mode == "fill";
             if let Some(ref mut ui) = self.ui {
                 ui.wind.show = true;
@@ -2277,7 +2313,7 @@ impl RenderState {
             }
         }
 
-        let Ok(spec) = std::env::var("NAVCORE_PLAN") else { return };
+        let Ok(spec) = std::env::var("MANX_PLAN") else { return };
         let parts: Vec<String> = spec.split(';').map(str::to_string).collect();
         if parts.len() >= 2 {
             let sail = parts.get(2).map(|m| m != "motor").unwrap_or(true);
@@ -2287,7 +2323,7 @@ impl RenderState {
             }
             self.plan_passage(&parts[0], &parts[1], sail);
         } else {
-            log::warn!("NAVCORE_PLAN must be 'from;to[;motor]'; ignoring '{spec}'");
+            log::warn!("MANX_PLAN must be 'from;to[;motor]'; ignoring '{spec}'");
         }
     }
 
@@ -2315,10 +2351,10 @@ impl RenderState {
             self.size.width as f32, self.size.height as f32,
         );
 
-        // Optional override for debugging/screenshots: NAVCORE_VIEW="lat,lon,mpp"
+        // Optional override for debugging/screenshots: MANX_VIEW="lat,lon,mpp"
         // positions the camera at a specific WGS84 point with a given zoom
         // (meters per pixel). Lets us reproduce a reference view exactly.
-        if let Ok(view) = std::env::var("NAVCORE_VIEW") {
+        if let Ok(view) = std::env::var("MANX_VIEW") {
             let parts: Vec<f64> = view
                 .split(',')
                 .filter_map(|s| s.trim().parse::<f64>().ok())
@@ -2330,31 +2366,31 @@ impl RenderState {
                     self.size.width as f32, self.size.height as f32,
                 );
                 log::debug!(
-                    "NAVCORE_VIEW override: lat={} lon={} mpp={} -> Mercator ({:.0},{:.0})",
+                    "MANX_VIEW override: lat={} lon={} mpp={} -> Mercator ({:.0},{:.0})",
                     parts[0], parts[1], parts[2], mx, my
                 );
             } else {
-                log::warn!("NAVCORE_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
+                log::warn!("MANX_VIEW must be 'lat,lon,mpp'; ignoring '{}'", view);
             }
         }
 
-        // NAVCORE_TILT=<degrees> pitches the camera back. Off by default: a
+        // MANX_TILT=<degrees> pitches the camera back. Off by default: a
         // chart is a plan, and every S-52 measurement — bearing, distance,
         // symbol size in millimetres — is stated on that plan.
-        if let Ok(t) = std::env::var("NAVCORE_TILT") {
+        if let Ok(t) = std::env::var("MANX_TILT") {
             match t.trim().parse::<f32>() {
                 Ok(deg) => {
                     self.camera.tilt =
                         deg.to_radians().clamp(0.0, crate::render::camera::MAX_TILT);
-                    log::debug!("NAVCORE_TILT: {:.1}°", self.camera.tilt.to_degrees());
+                    log::debug!("MANX_TILT: {:.1}°", self.camera.tilt.to_degrees());
                 }
-                Err(_) => log::warn!("NAVCORE_TILT must be a number of degrees; ignoring '{}'", t),
+                Err(_) => log::warn!("MANX_TILT must be a number of degrees; ignoring '{}'", t),
             }
         }
 
-        // NAVCORE_ROTATE=<degrees> puts that true bearing at the top of the
+        // MANX_ROTATE=<degrees> puts that true bearing at the top of the
         // screen, as a twist would, so a turned chart can be captured.
-        if let Ok(r) = std::env::var("NAVCORE_ROTATE") {
+        if let Ok(r) = std::env::var("MANX_ROTATE") {
             match r.trim().parse::<f64>() {
                 Ok(deg) => {
                     if let Some(ref mut ui) = self.ui {
@@ -2362,7 +2398,7 @@ impl RenderState {
                     }
                     self.camera.rotation = deg.to_radians().rem_euclid(std::f64::consts::TAU);
                 }
-                Err(_) => log::warn!("NAVCORE_ROTATE must be a number of degrees; ignoring '{}'", r),
+                Err(_) => log::warn!("MANX_ROTATE must be a number of degrees; ignoring '{}'", r),
             }
         }
 
@@ -2412,17 +2448,17 @@ impl RenderState {
             }
         }
 
-        // NAVCORE_PALETTE=day|dusk|night. `switch_palette` existed and nothing
+        // MANX_PALETTE=day|dusk|night. `switch_palette` existed and nothing
         // ever called it, so Dusk and Night were unreachable — which is how
         // atlas-dusk.png and atlas-dark.png came to be months out of date with
         // the layout atlas.json describes without anyone noticing.
-        if let Ok(p) = std::env::var("NAVCORE_PALETTE") {
+        if let Ok(p) = std::env::var("MANX_PALETTE") {
             let name = match p.to_ascii_lowercase().as_str() {
                 "day" | "day_bright" => Some("DAY_BRIGHT"),
                 "dusk" => Some("DUSK"),
                 "night" | "dark" => Some("NIGHT"),
                 other => {
-                    log::warn!("NAVCORE_PALETTE: unknown value {:?}", other);
+                    log::warn!("MANX_PALETTE: unknown value {:?}", other);
                     None
                 }
             };
@@ -2449,16 +2485,16 @@ impl RenderState {
         self.deferred_tile_results.clear();
         log::debug!("Background tile worker spawned");
 
-        // NAVCORE_PICK=lat,lon opens the info bubble at a position, so a
+        // MANX_PICK=lat,lon opens the info bubble at a position, so a
         // headless capture can show it. This is the second firing of the
         // hook (init_ui runs before the tile worker exists); when the pick
         // was aimed at a planner pin, that firing already consumed it.
         // Any hook that claims the tap has already consumed this pick during
         // init_ui; firing it again here would place a second waypoint or
         // refill a planner field.
-        let pick_env = std::env::var("NAVCORE_PICK").ok().filter(|_| {
-            std::env::var("NAVCORE_PLAN_PICK").is_err()
-                && std::env::var("NAVCORE_ROUTE_NEW").is_err()
+        let pick_env = std::env::var("MANX_PICK").ok().filter(|_| {
+            std::env::var("MANX_PLAN_PICK").is_err()
+                && std::env::var("MANX_ROUTE_NEW").is_err()
         });
         if let Some(spec) = pick_env {
             let parts: Vec<f64> = spec.split(',').filter_map(|v| v.trim().parse().ok()).collect();
@@ -2466,7 +2502,7 @@ impl RenderState {
                 let (mx, my) = crate::tiles::latlon_to_mercator(parts[0], parts[1]);
                 self.pick_at_world(mx, my);
             } else {
-                log::warn!("NAVCORE_PICK must be 'lat,lon'; ignoring {:?}", spec);
+                log::warn!("MANX_PICK must be 'lat,lon'; ignoring {:?}", spec);
             }
         }
 
@@ -2583,7 +2619,7 @@ impl RenderState {
     /// giving them in millimetres. OpenCPN evaluates them against a
     /// `canvas_pix_per_mm` that stays at the logical 96-dpi figure on a Retina
     /// canvas, which halves every stroke and dash; matching that would make
-    /// navcore's output depend on the display density the same way.
+    /// Manx's output depend on the display density the same way.
     fn line_style_ppmm(&self) -> f32 {
         self.effective_ppmm.max(1.0)
     }
@@ -2610,6 +2646,9 @@ impl RenderState {
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let render_start = profile_enabled().then(Instant::now);
+        if render_start.is_some() {
+            note_frame();
+        }
 
         // Before anything is drawn: what the boats have said this frame moves
         // the camera (follow) and the mariner symbols, and both must be
@@ -3598,7 +3637,7 @@ impl RenderState {
         // is no range that keeps the screen full of chart. The centre of the
         // screen is then only kept over the charts, not pinned to their
         // middle: pinning it — as this once did, every frame — undid every
-        // pan and every zoom-at-the-cursor at the zoom navcore opens at, and
+        // pan and every zoom-at-the-cursor at the zoom Manx opens at, and
         // snapped the boat away from the middle while following her.
         if min_x.is_finite() && max_x.is_finite() && min_x <= max_x {
             self.camera.position.x = self.camera.position.x.clamp(min_x, max_x);
@@ -4159,7 +4198,7 @@ impl RenderState {
 
         declutter_soundings(&mut all_soundings, &self.camera, origin);
         // S-52 portrays soundings with the presentation library's digit
-        // symbols. navcore can, and does under NAVCORE_SOUNDING_SYMBOLS=1, but
+        // symbols. Manx can, and does under MANX_SOUNDING_SYMBOLS=1, but
         // the raster atlas is too coarse to magnify — see
         // `text_layout::sounding_symbols_enabled`.
         let use_symbols = crate::render::text_layout::sounding_symbols_enabled();
@@ -4214,7 +4253,7 @@ impl RenderState {
 
     /// Record what the draw pass actually issued for a tile.
     ///
-    /// The scene dump (`navcore --dump-scene`) proves what the *builder*
+    /// The scene dump (`manx --dump-scene`) proves what the *builder*
     /// decided; this proves what the *renderer* did with it. Between them sits
     /// upload, cache residency and per-priority slicing — where geometry that
     /// exists in a tile packet can still never reach the screen.
@@ -4228,7 +4267,7 @@ impl RenderState {
         use std::sync::atomic::{AtomicU32, Ordering};
         // The dump is a record of *this* frame. Keeping every frame's records
         // grew without bound in a live session, and buried the captured frame
-        // under a hundred warm-up ones in a NAVCORE_SHOT dump.
+        // under a hundred warm-up ones in a MANX_SHOT dump.
         if let Some(log) = &self.draw_log {
             log.borrow_mut().clear();
         }
@@ -4296,11 +4335,11 @@ impl RenderState {
             }
         }
 
-        // NAVCORE_MAX_PRIO=<n> stops the draw loop after priority n. Bisecting
+        // MANX_MAX_PRIO=<n> stops the draw loop after priority n. Bisecting
         // the priority stack is the fastest way to find which layer is painting
         // over another: the scene dump says what *should* be there, this says
         // which pass removed it.
-        let max_prio: u8 = std::env::var("NAVCORE_MAX_PRIO")
+        let max_prio: u8 = std::env::var("MANX_MAX_PRIO")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(9);
@@ -4616,10 +4655,10 @@ impl RenderState {
 
     /// Create the UI. Separate from `new` because it needs the window.
     ///
-    /// `NAVCORE_UI=0` leaves it out entirely, which is how the parity captures
+    /// `MANX_UI=0` leaves it out entirely, which is how the parity captures
     /// get a frame of chart with no interface over it.
     pub fn init_ui(&mut self) {
-        if std::env::var("NAVCORE_UI").is_ok_and(|v| v == "0") {
+        if std::env::var("MANX_UI").is_ok_and(|v| v == "0") {
             return;
         }
         if self.ui.is_none() {
@@ -4638,10 +4677,10 @@ impl RenderState {
             {
                 ui.charts.chosen = dir.display().to_string();
             }
-            // `NAVCORE_ROUTE_NEW="lat,lon;lat,lon;…"` builds a route by the
+            // `MANX_ROUTE_NEW="lat,lon;lat,lon;…"` builds a route by the
             // same path a tap takes, so the editor can be captured without
             // a pointer.
-            if let Ok(spec) = std::env::var("NAVCORE_ROUTE_NEW") {
+            if let Ok(spec) = std::env::var("MANX_ROUTE_NEW") {
                 self.ensure_route_store();
                 let route = crate::nav::Route::new(unique_route_name(self.route_store.as_ref()));
                 let id = route.id;
@@ -4660,14 +4699,14 @@ impl RenderState {
                                 crate::render::projection::Projection::to_mercator(p.lat, p.lon);
                             self.route_edit_append(x, y);
                         }
-                        None => log::warn!("NAVCORE_ROUTE_NEW: cannot read '{point}'"),
+                        None => log::warn!("MANX_ROUTE_NEW: cannot read '{point}'"),
                     }
                 }
                 self.refresh_route_rows();
             }
-            // `NAVCORE_BOAT="query[;country]"` opens the boat window and
+            // `MANX_BOAT="query[;country]"` opens the boat window and
             // fires the polar search, for captures. "1" just opens it.
-            if let Ok(spec) = std::env::var("NAVCORE_BOAT") {
+            if let Ok(spec) = std::env::var("MANX_BOAT") {
                 if let Some(ref mut ui) = self.ui {
                     ui.boat.open = true;
                 }
@@ -4683,9 +4722,9 @@ impl RenderState {
                     self.spawn_orc_search(query, country);
                 }
             }
-            // `NAVCORE_PLAN_PICK=from|to` arms a planner pin at startup, so
-            // the tap-to-fill path can be driven by NAVCORE_PICK below.
-            if let Ok(which) = std::env::var("NAVCORE_PLAN_PICK") {
+            // `MANX_PLAN_PICK=from|to` arms a planner pin at startup, so
+            // the tap-to-fill path can be driven by MANX_PICK below.
+            if let Ok(which) = std::env::var("MANX_PLAN_PICK") {
                 if let Some(ref mut ui) = self.ui {
                     ui.plan.picking = match which.as_str() {
                         "from" => Some(crate::render::ui::PlanPickTarget::From),
@@ -4694,26 +4733,26 @@ impl RenderState {
                     };
                 }
             }
-            // `NAVCORE_PICK=lat,lon` taps the chart at startup, so the object
+            // `MANX_PICK=lat,lon` taps the chart at startup, so the object
             // bubble can be captured without a click.
-            if let Ok(at) = std::env::var("NAVCORE_PICK") {
+            if let Ok(at) = std::env::var("MANX_PICK") {
                 let parts: Vec<f64> = at.split(',').filter_map(|v| v.trim().parse().ok()).collect();
                 if parts.len() == 2 {
                     let (x, y) = crate::render::projection::Projection::to_mercator(parts[0], parts[1]);
                     self.pick_at_world(x, y);
                 }
             }
-            // `NAVCORE_ROUTES_OPEN=1` opens the routes window at startup.
-            if std::env::var("NAVCORE_ROUTES_OPEN").is_ok_and(|v| v != "0") {
+            // `MANX_ROUTES_OPEN=1` opens the routes window at startup.
+            if std::env::var("MANX_ROUTES_OPEN").is_ok_and(|v| v != "0") {
                 self.ensure_route_store();
                 self.refresh_route_rows();
                 if let Some(ref mut ui) = self.ui {
                     ui.routes.open = true;
                 }
             }
-            // `NAVCORE_FOLLOW=1` activates the first stored route at startup,
+            // `MANX_FOLLOW=1` activates the first stored route at startup,
             // so the guidance strip can be captured without a click.
-            if std::env::var("NAVCORE_FOLLOW").is_ok_and(|v| v != "0") {
+            if std::env::var("MANX_FOLLOW").is_ok_and(|v| v != "0") {
                 self.ensure_route_store();
                 if let Some(id) = self
                     .route_store
@@ -4724,44 +4763,44 @@ impl RenderState {
                     self.activate_route(id);
                 }
             }
-            // `NAVCORE_SHOP=1` opens the chart shop at startup, so it can be
+            // `MANX_SHOP=1` opens the chart shop at startup, so it can be
             // captured without a click.
             let mut signalk_override_saved: Option<String> = None;
             if let Some(ui) = self.ui.as_mut() {
-                if std::env::var("NAVCORE_SHOP").is_ok_and(|v| v != "0") {
+                if std::env::var("MANX_SHOP").is_ok_and(|v| v != "0") {
                     ui.shop.open = true;
-                    ui.shop.email = std::env::var("NAVCORE_SHOP_EMAIL").unwrap_or_default();
-                    // `NAVCORE_SHOP=free` or `=folder` opens that tab.
-                    ui.charts.tab = match std::env::var("NAVCORE_SHOP").as_deref() {
+                    ui.shop.email = std::env::var("MANX_SHOP_EMAIL").unwrap_or_default();
+                    // `MANX_SHOP=free` or `=folder` opens that tab.
+                    ui.charts.tab = match std::env::var("MANX_SHOP").as_deref() {
                         Ok("free") => crate::render::ui::ChartsTab::Free,
                         Ok("folder") => crate::render::ui::ChartsTab::Folder,
                         _ => crate::render::ui::ChartsTab::Shop,
                     };
                 }
-                // `NAVCORE_SIGNALK=<address>` overrides the saved server for
+                // `MANX_SIGNALK=<address>` overrides the saved server for
                 // this run only. It used to claim it did not touch settings
                 // while quietly doing exactly that: the override went into
                 // the live view, and the next save — which any settings
                 // change triggers — wrote it over the address the user had
                 // actually configured. The real one is kept here and put
                 // back at save time.
-                // `NAVCORE_LOG_OPEN=list|YYYY-MM-DD` opens the logbook on its
+                // `MANX_LOG_OPEN=list|YYYY-MM-DD` opens the logbook on its
                 // list or on a day, for captures.
-                if let Ok(v) = std::env::var("NAVCORE_LOG_OPEN") {
+                if let Ok(v) = std::env::var("MANX_LOG_OPEN") {
                     ui.logbook.open = true;
                     if let Ok(day) = chrono::NaiveDate::parse_from_str(&v, "%Y-%m-%d") {
                         ui.logbook.selected = Some(day);
                         self.log_samples = crate::nav::logbook::read_day(self.logbook.dir(), day);
                     }
                 }
-                // `NAVCORE_SAFETY=window|guide` opens the Safety window or
+                // `MANX_SAFETY=window|guide` opens the Safety window or
                 // the man overboard guide, for captures.
-                match std::env::var("NAVCORE_SAFETY").as_deref() {
+                match std::env::var("MANX_SAFETY").as_deref() {
                     Ok("window") => ui.safety.open = true,
                     Ok("guide") => ui.safety.guide_open = true,
                     _ => {}
                 }
-                if let Ok(url) = std::env::var("NAVCORE_SIGNALK") {
+                if let Ok(url) = std::env::var("MANX_SIGNALK") {
                     if !url.is_empty() {
                         signalk_override_saved = Some(ui.instruments.url.clone());
                         ui.instruments.url = url;
@@ -4899,7 +4938,7 @@ impl RenderState {
     }
 
     /// As [`pick_at_screen`](Self::pick_at_screen), for a position already in
-    /// Mercator metres. Used by `NAVCORE_PICK` so a capture can show the bubble.
+    /// Mercator metres. Used by `MANX_PICK` so a capture can show the bubble.
     pub fn pick_at_world(&mut self, x: f64, y: f64) {
         // An armed planner pin claims the tap first — it is a deliberate
         // one-shot — then an open route editor, which is a standing mode.
@@ -4988,7 +5027,7 @@ impl RenderState {
     /// Where "Remember me" keeps the o-charts session: beside the settings,
     /// readable by this user only. The session key, never the password.
     fn shop_session_path() -> Option<std::path::PathBuf> {
-        Some(dirs::config_dir()?.join("navcore").join("ocharts-session.json"))
+        Some(crate::paths::config_dir()?.join("ocharts-session.json"))
     }
 
     fn save_shop_session(username: &str, key: &str) {
@@ -5025,7 +5064,7 @@ impl RenderState {
     }
 
     fn settings_path() -> Option<std::path::PathBuf> {
-        Some(dirs::config_dir()?.join("navcore").join("settings.json"))
+        Some(crate::paths::config_dir()?.join("settings.json"))
     }
 
     fn save_settings(&self) {
@@ -5079,11 +5118,15 @@ impl RenderState {
         }
         // Current shape first, then the pre-weather file that was the
         // instruments alone — the user keeps their layout across the change.
+        let current = |mut v: crate::render::ui::InstrumentView| {
+            v.tiles = v.tiles.into_iter().map(crate::signalk::catalog::current_tile).collect();
+            v
+        };
         if let Ok(p) = serde_json::from_str::<Persisted>(&text) {
-            return Some(p.instruments);
+            return Some(current(p.instruments));
         }
         match serde_json::from_str(&text) {
-            Ok(v) => Some(v),
+            Ok(v) => Some(current(v)),
             Err(e) => {
                 // A settings file from an older build should cost the user
                 // their layout, not their session.
@@ -5140,7 +5183,7 @@ impl RenderState {
         let Some(ref ui) = self.ui else { return };
         let display = ui.display.clone();
         let draft = ui.boat.draft_m;
-        if std::env::var("NAVCORE_PALETTE").is_err()
+        if std::env::var("MANX_PALETTE").is_err()
             && self.palette_name.as_deref() != Some(display.palette.table())
         {
             self.switch_palette(display.palette.table());
@@ -5270,7 +5313,7 @@ impl RenderState {
             (logbook::to_gpx(day, &samples, &logbook::read_notes(&dir, day)), "gpx")
         };
         let mime = if csv { "text/csv" } else { "application/gpx+xml" };
-        let name = format!("navcore-log-{day}.{ext}");
+        let name = format!("manx-log-{day}.{ext}");
         self.log_state.message =
             Some(crate::export::save(&name, mime, text.as_bytes()).unwrap_or_else(|e| e));
     }
@@ -5450,12 +5493,12 @@ impl RenderState {
         };
         let fix = self.own_fix();
 
-        // NAVCORE_MOB=1 presses MOB once the boat has a fix — for captures.
+        // MANX_MOB=1 presses MOB once the boat has a fix — for captures.
         {
             use std::sync::atomic::{AtomicBool, Ordering};
             static PRESSED: AtomicBool = AtomicBool::new(false);
             if fix.is_some()
-                && std::env::var_os("NAVCORE_MOB").is_some()
+                && std::env::var_os("MANX_MOB").is_some()
                 && !PRESSED.swap(true, Ordering::Relaxed)
             {
                 self.mark_mob();
@@ -6175,9 +6218,9 @@ impl RenderState {
         if self.route_store.is_some() {
             return;
         }
-        // `NAVCORE_ROUTES=<dir>` points the store elsewhere — captures and
+        // `MANX_ROUTES=<dir>` points the store elsewhere — captures and
         // tests must not write into the user's real route folder.
-        let dir = std::env::var("NAVCORE_ROUTES")
+        let dir = std::env::var("MANX_ROUTES")
             .map(std::path::PathBuf::from)
             .ok()
             .or_else(crate::nav::RouteStore::default_dir)
@@ -6496,8 +6539,8 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
-            let cache = dirs::config_dir()
-                .map(|d| d.join("navcore").join("grib"))
+            let cache = crate::paths::config_dir()
+                .map(|d| d.join("grib"))
                 .unwrap_or_else(|| "grib-cache".into());
             let progress_tx = tx.clone();
             let result = crate::nav::grib::GribForecast::fetch(
@@ -6834,8 +6877,8 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
-            let cache = dirs::config_dir()
-                .map(|d| d.join("navcore").join("orc"))
+            let cache = crate::paths::config_dir()
+                .map(|d| d.join("orc"))
                 .unwrap_or_else(|| "orc-cache".into());
             let progress_tx = tx.clone();
             let result = crate::nav::orc::search(&country, &query, &cache, move |m| {
@@ -6855,8 +6898,8 @@ impl RenderState {
     fn adopt_orc_polar(&mut self, index: usize) {
         let Some(ref mut ui) = self.ui else { return };
         let Some(hit) = ui.boat.results.get(index).cloned() else { return };
-        let dir = dirs::config_dir()
-            .map(|d| d.join("navcore").join("polars"))
+        let dir = crate::paths::config_dir()
+            .map(|d| d.join("polars"))
             .unwrap_or_else(|| "polars".into());
         if let Err(e) = std::fs::create_dir_all(&dir) {
             ui.boat.status = format!("could not create {}: {e}", dir.display());
@@ -6989,15 +7032,17 @@ impl RenderState {
         let tx = self.route_net_sender();
         std::thread::spawn(move || {
             let _done = JobGuard(tx.clone());
-            let cache = dirs::config_dir()
-                .map(|d| d.join("navcore").join("grib"))
+            let cache = crate::paths::config_dir()
+                .map(|d| d.join("grib"))
                 .unwrap_or_else(|| "grib-cache".into());
             let generation = crate::nav::isochrone::begin_cancellable();
             let (polar_text, polar_name) = if polar_path.trim().is_empty() {
                 (crate::nav::wxroute::DEFAULT_POLAR.to_string(),
                  "built-in cruiser".to_string())
             } else {
-                match std::fs::read_to_string(polar_path.trim()) {
+                // A polar saved before the rename may have moved with Manx's
+                // folder.
+                match std::fs::read_to_string(crate::paths::moved(std::path::Path::new(polar_path.trim()))) {
                     Ok(t) => (t, polar_path.trim().to_string()),
                     Err(e) => {
                         let _ = tx.send(RouteNetEvent::WxFailed(format!(
@@ -7675,7 +7720,7 @@ impl RenderState {
         self.pending_capture.is_some()
     }
 
-    /// Copy a rendered surface texture to CPU and write it as a PNG. Used by NAVCORE_SHOT.
+    /// Copy a rendered surface texture to CPU and write it as a PNG. Used by MANX_SHOT.
     fn save_capture(&self, texture: &wgpu::Texture, path: &str) {
         let width = self.config.width;
         let height = self.config.height;
@@ -7720,7 +7765,7 @@ impl RenderState {
         });
         self.device.poll(wgpu::Maintain::Wait);
         if rx.recv().map(|r| r.is_err()).unwrap_or(true) {
-            log::warn!("NAVCORE_SHOT: failed to map readback buffer");
+            log::warn!("MANX_SHOT: failed to map readback buffer");
             return;
         }
 
@@ -7747,9 +7792,9 @@ impl RenderState {
         match image::RgbaImage::from_raw(width, height, pixels) {
             Some(img) => match img.save(path) {
                 Ok(()) => {
-                    log::warn!("NAVCORE_SHOT: wrote {} ({}x{})", path, width, height);
+                    log::warn!("MANX_SHOT: wrote {} ({}x{})", path, width, height);
                     if let (Ok(dump), Some(log)) =
-                        (std::env::var("NAVCORE_DUMP_DRAW"), &self.draw_log)
+                        (std::env::var("MANX_DUMP_DRAW"), &self.draw_log)
                     {
                         let lines: Vec<String> = log
                             .borrow()
@@ -7758,16 +7803,16 @@ impl RenderState {
                             .collect();
                         if std::fs::write(&dump, lines.join("\n") + "\n").is_ok() {
                             log::warn!(
-                                "NAVCORE_DUMP_DRAW: wrote {} draw records to {}",
+                                "MANX_DUMP_DRAW: wrote {} draw records to {}",
                                 lines.len(),
                                 dump
                             );
                         }
                     }
                 }
-                Err(e) => log::warn!("NAVCORE_SHOT: save failed: {}", e),
+                Err(e) => log::warn!("MANX_SHOT: save failed: {}", e),
             },
-            None => log::warn!("NAVCORE_SHOT: bad capture buffer dimensions"),
+            None => log::warn!("MANX_SHOT: bad capture buffer dimensions"),
         }
     }
 }

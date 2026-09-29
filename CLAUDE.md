@@ -1,17 +1,17 @@
-# Claude Code Rules for NavCore
+# Claude Code Rules for Manx
 
 ## MANDATORY: Read Before Implementing
 
 Before writing ANY code, you MUST:
 
 1. **Read the relevant doc first** and quote the specific section you're implementing
-2. **Use exact versions** from `doc/navcore_plan_v2.md` - no substitutions
+2. **Use exact versions** from `doc/manx_plan_v2.md` - no substitutions
 3. **Follow patterns** from `doc/wgpu ref notes.md` for all WGPU code
 4. **Ask if unsure** - don't guess or use "similar" APIs
 
 ## Key Documents
 
-- `doc/navcore_plan_v2.md` - Master implementation plan with dependency versions
+- `doc/manx_plan_v2.md` - Master implementation plan with dependency versions
 - `doc/wgpu ref notes.md` - WGPU API patterns to follow exactly
 - `doc/SENC_RENDER_BLUEPRINT.md` - SENC file format details
 - `doc/pi5-test-rig.md` - the Raspberry Pi 5 test machine: `ssh rpi5`, deploy, running on its screen

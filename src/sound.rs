@@ -67,7 +67,7 @@ mod desktop {
     fn file() -> Option<PathBuf> {
         static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
         FILE.get_or_init(|| {
-            let path = std::env::temp_dir().join("navcore-alarm.wav");
+            let path = std::env::temp_dir().join("manx-alarm.wav");
             match std::fs::write(&path, super::wav()) {
                 Ok(()) => Some(path),
                 Err(e) => {

@@ -143,7 +143,7 @@ impl ChartCatalog {
     /// Scan directory for .oesu files and load headers only
     ///
     /// Uses disk caching to speed up subsequent runs - first run decrypts all charts,
-    /// subsequent runs read from ~/.cache/navcore/senc/
+    /// subsequent runs read from ~/.cache/manx/senc/
     pub fn from_directory(
         dir: &Path,
         keys: &KeyStore,

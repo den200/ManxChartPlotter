@@ -250,7 +250,7 @@ fn wrecks02_area(
 /// depth — not as one of the WRECKS0x pictorial symbols, which are only for
 /// wrecks whose depth is unknown.
 ///
-/// Deviation: OpenCPN appends SNDFRM02's digit symbols; navcore emits the
+/// Deviation: OpenCPN appends SNDFRM02's digit symbols; Manx emits the
 /// sounding as text, as it does for soundings everywhere else.
 pub fn wrecks02_instructions(
     feature: &Feature,

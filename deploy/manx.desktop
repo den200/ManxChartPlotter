@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=navcore
+Name=Manx
 Comment=Chart plotter
 # The binary finds assets/, the chart helper and the licence beside itself,
 # so it can be started from anywhere.
-Exec=@HOME@/navcore/target/release/navcore
+Exec=@HOME@/manx/target/release/manx
 Terminal=false
 X-GNOME-Autostart-enabled=true

@@ -1,7 +1,7 @@
-//! Signal K: where navcore gets everything that is not a chart.
+//! Signal K: where Manx gets everything that is not a chart.
 //!
 //! Position, heading, depth, wind, tanks and batteries all arrive over one
-//! WebSocket as a stream of deltas. navcore reads that stream and nothing
+//! WebSocket as a stream of deltas. Manx reads that stream and nothing
 //! else — no NMEA parsing, no driver per instrument — because Signal K has
 //! already done that work and every modern boat network can speak it.
 //!

@@ -155,8 +155,8 @@ pub fn corridor(
     let k = 1.0 / mid_lat.cos();
     let (min, max) = passage_box(a, b, k, margin_factor);
     let mut coarse = build_hazard_grid(sources, min, max, safety, k);
-    // NAVCORE_ROUTE_DEBUG=<file.png>: the coarse grid as the search sees it.
-    let debug_png = std::env::var("NAVCORE_ROUTE_DEBUG").ok();
+    // MANX_ROUTE_DEBUG=<file.png>: the coarse grid as the search sees it.
+    let debug_png = std::env::var("MANX_ROUTE_DEBUG").ok();
     if let Some(ref out) = debug_png {
         coarse.debug_png(&[a, b], std::path::Path::new(out), 1600);
     }
@@ -211,9 +211,9 @@ pub fn corridor(
             Ok((points, params, mut warnings)) => {
                 if let Some(ref out) = debug_png {
                     coarse.debug_png(&points, std::path::Path::new(out), 1600);
-                    // NAVCORE_ROUTE_DEBUG_AT=lat,lon: the fine grid there,
+                    // MANX_ROUTE_DEBUG_AT=lat,lon: the fine grid there,
                     // a cell a pixel, beside the whole-box picture.
-                    let at = std::env::var("NAVCORE_ROUTE_DEBUG_AT").ok().and_then(|v| {
+                    let at = std::env::var("MANX_ROUTE_DEBUG_AT").ok().and_then(|v| {
                         let (lat, lon) = v.split_once(',')?;
                         Some(merc(LatLon::new(lat.trim().parse().ok()?, lon.trim().parse().ok()?)))
                     });

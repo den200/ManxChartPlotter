@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check navcore's emitted scene against invariants, and trace pixels to features.
+"""Check manx's emitted scene against invariants, and trace pixels to features.
 
-    navcore --dump-scene <charts> <lat,lon,mpp> <WxH> /tmp/scene.ndjson
+    manx --dump-scene <charts> <lat,lon,mpp> <WxH> /tmp/scene.ndjson
     tools/scenecheck.py /tmp/scene.ndjson              # invariant report
     tools/scenecheck.py /tmp/scene.ndjson --at 1180,420   # who drew this pixel
     tools/scenecheck.py /tmp/scene.ndjson --missing     # what the view is missing
@@ -10,7 +10,7 @@ Where the S-52 oracle answers "which instruction did this feature get", this
 answers "which polygon, from which chart, by which code path, put ink here".
 
 There is no OpenCPN counterpart and none is needed: area geometry arrives from
-the SENC already tessellated, so navcore is reproducing given triangles rather
+the SENC already tessellated, so manx is reproducing given triangles rather
 than computing them. A triangle that lies outside its own feature's declared
 extent is wrong on its face — no reference render required to say so.
 """
@@ -269,7 +269,7 @@ def coverage_report(viewport, areas, coverage):
 def quilt(viewport, areas):
     """Which charts contributed to each tile, and which overlap.
 
-    navcore quilts several charts into one view; where two of them cover the
+    manx quilts several charts into one view; where two of them cover the
     same tile, the finer one should win and the coarser one should only fill
     what the finer does not cover. A tile fed by two charts at different scales
     is where that goes wrong.

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 
 const PIPE_PATH: &str = "/tmp/OCPN_PIPEX";
-const RETURN_PIPE_PREFIX: &str = "/tmp/navcore_oex_";
+const RETURN_PIPE_PREFIX: &str = "/tmp/manx_oex_";
 /// Android's `oexserverd` has no FIFOs: it listens on this abstract Unix
 /// socket, takes the same 1025-byte request, and answers on the connection.
 #[cfg(target_os = "android")]
@@ -39,7 +39,7 @@ const MAX_REQUESTS_BEFORE_RESTART: u32 = 25;
 /// Typical usage:
 ///
 /// ```no_run
-/// use navcore2::{ChartDecryptor, KeyStore};
+/// use manx::{ChartDecryptor, KeyStore};
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let mut keys = KeyStore::new();
 /// keys.load_keylists_in_dir("charts/oeuSENC-DK-2025-1-20-base-macbook")?;
@@ -725,7 +725,7 @@ fn resolve_oeserverd_binary() -> DecryptResult<PathBuf> {
     }
 
     if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".navcore/decoder").join(exe_name));
+        candidates.push(PathBuf::from(home).join(".manx/decoder").join(exe_name));
     }
 
     candidates.push(PathBuf::from("/usr/local/bin").join(exe_name));

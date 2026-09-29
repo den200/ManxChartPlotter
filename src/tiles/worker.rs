@@ -222,7 +222,7 @@ fn worker_loop(
                 view_params,
                 generation: batch_generation,
             } => {
-                let profile = std::env::var("NAVCORE_PROFILE")
+                let profile = std::env::var("MANX_PROFILE")
                     .map(|v| v != "0" && !v.is_empty())
                     .unwrap_or(false);
                 let batch_start = profile.then(Instant::now);

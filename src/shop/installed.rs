@@ -1,7 +1,7 @@
 //! What is already on disk, and which shop chart it belongs to.
 //!
 //! The shop knows what an account owns; only the filesystem knows what has
-//! actually been fetched. Matching the two is what lets navcore say "you hold
+//! actually been fetched. Matching the two is what lets Manx say "you hold
 //! edition 2025/1-20" — and, for a lapsed subscription, what lets it ask for
 //! that edition rather than one the licence never covered.
 
@@ -56,7 +56,7 @@ fn edition_of(dir: &Path) -> Option<Edition> {
 
 /// Every chart set under `root`, plus `root` itself if it is one.
 ///
-/// Both cases are real: navcore is usually pointed at a directory of chart
+/// Both cases are real: Manx is usually pointed at a directory of chart
 /// sets, but pointing it straight at a single set is the quickest way to open
 /// one chart and is what the command line invites.
 pub fn scan(root: &Path) -> Vec<InstalledSet> {

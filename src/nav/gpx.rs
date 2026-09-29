@@ -7,7 +7,7 @@
 //! planned speeds — in exactly those elements, so importing a route and
 //! exporting it back must return them verbatim or OpenCPN sees a stranger.
 //!
-//! The split is: extension children in the `navcore:` namespace are *ours* —
+//! The split is: extension children in the `manx:` namespace are *ours* —
 //! parsed into typed fields on import, regenerated on export. Everything else
 //! is foreign — carried as raw XML and re-emitted untouched. One foreign
 //! element is peeked at without being consumed: `opencpn:guid`, adopted as
@@ -21,8 +21,18 @@ use uuid::Uuid;
 
 use super::model::{LegKind, LegPlan, Route, RouteProvenance, Waypoint, WaypointSet};
 
-/// The navcore GPX extension namespace.
-pub const NAVCORE_NS: &str = "https://navcore.io/gpx/1";
+/// Manx's GPX extension namespace.
+pub const MANX_NS: &str = "https://github.com/den200/manx/gpx/1";
+
+/// The element prefix Manx writes its extensions under.
+const PREFIX: &str = "manx:";
+/// The prefix files written before the rename carry. Still read.
+const OLD_PREFIX: &str = "navcore:";
+
+/// The local name of one of our extension elements, under either prefix.
+fn ours(name: &str) -> Option<&str> {
+    name.strip_prefix(PREFIX).or_else(|| name.strip_prefix(OLD_PREFIX))
+}
 
 #[derive(Debug)]
 pub enum GpxError {
@@ -52,7 +62,7 @@ pub struct GpxDocument {
     pub loose: Vec<Uuid>,
     /// The routes, legs computed, in file order.
     pub routes: Vec<Route>,
-    /// Root-element attributes other than the ones navcore writes itself —
+    /// Root-element attributes other than the ones Manx writes itself —
     /// chiefly foreign namespace declarations (`xmlns:opencpn=…`), which must
     /// come back on export or the preserved extensions dangle unprefixed.
     pub root_attrs: Vec<(String, String)>,
@@ -72,7 +82,7 @@ pub fn parse(text: &str) -> Result<GpxDocument, GpxError> {
                         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
                         // Ours are regenerated on write; keeping them here
                         // would duplicate attributes in the output.
-                        if matches!(key.as_str(), "version" | "creator" | "xmlns" | "xmlns:navcore")
+                        if matches!(key.as_str(), "version" | "creator" | "xmlns" | "xmlns:manx" | "xmlns:navcore")
                         {
                             continue;
                         }
@@ -98,7 +108,7 @@ pub fn parse(text: &str) -> Result<GpxDocument, GpxError> {
                     doc.loose.push(wp.id);
                     doc.waypoints.insert(wp);
                 }
-                // Tracks are a recorder's output, not a plan; navcore neither
+                // Tracks are a recorder's output, not a plan; Manx neither
                 // edits nor rewrites files containing them (see the store),
                 // so skipping is safe rather than lossy.
                 b"trk" => {
@@ -177,7 +187,7 @@ fn parse_point(
                     wp.foreign_extensions = split.foreign;
                 }
                 other => {
-                    // <time>, <cmt>, <link>… — valid GPX navcore has no field
+                    // <time>, <cmt>, <link>… — valid GPX Manx has no field
                     // for. Skipped, not preserved: they are per-export
                     // metadata, unlike extensions, which are another program's
                     // state.
@@ -338,12 +348,12 @@ fn split_extensions(raw: &str) -> Result<SplitExtensions, GpxError> {
             Ok(Event::Start(e)) => {
                 let name = e.name();
                 let name_str = String::from_utf8_lossy(name.as_ref()).into_owned();
-                if let Some(local) = name_str.strip_prefix("navcore:") {
+                if let Some(local) = ours(&name_str) {
                     // Ours: consume the subtree into a typed field.
                     let text = reader
                         .read_text(QName(name_str.as_bytes()))
                         .map_err(|e| GpxError::Xml(e.to_string()))?;
-                    apply_navcore(&mut out, local, text.trim());
+                    apply_manx(&mut out, local, text.trim());
                 } else {
                     peeking_opencpn_guid = name_str == "opencpn:guid";
                     writer
@@ -353,7 +363,7 @@ fn split_extensions(raw: &str) -> Result<SplitExtensions, GpxError> {
             }
             Ok(Event::Empty(e)) => {
                 let name_str = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                if !name_str.starts_with("navcore:") {
+                if ours(&name_str).is_none() {
                     writer
                         .write_event(Event::Empty(e))
                         .map_err(|e| GpxError::Xml(e.to_string()))?;
@@ -388,7 +398,7 @@ fn split_extensions(raw: &str) -> Result<SplitExtensions, GpxError> {
     Ok(out)
 }
 
-fn apply_navcore(out: &mut SplitExtensions, local: &str, text: &str) {
+fn apply_manx(out: &mut SplitExtensions, local: &str, text: &str) {
     // `read_text` hands back the text as it sits in the file — entities still
     // escaped. JSON full of `&quot;` is not JSON yet.
     let text: String = quick_xml::escape::unescape(text)
@@ -407,16 +417,16 @@ fn apply_navcore(out: &mut SplitExtensions, local: &str, text: &str) {
         }
         "plan" => match serde_json::from_str(text) {
             Ok(p) => out.plan = Some(p),
-            Err(e) => log::warn!("gpx: unreadable navcore:plan ignored: {e}"),
+            Err(e) => log::warn!("gpx: unreadable manx:plan ignored: {e}"),
         },
         "provenance" => match serde_json::from_str(text) {
             Ok(p) => out.provenance = Some(p),
-            Err(e) => log::warn!("gpx: unreadable navcore:provenance ignored: {e}"),
+            Err(e) => log::warn!("gpx: unreadable manx:provenance ignored: {e}"),
         },
-        // A navcore element this build does not know — from a newer navcore.
+        // A Manx element this build does not know — from a newer manx.
         // Dropping it is the price of the namespace split; log so it is not
         // silent.
-        other => log::warn!("gpx: unknown navcore:{other} ignored"),
+        other => log::warn!("gpx: unknown manx:{other} ignored"),
     }
 }
 
@@ -450,10 +460,10 @@ pub fn write_waypoints(
 fn write_header(out: &mut String, root_attrs: &[(String, String)]) {
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str(
-        "<gpx version=\"1.1\" creator=\"navcore\" \
+        "<gpx version=\"1.1\" creator=\"Manx\" \
          xmlns=\"http://www.topografix.com/GPX/1/1\" ",
     );
-    out.push_str(&format!("xmlns:navcore=\"{NAVCORE_NS}\""));
+    out.push_str(&format!("xmlns:manx=\"{MANX_NS}\""));
     // OpenCPN's namespace is declared even when no extensions reference it:
     // a file that gains an OpenCPN route later must not become invalid, and
     // a spurious namespace declaration costs nothing.
@@ -476,13 +486,13 @@ fn push_route(out: &mut String, route: &Route, set: &WaypointSet) {
     out.push_str(&format!("    <name>{}</name>\n", esc(&route.name)));
     out.push_str("    <extensions>\n");
     out.push_str(&format!(
-        "      <navcore:guid>{}</navcore:guid>\n",
+        "      <manx:guid>{}</manx:guid>\n",
         route.id
     ));
     if let Some(p) = &route.generated {
         match serde_json::to_string(p) {
             Ok(json) => out.push_str(&format!(
-                "      <navcore:provenance>{}</navcore:provenance>\n",
+                "      <manx:provenance>{}</manx:provenance>\n",
                 esc(&json)
             )),
             Err(e) => log::warn!("gpx: provenance not serializable: {e}"),
@@ -535,25 +545,25 @@ fn push_point(
     }
     out.push_str(&format!("{indent}  <extensions>\n"));
     out.push_str(&format!(
-        "{indent}    <navcore:guid>{}</navcore:guid>\n",
+        "{indent}    <manx:guid>{}</manx:guid>\n",
         wp.id
     ));
     if let Some(r) = wp.arrival_radius_nm {
         out.push_str(&format!(
-            "{indent}    <navcore:arrival_radius_nm>{r}</navcore:arrival_radius_nm>\n"
+            "{indent}    <manx:arrival_radius_nm>{r}</manx:arrival_radius_nm>\n"
         ));
     }
     // The default kind is not written: files stay minimal and a hand-edited
     // GPX without the element means what it should.
     if let Some(LegKind::RhumbLine) = leg_kind {
         out.push_str(&format!(
-            "{indent}    <navcore:leg_kind>rhumb-line</navcore:leg_kind>\n"
+            "{indent}    <manx:leg_kind>rhumb-line</manx:leg_kind>\n"
         ));
     }
     if let Some(p) = plan {
         match serde_json::to_string(p) {
             Ok(json) => out.push_str(&format!(
-                "{indent}    <navcore:plan>{}</navcore:plan>\n",
+                "{indent}    <manx:plan>{}</manx:plan>\n",
                 esc(&json)
             )),
             Err(e) => log::warn!("gpx: leg plan not serializable: {e}"),
@@ -637,6 +647,25 @@ mod tests {
         route.recompute_legs(&set);
         assert_eq!(route.legs.len(), 5);
         (route, set)
+    }
+
+    /// Routes saved before the rename carry `navcore:` extensions. They are
+    /// still ours: read exactly as the `manx:` ones are.
+    #[test]
+    fn a_route_saved_under_the_old_name_still_reads() {
+        let (route, set) = five_leg_route();
+        let xml = write_route(&route, &set, &[])
+            .replace("xmlns:manx=", "xmlns:navcore=")
+            .replace("<manx:", "<navcore:")
+            .replace("</manx:", "</navcore:");
+        assert!(!xml.contains("manx:"));
+        let doc = parse(&xml).expect("an old file parses");
+        let back = &doc.routes[0];
+        assert_eq!(back.id, route.id);
+        assert_eq!(back.waypoints.len(), 6);
+        // Written again, it comes out under the new name.
+        let again = write_route(back, &set, &[]);
+        assert!(again.contains("<manx:guid>") && !again.contains("navcore:"));
     }
 
     #[test]

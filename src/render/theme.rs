@@ -1,10 +1,10 @@
 //! The colours of everything that is not the chart: panels, instruments,
-//! buttons, and the marks navcore lays over the chart.
+//! buttons, and the marks Manx lays over the chart.
 //!
 //! The chart itself is drawn from the IHO S-52 colour tables (DAY_BRIGHT,
 //! DUSK, NIGHT in `assets/s52/chartsymbols.xml`), and those are the standard
 //! — IEC 62288 points to exactly them for readability in every ambient light.
-//! What S-52 also says, and navcore used not to do, is that the interface
+//! What S-52 also says, and Manx used not to do, is that the interface
 //! around the chart belongs to the same palette: its UI tokens (UIBCK, UINFD,
 //! UINFR, UINFG, UINFO, UINFB, UINFM…) change with it. A Night chart that
 //! peaks at RGB 50 beside a menu bar at RGB 200 is unreadable, and not

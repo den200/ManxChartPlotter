@@ -5,7 +5,7 @@
 //! localhost, with a vessel and a handful of AIS targets wherever you point
 //! it — by default the Kattegat, which is on the Danish charts.
 //!
-//! It is a *server*, not a shortcut: navcore connects to it over a real
+//! It is a *server*, not a shortcut: Manx connects to it over a real
 //! WebSocket and parses real delta messages, so everything between the socket
 //! and the screen is exercised. The in-process `sim` mode skips all of that,
 //! which makes it useful for a quick look and useless for finding the bugs
@@ -21,15 +21,15 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
 
-use navcore2::signalk::delta::{Delta, Value};
-use navcore2::signalk::sim::{traffic_around, Course, Simulator, Traffic};
+use manx::signalk::delta::{Delta, Value};
+use manx::signalk::sim::{traffic_around, Course, Simulator, Traffic};
 
 /// The port a Signal K server listens on by convention.
 const PORT: u16 = 3000;
 /// How often the fleet moves and reports.
 const TICK: Duration = Duration::from_millis(500);
 /// What the server calls our own vessel.
-const SELF_CONTEXT: &str = "vessels.urn:mrn:signalk:uuid:navcore-simulated-boat";
+const SELF_CONTEXT: &str = "vessels.urn:mrn:signalk:uuid:manx-simulated-boat";
 
 fn main() {
     let course = std::env::args()
@@ -52,10 +52,10 @@ fn main() {
     for t in &traffic {
         println!("  AIS  {:<16} {}", t.name, t.context);
     }
-    println!("\nIn navcore: Instruments → 127.0.0.1  (or NAVCORE_SIGNALK=127.0.0.1)");
+    println!("\nIn manx: Instruments → 127.0.0.1  (or MANX_SIGNALK=127.0.0.1)");
 
     // One fleet, many viewers: the deltas are generated once and broadcast, so
-    // two navcore windows see the same sea.
+    // two Manx windows see the same sea.
     let (subscribe_tx, subscribe_rx) = channel::<Sender<String>>();
     thread::spawn(move || fleet(course, traffic, subscribe_rx));
 
@@ -118,7 +118,7 @@ fn serve(stream: std::net::TcpStream, rx: Receiver<String>) {
     // own — so a simulator that omitted it would hide exactly the bug worth
     // testing for.
     let hello = format!(
-        r#"{{"name":"navcore-signalk-sim","version":"1.0.0",
+        r#"{{"name":"manx-signalk-sim","version":"1.0.0",
              "self":"{SELF_CONTEXT}","roles":["master","main"]}}"#
     );
     if socket.send(tungstenite::Message::Text(hello)).is_err() {

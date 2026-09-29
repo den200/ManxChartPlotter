@@ -80,9 +80,9 @@ The profound differences between NavCore2 and OpenCPN stem from a fundamental ar
 To guide and verify the remediation phase, add these non-destructive instrumentation tools:
 
 1.  **Environment Variables**:
-    *   `NAVCORE_AUDIT_Z_BUFFER=1`: Override the WGPU fragment shader to output grayscale values representing normalized Z-depth. (Verifies layering fixes).
-    *   `NAVCORE_DEBUG_SCAMIN=1`: Print console logs when a feature is culled by SCAMIN, including `view_scale`, `scamin`, and `object_class`.
-    *   `NAVCORE_LOG_CS_MISS=1`: Log warnings in `execute_cs()` whenever an unknown CS procedure is encountered (e.g., `DATCVR01`).
+    *   `MANX_AUDIT_Z_BUFFER=1`: Override the WGPU fragment shader to output grayscale values representing normalized Z-depth. (Verifies layering fixes).
+    *   `MANX_DEBUG_SCAMIN=1`: Print console logs when a feature is culled by SCAMIN, including `view_scale`, `scamin`, and `object_class`.
+    *   `MANX_LOG_CS_MISS=1`: Log warnings in `execute_cs()` whenever an unknown CS procedure is encountered (e.g., `DATCVR01`).
 2.  **Captures**:
     *   Use **RenderDoc** to inspect the WGPU `DepthStencilState` pipeline configuration. Ensure depth-write is enabled during priority batching.
     *   Generate a golden-image test suite locked to a specific viewport `(lat, lon, zoom)` simulating OpenCPN's Day Bright mode for automated pixel-diffing.

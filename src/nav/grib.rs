@@ -1,7 +1,7 @@
 //! Forecast wind: GRIB2 download, decode, and interpolation.
 //!
 //! The source is NOAA's NOMADS *filter* endpoint for GFS 0.25° — free, no
-//! key, and it subsets server-side: navcore asks for exactly two fields
+//! key, and it subsets server-side: Manx asks for exactly two fields
 //! (10 m U and V) over exactly the passage box, so a forecast step is
 //! kilobytes, not the 500 MB the full file would be. The source sits behind
 //! an enum so ECMWF open data or DWD ICON can join without touching callers;
@@ -38,7 +38,7 @@ impl GribSource {
     fn cycle_hours(self) -> u32 {
         6
     }
-    /// Forecast step spacing navcore requests.
+    /// Forecast step spacing Manx requests.
     pub fn step_hours(self) -> u32 {
         3
     }

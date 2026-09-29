@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn the_library_carries_every_symbol_this_layer_needs() {
-        // If this fails the presentation library is not the one navcore ships,
+        // If this fails the presentation library is not the one Manx ships,
         // and mariner objects would silently fall back to nothing.
         assert!(
             MarinerSymbols::resolve().is_some(),

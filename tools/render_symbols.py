@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build navcore's symbol atlas, rendering the vector symbols from their HPGL.
+"""Build manx's symbol atlas, rendering the vector symbols from their HPGL.
 
     tools/render_symbols.py [--check]
 
-navcore's atlas used to be OpenCPN's `rastersymbols-day.png` copied verbatim —
+manx's atlas used to be OpenCPN's `rastersymbols-day.png` copied verbatim —
 glyphs drawn for 1:1 display at the S-52 nominal density of 3.125 px/mm. On a
 200-dpi screen the renderer has to magnify them 2.5x to reach the right physical
 size, and magnifying a raster is exactly as lossy as it sounds: a sounding digit
@@ -41,7 +41,7 @@ RASTERSHEET = os.path.join(
 )
 OUT_JSON = os.path.join(ROOT, "assets/symbols/atlas.json")
 
-# The three palettes navcore can switch between at runtime, each written into
+# The three palettes manx can switch between at runtime, each written into
 # the *same* layout so one atlas.json describes all of them.
 #
 # They have to be generated together. atlas-dusk.png and atlas-dark.png were
