@@ -1,0 +1,114 @@
+# Build Manx for every desktop platform and publish a GitHub release.
+#
+# Push a tag to release:   git tag v0.5.0 && git push origin v0.5.0
+# Or run it by hand from the Actions tab (builds only, no release).
+#
+# Each download is the binary plus its assets/ folder; Manx finds assets/
+# beside itself wherever it is unpacked. Not included, on purpose:
+# - o-charts' decryption helper (oexserverd), which is not ours to
+#   redistribute. Users copy it from o-charts' OpenCPN plugin; see INSTALL.
+# - The Android APK, which must be signed with the one key the Odroid's
+#   o-charts licence depends on. That key never leaves Denis's machines, so
+#   the APK is built locally (deploy/build-apk.sh) and attached by hand.
+#
+# Linux builds run on Ubuntu 22.04 so they need glibc 2.35 at most: that
+# covers Raspberry Pi OS Bookworm (2.36) as well as Trixie.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            archive: tar.gz
+          - name: linux-arm64
+            os: ubuntu-22.04-arm
+            archive: tar.gz
+          - name: macos-arm64
+            os: macos-14
+            archive: tar.gz
+          # Experimental: builds, but o-charts decryption speaks Unix pipes
+          # and is not ported to Windows yet, so only free charts open.
+          - name: windows-x86_64
+            os: windows-2022
+            archive: zip
+            experimental: true
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental == true }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libwayland-dev libx11-dev \
+            libxcursor-dev libxrandr-dev libxi-dev libudev-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+      - name: Build
+        run: cargo build --release --locked --bin manx
+      - name: Package
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [[ "$GITHUB_REF_TYPE" == tag ]] || version="dev-${GITHUB_SHA::7}"
+          dir="manx-${version}-${{ matrix.name }}"
+          mkdir "$dir"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cp target/release/manx.exe "$dir/"
+          else
+            cp target/release/manx "$dir/"
+            strip "$dir/manx" || true
+          fi
+          cp -R assets "$dir/"
+          cp README.md LICENSE deploy/INSTALL.md "$dir/"
+          if [[ "${{ matrix.archive }}" == zip ]]; then
+            7z a -tzip "$dir.zip" "$dir" > /dev/null
+          else
+            tar czf "$dir.tar.gz" "$dir"
+          fi
+          echo "ASSET=$dir.${{ matrix.archive }}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') && !cancelled()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            **Beta. Not for navigation.** Always carry official charts.
+
+            | Download | For |
+            |---|---|
+            | `linux-arm64` | Raspberry Pi 5, Odroid and other 64-bit ARM Linux |
+            | `linux-x86_64` | Linux PCs |
+            | `macos-arm64` | Macs with Apple silicon |
+            | `windows-x86_64` | Windows, experimental: free charts only |
+
+            Unpack and run `manx`. Setup, o-charts and Android: see `INSTALL.md` inside.
