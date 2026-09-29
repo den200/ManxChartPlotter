@@ -2333,6 +2333,12 @@ impl RenderState {
         keys: Arc<KeyStore>,
         decryptor: CachedDecryptor,
     ) {
+        // No charts yet (a first start): frame the world map instead, or
+        // the camera would fit an empty extent and zoom into the Gulf of
+        // Guinea's open water.
+        if catalog.charts.is_empty() {
+            catalog.add_world_basemap();
+        }
         // Camera position must be in GLOBAL MERCATOR meters
         // catalog.combined_extent is already in global Mercator (computed during catalog build)
         let extent = &catalog.combined_extent;
