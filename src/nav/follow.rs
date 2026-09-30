@@ -66,6 +66,11 @@ pub struct Guidance {
     /// Speed over ground, knots — what time to the destination is reckoned
     /// from, since VMG toward this mark says nothing about the legs after it.
     pub sog_kt: Option<f64>,
+    /// The weather router's planned arrival at the active waypoint, when the
+    /// route came from it.
+    pub wp_plan_eta: Option<chrono::DateTime<chrono::Utc>>,
+    /// The planned arrival at the end of the route, likewise.
+    pub dest_plan_eta: Option<chrono::DateTime<chrono::Utc>>,
     /// Inside the arrival circle of the active waypoint right now.
     pub arrived: bool,
     /// The last waypoint's circle has been reached: the route is done.
@@ -185,6 +190,8 @@ impl Following {
             vmg_kt,
             dtg_nm,
             sog_kt,
+            wp_plan_eta: leg.plan.as_ref().map(|p| p.eta),
+            dest_plan_eta: route.legs.last().and_then(|l| l.plan.as_ref()).map(|p| p.eta),
             arrived: dtw_nm <= radius_nm,
             finished,
         })

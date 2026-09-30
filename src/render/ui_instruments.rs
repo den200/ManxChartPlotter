@@ -394,25 +394,49 @@ fn route_reading(
         let r = crate::signalk::Quantity::Distance.format(nm * crate::geo::METRES_PER_NM, units);
         (r.value, r.unit.to_string())
     };
-    // Time to the waypoint from the speed made good toward it; to the end,
-    // from speed over ground, since the legs after this one point elsewhere.
+    // Time to the waypoint from the speed made good toward it.
     let hours = |nm: f64, kt: Option<f64>| kt.filter(|&k| k > MIN_CLOSING_KT).map(|k| nm / k);
-    let wp_hours = || hours(g.dtw_nm, g.vmg_kt);
-    let dest_hours = || hours(g.dtg_nm, g.sog_kt);
+    let until = |t: chrono::DateTime<chrono::Utc>| (t - now.to_utc()).num_seconds() as f64 / 3600.0;
+    let wp_hours = hours(g.dtw_nm, g.vmg_kt);
+    // Late (positive) or early against a weather route's plan: the arrival
+    // at this mark as it is going now, against the one planned.
+    let delta = wp_hours.zip(g.wp_plan_eta).map(|(h, plan)| h - until(plan));
+    // To the end: on a weather route, the planned arrival moved by that
+    // delta — the plan knows the wind ahead, SOG only the wind here.
+    // Otherwise at SOG, since the legs after this one point elsewhere.
+    let dest_hours = match g.dest_plan_eta {
+        Some(plan) => delta.map(|d| (until(plan) + d).max(0.0)),
+        None => hours(g.dtg_nm, g.sog_kt),
+    };
     match id {
         "manx.route.wpDistance" => Some(distance(g.dtw_nm)),
         "manx.route.destDistance" => Some(distance(g.dtg_nm)),
-        "manx.route.wpTime" => wp_hours().map(time_to_go),
-        "manx.route.destTime" => dest_hours().map(time_to_go),
-        "manx.route.wpEta" => wp_hours().map(|h| eta(now, h)),
-        "manx.route.destEta" => dest_hours().map(|h| eta(now, h)),
+        "manx.route.wpTime" => wp_hours.map(time_to_go),
+        "manx.route.destTime" => dest_hours.map(time_to_go),
+        "manx.route.wpEta" => wp_hours.map(|h| eta(now, h)),
+        "manx.route.destEta" => dest_hours.map(|h| eta(now, h)),
+        "manx.route.planDelta" => delta.map(against_plan),
         _ => None,
+    }
+}
+
+/// How far off the plan, `+0:25 late` or `-0:10 early`, to the minute.
+fn against_plan(hours: f64) -> (String, String) {
+    let minutes = (hours * 60.0).round();
+    if minutes == 0.0 {
+        return ("0:00".into(), "on plan".into());
+    }
+    let (value, _) = time_to_go(hours.abs());
+    if minutes > 0.0 {
+        (format!("+{value}"), "late".into())
+    } else {
+        (format!("-{value}"), "early".into())
     }
 }
 
 /// Hours and minutes, `7:05`; past a hundred hours, whole days, which is all
 /// a figure that far out is good for.
-fn time_to_go(hours: f64) -> (String, String) {
+pub(crate) fn time_to_go(hours: f64) -> (String, String) {
     let minutes = (hours * 60.0).round() as u64;
     if minutes < 100 * 60 {
         (format!("{}:{:02}", minutes / 60, minutes % 60), String::new())
@@ -983,6 +1007,8 @@ mod tests {
             vmg_kt: Some(6.0),
             dtg_nm: 15.0,
             sog_kt: Some(5.0),
+            wp_plan_eta: None,
+            dest_plan_eta: None,
             arrived: false,
             finished: false,
         }
@@ -1025,6 +1051,35 @@ mod tests {
         assert_eq!(time_to_go(240.0), ("10".into(), "d".into()));
         // 30 hours from noon is six in the evening, the day after next.
         assert_eq!(eta(at_noon(), 30.0), ("18:00".into(), "+1d".into()));
+    }
+
+    #[test]
+    fn a_weather_route_is_read_against_its_plan() {
+        let mut g = guidance();
+        let noon = at_noon().to_utc();
+        // Planned at the mark by 12:20 and the end by 16:00; going now, the
+        // mark is half an hour off, so ten minutes late.
+        g.wp_plan_eta = Some(noon + chrono::Duration::minutes(20));
+        g.dest_plan_eta = Some(noon + chrono::Duration::hours(4));
+        assert_eq!(read("manx.route.planDelta", &g).unwrap(), ("+0:10".into(), "late".into()));
+        // The end follows the plan, ten minutes late — not DTG at SOG.
+        assert_eq!(read("manx.route.destEta", &g).unwrap().0, "16:10");
+        assert_eq!(read("manx.route.destTime", &g).unwrap().0, "4:10");
+
+        g.wp_plan_eta = Some(noon + chrono::Duration::minutes(45));
+        assert_eq!(read("manx.route.planDelta", &g).unwrap(), ("-0:15".into(), "early".into()));
+        g.wp_plan_eta = Some(noon + chrono::Duration::minutes(30));
+        assert_eq!(read("manx.route.planDelta", &g).unwrap().1, "on plan");
+
+        // Not closing on the mark: no delta, and so no planned end either.
+        g.vmg_kt = Some(0.0);
+        assert!(read("manx.route.planDelta", &g).is_none());
+        assert!(read("manx.route.destEta", &g).is_none());
+    }
+
+    #[test]
+    fn a_route_without_a_plan_has_no_delta() {
+        assert!(read("manx.route.planDelta", &guidance()).is_none());
     }
 
     #[test]

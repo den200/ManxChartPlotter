@@ -91,8 +91,9 @@ pub const ROUTE_TILES: &[(&str, &str, &str)] = &[
     ("manx.route.wpTime", "WP TTG", "time to the next waypoint, at VMG"),
     ("manx.route.wpEta", "WP ETA", "arrival at the next waypoint, at VMG"),
     ("manx.route.destDistance", "Dest DTG", "distance to the end of the route"),
-    ("manx.route.destTime", "Dest TTG", "time to the end of the route, at SOG"),
-    ("manx.route.destEta", "Dest ETA", "arrival at the end of the route, at SOG"),
+    ("manx.route.destTime", "Dest TTG", "time to the end of the route, at SOG or by the plan"),
+    ("manx.route.destEta", "Dest ETA", "arrival at the end of the route, at SOG or by the plan"),
+    ("manx.route.planDelta", "vs Plan", "ahead of or behind a weather route's plan"),
 ];
 
 /// Whether a tile id is one of [`ROUTE_TILES`].
