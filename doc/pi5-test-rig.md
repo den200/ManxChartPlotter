@@ -127,6 +127,12 @@ GPU: `Buffer slices can not be empty` in egui-wgpu. Where the view had no
 forecast data, the wash was a mesh of corners with no triangles. egui passes
 that on, and wgpu panics on its empty index range. `ui_batch.rs` now never
 hands egui a mesh without triangles.
+- **Touch without a touchscreen:** `deploy/pi-touch.py` creates a virtual
+  uinput multitouch screen, so gestures reach Manx as real touch events rather
+  than as mouse input. It needs `python3-evdev` (installed 2026-09-30) and
+  `sudo`: `ssh rpi5 'sudo python3 ~/manx/deploy/pi-touch.py swipe 1234 916 686 916'`.
+  Coordinates are pixels on the 1920×1080 output, so take a screenshot first
+  to find the target.
 - Screenshot of the Pi's screen: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 grim /tmp/s.png' && scp rpi5:/tmp/s.png .`
 - Check the outputs: `ssh rpi5 'WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 wlr-randr'`
 - GPU: V3D through Mesa Vulkan (`vulkaninfo --summary`).
