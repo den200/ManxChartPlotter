@@ -651,7 +651,9 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance, units: &crate::signalk::UnitP
                     if vmg > 0.2 {
                         let hours = g.dtw_nm / vmg;
                         ui.separator();
-                        ui.label(format!("TTG {}:{:02}", hours as u32, (hours.fract() * 60.0) as u32));
+                        // Rounded as the TTG tile rounds, so the two agree.
+                        let (ttg, unit) = super::ui_instruments::time_to_go(hours);
+                        ui.label(format!("TTG {ttg}{unit}"));
                     }
                 }
             });

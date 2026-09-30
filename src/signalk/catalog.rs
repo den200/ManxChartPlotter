@@ -83,6 +83,24 @@ known! {
 /// sends.
 pub const WIND_ROSE: &str = "manx.windRose";
 
+/// Tiles fed by the route being followed rather than by the boat. Like the
+/// wind rose they are `manx.` ids no server sends: id, tile label, and what
+/// the settings window says about each.
+pub const ROUTE_TILES: &[(&str, &str, &str)] = &[
+    ("manx.route.wpDistance", "WP DTW", "distance to the next waypoint"),
+    ("manx.route.wpTime", "WP TTG", "time to the next waypoint, at VMG"),
+    ("manx.route.wpEta", "WP ETA", "arrival at the next waypoint, at VMG"),
+    ("manx.route.destDistance", "Dest DTG", "distance to the end of the route"),
+    ("manx.route.destTime", "Dest TTG", "time to the end of the route, at SOG or by the plan"),
+    ("manx.route.destEta", "Dest ETA", "arrival at the end of the route, at SOG or by the plan"),
+    ("manx.route.planDelta", "vs Plan", "ahead of or behind a weather route's plan"),
+];
+
+/// Whether a tile id is one of [`ROUTE_TILES`].
+pub fn is_route_tile(id: &str) -> bool {
+    ROUTE_TILES.iter().any(|t| t.0 == id)
+}
+
 /// A tile id as saved by an older build, brought up to date: the wind rose
 /// was saved as `navcore.windRose` before the rename.
 pub fn current_tile(path: String) -> String {
@@ -106,6 +124,9 @@ pub fn lookup(path: &str) -> Option<&'static Known> {
 pub fn label_for(path: &str) -> &str {
     if path == WIND_ROSE {
         return "Wind rose";
+    }
+    if let Some(t) = ROUTE_TILES.iter().find(|t| t.0 == path) {
+        return t.1;
     }
     match lookup(path) {
         Some(k) => k.label,
