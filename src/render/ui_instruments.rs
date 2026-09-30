@@ -13,10 +13,14 @@
 //!   struck through; anything never received shows an em dash.
 //! - **Touch first.** Tiles are large enough to hit while holding on with the
 //!   other hand, with no target smaller than a fingertip.
+//! - **Pages, swiped.** The bar holds several pages of tiles — the boat's
+//!   instruments on one, the route being followed on the next — and a swipe
+//!   across it turns the page, as on a phone.
 
 use egui::{Align2, Color32, Context, FontId, RichText, Sense, Stroke, Vec2};
 
-use super::ui::{BarPosition, InstrumentView, UiAction};
+use super::ui::{BarPosition, InstrumentPage, InstrumentView, UiAction};
+use crate::nav::follow::Guidance;
 use crate::signalk::{catalog, state::Vessel};
 
 /// Height of the strip in points. Enough for a label and a large number, and
@@ -29,12 +33,24 @@ const LABEL_SIZE: f32 = 11.0;
 /// Width of the strip when it runs down a side: a tile's width and a margin.
 const SIDE_WIDTH: f32 = 132.0;
 
+/// How far a swipe must travel, in points, to turn the page.
+const SWIPE: f32 = 50.0;
+
+/// What a tile reads from: the boat, and the route when one is followed.
+#[derive(Clone, Copy)]
+pub struct Sources<'a> {
+    pub vessel: &'a Vessel,
+    pub route: Option<&'a Guidance>,
+}
+
 /// Draw the strip. Returns nothing; interaction arrives as actions.
-pub fn bar(ctx: &Context, view: &mut InstrumentView, vessel: &Vessel) {
+pub fn bar(ctx: &Context, view: &mut InstrumentView, src: Sources, actions: &mut Vec<UiAction>) {
     // Read the edge before the closure borrows `view`, so the panel choice is
     // not itself part of the borrow.
     let position = view.position;
-    if position == BarPosition::Hidden || view.tiles.is_empty() {
+    // An empty page still shows, when there are others to swipe to — or the
+    // bar would vanish and take the way back with it.
+    if position == BarPosition::Hidden || (view.tiles().is_empty() && view.pages.len() < 2) {
         return;
     }
 
@@ -43,42 +59,50 @@ pub fn bar(ctx: &Context, view: &mut InstrumentView, vessel: &Vessel) {
             egui::TopBottomPanel::top("instrument-bar")
                 .exact_height(BAR_HEIGHT)
                 .show_separator_line(true)
-                .show(ctx, |ui| strip(ui, view, vessel, false));
+                .show(ctx, |ui| strip(ui, view, src, false, actions));
         }
         BarPosition::Bottom => {
             egui::TopBottomPanel::bottom("instrument-bar")
                 .exact_height(BAR_HEIGHT)
                 .show_separator_line(true)
-                .show(ctx, |ui| strip(ui, view, vessel, false));
+                .show(ctx, |ui| strip(ui, view, src, false, actions));
         }
         BarPosition::Left => {
             egui::SidePanel::left("instrument-bar")
                 .exact_width(SIDE_WIDTH)
                 .resizable(false)
                 .show_separator_line(true)
-                .show(ctx, |ui| strip(ui, view, vessel, true));
+                .show(ctx, |ui| strip(ui, view, src, true, actions));
         }
         BarPosition::Right => {
             egui::SidePanel::right("instrument-bar")
                 .exact_width(SIDE_WIDTH)
                 .resizable(false)
                 .show_separator_line(true)
-                .show(ctx, |ui| strip(ui, view, vessel, true));
+                .show(ctx, |ui| strip(ui, view, src, true, actions));
         }
         BarPosition::Hidden => {}
     }
 }
 
 /// The strip's contents: across the screen, or stacked down a side.
-fn strip(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, down: bool) {
+fn strip(
+    ui: &mut egui::Ui,
+    view: &mut InstrumentView,
+    src: Sources,
+    down: bool,
+    actions: &mut Vec<UiAction>,
+) {
+    swipe(ui, view, actions);
     if down {
         // Stacked, and scrolled if there are more than the screen is tall.
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(6.0);
                 let size = Vec2::new(SIDE_WIDTH - 12.0, BAR_HEIGHT - 12.0);
-                tiles(ui, view, vessel, size, size.x);
+                tiles(ui, view, src, size, size.x);
                 status_dot(ui, view);
+                page_dots(ui, view, actions);
             });
         });
         return;
@@ -86,13 +110,14 @@ fn strip(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, down: bo
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
         let size = Vec2::new(TILE_WIDTH, BAR_HEIGHT - 12.0);
-        tiles(ui, view, vessel, size, size.y);
+        tiles(ui, view, src, size, size.y);
         // The connection's health belongs on the bar, not buried in a
         // window: a stale reading and a dropped link look identical
         // otherwise.
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
             status_dot(ui, view);
+            page_dots(ui, view, actions);
         });
     });
 }
@@ -100,17 +125,91 @@ fn strip(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, down: bo
 /// Every tile on the bar, each `size` — the wind rose excepted, which is a
 /// square `rose` wide: as tall as the bar across the screen, as wide as the
 /// strip down a side.
-fn tiles(ui: &mut egui::Ui, view: &mut InstrumentView, vessel: &Vessel, size: Vec2, rose: f32) {
-    for path in view.tiles.clone() {
+fn tiles(ui: &mut egui::Ui, view: &mut InstrumentView, src: Sources, size: Vec2, rose: f32) {
+    for path in view.tiles().to_vec() {
         let response = if path == catalog::WIND_ROSE {
-            wind_rose(ui, vessel, view, rose)
+            wind_rose(ui, src.vessel, view, rose)
+        } else if catalog::is_route_tile(&path) {
+            route_tile(ui, &path, src.route, view, size)
         } else {
-            tile(ui, &path, vessel, view, size)
+            tile(ui, &path, src.vessel, view, size)
         };
         if response.clicked() {
             // A tile is the shortest route to the thing that
             // configures it — no hunting through a menu.
             view.open = true;
+        }
+    }
+}
+
+/// Turn the page on a swipe across the bar.
+///
+/// Read from the raw pointer rather than from a widget's drag, because the
+/// strip down a side is a scroll area that claims drags for itself. The
+/// press is remembered here since egui forgets where it began on the frame
+/// it ends. A swipe travels far enough that the tile under it does not also
+/// count it as a tap.
+fn swipe(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
+    let rect = ui.max_rect();
+    let id = ui.id().with("swipe");
+    let (origin, pos, down, released) = ui.input(|i| {
+        (
+            i.pointer.press_origin(),
+            i.pointer.latest_pos(),
+            i.pointer.primary_down(),
+            i.pointer.primary_released(),
+        )
+    });
+    if down {
+        if let (Some(origin), Some(pos)) = (origin, pos) {
+            if rect.contains(origin) {
+                ui.data_mut(|d| d.insert_temp(id, (origin, pos)));
+            }
+        }
+        return;
+    }
+    let Some((origin, end)) = ui.data_mut(|d| d.remove_temp::<(egui::Pos2, egui::Pos2)>(id)) else {
+        return;
+    };
+    if !released {
+        return;
+    }
+    let travel = end - origin;
+    if travel.x.abs() < SWIPE || travel.x.abs() < 1.5 * travel.y.abs() {
+        return;
+    }
+    let n = view.pages.len();
+    if n < 2 {
+        return;
+    }
+    // Swiping left brings the next page in from the right, and round.
+    view.page = if travel.x < 0.0 { (view.page + 1) % n } else { (view.page + n - 1) % n };
+    actions.push(UiAction::SettingsChanged);
+}
+
+/// Which page is showing, as a row of dots; tapping one goes to it. Absent
+/// with a single page, where there is nothing to say.
+fn page_dots(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
+    let n = view.pages.len();
+    if n < 2 {
+        return;
+    }
+    let dim = ui.visuals().weak_text_color();
+    let strong = ui.visuals().strong_text_color();
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(18.0 * n as f32, 28.0), Sense::hover());
+    for i in 0..n {
+        let cell = egui::Rect::from_min_size(
+            rect.min + Vec2::new(18.0 * i as f32, 0.0),
+            Vec2::new(18.0, 28.0),
+        );
+        let response = ui
+            .interact(cell, ui.id().with(("page-dot", i)), Sense::click())
+            .on_hover_text(&view.pages[i].name);
+        let (radius, colour) = if i == view.page { (4.5, strong) } else { (3.0, dim) };
+        ui.painter().circle_filled(cell.center(), radius, colour);
+        if response.clicked() && i != view.page {
+            view.page = i;
+            actions.push(UiAction::SettingsChanged);
         }
     }
 }
@@ -222,6 +321,117 @@ fn tile(
     response.on_hover_text(path)
 }
 
+/// A tile fed by the route being followed: distance, time or arrival, to
+/// the next waypoint or to the end. Drawn as a Signal K tile is, so the bar
+/// reads as one instrument; with no route followed it shows the dash of a
+/// reading never received.
+fn route_tile(
+    ui: &mut egui::Ui,
+    id: &str,
+    route: Option<&Guidance>,
+    view: &InstrumentView,
+    size: Vec2,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter();
+    let dim = ui.visuals().weak_text_color();
+    let strong = ui.visuals().strong_text_color();
+
+    painter.text(
+        rect.center_top() + Vec2::new(0.0, 8.0),
+        Align2::CENTER_TOP,
+        catalog::label_for(id).to_uppercase(),
+        FontId::proportional(LABEL_SIZE),
+        dim,
+    );
+
+    let now = chrono::Local::now();
+    let (text, unit, colour) = match route.and_then(|g| route_reading(id, g, &view.units, now)) {
+        Some((value, unit)) => (value, unit, strong),
+        None => ("–".to_string(), String::new(), dim),
+    };
+
+    let value_pos = rect.center() + Vec2::new(0.0, 6.0);
+    let galley = painter.layout_no_wrap(text, FontId::monospace(VALUE_SIZE), colour);
+    let text_pos = value_pos - galley.size() / 2.0;
+    painter.galley(text_pos, galley.clone(), colour);
+    if !unit.is_empty() {
+        painter.text(
+            text_pos + Vec2::new(galley.size().x + 3.0, galley.size().y - 8.0),
+            Align2::LEFT_BOTTOM,
+            unit,
+            FontId::proportional(LABEL_SIZE + 1.0),
+            dim,
+        );
+    }
+
+    let about = catalog::ROUTE_TILES
+        .iter()
+        .find(|t| t.0 == id)
+        .map_or("", |t| t.2);
+    response.on_hover_text(match route {
+        Some(g) => format!("{about}\nTo {}", g.to_name),
+        None => format!("{about}\nNo route is being followed"),
+    })
+}
+
+/// Below this closing speed, in knots, a time to go is not worth showing:
+/// drifting, or heading away, it would promise an arrival that is not coming.
+const MIN_CLOSING_KT: f64 = 0.2;
+
+/// A route tile's value and unit, or `None` when there is nothing honest to
+/// show — no speed to reckon a time from, or a route already finished.
+fn route_reading(
+    id: &str,
+    g: &Guidance,
+    units: &crate::signalk::UnitPrefs,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<(String, String)> {
+    if g.finished {
+        return None;
+    }
+    let distance = |nm: f64| {
+        let r = crate::signalk::Quantity::Distance.format(nm * crate::geo::METRES_PER_NM, units);
+        (r.value, r.unit.to_string())
+    };
+    // Time to the waypoint from the speed made good toward it; to the end,
+    // from speed over ground, since the legs after this one point elsewhere.
+    let hours = |nm: f64, kt: Option<f64>| kt.filter(|&k| k > MIN_CLOSING_KT).map(|k| nm / k);
+    let wp_hours = || hours(g.dtw_nm, g.vmg_kt);
+    let dest_hours = || hours(g.dtg_nm, g.sog_kt);
+    match id {
+        "manx.route.wpDistance" => Some(distance(g.dtw_nm)),
+        "manx.route.destDistance" => Some(distance(g.dtg_nm)),
+        "manx.route.wpTime" => wp_hours().map(time_to_go),
+        "manx.route.destTime" => dest_hours().map(time_to_go),
+        "manx.route.wpEta" => wp_hours().map(|h| eta(now, h)),
+        "manx.route.destEta" => dest_hours().map(|h| eta(now, h)),
+        _ => None,
+    }
+}
+
+/// Hours and minutes, `7:05`; past a hundred hours, whole days, which is all
+/// a figure that far out is good for.
+fn time_to_go(hours: f64) -> (String, String) {
+    let minutes = (hours * 60.0).round() as u64;
+    if minutes < 100 * 60 {
+        (format!("{}:{:02}", minutes / 60, minutes % 60), String::new())
+    } else {
+        (format!("{:.0}", hours / 24.0), "d".to_string())
+    }
+}
+
+/// The clock time of arrival, local like every other clock on screen, and
+/// how many days on when it is not today.
+fn eta(now: chrono::DateTime<chrono::Local>, hours: f64) -> (String, String) {
+    // Capped at a year: a crawl across an ocean must not overflow the clock.
+    let seconds = (hours * 3600.0).min(365.0 * 86_400.0) as i64;
+    let at = now + chrono::Duration::seconds(seconds);
+    let days = (at.date_naive() - now.date_naive()).num_days();
+    let unit = if days > 0 { format!("+{days}d") } else { String::new() };
+    (at.format("%H:%M").to_string(), unit)
+}
+
 /// The wind on a dial, bow up: where the apparent and the true wind come
 /// from, and how hard each blows.
 ///
@@ -328,8 +538,13 @@ fn wind_rose(ui: &mut egui::Ui, vessel: &Vessel, view: &InstrumentView, side: f3
     )
 }
 
-/// Whether the boat sends what a tile shows.
-fn is_live(path: &str, vessel: &Vessel) -> bool {
+/// Whether the boat sends what a tile shows — or, for a route tile, whether
+/// a route is being followed.
+fn is_live(path: &str, src: Sources) -> bool {
+    let vessel = src.vessel;
+    if catalog::is_route_tile(path) {
+        return src.route.is_some();
+    }
     if path == catalog::WIND_ROSE {
         return ["environment.wind.angleApparent", "environment.wind.angleTrueWater", "environment.wind.angleTrueGround"]
             .iter()
@@ -342,7 +557,7 @@ fn is_live(path: &str, vessel: &Vessel) -> bool {
 pub fn settings(
     ctx: &Context,
     view: &mut InstrumentView,
-    vessel: &Vessel,
+    src: Sources,
     actions: &mut Vec<UiAction>,
 ) {
     let mut open = view.open;
@@ -355,13 +570,19 @@ pub fn settings(
         .resizable(true)
         .default_width(460.0)
         .show(ctx, |ui| {
-            connection(ui, view, actions);
-            ui.add_space(10.0);
-            ui.separator();
-            layout(ui, view, actions);
-            ui.add_space(10.0);
-            ui.separator();
-            picker(ui, view, vessel, actions);
+            // Scrolled: on a plotter-sized screen the pages and the tile
+            // lists run well below the bottom edge.
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                connection(ui, view, actions);
+                ui.add_space(10.0);
+                ui.separator();
+                layout(ui, view, actions);
+                ui.add_space(10.0);
+                ui.separator();
+                pages(ui, view, actions);
+                ui.add_space(10.0);
+                picker(ui, view, src, actions);
+            });
         });
     view.open = open;
 }
@@ -510,6 +731,60 @@ type Settings = (
     u32,
 );
 
+/// The bar's pages: which one is being edited — the same one the bar shows,
+/// so the edit is seen as it is made — adding, naming and removing them.
+fn pages(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
+    ui.label(RichText::new("Pages").strong());
+    ui.label(
+        RichText::new("Swipe across the bar to turn the page, or tap its dots.")
+            .small()
+            .weak(),
+    );
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        for i in 0..view.pages.len() {
+            if ui
+                .selectable_label(i == view.page, &view.pages[i].name)
+                .clicked()
+                && i != view.page
+            {
+                view.page = i;
+                changed = true;
+            }
+        }
+        if ui.button("+").on_hover_text("Add a page").clicked() {
+            view.pages.push(InstrumentPage {
+                name: format!("Page {}", view.pages.len() + 1),
+                tiles: Vec::new(),
+            });
+            view.page = view.pages.len() - 1;
+            changed = true;
+        }
+    });
+    if view.page < view.pages.len() {
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            let page = view.page;
+            changed |= ui
+                .add(egui::TextEdit::singleline(&mut view.pages[page].name).desired_width(140.0))
+                .changed();
+            // The last page stays: a bar with no pages has nowhere to put a tile.
+            let removable = view.pages.len() > 1;
+            if ui
+                .add_enabled(removable, egui::Button::new("Remove page"))
+                .clicked()
+            {
+                view.pages.remove(view.page);
+                view.page = view.page.min(view.pages.len() - 1);
+                changed = true;
+            }
+        });
+    }
+    if changed {
+        actions.push(UiAction::SettingsChanged);
+    }
+}
+
 /// Choosing what the bar shows.
 ///
 /// The offered list is what the boat has actually sent — a menu of every path
@@ -518,18 +793,23 @@ type Settings = (
 fn picker(
     ui: &mut egui::Ui,
     view: &mut InstrumentView,
-    vessel: &Vessel,
+    src: Sources,
     actions: &mut Vec<UiAction>,
 ) {
-    ui.label(RichText::new("On the bar").strong());
+    let vessel = src.vessel;
+    let Some(page) = view.pages.get(view.page) else {
+        return;
+    };
+    ui.label(RichText::new(format!("On this page — {}", page.name)).strong());
+    let mut tiles = page.tiles.clone();
 
     let mut changed = false;
     let mut remove: Option<usize> = None;
     let mut move_to: Option<(usize, usize)> = None;
 
-    for (i, path) in view.tiles.iter().enumerate() {
+    for (i, path) in tiles.iter().enumerate() {
         ui.horizontal(|ui| {
-            let live = is_live(path, vessel);
+            let live = is_live(path, src);
             let dot = if live {
                 crate::render::theme::current().green
             } else {
@@ -539,7 +819,13 @@ fn picker(
             ui.painter().circle_filled(rect.center(), 3.5, dot);
 
             ui.label(RichText::new(catalog::label_for(path)).strong());
-            let about = if path == catalog::WIND_ROSE { "apparent and true wind" } else { path };
+            let about = if path == catalog::WIND_ROSE {
+                "apparent and true wind"
+            } else if let Some(t) = catalog::ROUTE_TILES.iter().find(|t| t.0 == path) {
+                t.2
+            } else {
+                path
+            };
             ui.label(RichText::new(about).small().weak());
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -547,7 +833,7 @@ fn picker(
                     remove = Some(i);
                 }
                 if ui
-                    .add_enabled(i + 1 < view.tiles.len(), egui::Button::new("▼"))
+                    .add_enabled(i + 1 < tiles.len(), egui::Button::new("▼"))
                     .clicked()
                 {
                     move_to = Some((i, i + 1));
@@ -559,7 +845,9 @@ fn picker(
                     // Offline, nothing is sent at all; saying the boat does
                     // not send this path would read as a data fault.
                     ui.label(
-                        RichText::new(if view.connected {
+                        RichText::new(if catalog::is_route_tile(path) {
+                            "no route followed"
+                        } else if view.connected {
                             "not sent by this boat"
                         } else {
                             "not connected"
@@ -573,26 +861,47 @@ fn picker(
     }
 
     if let Some(i) = remove {
-        view.tiles.remove(i);
+        tiles.remove(i);
         changed = true;
     }
     if let Some((from, to)) = move_to {
-        view.tiles.swap(from, to);
+        tiles.swap(from, to);
         changed = true;
     }
 
     // The rose is drawn from several paths rather than being one, so it is
     // offered on its own rather than in the list of what the boat sends.
-    if !view.tiles.iter().any(|t| t == catalog::WIND_ROSE) {
+    if !tiles.iter().any(|t| t == catalog::WIND_ROSE) {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui.button("+").clicked() {
-                view.tiles.push(catalog::WIND_ROSE.to_string());
+                tiles.push(catalog::WIND_ROSE.to_string());
                 changed = true;
             }
             ui.label(RichText::new("Wind rose").strong());
             ui.label(RichText::new("apparent and true wind, angle and speed").small().weak());
         });
+    }
+
+    // The route's figures come from Manx, not the boat, so they are on offer
+    // whether or not anything is connected or followed.
+    let route_left: Vec<_> = catalog::ROUTE_TILES
+        .iter()
+        .filter(|t| !tiles.iter().any(|p| p == t.0))
+        .collect();
+    if !route_left.is_empty() {
+        ui.add_space(8.0);
+        ui.label(RichText::new("From the route being followed").strong());
+        for (id, label, about) in route_left {
+            ui.horizontal(|ui| {
+                if ui.button("+").clicked() {
+                    tiles.push(id.to_string());
+                    changed = true;
+                }
+                ui.label(RichText::new(*label).strong());
+                ui.label(RichText::new(*about).small().weak());
+            });
+        }
     }
 
     ui.add_space(8.0);
@@ -609,6 +918,7 @@ fn picker(
         );
         // Removing or reordering tiles offline is still a change to keep.
         if changed {
+            view.pages[view.page].tiles = tiles;
             actions.push(UiAction::SettingsChanged);
         }
         return;
@@ -619,7 +929,7 @@ fn picker(
         .max_height(200.0)
         .show(ui, |ui| {
             for path in &view.available {
-                if view.tiles.iter().any(|t| t == path) {
+                if tiles.iter().any(|t| t == path) {
                     continue;
                 }
                 ui.horizontal(|ui| {
@@ -645,11 +955,90 @@ fn picker(
             }
         });
     if let Some(path) = add {
-        view.tiles.push(path);
+        tiles.push(path);
         changed = true;
     }
 
     if changed {
+        view.pages[view.page].tiles = tiles;
         actions.push(UiAction::SettingsChanged);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn guidance() -> Guidance {
+        Guidance {
+            leg: 0,
+            from: uuid::Uuid::nil(),
+            to: uuid::Uuid::nil(),
+            to_name: "b".into(),
+            xte_nm: 0.0,
+            btw_deg: 0.0,
+            dtw_nm: 3.0,
+            bod_deg: 0.0,
+            vmg_kt: Some(6.0),
+            dtg_nm: 15.0,
+            sog_kt: Some(5.0),
+            arrived: false,
+            finished: false,
+        }
+    }
+
+    fn at_noon() -> chrono::DateTime<chrono::Local> {
+        chrono::Local.with_ymd_and_hms(2026, 9, 30, 12, 0, 0).unwrap()
+    }
+
+    fn read(id: &str, g: &Guidance) -> Option<(String, String)> {
+        route_reading(id, g, &Default::default(), at_noon())
+    }
+
+    #[test]
+    fn waypoint_time_is_reckoned_at_vmg_and_the_destination_at_sog() {
+        let g = guidance();
+        assert_eq!(read("manx.route.wpTime", &g).unwrap().0, "0:30");
+        assert_eq!(read("manx.route.wpEta", &g).unwrap().0, "12:30");
+        assert_eq!(read("manx.route.destTime", &g).unwrap().0, "3:00");
+        assert_eq!(read("manx.route.destEta", &g).unwrap().0, "15:00");
+        assert_eq!(read("manx.route.destDistance", &g).unwrap(), ("15.0".into(), "NM".into()));
+    }
+
+    #[test]
+    fn no_time_is_promised_without_closing_speed_or_after_the_end() {
+        let mut g = guidance();
+        g.vmg_kt = Some(-2.0);
+        g.sog_kt = None;
+        assert!(read("manx.route.wpTime", &g).is_none());
+        assert!(read("manx.route.destEta", &g).is_none());
+        // Distance needs no speed.
+        assert!(read("manx.route.wpDistance", &g).is_some());
+        g.finished = true;
+        assert!(read("manx.route.wpDistance", &g).is_none());
+    }
+
+    #[test]
+    fn a_long_passage_counts_days() {
+        assert_eq!(time_to_go(7.0 + 5.0 / 60.0), ("7:05".into(), String::new()));
+        assert_eq!(time_to_go(240.0), ("10".into(), "d".into()));
+        // 30 hours from noon is six in the evening, the day after next.
+        assert_eq!(eta(at_noon(), 30.0), ("18:00".into(), "+1d".into()));
+    }
+
+    #[test]
+    fn a_single_saved_bar_becomes_the_first_page() {
+        let json = r#"{"url":"","position":"Bottom","tiles":["navcore.windRose","navigation.speedOverGround"],
+                       "units":{},"follow":true}"#;
+        let v: InstrumentView = serde_json::from_str(json).unwrap();
+        let v = v.upgraded();
+        assert_eq!(v.pages.len(), 2);
+        assert_eq!(v.pages[0].tiles, [catalog::WIND_ROSE, "navigation.speedOverGround"]);
+        assert_eq!(v.pages[1], InstrumentPage::route());
+        // Written back, the pages replace the old single list.
+        let out: serde_json::Value = serde_json::to_value(&v).unwrap();
+        assert!(out.get("tiles").is_none());
+        assert!(out.get("pages").is_some());
     }
 }

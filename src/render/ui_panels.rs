@@ -78,7 +78,11 @@ pub fn build(
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
     // the helm's hand, which is the opposite of what was wanted.
-    super::ui_instruments::bar(ctx, instruments, &fleet.own);
+    let sources = super::ui_instruments::Sources {
+        vessel: &fleet.own,
+        route: routes.guidance.as_ref(),
+    };
+    super::ui_instruments::bar(ctx, instruments, sources, actions);
     if let Some(ref g) = routes.guidance {
         super::ui_routes::guidance_strip(ctx, g, &instruments.units);
     } else if let Some(ref why) = routes.guidance_waiting {
@@ -95,7 +99,7 @@ pub fn build(
         chart_shop(ctx, shop, charts, free, actions);
     }
     if instruments.open {
-        super::ui_instruments::settings(ctx, instruments, &fleet.own, actions);
+        super::ui_instruments::settings(ctx, instruments, sources, actions);
     }
     if routes.open {
         super::ui_routes::window(ctx, routes, weather, actions);
@@ -491,7 +495,7 @@ fn menu_bar(
             // With the instrument bar hidden, its connection dot would go
             // with it; keep one here so a dropped link is still visible.
             let bar_shown = instruments.position != crate::render::ui::BarPosition::Hidden
-                && !instruments.tiles.is_empty();
+                && !instruments.tiles().is_empty();
             if !bar_shown && instruments.active {
                 let colour = if instruments.connected {
                     crate::render::theme::current().green

@@ -4773,6 +4773,11 @@ impl RenderState {
             // captured without a click.
             let mut signalk_override_saved: Option<String> = None;
             if let Some(ui) = self.ui.as_mut() {
+                // `MANX_INSTRUMENTS_OPEN=1` opens the instrument settings,
+                // for the same reason.
+                if std::env::var("MANX_INSTRUMENTS_OPEN").is_ok_and(|v| v != "0") {
+                    ui.instruments.open = true;
+                }
                 if std::env::var("MANX_SHOP").is_ok_and(|v| v != "0") {
                     ui.shop.open = true;
                     ui.shop.email = std::env::var("MANX_SHOP_EMAIL").unwrap_or_default();
@@ -5124,10 +5129,7 @@ impl RenderState {
         }
         // Current shape first, then the pre-weather file that was the
         // instruments alone — the user keeps their layout across the change.
-        let current = |mut v: crate::render::ui::InstrumentView| {
-            v.tiles = v.tiles.into_iter().map(crate::signalk::catalog::current_tile).collect();
-            v
-        };
+        let current = crate::render::ui::InstrumentView::upgraded;
         if let Ok(p) = serde_json::from_str::<Persisted>(&text) {
             return Some(current(p.instruments));
         }

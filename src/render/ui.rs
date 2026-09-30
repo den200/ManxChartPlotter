@@ -703,6 +703,32 @@ impl DisplayView {
     }
 }
 
+/// One page of the instrument strip: a name and its tiles, in order.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct InstrumentPage {
+    pub name: String,
+    pub tiles: Vec<String>,
+}
+
+impl InstrumentPage {
+    /// The page a route is followed on. Four tiles, as the first page has,
+    /// so that it fits a narrow screen; the other route tiles are a tap away
+    /// in the settings window.
+    pub fn route() -> Self {
+        Self {
+            name: "Route".into(),
+            tiles: [
+                "manx.route.wpDistance",
+                "manx.route.wpTime",
+                "manx.route.destDistance",
+                "manx.route.destEta",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
+}
+
 /// The instrument strip and the connection behind it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InstrumentView {
@@ -710,8 +736,16 @@ pub struct InstrumentView {
     /// window shows it back exactly as they wrote it.
     pub url: String,
     pub position: BarPosition,
-    /// The paths on the bar, in the order shown.
-    pub tiles: Vec<String>,
+    /// The bar's pages, swiped between; each lists its tiles in order.
+    #[serde(default)]
+    pub pages: Vec<InstrumentPage>,
+    /// The page showing, and the one the settings window edits.
+    #[serde(default)]
+    pub page: usize,
+    /// The one list of tiles an older build saved, before there were pages.
+    /// Read so that layout survives the change; never written.
+    #[serde(default, rename = "tiles", skip_serializing)]
+    legacy_tiles: Vec<String>,
     pub units: crate::signalk::UnitPrefs,
     /// Follow the boat: recentre the chart as the position moves.
     pub follow: bool,
@@ -749,10 +783,18 @@ impl Default for InstrumentView {
         Self {
             url: String::new(),
             position: BarPosition::default(),
-            tiles: crate::signalk::catalog::DEFAULT_BAR
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            pages: vec![
+                InstrumentPage {
+                    name: "Main".into(),
+                    tiles: crate::signalk::catalog::DEFAULT_BAR
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                },
+                InstrumentPage::route(),
+            ],
+            page: 0,
+            legacy_tiles: Vec::new(),
             units: Default::default(),
             follow: true,
             cpa_alarm_nm: default_cpa_nm(),
@@ -764,6 +806,36 @@ impl Default for InstrumentView {
             active: false,
             available: Vec::new(),
         }
+    }
+}
+
+impl InstrumentView {
+    /// Bring settings saved by an older build up to date: renamed tile ids,
+    /// and a single list of tiles becoming the first page, with the route
+    /// page after it.
+    pub fn upgraded(mut self) -> Self {
+        if self.pages.is_empty() {
+            self.pages = vec![
+                InstrumentPage {
+                    name: "Main".into(),
+                    tiles: std::mem::take(&mut self.legacy_tiles),
+                },
+                InstrumentPage::route(),
+            ];
+        }
+        for page in &mut self.pages {
+            page.tiles = std::mem::take(&mut page.tiles)
+                .into_iter()
+                .map(crate::signalk::catalog::current_tile)
+                .collect();
+        }
+        self.page = self.page.min(self.pages.len() - 1);
+        self
+    }
+
+    /// The tiles of the page showing.
+    pub fn tiles(&self) -> &[String] {
+        self.pages.get(self.page).map_or(&[], |p| &p.tiles)
     }
 }
 

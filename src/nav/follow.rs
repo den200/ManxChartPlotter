@@ -60,6 +60,12 @@ pub struct Guidance {
     pub bod_deg: f64,
     /// Velocity made good toward the waypoint, knots. Needs SOG and COG.
     pub vmg_kt: Option<f64>,
+    /// Distance to go to the end of the route, nautical miles: to the active
+    /// waypoint, then along every leg after it.
+    pub dtg_nm: f64,
+    /// Speed over ground, knots — what time to the destination is reckoned
+    /// from, since VMG toward this mark says nothing about the legs after it.
+    pub sog_kt: Option<f64>,
     /// Inside the arrival circle of the active waypoint right now.
     pub arrived: bool,
     /// The last waypoint's circle has been reached: the route is done.
@@ -161,6 +167,12 @@ impl Following {
             _ => None,
         };
 
+        let dtg_nm = dtw_nm
+            + route.legs[self.leg + 1..]
+                .iter()
+                .map(|l| l.distance_nm)
+                .sum::<f64>();
+
         Some(Guidance {
             leg: self.leg,
             from: leg.from,
@@ -171,6 +183,8 @@ impl Following {
             dtw_nm,
             bod_deg: bod_rad.to_degrees(),
             vmg_kt,
+            dtg_nm,
+            sog_kt,
             arrived: dtw_nm <= radius_nm,
             finished,
         })
@@ -447,5 +461,26 @@ mod tests {
         let g = f.update(&route, &set, at, None, None).unwrap();
         assert!((g.bod_deg).abs() < 0.5 || (g.bod_deg - 360.0).abs() < 0.5);
         assert!(g.btw_deg > 270.0 && g.btw_deg < 360.0, "{}", g.btw_deg);
+    }
+
+    #[test]
+    fn distance_to_go_runs_to_the_end_of_the_route() {
+        let (route, set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        // Halfway from a to b; each leg is 0.2° of latitude, about 12 NM.
+        let g = f
+            .update(&route, &set, LatLon::new(56.1, 11.0), Some(5.0), Some(0.0))
+            .unwrap();
+        let later: f64 = route.legs[1..].iter().map(|l| l.distance_nm).sum();
+        assert!((g.dtg_nm - (g.dtw_nm + later)).abs() < 1e-9);
+        assert!((g.dtg_nm - 30.0).abs() < 0.2, "{}", g.dtg_nm);
+        assert_eq!(g.sog_kt, Some(5.0));
+
+        // On the last leg, distance to go is distance to the waypoint.
+        f.leg = 2;
+        let g = f
+            .update(&route, &set, LatLon::new(56.5, 11.0), None, None)
+            .unwrap();
+        assert!((g.dtg_nm - g.dtw_nm).abs() < 1e-9);
     }
 }
