@@ -18,6 +18,23 @@ The script needs the Android SDK/NDK, a JDK and the Rust target
 below). To install over the network, switch on network ADB on the device and
 run `adb connect <device-ip>:5555` first.
 
+## Test hooks (`MANX_*`)
+
+An Android app starts with no environment, so the `MANX_*` hooks a desktop
+run takes from its shell (`MANX_PROFILE`, `MANX_STRESS`, `MANX_VIEW`, ...)
+come from `manx.env` in the app's storage, one `KEY=VALUE` per line:
+
+```sh
+printf 'MANX_PROFILE=1\nMANX_STRESS=coast\n' > manx.env
+adb push manx.env /data/local/tmp/
+adb shell run-as org.navcore.plotter cp /data/local/tmp/manx.env files/
+adb shell am force-stop org.navcore.plotter      # read at the next start
+adb shell run-as org.navcore.plotter grep profile.fps files/manx.log
+```
+
+Delete the file (`run-as org.navcore.plotter rm files/manx.env`) to go back
+to a normal start.
+
 ## The signing key: never change it
 
 Every APK is signed with Manx's own key,
