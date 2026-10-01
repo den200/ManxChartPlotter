@@ -46,8 +46,10 @@ cp "$OEX" "$OUT/lib/arm64-v8a/liboexserverd.so"
 zip -qr -X "$OUT/assets/assets.zip" assets -x '*/.*'
 
 
+# Resources are only the launcher icon (android/res, drawn from doc/logo).
+"$BT/aapt2" compile --dir android/res -o "$OUT/res.zip"
 "$BT/aapt2" link -o "$OUT/base.apk" --manifest android/AndroidManifest.xml -I "$PLATFORM" \
-    --min-sdk-version $API --target-sdk-version 34 -A "$OUT/assets" -0 zip
+    --min-sdk-version $API --target-sdk-version 34 -A "$OUT/assets" -0 zip "$OUT/res.zip"
 (cd "$OUT" && zip -q base.apk lib/arm64-v8a/libmanx.so lib/arm64-v8a/liboexserverd.so)
 "$BT/zipalign" -p -f 4 "$OUT/base.apk" "$OUT/aligned.apk"
 

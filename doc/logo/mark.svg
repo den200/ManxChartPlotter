@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- Manx: a Manx shearwater banking low, one wingtip shearing the wave. -->
+  <rect width="512" height="512" rx="112" fill="#F5F2EC"/>
+  <path d="M56 380 C 128 356, 196 396, 264 376 S 396 350, 456 370"
+        fill="none" stroke="#5B9BC4" stroke-width="18" stroke-linecap="round"/>
+  <g fill="#1E3446">
+    <!-- near wing, down to the water -->
+    <path d="M236 240 C 200 270, 146 318, 92 360 C 166 330, 236 292, 294 250 Z"/>
+    <!-- far wing, up and away -->
+    <path d="M226 248 C 284 206, 350 154, 404 106 C 370 158, 326 206, 290 246 Z"/>
+    <!-- body, flying right -->
+    <path d="M196 252 C 222 238, 262 232, 300 234 C 318 230, 334 232, 346 238
+             C 334 244, 318 248, 300 250 C 262 258, 224 260, 196 252 Z"/>
+    <!-- head -->
+    <circle cx="314" cy="238" r="14"/>
+  </g>
+</svg>
