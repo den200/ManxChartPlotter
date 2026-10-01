@@ -60,10 +60,13 @@ ODROID-C5 (Android 14, 4 GB) at 1920 × 1080, the same charts and tour, with Sig
 | Frame rate | 55 fps on average; 60 fps in 31 of 45 five-second windows | — |
 | Frame time, 95th percentile | 18.0 ms (median window); up to 90 ms while new tiles are built | — |
 | CPU | 72 % of one core | 3 % |
-| Memory | 607 MB (678 MB peak), of which ~320 MB is GPU memory the Mali driver counts to the app | 417 MB |
+| Memory (app's own heap) | 290 MB | — |
+| GPU memory | ~320 MB | — |
 | Chip temperature | 51 °C (53 °C peak) | 46 °C |
 
-The C5's four Cortex-A55 cores build new tiles more slowly than the Pi 5's A76 cores, so frames stretch while the tour reaches fresh chart areas. Measured 2026-10-01 with `manx.env` (see [deploy/ANDROID.md](deploy/ANDROID.md)) and a 1 s sampler over adb.
+The C5's four Cortex-A55 cores build new tiles more slowly than the Pi 5's A76 cores, so frames stretch while the tour reaches fresh chart areas. Measured 2026-10-01 with `manx.env` (see [deploy/ANDROID.md](deploy/ANDROID.md)), `dumpsys meminfo` and a 1 s sampler over adb.
+
+**Memory is not comparable between the two tables yet.** The Pi's figure is the process's resident memory; Android's Mali driver also counts the GPU's buffers to the app, so the C5's GPU memory is listed on its own line. And memory depends on what has been viewed rather than on the platform: every chart cell Manx parses stays in memory until it quits. Zoomed out to the whole world with the 443 California cells installed, a fresh start holds 795 MB of heap (plus 230 MB of GPU memory) within 15 seconds, against 290 MB for the San Diego tour. Bounding that cache is the next fix.
 
 ## Download
 
