@@ -37,6 +37,9 @@ pub enum TileRequest {
         tiles: Vec<TileId>,
         view_params: ViewParams,
         generation: u64,
+        /// Where the boat is (Mercator), if known: the charts under it are
+        /// never dropped from the parsed-chart cache.
+        boat: Option<[f64; 2]>,
     },
     /// Identify the chart objects at a position, for the info bubble.
     ///
@@ -116,12 +119,13 @@ impl TileWorkerHandle {
     }
 
     /// Send a batch of tile build requests
-    pub fn request_tiles(&self, tiles: Vec<TileId>, view_params: ViewParams) {
+    pub fn request_tiles(&self, tiles: Vec<TileId>, view_params: ViewParams, boat: Option<[f64; 2]>) {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = self.request_tx.send(TileRequest::Build {
             tiles,
             view_params,
             generation,
+            boat,
         });
     }
 
@@ -208,6 +212,11 @@ fn worker_loop(
     let coverage_cache: crate::tiles::builder::CoverageCache = Mutex::new(HashMap::new());
     let decryptor: Mutex<CachedDecryptor> = Mutex::new(decryptor);
     let mut settings_generation = 0u64;
+    // Bounding the parsed charts: without it every cell ever looked at stays
+    // in memory, and a plotter that has been along a coast runs out.
+    let chart_budget = crate::tiles::builder::chart_cache_budget();
+    let mut chart_last_used: HashMap<u64, u64> = HashMap::new();
+    let mut chart_tick = 0u64;
 
     loop {
         // Block until next request
@@ -221,6 +230,7 @@ fn worker_loop(
                 tiles,
                 view_params,
                 generation: batch_generation,
+                boat,
             } => {
                 let profile = std::env::var("MANX_PROFILE")
                     .map(|v| v != "0" && !v.is_empty())
@@ -253,9 +263,9 @@ fn worker_loop(
                 // batch took six times longer in wall clock than when every
                 // thread wastefully parsed its own copy. Warming first gets
                 // both: each chart parsed once, and parsed in parallel.
+                let mut needed: Vec<u64> = Vec::new();
                 {
                     let warm_start = profile.then(Instant::now);
-                    let mut needed: Vec<u64> = Vec::new();
                     let mut seen = std::collections::HashSet::new();
                     for &tile_id in &tiles {
                         let scale =
@@ -333,6 +343,28 @@ fn worker_loop(
                     );
                 }
 
+                chart_tick += 1;
+                for id in &needed {
+                    chart_last_used.insert(*id, chart_tick);
+                }
+                let mut keep: std::collections::HashSet<u64> = needed.iter().copied().collect();
+                if let Some([bx, by]) = boat {
+                    keep.extend(catalog.charts.iter().filter(|c| c.contains_point(bx, by)).map(|c| c.id));
+                }
+                let (dropped, kept) = crate::tiles::builder::trim_chart_cache(
+                    &chart_cache, &catalog, &chart_last_used, &keep, chart_budget,
+                );
+                if dropped > 0 {
+                    chart_last_used.retain(|id, _| chart_cache.lock().unwrap().contains_key(id));
+                }
+                if profile || dropped > 0 {
+                    log::info!(
+                        "chart cache: dropped {dropped}, keeping ~{} MB of {} MB",
+                        kept / (1024 * 1024),
+                        chart_budget / (1024 * 1024),
+                    );
+                }
+
 
             }
             TileRequest::Settings {
@@ -360,6 +392,7 @@ fn worker_loop(
                     .iter()
                     .filter(|c| c.contains_point(mercator[0], mercator[1]))
                 {
+                    chart_last_used.insert(info.id, chart_tick);
                     match builder.load_chart(info) {
                         Ok(chart) => objects.extend(crate::pick::pick_at(
                             &chart, info, mercator, tolerance_m,

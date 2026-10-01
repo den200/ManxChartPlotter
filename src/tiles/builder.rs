@@ -409,7 +409,89 @@ pub type CoverageCache = Mutex<HashMap<u64, Arc<Vec<[[f64; 2]; 3]>>>>;
 /// One 3802-feature cell was being parsed six times per view — and because the
 /// decryptor is behind a single global mutex, those redundant reads serialised
 /// and blocked tiles that needed other charts.
-pub type ChartCache = Mutex<HashMap<u64, Arc<Mutex<Option<Arc<ChartData>>>>>>;
+pub type ChartCache = Mutex<HashMap<u64, Arc<Mutex<Option<CachedChart>>>>>;
+
+/// A parsed chart in the [`ChartCache`], with what it costs to keep.
+pub struct CachedChart {
+    pub chart: Arc<ChartData>,
+    /// Size of the SENC it was parsed from. The parsed chart takes about
+    /// 1.5x this in memory (measured on the ODROID-C5: 12 San Diego cells,
+    /// 33 MB of SENC, 51 MB of heap); [`trim_chart_cache`] counts 2x.
+    pub senc_bytes: usize,
+}
+
+/// What [`trim_chart_cache`] counts a parsed chart as, per byte of SENC.
+const PARSED_BYTES_PER_SENC_BYTE: usize = 2;
+
+/// How much parsed chart data to keep, in bytes: `MANX_CHART_CACHE_MB` if
+/// set, else a quarter of the machine's memory, between 256 MB and 1.5 GB.
+/// Where the memory can't be read (not Linux or Android), 1 GB.
+pub fn chart_cache_budget() -> usize {
+    const MB: usize = 1024 * 1024;
+    if let Some(mb) = std::env::var("MANX_CHART_CACHE_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return mb * MB;
+    }
+    let total_kb = std::fs::read_to_string("/proc/meminfo").ok().and_then(|m| {
+        m.lines()
+            .find(|l| l.starts_with("MemTotal:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<usize>().ok())
+    });
+    match total_kb {
+        Some(kb) => (kb * 1024 / 4).clamp(256 * MB, 1536 * MB),
+        None => 1024 * MB,
+    }
+}
+
+/// Drop parsed charts, least recently used first, until what is left fits
+/// in `budget` bytes. Charts in `keep` (the ones on screen, the ones under
+/// the boat) and the built-in world basemap stay whatever it costs; a chart
+/// still being parsed is skipped. A chart dropped while a tile still holds it
+/// lives until that tile is done, and is parsed again if it is wanted again.
+///
+/// Returns how many charts were dropped and the estimated bytes kept.
+pub fn trim_chart_cache(
+    cache: &ChartCache,
+    catalog: &ChartCatalog,
+    last_used: &HashMap<u64, u64>,
+    keep: &std::collections::HashSet<u64>,
+    budget: usize,
+) -> (usize, usize) {
+    let mut map = cache.lock().unwrap();
+    let mut held: Vec<(u64, usize)> = map
+        .iter()
+        .filter_map(|(id, slot)| {
+            let slot = slot.try_lock().ok()?;
+            slot.as_ref().map(|c| (*id, c.senc_bytes * PARSED_BYTES_PER_SENC_BYTE))
+        })
+        .collect();
+    let mut total: usize = held.iter().map(|(_, b)| b).sum();
+    if total <= budget {
+        return (0, total);
+    }
+    held.sort_by_key(|(id, _)| last_used.get(id).copied().unwrap_or(0));
+    let mut dropped = 0;
+    for (id, bytes) in held {
+        if total <= budget {
+            break;
+        }
+        if keep.contains(&id) {
+            continue;
+        }
+        let basemap = catalog
+            .charts
+            .iter()
+            .find(|c| c.id == id)
+            .is_some_and(|c| crate::s57::basemap::is_basemap(&c.path));
+        if basemap {
+            continue;
+        }
+        map.remove(&id);
+        total -= bytes;
+        dropped += 1;
+    }
+    (dropped, total)
+}
 
 impl TileBuilder<'_> {
     /// Smallest triangle worth sending to the GPU, in square metres at this
@@ -452,9 +534,7 @@ impl TileBuilder<'_> {
     /// that declares none, or cannot be read here, is given the benefit of
     /// the doubt — it is dropped later if it fails to load.
     fn has_coverage_in(&self, info: &ChartInfo, bounds: &TileBounds) -> bool {
-        let Ok(chart) = self.load_chart(info) else { return true };
-        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
-        let coverage = self.coverage_for(info.id, &chart, ref_mx, ref_my);
+        let Some(coverage) = self.coverage_of(info) else { return true };
         coverage.is_empty()
             || coverage.iter().any(|t| {
                 let (min_x, max_x) = (t[0][0].min(t[1][0]).min(t[2][0]), t[0][0].max(t[1][0]).max(t[2][0]));
@@ -474,9 +554,7 @@ impl TileBuilder<'_> {
         if rect.max_x <= rect.min_x || rect.max_y <= rect.min_y {
             return true;
         }
-        let Ok(chart) = self.load_chart(info) else { return true };
-        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
-        let coverage = self.coverage_for(info.id, &chart, ref_mx, ref_my);
+        let Some(coverage) = self.coverage_of(info) else { return true };
         if coverage.is_empty() {
             return true;
         }
@@ -488,6 +566,19 @@ impl TileBuilder<'_> {
                 point_in_any_triangle([x, y], &coverage)
             })
         })
+    }
+
+    /// The chart's coverage tessellation, parsing the chart only if it has
+    /// not been worked out yet: a chart dropped from the [`ChartCache`] keeps
+    /// its coverage, so the quilt can be chosen without parsing it again.
+    /// `None` if the chart cannot be loaded.
+    fn coverage_of(&self, info: &ChartInfo) -> Option<Arc<Vec<[[f64; 2]; 3]>>> {
+        if let Some(hit) = self.coverage_cache.lock().unwrap().get(&info.id) {
+            return Some(Arc::clone(hit));
+        }
+        let chart = self.load_chart(info).ok()?;
+        let (ref_mx, ref_my) = crate::tiles::latlon_to_mercator(info.ref_lat, info.ref_lon);
+        Some(self.coverage_for(info.id, &chart, ref_mx, ref_my))
     }
 
     /// The chart's coverage tessellation, computed once per chart.
@@ -1495,15 +1586,16 @@ impl<'a> TileBuilder<'a> {
             Arc::clone(cache.entry(info.id).or_default())
         };
         let mut slot = slot.lock().unwrap();
-        if let Some(chart) = slot.as_ref() {
-            return Ok(Arc::clone(chart));
+        if let Some(cached) = slot.as_ref() {
+            return Ok(Arc::clone(&cached.chart));
         }
 
         // The world basemap, built into the program.
         if crate::s57::basemap::is_basemap(&info.path) {
             let bytes = crate::s57::basemap::senc().to_vec();
+            let senc_bytes = bytes.len();
             let chart = Arc::new(ChartData::parse(bytes).map_err(BuildError::Parse)?);
-            *slot = Some(Arc::clone(&chart));
+            *slot = Some(CachedChart { chart: Arc::clone(&chart), senc_bytes });
             return Ok(chart);
         }
 
@@ -1515,8 +1607,9 @@ impl<'a> TileBuilder<'a> {
                 .unwrap()
                 .s57_senc(&info.path)
                 .map_err(BuildError::S57)?;
+            let senc_bytes = bytes.len();
             let chart = Arc::new(ChartData::parse(bytes).map_err(BuildError::Parse)?);
-            *slot = Some(Arc::clone(&chart));
+            *slot = Some(CachedChart { chart: Arc::clone(&chart), senc_bytes });
             return Ok(chart);
         }
 
@@ -1541,8 +1634,9 @@ impl<'a> TileBuilder<'a> {
             .decrypt_chart(&info.path, &install_key)
             .map_err(BuildError::Decrypt)?;
 
+        let size = senc_bytes.len();
         let chart = Arc::new(ChartData::parse(senc_bytes).map_err(BuildError::Parse)?);
-        *slot = Some(Arc::clone(&chart));
+        *slot = Some(CachedChart { chart: Arc::clone(&chart), senc_bytes: size });
         Ok(chart)
     }
 
@@ -4353,6 +4447,40 @@ fn legacy_line_style(
 mod tests {
     use super::*;
     use crate::senc::{AttributeValue, Feature, FeatureType};
+
+    /// Over budget, the least recently used charts go first, and the ones
+    /// in `keep` (on screen, under the boat) stay whatever they cost.
+    #[test]
+    fn the_chart_cache_drops_the_oldest_and_keeps_the_pinned() {
+        const MB: usize = 1024 * 1024;
+        let cache: ChartCache = Mutex::new(HashMap::new());
+        let empty = || {
+            Arc::new(ChartData {
+                header: crate::senc::SencHeader::default(),
+                features: Vec::new(),
+                edge_table: Default::default(),
+            })
+        };
+        // Four 10 MB SENCs: 20 MB each as counted, 80 MB in all.
+        for id in 1..=4u64 {
+            let slot = CachedChart { chart: empty(), senc_bytes: 10 * MB };
+            cache.lock().unwrap().insert(id, Arc::new(Mutex::new(Some(slot))));
+        }
+        let catalog = ChartCatalog::new();
+        // 1 was used longest ago, then 2, 3, 4. 1 is under the boat.
+        let last_used: HashMap<u64, u64> = [(1, 1), (2, 2), (3, 3), (4, 4)].into();
+        let keep: HashSet<u64> = [1].into();
+
+        let (dropped, kept) = trim_chart_cache(&cache, &catalog, &last_used, &keep, 45 * MB);
+        assert_eq!(dropped, 2);
+        assert_eq!(kept, 40 * MB);
+        let left: HashSet<u64> = cache.lock().unwrap().keys().copied().collect();
+        assert_eq!(left, [1, 4].into(), "the pinned one and the newest");
+
+        // Within budget nothing goes.
+        let (dropped, _) = trim_chart_cache(&cache, &catalog, &last_used, &keep, 45 * MB);
+        assert_eq!(dropped, 0);
+    }
 
     #[test]
     fn area_vertex_layout_matches_shader() {

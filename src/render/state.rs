@@ -4124,7 +4124,11 @@ impl RenderState {
                 for tid in &missing {
                     self.pending_tiles.insert(*tid);
                 }
-                worker.request_tiles(missing, view_params);
+                let boat = self.fleet.own.position().map(|(lat, lon)| {
+                    let (x, y) = crate::render::projection::Projection::to_mercator(lat, lon);
+                    [x, y]
+                });
+                worker.request_tiles(missing, view_params, boat);
             }
         }
 
