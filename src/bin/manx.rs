@@ -302,6 +302,15 @@ pub fn android_start(android: winit::platform::android::activity::AndroidApp) {
 
     let Some(files) = android.internal_data_path() else { return };
     env::set_var("HOME", &files);
+    // A desktop run takes the MANX_* hooks (MANX_PROFILE, MANX_STRESS, ...)
+    // from its environment; an Android app is started with none, so they come
+    // from `manx.env` beside the log, one KEY=VALUE per line, written with
+    // `adb shell run-as`.
+    if let Ok(text) = std::fs::read_to_string(files.join("manx.env")) {
+        for (key, value) in text.lines().filter_map(|l| l.trim().split_once('=')) {
+            env::set_var(key.trim(), value.trim());
+        }
+    }
 
     let mut logger = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     logger
@@ -1951,6 +1960,8 @@ struct App {
     suspended: bool,
     /// MANX_STRESS=coast: legs of the coastal tour done so far.
     stress_leg: usize,
+    /// When the next slow-poll frame (route worker, watch, Signal K) is due.
+    slow_poll_due: Option<std::time::Instant>,
 }
 
 /// The two fingers on the glass, in a fixed order (by touch id), so the line
@@ -2007,6 +2018,7 @@ impl App {
             frame_count: 0,
             suspended: false,
             stress_leg: 0,
+            slow_poll_due: None,
         }
     }
 
@@ -2255,29 +2267,33 @@ impl ApplicationHandler for App {
                     std::time::Instant::now() + std::time::Duration::from_millis(16),
                 ));
                 state.window().request_redraw();
-            } else if state.routing_busy() {
+            } else if let Some(period_ms) = if state.routing_busy() {
                 // A worker's answer is drained during a frame, and nothing
                 // else would ask for one: a fetched route or a finished plan
                 // would otherwise sit in its channel until the user happened
                 // to touch the screen. Slow poll — these take seconds.
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    std::time::Instant::now() + std::time::Duration::from_millis(150),
-                ));
-                state.window().request_redraw();
+                Some(150)
             } else if state.watch_active() {
                 // An alarm, a man overboard or an anchor watch keeps time
                 // on its own: twice a second, data or no data.
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    std::time::Instant::now() + std::time::Duration::from_millis(500),
-                ));
-                state.window().request_redraw();
+                Some(500)
             } else if state.signalk_live() {
                 // Live data arrives on its own schedule, not the user's.
                 // Four frames a second is enough for a plotter and cheap.
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    std::time::Instant::now() + std::time::Duration::from_millis(250),
-                ));
-                state.window().request_redraw();
+                Some(250)
+            } else {
+                None
+            } {
+                // Every frame ends in about_to_wait, so asking for a redraw
+                // on each visit draws at the display rate, whatever the
+                // period says. Ask only once the period has run out.
+                let now = std::time::Instant::now();
+                let due = *self.slow_poll_due.get_or_insert(now);
+                if now >= due {
+                    state.window().request_redraw();
+                    self.slow_poll_due = Some(now + std::time::Duration::from_millis(period_ms));
+                }
+                event_loop.set_control_flow(ControlFlow::WaitUntil(self.slow_poll_due.unwrap()));
             } else {
                 // Idle — block until next event
                 event_loop.set_control_flow(ControlFlow::Wait);
