@@ -18,6 +18,26 @@ The script needs the Android SDK/NDK, a JDK and the Rust target
 below). To install over the network, switch on network ADB on the device and
 run `adb connect <device-ip>:5555` first.
 
+## ODROID-C5: one-time setup
+
+Found on the boat's C5 (Android 14, build 151). None of it is Manx's doing,
+but each makes it a poor plotter until fixed:
+
+- **Screen goes black for a few seconds when switching apps.** The C5
+  defaults to 1080p at 59.94 Hz, while apps such as Chrome or Brave ask for
+  60 Hz. Each switch between the two is a full HDMI reset. Make 60 Hz the
+  default, once (it survives reboots):
+  `adb shell cmd display set-user-preferred-display-mode 1920 1080 60.000004`
+- **Wrong date after power-up, so nothing online works.** The C5 has no clock
+  battery. It boots at its firmware's build date, and Android gives up on
+  internet time after a few failed tries. Point it at a time server on the
+  boat, such as a GPS-fed one, with Google's as a fallback:
+  `adb shell settings put global ntp_server "ntp://<boat-ntp-host>|ntp://time.android.com"`
+- **Google sign-in keeps resetting.** Google's security-key step opens the USB
+  touch panel as if it were a key, and the touchscreen drops each time.
+  Sign in from a computer with `scrcpy`, choose *Try another way → Enter your
+  password*, and avoid the passkey and security-key options.
+
 ## Test hooks (`MANX_*`)
 
 An Android app starts with no environment, so the `MANX_*` hooks a desktop
