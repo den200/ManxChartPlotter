@@ -1,3 +1,5 @@
+<img src="doc/logo/logo.png" alt="Manx" width="420">
+
 # Manx
 
 A fast, light chart plotter for the Raspberry Pi, Linux, macOS, Windows and Android.
@@ -66,7 +68,7 @@ ODROID-C5 (Android 14, 4 GB) at 1920 × 1080, the same charts and tour, with Sig
 
 The C5's four Cortex-A55 cores build new tiles more slowly than the Pi 5's A76 cores, so frames stretch while the tour reaches fresh chart areas. Measured 2026-10-01 with `manx.env` (see [deploy/ANDROID.md](deploy/ANDROID.md)), `dumpsys meminfo` and a 1 s sampler over adb.
 
-**Memory is not comparable between the two tables yet.** The Pi's figure is the process's resident memory; Android's Mali driver also counts the GPU's buffers to the app, so the C5's GPU memory is listed on its own line. And memory depends on what has been viewed rather than on the platform: every chart cell Manx parses stays in memory until it quits. Zoomed out to the whole world with the 443 California cells installed, a fresh start holds 795 MB of heap (plus 230 MB of GPU memory) within 15 seconds, against 290 MB for the San Diego tour. Bounding that cache is the next fix.
+**Memory is not comparable between the two tables.** The Pi's figure is the process's resident memory; Android's Mali driver also counts the GPU's buffers to the app, so the C5's GPU memory is listed on its own line. And memory depends on what has been viewed rather than on the platform: every chart cell Manx parses stays in memory until it quits. Zoomed out to the whole world with the 443 California cells installed, a fresh start holds 795 MB of heap (plus 230 MB of GPU memory) within 15 seconds, against 290 MB for the San Diego tour. Both are fixed now: zoomed out, Manx no longer parses cells too detailed to draw (87 MB at world view), and parsed charts are kept within a budget of a quarter of the memory, dropping the least recently used ones but never those on screen or under the boat.
 
 ## Download
 
