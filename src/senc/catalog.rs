@@ -394,13 +394,15 @@ impl ChartCatalog {
         const MAX_OVERZOOM_OUT: f64 = 3.0;
 
         let intersecting: Vec<&ChartInfo> =
-            self.charts.iter().filter(|c| c.intersects(tile) && has_data(c)).collect();
-        if intersecting.len() <= 1 {
-            return intersecting;
-        }
+            self.charts.iter().filter(|c| c.intersects(tile)).collect();
 
         // Drop charts whose native scale is much finer than this tile needs.
         // A non-finite scale means "no scale filtering" (keep all intersecting).
+        //
+        // The scale test comes before `has_data`, which reads the cell's
+        // coverage and so parses the whole cell: asked first, zoomed out over
+        // California it parsed all 443 cells to draw the dozen overview ones,
+        // and every parsed cell stays in memory.
         let min_native = if tile_scale_denom.is_finite() {
             tile_scale_denom / MAX_OVERZOOM_OUT
         } else {
@@ -409,12 +411,15 @@ impl ChartCatalog {
         let mut candidates: Vec<&ChartInfo> = intersecting
             .iter()
             .copied()
-            .filter(|c| (c.native_scale as f64) >= min_native)
+            .filter(|c| (c.native_scale as f64) >= min_native && has_data(c))
             .collect();
         if candidates.is_empty() {
             // All intersecting charts are finer than the view warrants (zoomed
-            // out past the coarsest chart). Keep the coarsest so it still draws.
-            if let Some(coarsest) = intersecting.iter().copied().max_by_key(|c| c.native_scale) {
+            // out past the coarsest chart). Keep the coarsest with data so it
+            // still draws.
+            let mut coarsest_first = intersecting.clone();
+            coarsest_first.sort_by(|a, b| b.native_scale.cmp(&a.native_scale));
+            if let Some(coarsest) = coarsest_first.into_iter().find(|c| has_data(c)) {
                 candidates.push(coarsest);
             }
         }
@@ -667,6 +672,43 @@ mod tests {
         let selected = catalog.charts_for_tile_where(&tile, f64::INFINITY, &|_| true, &full);
         let names: Vec<&str> = selected.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["detailed"]);
+    }
+
+    /// Zoomed out, a chart far too detailed for the tile is never asked
+    /// whether it has data: the builder answers that by parsing the whole
+    /// cell, and a parsed cell stays in memory. Asked before the scale cut,
+    /// a view of California parsed all 443 cells to draw the overview ones.
+    #[test]
+    fn a_chart_too_fine_for_the_tile_is_not_parsed() {
+        let tile = TileBounds::new(0.0, 1000.0, 0.0, 1000.0);
+        let big = TileBounds::new(-9000.0, 9000.0, -9000.0, 9000.0);
+        let mut catalog = ChartCatalog::new();
+        catalog.charts.push(chart_at("overview", 1_500_000, big));
+        catalog.charts.push(chart_at("coastal", 180_000, big));
+        catalog.charts.push(chart_at("harbour", 12_000, big));
+
+        let asked = std::cell::RefCell::new(Vec::new());
+        let has_data = |c: &ChartInfo| {
+            asked.borrow_mut().push(c.name.clone());
+            true
+        };
+        let selected = catalog.charts_for_tile_where(&tile, 1_000_000.0, &has_data, &|_, _| true);
+        let names: Vec<&str> = selected.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["overview"]);
+        assert!(!asked.borrow().contains(&"harbour".to_string()), "asked {:?}", asked.borrow());
+        assert!(!asked.borrow().contains(&"coastal".to_string()), "asked {:?}", asked.borrow());
+
+        // Zoomed out past every chart, the coarsest one with data still draws.
+        asked.borrow_mut().clear();
+        let no_overview = |c: &ChartInfo| {
+            asked.borrow_mut().push(c.name.clone());
+            c.name != "overview"
+        };
+        let selected =
+            catalog.charts_for_tile_where(&tile, 50_000_000.0, &no_overview, &|_, _| true);
+        let names: Vec<&str> = selected.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["coastal"]);
+        assert!(!asked.borrow().contains(&"harbour".to_string()));
     }
 
     /// The tile's scale is a ground scale: at 55.7°N a tile is shown at a
