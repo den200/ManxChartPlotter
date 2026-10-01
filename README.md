@@ -53,6 +53,18 @@ Raspberry Pi 5 (4 GB) at 1920 × 1080, NOAA charts of San Diego.
 
 Measured with `MANX_PROFILE=1 MANX_STRESS=coast` and the rig's sampler ([doc/pi5-test-rig.md](doc/pi5-test-rig.md)).
 
+ODROID-C5 (Android 14, 4 GB) at 1920 × 1080, the same charts and tour, with Signal K connected.
+
+| | Panning and zooming every frame | View held still |
+|---|---|---|
+| Frame rate | 55 fps on average; 60 fps in 31 of 45 five-second windows | — |
+| Frame time, 95th percentile | 18.0 ms (median window); up to 90 ms while new tiles are built | — |
+| CPU | 72 % of one core | 3 % |
+| Memory | 607 MB (678 MB peak), of which ~320 MB is GPU memory the Mali driver counts to the app | 417 MB |
+| Chip temperature | 51 °C (53 °C peak) | 46 °C |
+
+The C5's four Cortex-A55 cores build new tiles more slowly than the Pi 5's A76 cores, so frames stretch while the tour reaches fresh chart areas. Measured 2026-10-01 with `manx.env` (see [deploy/ANDROID.md](deploy/ANDROID.md)) and a 1 s sampler over adb.
+
 ## Download
 
 [Latest release](https://github.com/den200/manx/releases/latest):
