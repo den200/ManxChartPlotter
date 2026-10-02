@@ -58,3 +58,8 @@ doc/.claude/
 # Trace sessions pulled from the Pi (deploy/pi-trace-pull.sh)
 /traces/
 __pycache__/
+
+# Kept locally, out of the public repository: the abandoned first attempt and
+# the PortrayalPipe experiment (with its build output) plus OpenCPN sources.
+/src old attempt/
+/third_party/

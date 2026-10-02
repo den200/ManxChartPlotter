@@ -4,7 +4,7 @@
 
 A fast, light chart plotter for the Raspberry Pi, Linux, macOS, Windows and Android.
 
-**Beta. Not for navigation.** [Download](https://github.com/den200/manx/releases/latest) · [Features](#features) · [Screenshots](#screenshots) · [Performance](#performance)
+**Beta. Not for navigation.** [Download](https://github.com/den200/ManxChartPlotter/releases/latest) · [Features](#features) · [Screenshots](#screenshots) · [Performance](#performance)
 
 ![Manx on the approach to Copenhagen](doc/img/hero.png)
 
@@ -72,7 +72,7 @@ The C5's four Cortex-A55 cores build new tiles more slowly than the Pi 5's A76 c
 
 ## Download
 
-[Latest release](https://github.com/den200/manx/releases/latest):
+[Latest release](https://github.com/den200/ManxChartPlotter/releases/latest):
 
 - **Raspberry Pi 5** and other 64-bit ARM Linux, like Odroid
 - **Linux** PCs (x86_64)
