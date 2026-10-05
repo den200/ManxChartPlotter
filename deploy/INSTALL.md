@@ -18,7 +18,7 @@ Unpack the download anywhere and run `manx` (`manx.exe` on Windows). Keep the `a
   2. Copy `oexserverd` and the libraries beside it into `~/.manx/decoder/`.
   3. On a Mac, the helper is Intel-only: install Rosetta with `softwareupdate --install-rosetta`.
 
-Each machine uses one of your o-charts licence slots.
+Each machine uses one of your o-charts licence slots. On Android the slot belongs to Manx alone and can't be shared with OpenCPN or another app. o-charts doesn't support Manx; ask us instead. See [o-charts terms](../README.md#o-charts-terms).
 
 ## Boat data
 

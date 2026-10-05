@@ -106,6 +106,13 @@ The Widevine ID survives even a factory reset. `ANDROID_ID` doesn't.
 keeps user data. After an update, Manx's fingerprint in `files/license/`
 should be unchanged.
 
+## One app, one slot
+
+o-charts' terms: on Android each app uses its own licence slot. Charts
+installed in Manx can't be shared with OpenCPN or any other app, and
+OpenCPN's can't be shared with Manx. The chart shop says so before it
+spends the slot. See [o-charts terms](../README.md#o-charts-terms).
+
 ## How o-charts works on Android (for developers)
 
 - **Helper:** o-charts' closed `oexserverd` 1.23 for arm64 Android, the file

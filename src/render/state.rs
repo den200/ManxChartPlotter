@@ -6152,12 +6152,21 @@ impl RenderState {
         // not the subscription is live. Said before, not discovered after.
         let mine = chart.slot_for(&machine).map(|(_, s)| s.clone());
         let slot_note = mine.is_none().then(|| {
-            format!(
+            let mut note = format!(
                 "This assigns 1 of the {} free slot(s) on this licence to \"{machine}\", \
                  permanently: o-charts cannot move or cancel an assignment once a chart is \
                  requested for it.",
                 chart.free_slots()
-            )
+            );
+            // o-charts' terms: on Android each app is its own licence holder.
+            if cfg!(target_os = "android") {
+                note.push_str(
+                    " On Android the slot belongs to Manx alone: these charts cannot be \
+                     shared with OpenCPN or any other app, which would each need a slot of \
+                     their own.",
+                );
+            }
+            note
         });
 
         if !chart.expired {
