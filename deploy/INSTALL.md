@@ -13,12 +13,12 @@ Unpack the download anywhere and run `manx` (`manx.exe` on Windows). Keep the `a
 ## Charts
 
 - **Free charts:** Charts → Free charts. NOAA charts download and open in the app.
-- **o-charts:** buy and install them from Charts → Chart shop. To read them, Manx needs o-charts' own decryption helper, which we may not redistribute:
+- **o-charts:** buy them at [o-charts.org](https://o-charts.org), then download them in Charts → My o-charts. To read them, Manx needs o-charts' own decryption helper, which we may not redistribute:
   1. Install the o-charts plugin in OpenCPN, or download it from o-charts.
   2. Copy `oexserverd` and the libraries beside it into `~/.manx/decoder/`.
   3. On a Mac, the helper is Intel-only: install Rosetta with `softwareupdate --install-rosetta`.
 
-Each machine uses one of your o-charts licence slots.
+Each machine uses one of your o-charts licence slots. On Android the slot belongs to Manx alone and can't be shared with OpenCPN or another app. o-charts doesn't support Manx; ask us instead. See [o-charts terms](../README.md#o-charts-terms).
 
 ## Boat data
 

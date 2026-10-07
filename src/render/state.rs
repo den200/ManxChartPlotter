@@ -6166,9 +6166,10 @@ impl RenderState {
                 chart_name: chart.name.clone(),
                 expired: false,
                 choices: Vec::new(),
-                because: format!("The shop's current edition, {}.", chart.edition),
+                because: format!("o-charts' current edition, {}.", chart.edition),
                 new_slot: mine.is_none(),
                 slot_note,
+                understood: false,
             });
             return;
         }
@@ -6202,13 +6203,13 @@ impl RenderState {
 
         let because = if choices.is_empty() {
             format!(
-                "The shop has {}, published after your licence expired. No machine on the \
+                "o-charts has {}, published after your licence expired. No machine on the \
                  account has recorded an earlier edition, so there is none to name.",
                 chart.edition
             )
         } else {
             format!(
-                "The shop has {}, published after your licence expired, and will likely \
+                "o-charts has {}, published after your licence expired, and will likely \
                  refuse it. Your licence did cover the editions below — ask for one of those.",
                 chart.edition
             )
@@ -6222,6 +6223,7 @@ impl RenderState {
             because,
             new_slot: mine.is_none(),
             slot_note,
+            understood: false,
         });
     }
 

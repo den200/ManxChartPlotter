@@ -21,7 +21,7 @@ A chart plotter can be blazing fast. Manx proves it.
 ## Features
 
 - **Charts.** S-52, drawn as the standard says. o-charts and free NOAA ENCs.
-- **Chart shop.** Buy o-charts or download NOAA charts in the app.
+- **Chart downloads.** Sign in with your o-charts account to download charts you bought at [o-charts.org](https://o-charts.org), or download free NOAA charts, all in the app.
 - **Day, Dusk, Night.** IHO colours. The interface dims with the chart.
 - **Signal K.** The only data source, so there is one thing to set up.
 - **AIS.** Targets and CPA alarms.
@@ -83,6 +83,14 @@ The C5's four Cortex-A55 cores build new tiles more slowly than the Pi 5's A76 c
 Unpack and run `manx`. Setup and o-charts: [deploy/INSTALL.md](deploy/INSTALL.md).
 
 To build it yourself: `cargo run --release -- /path/to/charts`. Raspberry Pi: [deploy/README.md](deploy/README.md). Android: [deploy/ANDROID.md](deploy/ANDROID.md).
+
+## o-charts terms
+
+o-charts licenses its charts for OpenCPN and for programs derived from OpenCPN's presentation and encryption code. Manx is one of those. Their [terms](https://o-charts.org) apply as for OpenCPN, with three points to know:
+
+- **Support for Manx is ours, not o-charts'.** o-charts supports OpenCPN only. Questions about using o-charts in Manx go to [Manx's issues](https://github.com/den200/ManxChartPlotter/issues), not to o-charts.
+- **Each machine uses a licence slot**, as in OpenCPN.
+- **On Android, each app uses its own slot.** Charts installed in Manx count as one of your permitted installations and can't be shared with any other app, OpenCPN included. To use the same charts in OpenCPN on that device, OpenCPN needs another slot.
 
 ## The name
 

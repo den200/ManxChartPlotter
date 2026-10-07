@@ -119,15 +119,15 @@ impl std::error::Error for ShopError {}
 fn explain(code: &str) -> &'static str {
     match code {
         "1" => "ok",
-        "2" => "the shop is in maintenance",
+        "2" => "o-charts is in maintenance",
         "4" => "no such user",
-        "5" => "this client version is no longer accepted by the shop",
+        "5" => "this client version is no longer accepted by o-charts",
         "6" => "wrong email or password",
         "10" => "this system name has been disabled",
         // Not in the reference client's table — it falls through to a generic
         // "operation cancelled". Observed when asking for an edition published
         // after the licence lapsed.
-        "14" => "the shop would not grant this edition",
+        "14" => "o-charts would not grant this edition",
         "20" => "that chart is already assigned to this machine",
         "3d" => "no username given",
         "3e" => "invalid username",
@@ -136,7 +136,7 @@ fn explain(code: &str) -> &'static str {
         "8h" => "the machine assigned to this system name has changed",
         "8j" => "this machine already has a system name",
         "8l" => "this machine is not known to the account yet",
-        _ => "the shop refused the request",
+        _ => "o-charts refused the request",
     }
 }
 

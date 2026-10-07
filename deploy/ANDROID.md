@@ -75,7 +75,7 @@ recovered.
 
 **o-charts:** follow the same steps as on any new machine:
 
-1. Charts → o-charts shop → **1. Sign in**.
+1. Charts → My o-charts → **1. Sign in**.
 2. **2. This system**: register the device under a new name, such as
    `odroid`. This is free and uses no slot. Don't reuse another machine's
    name.
@@ -105,6 +105,13 @@ The Widevine ID survives even a factory reset. `ANDROID_ID` doesn't.
 **Before re-flashing a device that holds a slot**, check that the update
 keeps user data. After an update, Manx's fingerprint in `files/license/`
 should be unchanged.
+
+## One app, one slot
+
+o-charts' terms: on Android each app uses its own licence slot. Charts
+installed in Manx can't be shared with OpenCPN or any other app, and
+OpenCPN's can't be shared with Manx. Manx says so in Charts → My o-charts
+before it spends the slot. See [o-charts terms](../README.md#o-charts-terms).
 
 ## How o-charts works on Android (for developers)
 

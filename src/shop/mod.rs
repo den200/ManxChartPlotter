@@ -82,7 +82,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Shop(e) => write!(f, "{e}"),
-            Error::Transport(e) => write!(f, "could not reach the chart shop: {e}"),
+            Error::Transport(e) => write!(f, "could not reach o-charts: {e}"),
         }
     }
 }
@@ -336,7 +336,7 @@ impl ShopClient {
             let got = format!("{:x}", hasher.finalize());
             if got != expected_sha256.to_ascii_lowercase() {
                 return Err(Error::Transport(format!(
-                    "downloaded file does not match the shop's checksum \
+                    "downloaded file does not match o-charts' checksum \
                      (expected {expected_sha256}, got {got})"
                 )));
             }
@@ -362,6 +362,6 @@ mod tests {
         });
         assert!(e.to_string().contains("wrong email or password"));
         let e = Error::Transport("dns failure".into());
-        assert!(e.to_string().contains("could not reach the chart shop"));
+        assert!(e.to_string().contains("could not reach o-charts"));
     }
 }
