@@ -1013,8 +1013,8 @@ fn chart_shop(
             // keyboard.
             ui.horizontal(|ui| {
                 if ui
-                    .selectable_label(charts.tab == ChartsTab::Shop, "o-charts shop")
-                    .on_hover_text("Buy and install licensed charts")
+                    .selectable_label(charts.tab == ChartsTab::Shop, "My o-charts")
+                    .on_hover_text("Download charts you bought at o-charts.org")
                     .clicked()
                 {
                     charts.tab = ChartsTab::Shop;
@@ -1445,7 +1445,7 @@ fn confirm_download(
                     .add_enabled(may_assign, egui::Button::new("Ask for the current edition anyway"))
                     .on_hover_text(
                         "Expect a refusal — the licence expired before this edition \
-                         was published. The shop's exact answer is worth having.",
+                         was published. o-charts' exact answer is worth having.",
                     )
                     .clicked()
                 {

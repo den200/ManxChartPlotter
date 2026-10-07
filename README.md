@@ -21,7 +21,7 @@ A chart plotter can be blazing fast. Manx proves it.
 ## Features
 
 - **Charts.** S-52, drawn as the standard says. o-charts and free NOAA ENCs.
-- **Chart shop.** Buy o-charts or download NOAA charts in the app.
+- **Chart downloads.** Sign in with your o-charts account to download charts you bought at [o-charts.org](https://o-charts.org), or download free NOAA charts, all in the app.
 - **Day, Dusk, Night.** IHO colours. The interface dims with the chart.
 - **Signal K.** The only data source, so there is one thing to set up.
 - **AIS.** Targets and CPA alarms.

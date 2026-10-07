@@ -347,7 +347,7 @@ fn download(
         Ok(grant) if grant.files.is_empty() => {
             let _ = events.send(Event::Grant {
                 chart_id: chart_id.to_string(),
-                summary: "the shop granted no files".into(),
+                summary: "o-charts granted no files".into(),
             });
         }
         Ok(grant) => {
