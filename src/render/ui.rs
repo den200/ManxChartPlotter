@@ -860,6 +860,8 @@ pub struct PendingDownload {
     pub new_slot: bool,
     /// Said above everything else when a slot will be spent.
     pub slot_note: Option<String>,
+    /// On Android, the user has ticked that the slot is for Manx alone.
+    pub understood: bool,
 }
 
 /// What the shop panel is showing.

@@ -1189,6 +1189,10 @@ fn chart_shop(
                         .small()
                         .weak(),
                     );
+                    if cfg!(target_os = "android") {
+                        ui.add_space(4.0);
+                        android_licence_note(ui);
+                    }
                     // Reusing the name this machine already carries is almost
                     // always what is wanted, and typing a fresh one is the
                     // expensive mistake: o-charts will not move or cancel an
@@ -1229,7 +1233,11 @@ fn chart_shop(
                         ui.label("Name:");
                         let field = ui.add(
                             egui::TextEdit::singleline(&mut shop.new_system_name)
-                                .hint_text("e.g. saloon-mac")
+                                .hint_text(if cfg!(target_os = "android") {
+                                    "e.g. odroid-manx"
+                                } else {
+                                    "e.g. saloon-mac"
+                                })
                                 .desired_width(180.0),
                         );
                         let entered =
@@ -1276,8 +1284,8 @@ fn chart_shop(
                     ui.label(RichText::new("3. Install your charts").strong());
                     ui.separator();
                     chart_table(ui, shop, actions);
-                    if let Some(pending) = shop.pending.clone() {
-                        confirm_download(ui, &pending, actions);
+                    if let Some(pending) = shop.pending.as_mut() {
+                        confirm_download(ui, pending, actions);
                     }
                 }
             }
@@ -1303,8 +1311,34 @@ fn chart_shop(
                 ui.separator();
                 ui.label(RichText::new(&shop.status).small());
             }
+            // o-charts supports OpenCPN only, and sends Manx questions back
+            // to us: said where the user would otherwise go looking for help.
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "o-charts licenses its charts for OpenCPN and programs derived from it, \
+                     like Manx, but supports OpenCPN only. For help with o-charts in Manx, \
+                     ask us, not o-charts: github.com/den200/ManxChartPlotter/issues",
+                )
+                .small()
+                .weak(),
+            );
         });
     shop.open = open;
+}
+
+/// On Android o-charts treats each app as its own system: said where the
+/// user names this system and again before a slot is spent.
+fn android_licence_note(ui: &mut egui::Ui) {
+    let amber = crate::render::theme::current().amber;
+    egui::Frame::group(ui.style()).stroke(egui::Stroke::new(1.0_f32, amber)).show(ui, |ui| {
+        ui.label(RichText::new("On Android, each app needs its own licence").strong().color(amber));
+        ui.label(
+            "Charts installed in Manx use one of your o-charts slots and work in Manx only. \
+             They can't be shared with OpenCPN or any other app on this device. Installing \
+             the same charts in OpenCPN too uses a second slot.",
+        );
+    });
 }
 
 /// The three steps as a bar: where the user is, and which steps they may go
@@ -1349,7 +1383,7 @@ fn step_nav(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
 /// the user's business, so it is shown, named, and confirmed.
 fn confirm_download(
     ui: &mut egui::Ui,
-    pending: &crate::render::ui::PendingDownload,
+    pending: &mut crate::render::ui::PendingDownload,
     actions: &mut Vec<UiAction>,
 ) {
     ui.add_space(8.0);
@@ -1365,11 +1399,27 @@ fn confirm_download(
         if let Some(note) = &pending.slot_note {
             ui.label(RichText::new(note).color(crate::render::theme::current().amber));
         }
+        // o-charts' terms: on Android each app holds its own licence, so a
+        // slot spent here is Manx's alone. The user ticks that they know
+        // before the slot can be spent, rather than finding out in OpenCPN.
+        let per_app = cfg!(target_os = "android") && pending.new_slot;
+        if per_app {
+            ui.add_space(4.0);
+            android_licence_note(ui);
+            ui.checkbox(
+                &mut pending.understood,
+                "I understand these charts will work in Manx only",
+            );
+        }
+        let may_assign = !per_app || pending.understood;
         ui.label(RichText::new(&pending.because).small());
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             if !pending.expired {
-                if ui.button("Assign and download").clicked() {
+                if ui
+                    .add_enabled(may_assign, egui::Button::new("Assign and download"))
+                    .clicked()
+                {
                     actions.push(UiAction::ShopDownload {
                         chart_id: pending.chart_id.clone(),
                         edition: None,
@@ -1379,7 +1429,8 @@ fn confirm_download(
             // One button per edition the licence demonstrably covered, each
             // saying where it was seen: which to claim is the user's call.
             for (edition, source) in &pending.choices {
-                if ui.button(format!("Ask for {edition} ({source})")).clicked() {
+                let label = format!("Ask for {edition} ({source})");
+                if ui.add_enabled(may_assign, egui::Button::new(label)).clicked() {
                     actions.push(UiAction::ShopDownload {
                         chart_id: pending.chart_id.clone(),
                         edition: Some(edition.clone()),
@@ -1391,7 +1442,7 @@ fn confirm_download(
                 // lapsed. Asking will almost certainly be refused, but the
                 // shop's answer is more use than Manx's guess about it.
                 if ui
-                    .button("Ask for the current edition anyway")
+                    .add_enabled(may_assign, egui::Button::new("Ask for the current edition anyway"))
                     .on_hover_text(
                         "Expect a refusal — the licence expired before this edition \
                          was published. The shop's exact answer is worth having.",

@@ -88,7 +88,7 @@ To build it yourself: `cargo run --release -- /path/to/charts`. Raspberry Pi: [d
 
 o-charts licenses its charts for OpenCPN and for programs derived from OpenCPN's presentation and encryption code. Manx is one of those. Their [terms](https://o-charts.org) apply as for OpenCPN, with three points to know:
 
-- **Support for Manx is ours, not o-charts'.** o-charts supports OpenCPN only. Questions about using o-charts in Manx go to [Manx's issues](https://github.com/den200/manx/issues), not to o-charts.
+- **Support for Manx is ours, not o-charts'.** o-charts supports OpenCPN only. Questions about using o-charts in Manx go to [Manx's issues](https://github.com/den200/ManxChartPlotter/issues), not to o-charts.
 - **Each machine uses a licence slot**, as in OpenCPN.
 - **On Android, each app uses its own slot.** Charts installed in Manx count as one of your permitted installations and can't be shared with any other app, OpenCPN included. To use the same charts in OpenCPN on that device, OpenCPN needs another slot.
 
