@@ -512,135 +512,167 @@ mod tests {
 
     const CHARTSYMBOLS_PATH: &str = "assets/s52/chartsymbols.xml";
 
+    fn table() -> LineStyleTable {
+        LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).expect("chartsymbols.xml loads")
+    }
+
     #[test]
     fn test_load_line_style_table() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH);
-        assert!(table.is_ok(), "Failed to load line-style table");
+        // chartsymbols.xml defines 57 line-styles; every one must survive,
+        // or LC() lines referencing the dropped ones draw nothing.
+        assert_eq!(table().len(), 57);
+    }
 
-        let table = table.unwrap();
-        assert!(!table.is_empty(), "Line-style table should not be empty");
-
-        println!("Loaded {} line-style symbols", table.len());
+    #[test]
+    fn missing_file_is_an_error() {
+        assert!(LineStyleTable::load_from_xml("assets/s52/no-such-file.xml").is_err());
     }
 
     #[test]
     fn test_lowacc21_exists() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).unwrap();
-        let symbol = table.get("LOWACC21");
-        assert!(symbol.is_some(), "LOWACC21 should exist");
-
-        let symbol = symbol.unwrap();
+        let table = table();
+        let symbol = table.get("LOWACC21").expect("LOWACC21 should exist");
         assert_eq!(symbol.name, "LOWACC21");
+        assert_eq!(symbol.rcid, 3426);
         assert_eq!(symbol.width, 130);
         assert_eq!(symbol.height, 79);
+        // <origin> and <pivot> are self-closing tags; both must be read.
+        assert_eq!((symbol.origin_x, symbol.origin_y), (5476, 2607));
+        assert_eq!((symbol.pivot_x, symbol.pivot_y), (5305, 2650));
+        assert_eq!(
+            symbol.description,
+            "coastline or shoreline construction of low accuracy in position"
+        );
+        assert_eq!(
+            symbol.hpgl,
+            "SPA;SW1;PU5476,2607;PD5476,2686;PD5606,2686;PD5606,2607;PD5476,2607;"
+        );
         // The XML writes the token with its leading pen letter (ACSTLN); the
         // parser strips it so the token resolves in the colour table.
         assert_eq!(symbol.color_ref, "CSTLN");
-        println!("LOWACC21: {:?}", symbol);
-    }
-
-    #[test]
-    fn test_arcsln01_exists() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).unwrap();
-        // ARCSLN01 is commonly referenced in LC() instructions
-        // Check if it exists (might have different name format)
-        let found = table.names().any(|n| n.contains("ARCSLN"));
-        if !found {
-            println!("Available line-styles containing 'ARC': {:?}",
-                table.names().filter(|n| n.contains("ARC")).collect::<Vec<_>>());
-        }
     }
 
     #[test]
     fn test_repeat_distance() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).unwrap();
-        if let Some(symbol) = table.get("LOWACC21") {
-            assert_eq!(symbol.repeat_distance(), 130);
-            // At 96 DPI (3.78 ppmm), width should be ~0.49 pixels
-            let width_px = symbol.width_pixels(3.78);
-            assert!(width_px > 0.0, "Width in pixels should be positive");
-        }
+        let table = table();
+        let symbol = table.get("LOWACC21").unwrap();
+        assert_eq!(symbol.repeat_distance(), 130);
+        // S-52 units are 0.01 mm: 130 units at 3.78 px/mm (96 DPI) is 4.914 px.
+        assert!((symbol.width_pixels(3.78) - 4.914).abs() < 1e-4);
+        assert!((symbol.height_pixels(3.78) - 2.9862).abs() < 1e-4);
+        assert_eq!(symbol.size_pixels(3.78), (symbol.width_pixels(3.78), symbol.height_pixels(3.78)));
     }
 
     // HPGL parsing tests
 
     #[test]
     fn test_hpgl_parse_lowacc21() {
-        // LOWACC21 HPGL: "SPA;SW1;PU5476,2607;PD5476,2686;PD5606,2686;PD5606,2607;PD5476,2607;"
-        // This draws a rectangle
+        // LOWACC21 HPGL draws a rectangle, one PD at a time.
         let hpgl = "SPA;SW1;PU5476,2607;PD5476,2686;PD5606,2686;PD5606,2607;PD5476,2607;";
         let primitives = HpglPrimitives::parse(hpgl);
 
-        // Should have 4 line segments forming a rectangle
-        assert_eq!(primitives.segments.len(), 4, "LOWACC21 should have 4 segments");
-
-        // All segments should have width 1
-        for seg in &primitives.segments {
-            assert_eq!(seg.width, 1);
-        }
+        let segs: Vec<_> = primitives
+            .segments
+            .iter()
+            .map(|s| (s.x0, s.y0, s.x1, s.y1, s.width))
+            .collect();
+        assert_eq!(
+            segs,
+            [
+                (5476, 2607, 5476, 2686, 1),
+                (5476, 2686, 5606, 2686, 1),
+                (5606, 2686, 5606, 2607, 1),
+                (5606, 2607, 5476, 2607, 1),
+            ]
+        );
+        assert_eq!(primitives.bounds, (5476, 2607, 5606, 2686));
     }
 
     #[test]
     fn test_hpgl_parse_navare51() {
-        // NAVARE51 HPGL: "SPA;SW1;PU1507,814;PD2107,814;SPA;SW1;PU1647,812;PD1812,976;PD1976,812;"
-        // This draws a horizontal line with a caret/chevron
+        // NAVARE51: a horizontal line, then a pen-up move and a chevron. The
+        // pen-up must not leave a segment from the line's end to the chevron.
         let hpgl = "SPA;SW1;PU1507,814;PD2107,814;SPA;SW1;PU1647,812;PD1812,976;PD1976,812;";
         let primitives = HpglPrimitives::parse(hpgl);
+        let segs: Vec<_> = primitives.segments.iter().map(|s| (s.x0, s.y0, s.x1, s.y1)).collect();
+        assert_eq!(
+            segs,
+            [(1507, 814, 2107, 814), (1647, 812, 1812, 976), (1812, 976, 1976, 812)]
+        );
+    }
 
-        // Should have 3 segments: horizontal line + 2 for caret
-        assert_eq!(primitives.segments.len(), 3, "NAVARE51 should have 3 segments");
+    #[test]
+    fn hpgl_pen_down_with_several_points_draws_a_polyline() {
+        let primitives = HpglPrimitives::parse("SW2;PU0,0;PD10,0,10,10,0,10;");
+        let segs: Vec<_> = primitives
+            .segments
+            .iter()
+            .map(|s| (s.x0, s.y0, s.x1, s.y1, s.width))
+            .collect();
+        assert_eq!(segs, [(0, 0, 10, 0, 2), (10, 0, 10, 10, 2), (10, 10, 0, 10, 2)]);
     }
 
     #[test]
     fn test_hpgl_parse_circle() {
-        // Test circle command
-        let hpgl = "PU100,100;CI50;";
-        let primitives = HpglPrimitives::parse(hpgl);
-
-        // Circle is approximated with 16 segments
+        // A circle around the current pen position, as 16 chords.
+        let primitives = HpglPrimitives::parse("PU100,100;CI50;");
         assert_eq!(primitives.segments.len(), 16, "Circle should have 16 segments");
+        // The chords close (to within the integer truncation of f32 trig):
+        // the last one ends where the first began, at radius 50 east of the
+        // pen, and the whole ring spans 100 units each way.
+        let first = primitives.segments[0];
+        let last = primitives.segments[15];
+        assert!((last.x1 - first.x0).abs() <= 1 && (last.y1 - first.y0).abs() <= 1);
+        assert_eq!((first.x0, first.y0), (150, 100));
+        let (min_x, min_y, max_x, max_y) = primitives.bounds;
+        for (got, want) in [(min_x, 50), (min_y, 50), (max_x, 150), (max_y, 150)] {
+            assert!((got - want).abs() <= 1, "bounds {:?}", primitives.bounds);
+        }
+    }
+
+    #[test]
+    fn hpgl_with_nothing_drawn_has_unit_bounds() {
+        let primitives = HpglPrimitives::parse("SPA;SW1;PU10,10;");
+        assert!(primitives.segments.is_empty());
+        assert_eq!(primitives.bounds, (0, 0, 1, 1));
     }
 
     #[test]
     fn test_normalized_segments() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).unwrap();
-        if let Some(symbol) = table.get("LOWACC21") {
-            let segments = symbol.normalized_segments();
-            assert!(!segments.is_empty(), "LOWACC21 should have normalized segments");
-
-            // All normalized coordinates should be finite
-            for (x0, y0, x1, y1, _) in &segments {
-                assert!(x0.is_finite() && y0.is_finite() && x1.is_finite() && y1.is_finite());
-            }
-
-            println!("LOWACC21 normalized segments: {:?}", segments);
-        }
+        // LOWACC21's rectangle starts at its origin and spans exactly its
+        // tile, so it normalises to the unit square.
+        let table = table();
+        let segments = table.get("LOWACC21").unwrap().normalized_segments();
+        assert_eq!(
+            segments,
+            [
+                (0.0, 0.0, 0.0, 1.0, 1),
+                (0.0, 1.0, 1.0, 1.0, 1),
+                (1.0, 1.0, 1.0, 0.0, 1),
+                (1.0, 0.0, 0.0, 0.0, 1),
+            ]
+        );
+        // A zero-size tile cannot be normalised.
+        assert!(HpglPrimitives::parse("PU0,0;PD1,1;").normalized_segments(0, 0, 0, 10).is_empty());
     }
 
     #[test]
     fn test_advance_meters() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).unwrap();
-        if let Some(symbol) = table.get("LOWACC21") {
-            // At 96 DPI (3.78 ppmm) and 10 px/m zoom
-            let ppmm = 3.78;
-            let px_per_m = 10.0;
-            let advance = symbol.advance_meters(ppmm, px_per_m);
-
-            // Width is 130 S-52 units = 1.30mm = ~4.9 px at 96 DPI
-            // At 10 px/m, advance should be ~0.49 meters
-            assert!(advance > 0.0 && advance < 1.0, "Advance should be reasonable: {}", advance);
-            println!("LOWACC21 advance at 10 px/m: {} meters", advance);
-        }
+        let table = table();
+        let symbol = table.get("LOWACC21").unwrap();
+        // 130 units = 1.30 mm = 4.914 px at 3.78 px/mm; at 10 px per metre
+        // the pattern repeats every 0.4914 m.
+        assert!((symbol.advance_meters(3.78, 10.0) - 0.4914).abs() < 1e-4);
+        // A degenerate scale falls back to pixels rather than dividing by 0.
+        assert!((symbol.advance_meters(3.78, 0.0) - 4.914).abs() < 1e-4);
     }
 
     #[test]
     fn test_navare51_exists() {
-        let table = LineStyleTable::load_from_xml(CHARTSYMBOLS_PATH).unwrap();
-        let symbol = table.get("NAVARE51");
-        assert!(symbol.is_some(), "NAVARE51 should exist (most common LC symbol)");
-
-        let symbol = symbol.unwrap();
-        assert_eq!(symbol.width, 600);  // 6.00mm
+        let table = table();
+        let symbol = table.get("NAVARE51").expect("NAVARE51 should exist (most common LC symbol)");
+        assert_eq!(symbol.width, 600); // 6.00mm
         assert_eq!(symbol.color_ref, "CHGRD");
+        assert_eq!(symbol.parse_hpgl().segments.len(), 3);
     }
 }

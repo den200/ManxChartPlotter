@@ -298,33 +298,20 @@ fn set_file(f: &mut FileGrant, name: &str, value: &str) {
     }
 }
 
-/// What to ask the shop for: which package, and which edition by name.
+/// Said instead of installing when the licence for a chart set has run out.
 ///
-/// The edition is a string rather than an [`Edition`] because the shop's own
-/// wording is the safest thing to echo back — a chart's `edition` arrives as
-/// `2026/1-29` while a slot's `lastRequested` arrives as `1-20`, and
-/// re-formatting either risks naming an edition that does not exist.
-///
-/// The expired case is the interesting one. A lapsed subscription still paid
-/// for the editions published while it ran, so asking for the shop's *current*
-/// edition asks for something the licence never covered and is refused. Ask
-/// instead for the last edition this slot actually received, as a full base:
-/// an update package is only valid against the exact edition it was built from.
-pub fn choose_request(
-    expired: bool,
-    slot_last_requested: &str,
-    installed: Option<Edition>,
-    available: Edition,
-) -> (DownloadTarget, String) {
-    if expired {
-        let entitled = Some(slot_last_requested.trim())
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
-            .or_else(|| installed.map(|e| e.to_string()));
-        if let Some(version) = entitled {
-            return (DownloadTarget::Base, version);
-        }
-    }
+/// o-charts' conditions (October 2026): "An install can only happen during
+/// the licensing period." A set already installed keeps working — the EULA
+/// says so — but Manx does not fetch or unpack one, not even the edition
+/// the licence covered while it ran. Versions up to 0.5.1 asked the shop
+/// for that older edition; that is gone.
+pub const LICENCE_EXPIRED: &str = "The licence for this chart set has expired. A chart set can \
+     only be installed while its licence runs. Charts already installed here keep working; \
+     renew the licence at o-charts.org to install or update.";
+
+/// What to ask the shop for: which package, and the shop's current edition
+/// by name. Only for a licence that is running; see [`LICENCE_EXPIRED`].
+pub fn choose_request(installed: Option<Edition>, available: Edition) -> (DownloadTarget, String) {
     (
         choose_download(installed, available),
         available.to_string(),
@@ -360,43 +347,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_expired_licence_asks_for_the_edition_it_paid_for() {
+    fn a_running_licence_asks_for_the_shops_current_edition() {
         let shop_has = Edition::parse("2026/1-29");
         let on_disk = Some(Edition::parse("2025/1-20"));
 
-        // Live subscription: the shop's current edition. A base, because the
-        // year moved — only a minor bump within one edition can be patched.
-        let (target, version) = choose_request(false, "1-20", on_disk, shop_has);
+        // A base, because the year moved — only a minor bump within one
+        // edition can be patched.
+        let (target, version) = choose_request(on_disk, shop_has);
         assert_eq!(target, DownloadTarget::Base);
         assert_eq!(version, "2026/1-29");
 
         // Same edition, later update: that one is a patch.
-        let (target, version) =
-            choose_request(false, "1-20", on_disk, Edition::parse("2025/1-24"));
+        let (target, version) = choose_request(on_disk, Edition::parse("2025/1-24"));
         assert_eq!(target, DownloadTarget::Update);
         assert_eq!(version, "2025/1-24");
-
-        // Lapsed: ask for what the slot last received, as a whole base. Asking
-        // for 2026/1-29 is asking for an edition published after the licence
-        // ran out, and the shop answers 14.
-        let (target, version) = choose_request(true, "1-20", on_disk, shop_has);
-        assert_eq!(target, DownloadTarget::Base);
-        assert_eq!(version, "1-20");
-
-        // The shop's own string wins over ours, verbatim — including its
-        // year-less form, which we must not "helpfully" reformat.
-        let (_, version) = choose_request(true, "  2025/1-20 ", on_disk, shop_has);
-        assert_eq!(version, "2025/1-20");
-
-        // No record on the slot: fall back to what is installed here.
-        let (target, version) = choose_request(true, "", on_disk, shop_has);
-        assert_eq!(target, DownloadTarget::Base);
-        assert_eq!(version, "2025/1-20");
-
-        // Expired and nothing installed: there is no old edition to name, so
-        // ask normally and let the shop refuse in its own words.
-        let (_, version) = choose_request(true, "", None, shop_has);
-        assert_eq!(version, "2026/1-29");
     }
 
     #[test]
@@ -520,10 +484,78 @@ mod tests {
         );
     }
 
+    /// The shop gates on this exact string. Checked against this platform's
+    /// own prefix and the accepted plugin version — "starts with one of four
+    /// prefixes" would pass a macOS build announcing itself as Windows.
+    ///
+    /// The override is not exercised here: setting an environment variable
+    /// in one test races every other test that reads the environment.
     #[test]
-    fn the_client_version_names_the_platform_and_can_be_overridden() {
-        let v = client_version();
-        assert!(v.starts_with("w.") || v.starts_with("d.") || v.starts_with("l.") || v.starts_with("r."));
-        assert!(v.len() > 2);
+    fn the_client_version_names_this_platform_and_the_accepted_plugin() {
+        let expected = match std::env::var("MANX_SHOP_VERSION") {
+            Ok(v) if !v.trim().is_empty() => v,
+            _ => {
+                let os = if cfg!(target_os = "windows") {
+                    "w."
+                } else if cfg!(target_os = "macos") {
+                    "d."
+                } else if cfg!(target_os = "android") {
+                    "r."
+                } else {
+                    "l."
+                };
+                format!("{os}{}", crate::shop::COMPATIBLE_PLUGIN_VERSION)
+            }
+        };
+        assert_eq!(client_version(), expected);
+    }
+
+    /// Only an explicit `1` is success. A reply with no result at all — a
+    /// proxy's error page that happens to be XML, a truncated body — must not
+    /// be read as an empty success.
+    #[test]
+    fn anything_but_an_explicit_success_is_an_error() {
+        let e = parse("<response><key>abc</key></response>").unwrap_err();
+        assert_eq!(e.code, "");
+        assert!(parse("").is_err());
+        assert!(parse("<response><result>10</result></response>").is_err());
+        assert!(parse("<response><result> 1 </result></response>").is_ok());
+        // Broken XML is reported as such rather than as a refusal.
+        let e = parse("<response><result>1</result></wrong>").unwrap_err();
+        assert_eq!(e.code, "xml");
+    }
+
+    /// A machine name inside a chart's slot is that slot's holder, not one of
+    /// the account's own machines; and a second chart must not inherit the
+    /// first one's slots.
+    #[test]
+    fn slots_and_system_names_stay_where_they_were_found() {
+        let xml = r#"
+        <response>
+          <result>1</result>
+          <systemName>saloon-mac</systemName>
+          <systemName>pi5</systemName>
+          <chart>
+            <chartId>DK-1</chartId>
+            <baseChartList>https://o-charts.org/a/oeuSENC-DK-2025-1-20/ChartList.XML</baseChartList>
+            <baseChartList>https://o-charts.org/b/oeuSENC-DK-2025-1-20/ChartList.XML</baseChartList>
+            <quantity><quantityId>7</quantityId>
+              <slot><slotUuid>UU-1</slotUuid><systemName>other-boat</systemName>
+                <lastRequested>1-20</lastRequested></slot>
+            </quantity>
+          </chart>
+          <chart><chartId>NO-1</chartId><expired>1</expired></chart>
+        </response>"#;
+        let r = parse(xml).unwrap();
+        assert_eq!(r.system_names, ["saloon-mac", "pi5"]);
+        assert_eq!(r.charts.len(), 2);
+        assert_eq!(r.charts[0].base_chart_lists.len(), 2);
+        assert_eq!(r.charts[0].quantities[0].id, "7");
+        assert_eq!(r.charts[0].quantities[0].slots[0].last_requested, "1-20");
+        assert_eq!(r.charts[1].id, "NO-1");
+        assert!(r.charts[1].expired);
+        assert!(r.charts[1].quantities.is_empty());
+        // Chart fields do not leak into the reply's own values.
+        assert_eq!(r.value("chartId"), None);
     }
 }

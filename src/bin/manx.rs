@@ -26,6 +26,32 @@ use winit::{
 /// click rather than a drag, in physical pixels. A mouse is steady; a hand on a
 /// trackpad is not.
 const CLICK_SLOP: f64 = 4.0;
+
+/// How far above the finger a dragged waypoint is held, in logical points:
+/// clear of a fingertip, near enough to feel attached.
+const TOUCH_LIFT: f64 = 48.0;
+
+/// Whether a press and release was a tap: it ended within `slop` pixels of
+/// where it began, and never left that circle in between. A drag out and
+/// back ends where it began too, but it panned the chart on the way and
+/// is not also a tap — it used to be both, dropping a waypoint or opening
+/// the object bubble at the end of a pan.
+fn is_tap(moved: f64, slop: f64, panned: bool) -> bool {
+    !panned && moved <= slop
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::is_tap;
+
+    #[test]
+    fn a_drag_that_comes_back_to_its_start_is_not_a_tap() {
+        assert!(is_tap(0.0, 4.0, false));
+        assert!(is_tap(4.0, 4.0, false));
+        assert!(!is_tap(4.1, 4.0, false));
+        assert!(!is_tap(1.0, 4.0, true), "it panned on the way");
+    }
+}
 /// The same for a finger, which never lifts from quite where it landed.
 const TOUCH_SLOP: f64 = 10.0;
 /// How far two fingers must turn before the chart turns with them. A pinch
@@ -67,7 +93,10 @@ fn find_install_dir() {
     let Ok(exe) = env::current_exe().and_then(|p| p.canonicalize()) else {
         return;
     };
-    for dir in exe.ancestors().skip(1) {
+    // A macOS app keeps them in `Manx.app/Contents/Resources`, beside the
+    // `MacOS` folder the executable is in rather than above it.
+    let bundle = exe.parent().and_then(|d| d.parent()).map(|c| c.join("Resources"));
+    for dir in bundle.iter().map(|p| p.as_path()).chain(exe.ancestors().skip(1)) {
         if dir.join(marker).exists() {
             if env::set_current_dir(dir).is_ok() {
                 log::info!("working directory set to {}", dir.display());
@@ -244,6 +273,15 @@ fn main() {
     }
 
     // Dump what the renderer decided to draw, with provenance
+    // Neither dump is made of o-charts: both write decrypted chart content
+    // to a file.
+    if args.len() >= 3
+        && matches!(args[1].as_str(), "--dump-scene" | "--dump-ir")
+        && manx::shop::eula::is_licensed_source(std::path::Path::new(&args[2]))
+    {
+        eprintln!("{}: {}", args[1], manx::shop::eula::NO_COPIES);
+        std::process::exit(2);
+    }
     if args.len() >= 6 && args[1] == "--dump-scene" {
         dump_scene_mode(&args[2], &args[3], &args[4], &args[5]);
         return;
@@ -655,26 +693,10 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
     use manx::s52::{DepthAreaIndex, GeometryType, S52Engine};
     use manx::senc::{AttributeValue, FeatureType};
 
+    // Free S-57 cells only: o-charts are refused before this is reached
+    // (the dump writes chart content to a file).
     let path = PathBuf::from(chart_path);
-    let chart_dir = if path.is_dir() {
-        path.clone()
-    } else {
-        path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
-    };
-
-    let mut keys = KeyStore::new();
-    if let Err(e) = keys.load_keylists_in_dir(&chart_dir) {
-        eprintln!("Warning: could not load keys: {}", e);
-    }
-
-    let base_decryptor = match ChartDecryptor::new("license") {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("Failed to create decryptor: {}", e);
-            return;
-        }
-    };
-    let mut decryptor = CachedDecryptor::new(base_decryptor);
+    let decryptor = CachedDecryptor::open("license");
 
     let engine = match S52Engine::load("assets/s52/chartsymbols.xml") {
         Ok(mut e) => {
@@ -695,17 +717,7 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
         .and_then(|v| v.parse().ok());
 
     let mut chart_files: Vec<PathBuf> = if path.is_dir() {
-        std::fs::read_dir(&path)
-            .into_iter()
-            .flatten()
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension()
-                    .map(|x| x.eq_ignore_ascii_case("oesu"))
-                    .unwrap_or(false)
-            })
-            .collect()
+        manx::senc::find_s57_cells(&path, 5)
     } else {
         vec![path.clone()]
     };
@@ -726,14 +738,10 @@ fn dump_ir_mode(chart_path: &str, out_prefix: &str, limit: Option<usize>) {
 
     for chart_file in chart_files.iter() {
         let name = chart_file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let Some(key) = keys.lookup(name).map(|k| k.to_string()) else {
-            eprintln!("skip {} (no key)", name);
-            continue;
-        };
-        let bytes = match decryptor.decrypt_chart(chart_file.to_str().unwrap(), &key) {
+        let bytes = match decryptor.s57_senc(chart_file) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("skip {} (decrypt: {})", name, e);
+                eprintln!("skip {} (read: {})", name, e);
                 continue;
             }
         };
@@ -911,7 +919,7 @@ fn info_mode(chart_path: &str) {
         }
     };
 
-    // Decrypt (with disk cache)
+    // Decrypt, into memory
     let base_decryptor = match ChartDecryptor::new("license") {
         Ok(d) => d,
         Err(e) => {
@@ -961,7 +969,7 @@ fn catalog_mode(dir_path: &str) {
     }
     println!("Loaded {} chart keys", keys.len());
 
-    // Create decryptor with disk cache
+    // Create the decryptor
     let base_decryptor = match ChartDecryptor::new("license") {
         Ok(d) => d,
         Err(e) => {
@@ -1937,6 +1945,9 @@ struct App {
     /// hand moves between pressing and releasing: the object bubble opened and
     /// the chart slid out from under it at the same moment.
     panning: bool,
+    /// The press landed on a waypoint of the route being drawn: the drag
+    /// that follows moves the waypoint, not the chart.
+    waypoint_in_hand: bool,
     /// The same, for a single finger.
     touch_start: Option<PhysicalPosition<f64>>,
     // Touch state for pinch-zoom
@@ -2006,6 +2017,7 @@ impl App {
             drag_start: None,
             gesture_on_ui: false,
             panning: false,
+            waypoint_in_hand: false,
             touch_start: None,
             touches: HashMap::new(),
             pinch_start_distance: None,
@@ -2042,6 +2054,22 @@ impl App {
     fn load_directory(&mut self, dir: PathBuf) {
         println!("Loading chart directory: {}", dir.display());
 
+        // o-charts' conditions: the licence agreement that comes with the
+        // chart set is accepted before the charts are used. Not yet: start
+        // on the world map and let the window ask; accepting opens the
+        // folder (`start_chart_folder_load`).
+        if manx::shop::eula::pending(&dir).is_some() {
+            if let Some(ref mut state) = self.state {
+                state.load_catalog(
+                    ChartCatalog::new(),
+                    Arc::clone(&self.keys),
+                    CachedDecryptor::open("license"),
+                );
+                state.start_chart_folder_load(dir, false);
+            }
+            return;
+        }
+
         // Load keys into our Arc (get_mut works since we haven't shared it yet)
         let keys = Arc::get_mut(&mut self.keys)
             .expect("KeyStore Arc should have single reference before sharing");
@@ -2050,12 +2078,12 @@ impl App {
         }
         println!("Loaded {} chart keys", keys.len());
 
-        // Create decryptor with disk cache (will be moved to RenderState).
+        // Create the decryptor (will be moved to RenderState).
         // The o-charts helper if it starts; S-57 cells load either way.
         let mut decryptor = CachedDecryptor::open("license");
 
         // Build catalog (needs mutable decryptor for header parsing)
-        let catalog = match ChartCatalog::from_directory(&dir, &self.keys, &mut decryptor) {
+        let catalog = match ChartCatalog::from_chart_folder(&dir, &self.keys, &mut decryptor) {
             Ok(c) => {
                 println!("{}", c.summary());
                 c
@@ -2067,9 +2095,11 @@ impl App {
                 println!("No charts in {} yet; showing the world map", dir.display());
                 ChartCatalog::new()
             }
+            // The folder is not there (a stick not plugged in) or cannot be
+            // read. Still a working plotter, on the world map.
             Err(e) => {
                 eprintln!("Failed to build catalog: {}", e);
-                return;
+                ChartCatalog::new()
             }
         };
 
@@ -2110,7 +2140,7 @@ impl App {
 
         println!("Found key for {}", chart_name);
 
-        // Create decryptor with disk cache
+        // Create the decryptor
         let base_decryptor = match ChartDecryptor::new("license") {
             Ok(d) => d,
             Err(e) => {
@@ -2120,7 +2150,7 @@ impl App {
         };
         let mut decryptor = CachedDecryptor::new(base_decryptor);
 
-        // Decrypt chart (uses disk cache if available)
+        // Decrypt the chart, into memory
         let senc_bytes = match decryptor.decrypt_chart(&path, &install_key) {
             Ok(b) => {
                 println!("Decrypted {} bytes", b.len());
@@ -2198,6 +2228,11 @@ impl ApplicationHandler for App {
                         && state.pending_tiles_empty()
                         && !state.routing_busy()
                     {
+                        // No picture of o-charts is written to disk.
+                        if state.licensed_charts_loaded() {
+                            eprintln!("MANX_SHOT: {}", manx::shop::eula::NO_COPIES);
+                            std::process::exit(2);
+                        }
                         state.request_capture(path);
                         self.shot_requested = true;
                     }
@@ -2362,6 +2397,20 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } if consumed => {
                 self.last_mouse_pos = *position;
             }
+            // A button let go over the interface is still let go. Skipping
+            // this left the chart believing it was held: every move of the
+            // pointer afterwards panned the chart, with no button down.
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. }
+                if consumed =>
+            {
+                self.mouse_pressed = false;
+                self.drag_start = None;
+                self.panning = false;
+                self.gesture_on_ui = false;
+                if std::mem::take(&mut self.waypoint_in_hand) {
+                    state.route_drag_end();
+                }
+            }
             WindowEvent::Touch(Touch { id, phase: TouchPhase::Ended | TouchPhase::Cancelled, .. })
                 if consumed =>
             {
@@ -2496,19 +2545,31 @@ impl ApplicationHandler for App {
                         self.gesture_on_ui = state.ui_pointer_over();
                         self.drag_start = Some(self.last_mouse_pos);
                         self.panning = false;
+                        self.waypoint_in_hand = !self.gesture_on_ui
+                            && state.route_drag_begin(
+                                self.last_mouse_pos.x as f32,
+                                self.last_mouse_pos.y as f32,
+                            );
                     } else if self.gesture_on_ui {
                         self.gesture_on_ui = false;
                         self.drag_start = None;
                         self.mouse_pressed = false;
                         return;
                     } else if let Some(start) = self.drag_start.take() {
+                        // A waypoint let go stays where it was dropped. If it
+                        // never moved, the press was a tap on it, and falls
+                        // through to be one.
+                        if std::mem::take(&mut self.waypoint_in_hand) {
+                            state.route_drag_end();
+                            state.mark_dirty();
+                        }
                         // A click identifies what is under it; a drag pans. The
                         // two arrive as the same pair of events, so they are
                         // told apart by how far the pointer moved in between.
                         let moved = ((self.last_mouse_pos.x - start.x).powi(2)
                             + (self.last_mouse_pos.y - start.y).powi(2))
                         .sqrt();
-                        if moved <= CLICK_SLOP * state.window().scale_factor() {
+                        if is_tap(moved, CLICK_SLOP * state.window().scale_factor(), self.panning) {
                             let (x, y) = (self.last_mouse_pos.x as f32, self.last_mouse_pos.y as f32);
                             state.tap_at_screen(x, y);
                         }
@@ -2530,7 +2591,10 @@ impl ApplicationHandler for App {
                             self.panning = moved > CLICK_SLOP * state.window().scale_factor();
                         }
                     }
-                    if self.panning {
+                    if self.panning && self.waypoint_in_hand {
+                        state.route_drag_to(position.x as f32, position.y as f32);
+                        state.mark_dirty();
+                    } else if self.panning {
                         // Taking the chart in hand takes it off follow, or
                         // the next fix would undo the drag.
                         state.release_follow();
@@ -2604,8 +2668,15 @@ impl ApplicationHandler for App {
                             self.gesture_on_ui =
                                 state.ui_covers(location.x as f32, location.y as f32);
                             self.panning = false;
+                            self.waypoint_in_hand = !self.gesture_on_ui
+                                && state.route_drag_begin(location.x as f32, location.y as f32);
                         } else {
                             self.touch_start = None;
+                            // A second finger makes it a pinch: whatever
+                            // waypoint was in hand is put down where it is.
+                            if std::mem::take(&mut self.waypoint_in_hand) {
+                                state.route_drag_end();
+                            }
                         }
                         if self.touches.len() == 2 {
                             // Inline distance calculation to avoid borrow conflicts
@@ -2684,7 +2755,13 @@ impl ApplicationHandler for App {
                                     self.panning = moved > TOUCH_SLOP * state.window().scale_factor();
                                 }
                             }
-                            if let (true, Some(old_loc)) = (self.panning, old_location) {
+                            if self.panning && self.waypoint_in_hand {
+                                // Above the finger, not under it: the finger
+                                // hides exactly the spot being chosen.
+                                let lift = TOUCH_LIFT * state.window().scale_factor();
+                                state.route_drag_to(location.x as f32, (location.y - lift) as f32);
+                                state.mark_dirty();
+                            } else if let (true, Some(old_loc)) = (self.panning, old_location) {
                                 state.release_follow();
                                 let dx = (location.x - old_loc.x) as f32;
                                 let dy = (location.y - old_loc.y) as f32;
@@ -2697,12 +2774,16 @@ impl ApplicationHandler for App {
                         // A tap identifies what is under the finger; a drag
                         // pans. Ten pixels of slop, because a finger on glass
                         // never lifts from exactly where it landed.
+                        if std::mem::take(&mut self.waypoint_in_hand) {
+                            state.route_drag_end();
+                            state.mark_dirty();
+                        }
                         if phase == TouchPhase::Ended {
                             if let Some(start) = self.touch_start.take() {
                                 let moved = ((location.x - start.x).powi(2)
                                     + (location.y - start.y).powi(2))
                                 .sqrt();
-                                if moved <= TOUCH_SLOP * state.window().scale_factor()
+                                if is_tap(moved, TOUCH_SLOP * state.window().scale_factor(), self.panning)
                                     && self.touches.len() == 1
                                     && !self.gesture_on_ui
                                 {

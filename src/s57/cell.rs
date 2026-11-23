@@ -581,6 +581,23 @@ mod tests {
         }
     }
 
+    /// A cell cut short anywhere — a download that stopped, a card pulled
+    /// mid-copy — is an error to report, not a panic that takes the plotter
+    /// down. The same for an update file.
+    #[test]
+    fn a_truncated_cell_is_an_error_not_a_panic() {
+        let base = fixture("000");
+        for n in (0..base.len()).step_by(7) {
+            let _ = Cell::parse_base(&base[..n]);
+        }
+        assert!(Cell::parse_base(&base[..base.len() / 2]).is_err());
+        let update = fixture("001");
+        for n in (0..update.len()).step_by(5) {
+            let mut cell = Cell::parse_base(&base).unwrap();
+            let _ = cell.apply_update(&update[..n]);
+        }
+    }
+
     #[test]
     fn update_lists_edit_in_place() {
         let mut v = vec![1, 2, 3, 4];

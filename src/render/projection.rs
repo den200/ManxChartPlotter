@@ -183,27 +183,32 @@ mod tests {
         assert!((back_lon - lon).abs() < 1e-9, "lon {back_lon}");
     }
 
+    /// The same Simple Mercator lives in `tiles` (which places chart
+    /// geometry) and here (which the camera and the UI use). They must agree
+    /// to the millimetre everywhere, or a tap lands beside what it touched;
+    /// and both must be the true Mercator northing, R·atanh(sin φ), on the
+    /// R = 0.9996·a sphere OpenCPN's SENC coordinates are built on.
     #[test]
-    fn mercator_roundtrip() {
-        let lat = 55.67; // Copenhagen
-        let lon = 12.57;
-
-        let (x, y) = Projection::to_mercator(lat, lon);
-        let (lat2, lon2) = Projection::to_wgs84(x, y);
-
-        assert!((lat - lat2).abs() < 0.0001);
-        assert!((lon - lon2).abs() < 0.0001);
+    fn this_projection_is_the_one_the_tiles_use() {
+        assert_eq!(EARTH_RADIUS, 6_378_137.0 * 0.9996);
+        for (lat, lon) in [(55.67, 12.57), (-33.9, 151.2), (40.6, -73.8), (78.2, -15.6), (0.0, 0.0)] {
+            let (x, y) = Projection::to_mercator(lat, lon);
+            let (tx, ty) = crate::tiles::latlon_to_mercator(lat, lon);
+            assert!((x - tx).abs() < 1e-3 && (y - ty).abs() < 1e-3, "{lat},{lon}");
+            let y_ref = EARTH_RADIUS * (lat as f64).to_radians().sin().atanh();
+            assert!((y - y_ref).abs() < 1e-6, "{lat}: {y} vs {y_ref}");
+            let (lat2, lon2) = Projection::to_wgs84(x, y);
+            assert!((lat - lat2).abs() < 1e-9 && (lon - lon2).abs() < 1e-9);
+        }
+        // The latitude limit is where the world becomes square.
+        let top = Projection::lat_to_y(90.0);
+        assert!((top - std::f64::consts::PI * EARTH_RADIUS).abs() < 1.0, "{top}");
     }
 
     #[test]
-    fn equator_no_distortion() {
-        let scale = Projection::scale_at_lat(0.0);
-        assert!((scale - 1.0).abs() < 0.0001);
-    }
-
-    #[test]
-    fn polar_high_distortion() {
-        let scale = Projection::scale_at_lat(80.0);
-        assert!(scale < 0.2); // Much less than 1
+    fn scale_falls_with_the_cosine_of_latitude() {
+        assert!((Projection::scale_at_lat(0.0) - 1.0).abs() < 1e-12);
+        assert!((Projection::scale_at_lat(60.0) - 0.5).abs() < 1e-12);
+        assert!((Projection::scale_at_lat(-60.0) - 0.5).abs() < 1e-12);
     }
 }

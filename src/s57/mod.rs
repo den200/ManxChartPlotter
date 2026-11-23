@@ -26,7 +26,8 @@ mod tests {
         use crate::decrypt::KeyStore;
         use crate::senc::{ChartCatalog, ChartData};
         let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/s57"));
-        let mut decryptor = CachedDecryptor::open("license");
+        let cache = tempfile::tempdir().unwrap();
+        let mut decryptor = CachedDecryptor::s57_only_in(cache.path().to_path_buf());
         let catalog = ChartCatalog::from_directory(dir, &KeyStore::new(), &mut decryptor)
             .expect("the fixture folder catalogs");
         assert_eq!(catalog.charts.len(), 1);
@@ -36,5 +37,8 @@ mod tests {
         assert!(ChartCatalog::is_s57(&info.path));
         let chart = ChartData::parse(decryptor.s57_senc(&info.path).unwrap()).unwrap();
         assert_eq!(chart.features.len(), 22, "as OpenCPN's reader finds, updates applied");
+        // Converted here, into this test's own cache, and nowhere else.
+        let cached = std::fs::read_dir(cache.path()).unwrap().count();
+        assert_eq!(cached, 1, "the converted cell is cached once");
     }
 }

@@ -467,13 +467,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_wreck_non_dangerous() {
-        // CATWRK=1 (non-dangerous)
-        let feature = make_wreck(Some(25.0), None, Some(1));
-        let settings = test_contours();
-        let result = wrecks02(&feature, &settings, CsContext::EMPTY);
-        assert_eq!(result.symbol, WrecksSymbol::Wrecks01);
+    fn s52(instrs: &[RenderInstruction]) -> Vec<String> {
+        instrs.iter().map(|i| i.to_s52()).collect()
+    }
+
+    fn deep_water() -> CsContext {
+        CsContext {
+            area_drval1: vec![20.0],
+            line_drval2: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// "Wk" in s52cnsy.cpp: TX('Wk',3,1,2,'15110',2,0,CHBLK,21).
+    const WK: &str = "TX(Wk,3,1,2,'15110',2,0,CHBLK,21)";
+
+    fn sounding(colour: &str) -> String {
+        format!("TE('%4.1lf','VALSOU',3,1,2,'15110',1,1,{colour},11)")
     }
 
     #[test]
@@ -490,62 +500,143 @@ mod tests {
         let result = wrecks02(&feature, &settings, &ctx);
         assert_eq!(result.symbol, WrecksSymbol::Isodgr51);
         assert!(result.is_isolated_danger);
+        // A point isolated danger is ISODGR51 alone.
+        assert_eq!(s52(&wrecks02_instructions(&feature, &settings, &ctx)), ["SY(ISODGR51)"]);
     }
 
+    /// A wreck with a sounding is not drawn with a pictorial wreck symbol:
+    /// s52cnsy.cpp draws DANGER51 when it is shallower than the safety
+    /// contour, DANGER52 otherwise, then "Wk" and the depth — whatever the
+    /// wreck's category or water level.
     #[test]
-    fn test_wreck_mast_showing() {
-        // CATWRK=5 (mast showing) with deep depth (> safety contour)
-        let feature = make_wreck(Some(15.0), Some(4), Some(5));
-        let settings = test_contours(); // safety_contour = 10.0
-        let result = wrecks02(&feature, &settings, CsContext::EMPTY);
-        assert_eq!(result.symbol, WrecksSymbol::Wrecks05);
+    fn sounded_wreck_is_a_danger_symbol_with_wk_and_its_depth() {
+        let settings = test_contours(); // safety contour 10 m
+        let draw = |f: Feature| s52(&wrecks02_instructions(&f, &settings, CsContext::EMPTY));
+
+        assert_eq!(
+            draw(make_wreck(Some(5.0), Some(3), Some(2))),
+            ["SY(DANGER51)".to_string(), WK.to_string(), sounding("CHBLK")]
+        );
+        // CATWRK 5 (mast showing) and WATLEV 4 change nothing once VALSOU is known.
+        assert_eq!(
+            draw(make_wreck(Some(15.0), Some(4), Some(5))),
+            ["SY(DANGER52)".to_string(), WK.to_string(), sounding("CHBLK")]
+        );
+        // Deeper than 20 m the depth is printed grey.
+        assert_eq!(
+            draw(make_wreck(Some(30.0), Some(3), None)),
+            ["SY(DANGER52)".to_string(), WK.to_string(), sounding("CHGRD")]
+        );
     }
 
+    /// `valsou < safety_contour` picks DANGER51: a wreck exactly at the
+    /// safety contour is DANGER52.
     #[test]
-    fn test_wreck_quasou_7() {
-        // QUASOU=7 (least depth unknown) gets special symbol
+    fn wreck_at_the_safety_contour_is_danger52() {
+        let settings = test_contours();
+        let first = |v| {
+            s52(&wrecks02_instructions(&make_wreck(Some(v), None, None), &settings, CsContext::EMPTY))[0].clone()
+        };
+        assert_eq!(first(9.9), "SY(DANGER51)");
+        assert_eq!(first(10.0), "SY(DANGER52)");
+    }
+
+    /// QUASOU 7, "least depth unknown, safe clearance at value shown": the
+    /// sounding is a clearance, not a least depth, so UDWHAZ03 is skipped and
+    /// WRECKS07 is added beside the danger symbol.
+    #[test]
+    fn quasou_7_skips_the_isolated_danger_test_and_adds_wrecks07() {
         let mut feature = make_wreck(Some(5.0), Some(3), None);
         feature.attributes.insert("QUASOU",
             AttributeValue::String("7".to_string()),
         );
         let settings = test_contours();
-        let result = wrecks02(&feature, &settings, CsContext::EMPTY);
-        assert_eq!(result.symbol, WrecksSymbol::Wrecks07);
+        let result = wrecks02(&feature, &settings, &deep_water());
+        assert!(!result.is_isolated_danger);
+        assert_eq!(
+            s52(&wrecks02_instructions(&feature, &settings, &deep_water())),
+            [
+                "SY(DANGER51)".to_string(),
+                WK.to_string(),
+                "SY(WRECKS07)".to_string(),
+                sounding("CHBLK"),
+            ]
+        );
     }
 
+    /// Without VALSOU the depth for UDWHAZ03 comes from CATWRK first: a
+    /// non-dangerous wreck stands for 20 m of clearance, so it is not an
+    /// isolated danger under a 10 m safety contour — but it is under a 25 m
+    /// one, in water deeper than that.
     #[test]
-    fn test_wreck_covers_uncovers() {
-        // WATLEV=3 (covers/uncovers) with depth > safety_contour
-        let feature = make_wreck(Some(15.0), Some(3), None);
-        let settings = test_contours(); // safety_contour = 10.0
-        let result = wrecks02(&feature, &settings, CsContext::EMPTY);
-        assert_eq!(result.symbol, WrecksSymbol::Wrecks04);
-    }
-
-    #[test]
-    fn test_wreck_always_dry() {
-        // WATLEV=1 (always dry)
-        let feature = make_wreck(None, Some(1), None);
+    fn non_dangerous_wreck_counts_as_twenty_metres() {
+        let wreck = make_wreck(None, Some(3), Some(1));
         let settings = test_contours();
-        let result = wrecks02(&feature, &settings, CsContext::EMPTY);
-        assert_eq!(result.symbol, WrecksSymbol::Wrecks01);
+        assert!(!wrecks02(&wreck, &settings, &deep_water()).is_isolated_danger);
+
+        let deep_settings = MarinerSettings {
+            safety_contour: 25.0,
+            ..test_contours()
+        };
+        let deeper = CsContext {
+            area_drval1: vec![30.0],
+            line_drval2: vec![],
+            ..Default::default()
+        };
+        assert!(wrecks02(&wreck, &deep_settings, &deeper).is_isolated_danger);
+
+        // A dangerous wreck (CATWRK 2) counts as 0 m: isolated in deep water.
+        let dangerous = make_wreck(None, Some(3), Some(2));
+        assert!(wrecks02(&dangerous, &settings, &deep_water()).is_isolated_danger);
+    }
+
+    /// Continuation A without VALSOU: the pictorial symbol needs both CATWRK
+    /// and WATLEV, and follows s52cnsy.cpp's table.
+    #[test]
+    fn unsounded_wreck_pictorial_symbol_table() {
+        let settings = test_contours();
+        let draw = |c, w| s52(&wrecks02_instructions(&make_wreck(None, w, c), &settings, CsContext::EMPTY));
+        assert_eq!(draw(Some(1), Some(3)), ["SY(WRECKS04)"]);
+        assert_eq!(draw(Some(2), Some(3)), ["SY(WRECKS05)"]);
+        assert_eq!(draw(Some(4), Some(3)), ["SY(WRECKS01)"]);
+        assert_eq!(draw(Some(5), Some(3)), ["SY(WRECKS01)"]);
+        assert_eq!(draw(Some(2), Some(1)), ["SY(WRECKS01)"]);
+        assert_eq!(draw(Some(2), Some(4)), ["SY(WRECKS01)"]);
+        assert_eq!(draw(Some(2), Some(6)), ["SY(WRECKS05)"]);
+        // One attribute missing: no symbol at all.
+        assert!(draw(Some(2), None).is_empty());
+        assert!(draw(None, Some(1)).is_empty());
+    }
+
+    /// Continuation B: an area wreck is outlined by its depth or water
+    /// level, filled only when there is no sounding, and marked ISODGR51
+    /// when isolated.
+    #[test]
+    fn area_wreck_outline_and_fill() {
+        let settings = test_contours();
+        let area = |valsou, watlev, ctx: &CsContext| {
+            let mut f = make_wreck(valsou, watlev, None);
+            f.feature_type = FeatureType::Area;
+            s52(&wrecks02_instructions(&f, &settings, ctx))
+        };
+        let none = CsContext::EMPTY;
+        assert_eq!(area(Some(5.0), None, none), ["LS(DOTT,2,CHBLK)".to_string(), sounding("CHBLK")]);
+        assert_eq!(area(Some(25.0), None, none), ["LS(DASH,2,CHBLK)"]);
+        assert_eq!(area(None, Some(2), none), ["LS(SOLD,2,CSTLN)", "AC(CHBRN)"]);
+        assert_eq!(area(None, Some(4), none), ["LS(DASH,2,CSTLN)", "AC(DEPIT)"]);
+        assert_eq!(area(None, None, none), ["LS(DOTT,2,CSTLN)", "AC(DEPVS)"]);
+        assert_eq!(
+            area(Some(5.0), None, &deep_water()),
+            ["LS(DOTT,2,CHBLK)".to_string(), "SY(ISODGR51)".to_string(), sounding("CHBLK")]
+        );
     }
 
     #[test]
-    fn test_wreck_deep() {
-        // Deep wreck (> 20m) is non-dangerous
-        let feature = make_wreck(Some(30.0), Some(3), None);
-        let settings = test_contours();
-        let result = wrecks02(&feature, &settings, CsContext::EMPTY);
-        assert_eq!(result.symbol, WrecksSymbol::Wrecks01);
-        assert!(result.show_sounding);
-    }
-
-    #[test]
-    fn test_wrecks02_symbol() {
-        let feature = make_wreck(None, Some(3), Some(4));
-        let settings = test_contours();
-        let symbol = wrecks02_symbol(&feature, &settings);
-        assert_eq!(symbol, "WRECKS04");
+    fn low_accuracy_area_wreck_uses_lowacc41() {
+        let mut f = make_wreck(Some(5.0), None, None);
+        f.feature_type = FeatureType::Area;
+        f.attributes.insert("QUAPOS", AttributeValue::Integer(4));
+        let instrs = wrecks02_instructions(&f, &test_contours(), CsContext::EMPTY);
+        assert_eq!(s52(&instrs)[0], "LC(LOWACC41)");
     }
 }

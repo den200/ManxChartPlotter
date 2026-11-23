@@ -791,5 +791,9 @@ mod tests {
         assert_eq!(&out[0..4], &[40, 30, 20, 255]);
         assert_eq!(&out[4..8], &[40, 30, 20, 128]);
         assert_eq!(&out[8..12], &[0, 0, 0, 0]);
+
+        // A pixel nearest a token the target palette lacks keeps its colour.
+        let landf = [201, 185, 122, 255];
+        assert_eq!(recolour_atlas(&landf, night), landf.to_vec());
     }
 }

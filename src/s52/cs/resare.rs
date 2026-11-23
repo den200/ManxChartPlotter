@@ -33,8 +33,8 @@ pub fn resare02_instructions(
     feature: &Feature,
     settings: &MarinerSettings,
 ) -> Vec<RenderInstruction> {
-    let restrn = list_values(feature, "RESTRN");
-    let catrea = list_values(feature, "CATREA");
+    let restrn = super::list_values(feature, "RESTRN");
+    let catrea = super::list_values(feature, "CATREA");
 
     let restrn_has = |set: &[i32]| restrn.iter().any(|v| set.contains(v));
     let catrea_has = |set: &[i32]| catrea.iter().any(|v| set.contains(v));
@@ -125,21 +125,6 @@ pub fn resare02_instructions(
     out
 }
 
-/// Read an S-57 list attribute as integers. Values arrive either as a single
-/// integer or as the comma-separated string the SENC stores for 'L' types.
-fn list_values(feature: &Feature, name: &str) -> Vec<i32> {
-    if let Some(s) = feature.attribute_str(name) {
-        return s
-            .split(',')
-            .filter_map(|v| v.trim().parse::<i32>().ok())
-            .collect();
-    }
-    if let Some(v) = feature.attribute_int(name) {
-        return vec![v];
-    }
-    Vec::new()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,12 +157,93 @@ mod tests {
             .expect("expected a symbol")
     }
 
+    fn s52(instrs: &[RenderInstruction]) -> Vec<String> {
+        instrs.iter().map(|i| i.to_s52()).collect()
+    }
+
     #[test]
     fn line_precedes_symbol() {
         let f = resare(&[("RESTRN", "7")]);
         let out = resare02_instructions(&f, &MarinerSettings::default());
-        assert!(matches!(out[0], RenderInstruction::LineStyle { .. }));
-        assert!(matches!(out[1], RenderInstruction::Symbol { .. }));
+        assert_eq!(s52(&out), ["LS(DASH,2,CHMGD)", "SY(ENTRES51)"]);
+    }
+
+    /// With symbolized boundaries each continuation has its own line
+    /// complex: RESARE51 for entry and anchoring restrictions, FSHRES51 for
+    /// fishing, CTYARE51 for everything else.
+    #[test]
+    fn symbolized_boundary_line_complex_follows_the_continuation() {
+        let settings = MarinerSettings {
+            symbolized_boundaries: true,
+            ..Default::default()
+        };
+        let lc = |attrs: &[(&str, &str)]| s52(&resare02_instructions(&resare(attrs), &settings))[0].clone();
+        assert_eq!(lc(&[("RESTRN", "8")]), "LC(RESARE51)");
+        assert_eq!(lc(&[("RESTRN", "2")]), "LC(RESARE51)");
+        assert_eq!(lc(&[("RESTRN", "4")]), "LC(FSHRES51)");
+        assert_eq!(lc(&[("RESTRN", "10")]), "LC(CTYARE51)");
+        assert_eq!(lc(&[("CATREA", "1")]), "LC(CTYARE51)");
+        assert_eq!(lc(&[]), "LC(CTYARE51)");
+    }
+
+    /// Continuation A: an entry restriction (RESTRN 7, 8 or 14) combined with
+    /// an anchoring or fishing restriction is the "!" variant ENTRES61, and
+    /// so is one with a major CATREA; other restrictions or a minor CATREA
+    /// give ENTRES71.
+    #[test]
+    fn entry_restriction_variants() {
+        let sym = |attrs: &[(&str, &str)]| {
+            symbol_of(&resare02_instructions(&resare(attrs), &MarinerSettings::default())).to_string()
+        };
+        assert_eq!(sym(&[("RESTRN", "14")]), "ENTRES51");
+        assert_eq!(sym(&[("RESTRN", "8,1")]), "ENTRES61");
+        assert_eq!(sym(&[("RESTRN", "7,5")]), "ENTRES61");
+        assert_eq!(sym(&[("RESTRN", "7,12")]), "ENTRES71");
+        // CATREA 25 is octal \031 in s52cnsy.cpp — major; 24 (\030) is minor.
+        assert_eq!(sym(&[("RESTRN", "7"), ("CATREA", "25")]), "ENTRES61");
+        assert_eq!(sym(&[("RESTRN", "7"), ("CATREA", "24")]), "ENTRES71");
+        // A CATREA in neither list leaves the plain symbol.
+        assert_eq!(sym(&[("RESTRN", "7"), ("CATREA", "2")]), "ENTRES51");
+    }
+
+    /// Continuation B (anchoring, RESTRN 1 or 2) and C (fishing, 3 to 6).
+    #[test]
+    fn anchoring_and_fishing_restriction_variants() {
+        let sym = |attrs: &[(&str, &str)]| {
+            symbol_of(&resare02_instructions(&resare(attrs), &MarinerSettings::default())).to_string()
+        };
+        assert_eq!(sym(&[("RESTRN", "2,3")]), "ACHRES61");
+        assert_eq!(sym(&[("RESTRN", "1"), ("CATREA", "9")]), "ACHRES61");
+        assert_eq!(sym(&[("RESTRN", "1,13")]), "ACHRES71");
+        assert_eq!(sym(&[("RESTRN", "1"), ("CATREA", "10")]), "ACHRES71");
+
+        assert_eq!(sym(&[("RESTRN", "6")]), "FSHRES51");
+        assert_eq!(sym(&[("RESTRN", "3"), ("CATREA", "12")]), "FSHRES51");
+        assert_eq!(sym(&[("RESTRN", "3,9")]), "FSHRES71");
+        assert_eq!(sym(&[("RESTRN", "5"), ("CATREA", "18")]), "FSHRES71");
+
+        // Diving/dredging/no-wake restrictions alone: information symbol.
+        assert_eq!(sym(&[("RESTRN", "11")]), "INFARE51");
+    }
+
+    /// Continuation D: no RESTRN, CATREA alone.
+    #[test]
+    fn catrea_only_variants() {
+        let sym = |attrs: &[(&str, &str)]| {
+            symbol_of(&resare02_instructions(&resare(attrs), &MarinerSettings::default())).to_string()
+        };
+        assert_eq!(sym(&[("CATREA", "12")]), "CTYARE51");
+        assert_eq!(sym(&[("CATREA", "12,4")]), "CTYARE71");
+        assert_eq!(sym(&[("CATREA", "2")]), "RSRDEF51");
+    }
+
+    #[test]
+    fn integer_encoded_restriction_is_read() {
+        // A single-valued list may arrive as an integer rather than a string.
+        let mut f = resare(&[]);
+        f.attributes.insert("RESTRN", AttributeValue::Integer(7));
+        let out = resare02_instructions(&f, &MarinerSettings::default());
+        assert_eq!(symbol_of(&out), "ENTRES51");
     }
 
     #[test]

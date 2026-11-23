@@ -3,6 +3,7 @@
 //! Kept apart from the egui plumbing in [`super::ui`] so the layout of a panel
 //! can be read, and changed, without wading through render passes.
 
+use crate::render::ui::ShowWindow as _;
 use egui::{Align2, Context, RichText, ScrollArea, Window};
 
 use super::ui::{ShopView, UiAction, UiState};
@@ -73,33 +74,73 @@ pub fn build(
         super::ui_ownship::draw(ctx, ship);
     }
 
-    menu_bar(ctx, shop, instruments, routes, plan, boat, display, sheet, weather, safety, logbook, actions);
+    menu_bar(
+        ctx,
+        shop,
+        instruments,
+        routes,
+        plan,
+        boat,
+        display,
+        sheet,
+        safety,
+        logbook,
+        state.anchor.is_some(),
+        actions,
+    );
     // The instrument bar takes the bottom edge first. egui gives the outermost
     // edge to the panel declared first, so declaring the strip first — as this
     // did — put the strip *below* the bar, hard against the screen edge under
     // the helm's hand, which is the opposite of what was wanted.
+    // A copy, so the strip that edits the route can have `routes` to itself.
+    let guidance = routes.guidance.clone();
     let sources = super::ui_instruments::Sources {
         vessel: &fleet.own,
-        route: routes.guidance.as_ref(),
+        route: guidance.as_ref(),
     };
     super::ui_instruments::bar(ctx, instruments, sources, actions);
+    // What the menu bar and the instruments leave. The MOB button is
+    // anchored to this and to nothing declared later: the guidance strip
+    // and the weather sheet come and go, and the button must not go with
+    // them. A control reached for in a hurry has to be where it was.
+    let chart_floor = ctx.available_rect();
     if let Some(ref g) = routes.guidance {
         super::ui_routes::guidance_strip(ctx, g, &instruments.units);
     } else if let Some(ref why) = routes.guidance_waiting {
         super::ui_routes::waiting_strip(ctx, why);
+    }
+    plan_card(ctx, weather, actions);
+    super::ui_routes::edit_strip(ctx, routes, actions);
+    if let (Some(objects), Some(at)) = (state.picked, state.pick_geo) {
+        pick_card(
+            ctx,
+            objects,
+            at,
+            state.pick_from_boat,
+            state.pick_id,
+            routes.editing.is_some(),
+            weather.busy,
+            actions,
+        );
     }
     // Last of the bottom panels, so it sits *above* the instrument strip and
     // the guidance line rather than pushing them off the screen edge — the
     // same ordering rule the strip and the bar already rely on.
     super::ui_weather::sheet(ctx, sheet, wind, &instruments.units, actions);
     if let Some(objects) = state.picked {
-        object_query(ctx, objects, state.pick_anchor, state.pick_id, actions);
+        // The whole list, with every attribute, only when asked for.
+        if pick_more_open(ctx, state.pick_id) {
+            object_query(ctx, objects, state.pick_anchor, state.pick_id, actions);
+        }
     }
     if shop.open {
         chart_shop(ctx, shop, charts, free, actions);
     }
     if instruments.open {
         super::ui_instruments::settings(ctx, instruments, sources, actions);
+    }
+    if plan.open {
+        goto_window(ctx, plan, weather, &boat.name, actions);
     }
     if routes.open {
         super::ui_routes::window(ctx, routes, weather, actions);
@@ -108,22 +149,29 @@ pub fn build(
         super::ui_boat::window(ctx, boat, weather, instruments.units.depth, actions);
     }
     if display.open {
-        display_window(ctx, display, boat.draft_m, actions);
+        display_window(ctx, display, instruments, boat.draft_m, actions);
     }
+    let watch = super::ui_safety::WatchState {
+        anchor: state.anchor.as_ref(),
+        has_fix: state.own_ship.as_ref().is_some_and(|s| !s.stale),
+        depth_m: state.depth_m,
+    };
     if safety.open {
-        let watch = super::ui_safety::WatchState {
-            anchor: state.anchor.as_ref(),
-            has_fix: state.own_ship.as_ref().is_some_and(|s| !s.stale),
-            depth_m: state.depth_m,
-        };
         super::ui_safety::window(ctx, safety, instruments, &watch, actions);
+    }
+    if safety.anchor_open {
+        super::ui_safety::anchor_window(ctx, safety, &watch, actions);
     }
     if logbook.open {
         super::ui_logbook::window(ctx, logbook, &state.logbook, actions);
     }
+    if state.no_charts {
+        no_charts(ctx, shop);
+    }
     // Last, over the chart area the panels have left: what a chart tap will
     // do right now, and the way back to following the boat.
-    tap_mode_chip(ctx, plan);
+    tap_mode_chip(ctx, plan, routes, actions);
+    scale_bar(ctx, state.mpp);
     chart_buttons(
         ctx,
         instruments,
@@ -132,16 +180,93 @@ pub fn build(
         state.own_ship.is_some(),
         actions,
     );
-    super::ui_safety::mob_button(ctx, state.mob.is_some(), actions);
+    super::ui_safety::mob_button(ctx, chart_floor, state.mob.is_some(), actions);
     if let Some(ref mob) = state.mob {
-        super::ui_safety::mob_panel(ctx, mob, safety, actions);
+        super::ui_safety::mob_panel(ctx, chart_floor, mob, safety, actions);
     } else {
         safety.mob_clear_armed = false;
     }
     super::ui_safety::guide(ctx, safety);
     super::ui_safety::banner(ctx, &state.alarms, actions);
+    eula(ctx, &mut shop.eula, actions);
     // Over everything, first start: nothing else is usable until it is read.
     super::ui_safety::notice(ctx, safety, actions);
+}
+
+/// The o-charts licence agreement: to accept before a chart set is used,
+/// or to read at any time.
+///
+/// o-charts' conditions: the user accepts the agreement that comes with the
+/// chart set before the charts are used, can get it back at any moment from
+/// within the program, and understands that the charts are not official
+/// charts under carriage requirements.
+fn eula(ctx: &Context, view: &mut crate::render::ui::EulaView, actions: &mut Vec<UiAction>) {
+    let text = |ui: &mut egui::Ui, text: &str| {
+        egui::ScrollArea::vertical()
+            .max_height((ctx.available_rect().height() - 260.0).max(120.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.label(RichText::new(text).small());
+            });
+    };
+    if let Some(pending) = &view.gate {
+        // Dim and block everything behind it.
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("eula-shade"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click_and_drag());
+                ui.painter().rect_filled(rect, 0.0, egui::Color32::from_black_alpha(160));
+            });
+        Window::new("o-charts licence agreement")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .order(egui::Order::Foreground)
+            .default_width(560.0)
+            .show_fitted(ctx, |ui| {
+                ui.label(format!(
+                    "The charts in {} are licensed by o-charts. Read the agreement and accept \
+                     it to use them.",
+                    pending.set
+                ));
+                ui.add_space(4.0);
+                text(ui, &pending.text);
+                ui.add_space(6.0);
+                ui.label(RichText::new(crate::shop::eula::NOT_OFFICIAL).strong());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("I accept the agreement and understand this").strong())
+                        .clicked()
+                    {
+                        actions.push(UiAction::EulaAccept);
+                    }
+                    if ui.button("Do not open these charts").clicked() {
+                        actions.push(UiAction::EulaDecline);
+                    }
+                });
+            });
+        return;
+    }
+    let mut open = view.reading.is_some();
+    if let Some((set, agreement)) = &view.reading {
+        Window::new("o-charts licence agreement")
+            .collapsible(false)
+            .open(&mut open)
+            .default_width(560.0)
+            .constrain_to(ctx.available_rect())
+            .show_fitted(ctx, |ui| {
+                ui.label(RichText::new(set).weak().small());
+                text(ui, agreement);
+                ui.add_space(6.0);
+                ui.label(RichText::new(crate::shop::eula::NOT_OFFICIAL).strong());
+            });
+    }
+    if !open {
+        view.reading = None;
+    }
 }
 
 /// How the chart is drawn: palette, safety depth, detail.
@@ -153,6 +278,7 @@ pub fn build(
 fn display_window(
     ctx: &Context,
     display: &mut crate::render::ui::DisplayView,
+    instruments: &mut crate::render::ui::InstrumentView,
     draft_m: f64,
     actions: &mut Vec<UiAction>,
 ) {
@@ -164,7 +290,7 @@ fn display_window(
         .collapsible(false)
         .resizable(false)
         .constrain_to(ctx.available_rect())
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Colours").strong());
                 ui.selectable_value(&mut display.palette, Palette::Day, "Day");
@@ -206,13 +332,7 @@ fn display_window(
             });
             let auto = display.depth_from_draft && known_draft;
             let metres = |ui: &mut egui::Ui, v: &mut f32, max: f32| {
-                ui.add(
-                    egui::DragValue::new(v)
-                        .speed(0.1)
-                        .range(0.0..=max)
-                        .fixed_decimals(1)
-                        .suffix(" m"),
-                );
+                crate::render::ui::stepper_f32(ui, v, 0.5, 0.0..=max, 1, " m");
             };
             if auto {
                 ui.horizontal(|ui| {
@@ -262,6 +382,15 @@ fn display_window(
             });
             ui.checkbox(&mut display.show_text, "Names and light descriptions");
             ui.checkbox(&mut display.show_soundings, "Soundings");
+            ui.separator();
+            ui.label(RichText::new("Interface size").strong());
+            ui.horizontal_wrapped(|ui| {
+                for size in crate::render::ui::UiSize::ALL {
+                    ui.selectable_value(&mut display.size, size, size.label());
+                }
+            });
+            ui.separator();
+            super::ui_instruments::layout(ui, instruments, actions);
         });
     display.open = open;
     // Applied as they change, but a drag emits a change per frame, and each
@@ -282,17 +411,24 @@ fn display_window(
 /// chart itself, with the way out beside it. A mode that lives only in a
 /// window the user has scrolled past, or in small grey text in the menu
 /// bar, is a mode the user does not know they are in.
-fn tap_mode_chip(ctx: &Context, plan: &mut crate::render::ui::PlanView) {
+fn tap_mode_chip(
+    ctx: &Context,
+    plan: &mut crate::render::ui::PlanView,
+    routes: &crate::render::ui::RoutesView,
+    actions: &mut Vec<UiAction>,
+) {
     use crate::render::ui::PlanPickTarget;
+    // An armed planner pin is a one-shot and claims the tap first; an open
+    // route is a standing mode (the same order `tap_at_screen` uses).
     let (text, button) = if let Some(target) = plan.picking {
         let text = match target {
-            PlanPickTarget::From => "Tap the chart to set the start".to_string(),
-            PlanPickTarget::To => "Tap the chart to set the destination".to_string(),
+            PlanPickTarget::From => "Tap the chart to set the start",
+            PlanPickTarget::To => "Tap the chart to set the destination",
         };
         (text, "Cancel")
     } else {
-        // Route editing needs no chip: it only runs while the Routes window
-        // is open (closing it ends editing), and the window says so itself.
+        // A route being drawn has a strip of its own under the chart.
+        let _ = (routes, &actions);
         return;
     };
     // Bottom centre of the chart: windows open from the top, so down here
@@ -312,6 +448,342 @@ fn tap_mode_chip(ctx: &Context, plan: &mut crate::render::ui::PlanView) {
                 });
             });
         });
+}
+
+/// With no chart loaded, say so on the empty sea and offer the way out.
+/// A new boat's first screen used to be a blue rectangle and a menu bar.
+fn no_charts(ctx: &Context, shop: &mut ShopView) {
+    if shop.open {
+        return;
+    }
+    let area = ctx.available_rect();
+    egui::Area::new(egui::Id::new("no-charts"))
+        .fixed_pos(area.center())
+        .pivot(Align2::CENTER_CENTER)
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("No charts yet").strong());
+                    ui.label("Download free NOAA charts, charts you bought at o-charts, or open a folder.");
+                    if ui.button("Get charts").clicked() {
+                        shop.open = true;
+                    }
+                });
+            });
+        });
+}
+
+/// Whether the full object list is open for this tap. Kept per tap: a new
+/// tap starts again with the card alone.
+fn pick_more_open(ctx: &Context, pick_id: u64) -> bool {
+    ctx.data(|d| d.get_temp::<u64>(egui::Id::new("pick-more"))) == Some(pick_id)
+}
+
+/// What a picked object is called on the card: its own name where it has
+/// one, what it is, and how the chart reads it — in a sailor's words, with
+/// the catalogue's codes left to the full list.
+fn headline(o: &PickedObject) -> String {
+    let attr = |name: &str| {
+        o.attributes
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.trim())
+            .filter(|v| !v.is_empty())
+    };
+    let mut text = match attr("OBJNAM") {
+        Some(name) => format!("{name} · {}", o.title),
+        None => o.title.clone(),
+    };
+    match o.acronym.as_str() {
+        "DEPCNT" => {
+            if let Some(depth) = attr("VALDCO") {
+                text = format!("{text} {depth} m");
+            }
+        }
+        "DEPARE" | "DRGARE" => match (attr("DRVAL1"), attr("DRVAL2")) {
+            (Some(a), Some(b)) => text = format!("{text} {a}–{b} m"),
+            (Some(a), None) => text = format!("{text} {a} m"),
+            _ => {}
+        },
+        _ => {}
+    }
+    if crate::pick::is_overhead(&o.acronym) {
+        text = overhead_text(o.acronym == "BRIDGE", &attr);
+        if let Some(name) = attr("OBJNAM") {
+            text = format!("{name} · {text}");
+        }
+    }
+    if let Some(summary) = &o.summary {
+        text = format!("{text} · {summary}");
+    }
+    text
+}
+
+/// A bridge or an overhead cable, as the answer to "does the mast go
+/// under?": what it is, how much air there is, and how wide the opening.
+///
+/// The chart labels it `clr 16.0` (S-52), which says the same to someone
+/// who knows the abbreviation and nothing about whether the bridge opens.
+/// S-57 gives the clearances as VERCLR (fixed), VERCCL and VERCOP (an
+/// opening bridge closed and open), VERCSA (the safe clearance under a
+/// power cable, less than the physical one) and HORCLR (width).
+fn overhead_text<'a>(bridge: bool, attr: &impl Fn(&str) -> Option<&'a str>) -> String {
+    let metres = |v: &str| format!("{} m", v.trim_end_matches(".0"));
+    let kind = if bridge {
+        attr("CATBRG").map_or("Bridge".to_string(), |kind| {
+            let mut c = kind.chars();
+            c.next().map_or(String::new(), |f| f.to_uppercase().chain(c).collect())
+        })
+    } else {
+        "Overhead cable or pipe".to_string()
+    };
+    let air = match (attr("VERCSA"), attr("VERCLR"), attr("VERCCL"), attr("VERCOP")) {
+        (Some(safe), ..) => format!("safe clearance {}", metres(safe)),
+        (_, _, Some(closed), Some(open)) => {
+            format!("clearance {} closed, {} open", metres(closed), metres(open))
+        }
+        (_, _, Some(closed), None) => {
+            format!("clearance {} closed, no limit charted when open", metres(closed))
+        }
+        (_, Some(fixed), ..) => format!("clearance {}", metres(fixed)),
+        (_, _, None, Some(open)) => format!("clearance {} open", metres(open)),
+        _ => "clearance not charted".to_string(),
+    };
+    match attr("HORCLR") {
+        Some(width) => format!("{kind} · {air} · {} wide", metres(width)),
+        None => format!("{kind} · {air}"),
+    }
+}
+
+/// How far and which way, as the card says it: metres under a cable,
+/// nautical miles beyond.
+fn range_text(metres: f64, bearing_deg: f64) -> String {
+    let nm = metres / crate::geo::METRES_PER_NM;
+    let range = if nm < 0.1 {
+        format!("{metres:.0} m")
+    } else if nm < 10.0 {
+        format!("{nm:.2} NM")
+    } else {
+        format!("{nm:.1} NM")
+    };
+    format!("{range} · {} from the boat", crate::geo::format_bearing(bearing_deg))
+}
+
+/// The card for a tap on the chart: what is there, where it is, and what
+/// can be done about it.
+///
+/// A tap used to open a list — twenty-seven objects in a harbour mouth, a
+/// depth contour first, each with a Copy button and nothing else. Going
+/// there, adding the place to a route or asking for its weather all began
+/// somewhere else on the screen. The chart is where a sailor points, so
+/// the tap is where those start.
+#[allow(clippy::too_many_arguments)]
+fn pick_card(
+    ctx: &Context,
+    objects: &[PickedObject],
+    at: [f64; 2],
+    from_boat: Option<(f64, f64)>,
+    pick_id: u64,
+    editing_route: bool,
+    planning: bool,
+    actions: &mut Vec<UiAction>,
+) {
+    let [lat, lon] = at;
+    let lead = objects.iter().find(|o| !is_cell_description(&o.acronym));
+    egui::TopBottomPanel::bottom("pick-card").show(ctx, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            // Clear of the MOB button's corner.
+            ui.add_space(super::ui_routes::MOB_CORNER);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let title = lead.map(headline).unwrap_or_else(|| "Nothing charted here".into());
+                    ui.add(egui::Label::new(RichText::new(title).strong()).wrap());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Close").clicked() {
+                            actions.push(UiAction::DismissPick);
+                        }
+                    });
+                });
+                let mut place = crate::geo::format_latlon(lat, lon);
+                if let Some((metres, bearing)) = from_boat {
+                    place = format!("{place} · {}", range_text(metres, bearing));
+                }
+                ui.label(RichText::new(place).weak());
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!planning, egui::Button::new("Sail here"))
+                        .on_hover_text("Weather-routed passage to this place")
+                        .clicked()
+                    {
+                        actions.push(UiAction::PlanTo { lat, lon, sail: true });
+                    }
+                    if ui
+                        .add_enabled(!planning, egui::Button::new("Motor here"))
+                        .on_hover_text("Shortest safe route to this place")
+                        .clicked()
+                    {
+                        actions.push(UiAction::PlanTo { lat, lon, sail: false });
+                    }
+                    let add = if editing_route { "Add to route" } else { "Start a route here" };
+                    if ui.button(add).clicked() {
+                        actions.push(UiAction::RouteAddPoint { lat, lon });
+                    }
+                    if ui.button("Weather here").clicked() {
+                        actions.push(UiAction::WeatherAt { lat, lon });
+                    }
+                    if !objects.is_empty() {
+                        let open = pick_more_open(ui.ctx(), pick_id);
+                        if ui
+                            .selectable_label(open, format!("More ({})", objects.len()))
+                            .on_hover_text("Everything charted here, with every attribute")
+                            .clicked()
+                        {
+                            ui.ctx().data_mut(|d| {
+                                let id = egui::Id::new("pick-more");
+                                if open {
+                                    d.remove::<u64>(id);
+                                } else {
+                                    d.insert_temp(id, pick_id);
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+    });
+}
+
+/// The planner's card, under the chart: what it is doing, what it found,
+/// or why it could not — and, for a plan, what to do with it.
+///
+/// A finished plan used to be a line of small text in the menu bar and a
+/// route drawn on the chart. To follow it the crew opened Routes, found
+/// its row and pressed Activate. The answer to "where to?" is "follow
+/// this", so that is the first button.
+fn plan_card(ctx: &Context, weather: &mut crate::render::ui::WeatherView, actions: &mut Vec<UiAction>) {
+    if !weather.busy && weather.planned.is_none() && weather.status.is_empty() {
+        return;
+    }
+    egui::TopBottomPanel::bottom("plan-card").show(ctx, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            // Clear of the MOB button's corner.
+            ui.add_space(super::ui_routes::MOB_CORNER);
+            // The words on lines of their own, as many as they need: a
+            // warning about the route is the part not to cut short.
+            ui.vertical(|ui| {
+                if weather.busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(&weather.status);
+                    });
+                    if ui.button("Cancel").on_hover_text("Stop planning this passage").clicked() {
+                        actions.push(UiAction::PlanCancel);
+                    }
+                } else if let Some(planned) = weather.planned.clone() {
+                    ui.add(egui::Label::new(RichText::new(&weather.status).strong()).wrap());
+                    if let Some(arrival) = &planned.arrival {
+                        ui.label(arrival);
+                    }
+                    let route_id = planned.route_id;
+                    ui.horizontal(|ui| {
+                        if ui.button("Follow").on_hover_text("Steer by this route now").clicked() {
+                            actions.push(UiAction::RouteActivate { route_id });
+                            actions.push(UiAction::PlanDismiss);
+                        }
+                        if ui
+                            .button("Look at it")
+                            .on_hover_text("Put the whole route on the screen")
+                            .clicked()
+                        {
+                            actions.push(UiAction::RouteShow { route_id });
+                        }
+                        if ui.button("Discard").on_hover_text("Delete this route").clicked() {
+                            actions.push(UiAction::RouteDelete { route_id });
+                            actions.push(UiAction::PlanDismiss);
+                        }
+                        if ui
+                            .button("Keep")
+                            .on_hover_text("Keep the route under Routes and close this")
+                            .clicked()
+                        {
+                            actions.push(UiAction::PlanDismiss);
+                        }
+                    });
+                } else {
+                    ui.add(egui::Label::new(&weather.status).wrap());
+                    if ui.button("OK").clicked() {
+                        actions.push(UiAction::PlanDismiss);
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+    });
+}
+
+/// A length for the scale bar: the longest round distance that fits in
+/// `max_pt` points when one point covers `ground_m_per_pt` metres of sea.
+/// Round means 1, 2 or 5 times a power of ten — in metres up to 100 m, in
+/// nautical miles (a cable, 0.1 NM, and up) beyond. `None` when there is
+/// no scale to draw.
+fn scale_bar_length(ground_m_per_pt: f32, max_pt: f32) -> Option<(f32, String)> {
+    if !(ground_m_per_pt.is_finite() && ground_m_per_pt > 0.0 && max_pt > 0.0) {
+        return None;
+    }
+    const NM: f32 = 1852.0;
+    let metres = [1.0_f32, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0]
+        .into_iter()
+        .map(|m| (m, format!("{m:.0} m")));
+    let miles = (-1..=3).flat_map(|exp| {
+        [1.0_f32, 2.0, 5.0].into_iter().map(move |d| {
+            let nm = d * 10f32.powi(exp);
+            let label = if nm < 1.0 { format!("{nm:.1} NM") } else { format!("{nm:.0} NM") };
+            (nm * NM, label)
+        })
+    });
+    metres
+        .chain(miles)
+        .map(|(m, label)| (m / ground_m_per_pt, label))
+        .filter(|(pt, _)| *pt <= max_pt)
+        .last()
+        // Off either end of the list the longest that fits is a stub: no
+        // bar is better than one too short to read a distance off.
+        .filter(|(pt, _)| *pt >= max_pt * 0.25)
+}
+
+/// The scale bar: how far is that, without a tap. Bottom left of the chart,
+/// beside the MOB button, drawn on the chart itself — it is part of the
+/// chart, not a control, and takes no taps.
+fn scale_bar(ctx: &Context, ground_m_per_pt: f32) {
+    let Some((length, label)) = scale_bar_length(ground_m_per_pt, 120.0) else { return };
+    let area = ctx.available_rect();
+    let left = area.left() + 90.0;
+    let y = area.bottom() - 16.0;
+    if left + length + 8.0 > area.right() || y < area.top() + 30.0 {
+        return;
+    }
+    let visuals = ctx.style().visuals.clone();
+    let ink = visuals.strong_text_color();
+    let paper = visuals.panel_fill.gamma_multiply(0.85);
+    let painter = ctx.layer_painter(egui::LayerId::background()).with_clip_rect(area);
+    let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), ink);
+    // A plate behind it: the chart under it may be any colour at all.
+    let plate = egui::Rect::from_min_max(
+        egui::pos2(left - 6.0, y - galley.size().y - 6.0),
+        egui::pos2(left + length.max(galley.size().x) + 6.0, y + 6.0),
+    );
+    painter.rect_filled(plate, 4.0, paper);
+    painter.galley(egui::pos2(left, y - galley.size().y - 3.0), galley, ink);
+    let stroke = egui::Stroke::new(2.0_f32, ink);
+    painter.line_segment([egui::pos2(left, y), egui::pos2(left + length, y)], stroke);
+    for x in [left, left + length] {
+        painter.line_segment([egui::pos2(x, y - 4.0), egui::pos2(x, y + 1.0)], stroke);
+    }
 }
 
 /// The buttons in the chart's corner: which way up, and follow the boat.
@@ -340,7 +812,30 @@ fn chart_buttons(
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.horizontal(|ui| {
+                // A column in the corner, each button a fingertip across.
+                // Zoom has buttons because a pinch takes two fingers and a
+                // steady hand, and at the helm there is often neither.
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    if icon_button(ui, false, Icon::Plus).on_hover_text("Zoom in").clicked() {
+                        actions.push(UiAction::Zoom { factor: ZOOM_STEP });
+                    }
+                    if icon_button(ui, false, Icon::Minus).on_hover_text("Zoom out").clicked() {
+                        actions.push(UiAction::Zoom { factor: 1.0 / ZOOM_STEP });
+                    }
+                    if has_boat {
+                        let on = instruments.follow;
+                        if icon_button(ui, on, Icon::Follow)
+                            .on_hover_text(if on {
+                                "Following the boat. Drag the chart to look elsewhere."
+                            } else {
+                                "Centre the chart on the boat and keep it there"
+                            })
+                            .clicked()
+                        {
+                            actions.push(UiAction::FollowSet { on: !on });
+                        }
+                    }
                     let hover = match chart_up {
                         ChartUp::North => "North up. Tap for head-up.",
                         ChartUp::Head => "Head up: the boat's heading is at the top. Tap for north-up.",
@@ -352,24 +847,54 @@ fn chart_buttons(
                     {
                         actions.push(UiAction::ChartUpSet { mode: chart_up.next() });
                     }
-                    if !has_boat {
-                        return;
-                    }
-                    let on = instruments.follow;
-                    if ui
-                        .selectable_label(on, if on { "Following boat" } else { "Follow boat" })
-                        .on_hover_text(if on {
-                            "The chart keeps the boat centred. Drag the chart to look elsewhere."
-                        } else {
-                            "Centre the chart on the boat and keep it there"
-                        })
-                        .clicked()
-                    {
-                        actions.push(UiAction::FollowSet { on: !on });
-                    }
                 });
             });
         });
+}
+
+/// One press of a zoom button: the same step the `+` and `-` keys take.
+const ZOOM_STEP: f32 = 1.5;
+
+/// The side of a button on the chart, points: a fingertip, with room.
+const CHART_BUTTON: f32 = 44.0;
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Plus,
+    Minus,
+    /// A ring round a dot: the boat held in the middle of the chart.
+    Follow,
+}
+
+/// A square button on the chart whose face is drawn, not written: the
+/// strokes are the same in every font and every palette, and need no
+/// translating.
+fn icon_button(ui: &mut egui::Ui, selected: bool, icon: Icon) -> egui::Response {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(CHART_BUTTON, CHART_BUTTON), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let visuals = ui.style().interact_selectable(&response, selected);
+    let painter = ui.painter();
+    painter.rect(rect, 6.0, visuals.bg_fill, visuals.bg_stroke);
+    let c = rect.center();
+    let stroke = egui::Stroke::new(2.5_f32, visuals.fg_stroke.color);
+    let arm = CHART_BUTTON * 0.22;
+    match icon {
+        Icon::Plus => {
+            painter.line_segment([c - egui::vec2(arm, 0.0), c + egui::vec2(arm, 0.0)], stroke);
+            painter.line_segment([c - egui::vec2(0.0, arm), c + egui::vec2(0.0, arm)], stroke);
+        }
+        Icon::Minus => {
+            painter.line_segment([c - egui::vec2(arm, 0.0), c + egui::vec2(arm, 0.0)], stroke);
+        }
+        Icon::Follow => {
+            painter.circle_stroke(c, arm, stroke);
+            painter.circle_filled(c, arm * 0.35, visuals.fg_stroke.color);
+        }
+    }
+    response
 }
 
 /// The orientation button: a round compass whose needle points where north
@@ -377,7 +902,7 @@ fn chart_buttons(
 /// when the chart is not north-up. An icon rather than words, because it sits
 /// on the chart and the chart is what the screen is for.
 fn compass_button(ui: &mut egui::Ui, rotation: f32, active: bool) -> egui::Response {
-    let size = ui.spacing().interact_size.y.max(30.0);
+    let size = CHART_BUTTON;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
     if !ui.is_rect_visible(rect) {
         return response;
@@ -456,16 +981,19 @@ fn draw_plan_pins(ctx: &Context, pins: &[crate::render::ui::PlanPin]) {
 }
 
 /// What the position fields accept, for their hover.
-const POSITION_FORMATS: &str = "Tap 📍 and then the chart, or type a position:\n\
+const POSITION_FORMATS: &str = "Press \"Tap the chart\" and then the chart, or type a position:\n\
     56°24.6'N 10°58.8'E  ·  56 24.6N 10 58.8E  ·  56.41, 10.98";
 
 /// A thin strip along the top. Deliberately thin: the chart is the instrument,
 /// and every row of pixels the interface takes is a row of sea it does not show.
 ///
-/// The passage planner lives here because it is the question a plotter
-/// exists to answer: where from, where to, sail or motor. Two fields and
-/// two verbs — everything else (forecast, polar, waves, currents) is
-/// arranged in the Routes window and simply applies.
+/// What is on it is what is reached for under way, named for the job: where
+/// to go, the routes, the weather, the anchor, the light. What is set up
+/// once — charts, the connection to the boat, the boat herself, how the
+/// chart is drawn, the alarms' limits — and the logbook are one tap further,
+/// under More. The bar used to list all eight windows side by side with the
+/// planner's two fields after them: thirteen controls, the set-up first.
+#[allow(clippy::too_many_arguments)]
 fn menu_bar(
     ctx: &Context,
     shop: &mut ShopView,
@@ -475,23 +1003,83 @@ fn menu_bar(
     boat: &mut crate::render::ui::BoatView,
     display: &mut crate::render::ui::DisplayView,
     sheet: &crate::render::ui_weather::SheetView,
-    weather: &mut crate::render::ui::WeatherView,
     safety: &mut crate::render::ui_safety::SafetyView,
     logbook: &mut crate::render::ui_logbook::LogView,
+    anchored: bool,
     actions: &mut Vec<UiAction>,
 ) {
     egui::TopBottomPanel::top("menu").show(ctx, |ui| {
-        // Wrapped, so on a narrow plotter screen the planner drops to a
-        // second row instead of running Sail and Motor off the edge.
         ui.horizontal_wrapped(|ui| {
-            // Every window button shows whether its window is open, as the
-            // Weather button always did.
-            if ui.selectable_label(shop.open, "Charts").clicked() {
-                shop.open = !shop.open;
+            if ui
+                .selectable_label(plan.open, "Go to…")
+                .on_hover_text("Plan a passage: where from, where to, sail or motor")
+                .clicked()
+            {
+                plan.open = !plan.open;
             }
-            if ui.selectable_label(instruments.open, "Instruments").clicked() {
-                instruments.open = !instruments.open;
+            if ui.selectable_label(routes.open, "Routes").clicked() {
+                actions.push(UiAction::RoutesOpen);
             }
+            if ui
+                .selectable_label(sheet.show, "Weather")
+                .on_hover_text("Wind, sea, current, rain and tide, on one time axis")
+                .clicked()
+            {
+                actions.push(UiAction::WeatherSheetToggle);
+            }
+            // Lit while the watch is set, so a glance says the boat is
+            // being watched.
+            if ui
+                .selectable_label(safety.anchor_open || anchored, "Anchor")
+                .on_hover_text(if anchored { "The anchor watch is set" } else { "Set an anchor watch" })
+                .clicked()
+            {
+                safety.anchor_open = !safety.anchor_open;
+            }
+            ui.separator();
+            // The palette, one tap from anywhere: it is changed every
+            // evening and every morning, and was three taps into a window.
+            if ui
+                .button(display.palette.label())
+                .on_hover_text(format!("Chart colours. Tap for {}.", display.palette.next().label()))
+                .clicked()
+            {
+                display.palette = display.palette.next();
+                actions.push(UiAction::DisplayChanged);
+            }
+            let any_open = shop.open || instruments.open || boat.open || display.open || safety.open || logbook.open;
+            let more = egui::RichText::new("More");
+            let more = if any_open { more.strong() } else { more };
+            ui.menu_button(more, |ui| {
+                // Each a full-height row: this is a menu for fingers.
+                ui.spacing_mut().interact_size.y = 40.0;
+                let item = |ui: &mut egui::Ui, open: &mut bool, label: &str, hint: &str| {
+                    if ui.selectable_label(*open, label).on_hover_text(hint).clicked() {
+                        *open = !*open;
+                        ui.close_menu();
+                    }
+                };
+                item(ui, &mut shop.open, "Charts", "Get charts: o-charts, free NOAA charts, or a folder");
+                item(
+                    ui,
+                    &mut instruments.open,
+                    "Connection",
+                    "The Signal K server on the boat, and what the instrument bar shows",
+                );
+                item(ui, &mut boat.open, "Boat", "Her name, her draft and air draft, her sailing speeds");
+                item(
+                    ui,
+                    &mut display.open,
+                    "Display",
+                    "Safety depth, chart detail, units, where the instrument bar sits",
+                );
+                item(ui, &mut safety.open, "Alarms", "Collision and shallow-water alarms, and the man overboard guide");
+                item(ui, &mut logbook.open, "Log", "The logbook: where the boat went, the numbers, your notes");
+                if ui.selectable_label(safety.notice_open, "About").clicked() {
+                    safety.notice_open = true;
+                    ui.close_menu();
+                }
+            });
             // With the instrument bar hidden, its connection dot would go
             // with it; keep one here so a dropped link is still visible.
             let bar_shown = instruments.position != crate::render::ui::BarPosition::Hidden
@@ -507,166 +1095,97 @@ fn menu_bar(
                 ui.painter().circle_filled(rect.center(), 4.0, colour);
                 response.on_hover_text(&instruments.status);
             }
-            if ui.selectable_label(routes.open, "Routes").clicked() {
-                actions.push(UiAction::RoutesOpen);
-            }
-            if ui.selectable_label(boat.open, "Boat").clicked() {
-                boat.open = !boat.open;
-            }
-            if ui
-                .selectable_label(display.open, "Display")
-                .on_hover_text("Day, dusk or night; safety depth; how much of the chart to show")
-                .clicked()
-            {
-                display.open = !display.open;
-            }
-            if ui
-                .selectable_label(sheet.show, "Weather")
-                .on_hover_text("Wind, sea, current, rain and tide, on one time axis")
-                .clicked()
-            {
-                actions.push(UiAction::WeatherSheetToggle);
-            }
-            if ui
-                .selectable_label(logbook.open, "Log")
-                .on_hover_text("The logbook: where the boat went, the numbers, your notes")
-                .clicked()
-            {
-                logbook.open = !logbook.open;
-            }
-            if ui
-                .selectable_label(safety.open, "Safety")
-                .on_hover_text("Alarms, anchor watch, track, and the man overboard guide")
-                .clicked()
-            {
-                safety.open = !safety.open;
-            }
-            ui.separator();
+        });
+    });
+}
 
-            use crate::render::ui::PlanPickTarget;
-            // The pin toggles: arm one and the next chart tap fills its
-            // field instead of identifying an object. Tapping the chart is
-            // how a sailor points at water; typing coordinates is the
-            // fallback, not the primary.
-            // Each label stays with its field and pin: the row wraps on a
-            // narrow screen, and "to" must not end one line with its field
-            // starting the next.
-            // A group laid out with `horizontal` is not itself wrapped, so
-            // move to the next row by hand when the rest will not fit.
-            const GROUP_WIDTH: f32 = 200.0;
-            if ui.available_size_before_wrap().x < GROUP_WIDTH {
-                ui.end_row();
-            }
-            let from_edit = ui
-                .horizontal(|ui| {
-                    ui.label(RichText::new("from").weak());
+/// The Go to window: where from, where to, sail or motor — and what the
+/// router should allow for.
+///
+/// The planner's two fields and two verbs used to live in the menu bar,
+/// always on show; its options were at the foot of the Routes list. Most
+/// passages now start from a tap on the chart ("Sail here"), so this is
+/// for the rest: a position typed in, a start that is not the boat, the
+/// options.
+fn goto_window(
+    ctx: &Context,
+    plan: &mut crate::render::ui::PlanView,
+    weather: &mut crate::render::ui::WeatherView,
+    boat_name: &str,
+    actions: &mut Vec<UiAction>,
+) {
+    use crate::render::ui::PlanPickTarget;
+    let mut open = plan.open;
+    let mut changed = false;
+    Window::new("Go to")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .constrain_to(ctx.available_rect())
+        .default_width(380.0)
+        .show_fitted(ctx, |ui| {
+            let field = |ui: &mut egui::Ui, label: &str, text: &mut String, hint: &str, target: PlanPickTarget, picking: &mut Option<PlanPickTarget>| {
+                let mut edited = None;
+                ui.horizontal(|ui| {
+                    ui.add_sized([44.0, 32.0], egui::Label::new(RichText::new(label).weak()));
                     let edit = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut plan.from)
-                                .hint_text("boat position")
-                                .desired_width(110.0),
-                        )
+                        .add(egui::TextEdit::singleline(text).hint_text(hint).desired_width(190.0))
                         .on_hover_text(POSITION_FORMATS);
-                    let armed = plan.picking == Some(PlanPickTarget::From);
+                    let armed = *picking == Some(target);
                     if ui
-                        .selectable_label(armed, "📍")
-                        .on_hover_text("Tap the chart to set the start")
+                        .selectable_label(armed, "Tap the chart")
+                        .on_hover_text("Then tap the place on the chart")
                         .clicked()
                     {
-                        plan.picking = (!armed).then_some(PlanPickTarget::From);
+                        *picking = (!armed).then_some(target);
                     }
-                    edit
-                })
-                .inner;
-            if ui.available_size_before_wrap().x < GROUP_WIDTH {
-                ui.end_row();
-            }
-            let to_edit = ui
-                .horizontal(|ui| {
-                    ui.label(RichText::new("to").weak());
-                    let edit = ui
-                        .add(
-                            egui::TextEdit::singleline(&mut plan.to)
-                                .hint_text("destination")
-                                .desired_width(110.0),
-                        )
-                        .on_hover_text(POSITION_FORMATS);
-                    let armed = plan.picking == Some(PlanPickTarget::To);
-                    if ui
-                        .selectable_label(armed, "📍")
-                        .on_hover_text("Tap the chart to set the destination")
-                        .clicked()
-                    {
-                        plan.picking = (!armed).then_some(PlanPickTarget::To);
-                    }
-                    edit
-                })
-                .inner;
+                    edited = Some(edit);
+                });
+                edited.expect("the row was drawn")
+            };
+            let from = field(ui, "From", &mut plan.from, "the boat", PlanPickTarget::From, &mut plan.picking);
+            let to = field(ui, "To", &mut plan.to, "56°24.6'N 10°58.8'E", PlanPickTarget::To, &mut plan.picking);
+            changed = from.changed() || to.changed();
             // Enter in the destination field is the promise the layout makes:
             // type where you are going, press enter, sail.
-            let entered = to_edit.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let entered = to.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             let go = |sail: bool| UiAction::PlanRoute {
                 from: plan.from.clone(),
                 to: plan.to.clone(),
                 sail,
             };
-            // Greyed while a plan runs, like the Routes window's Wx button,
-            // rather than looking ready and ignoring the click.
-            if (ui
-                .add_enabled(!weather.busy, egui::Button::new("Sail"))
-                .on_hover_text("Weather-routed passage on the forecast and your polar")
-                .clicked()
-                || entered)
-                && !weather.busy
-            {
-                actions.push(go(true));
-            }
-            if ui
-                .add_enabled(!weather.busy, egui::Button::new("Motor"))
-                .on_hover_text("Shortest safe route, no weather")
-                .clicked()
-            {
-                actions.push(go(false));
-            }
-            if weather.busy
-                && ui
-                    .small_button("Cancel")
-                    .on_hover_text("Stop planning this passage")
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                // Greyed while a plan runs rather than looking ready and
+                // ignoring the tap.
+                if (ui
+                    .add_enabled(!weather.busy, egui::Button::new("Sail"))
+                    .on_hover_text("Weather-routed passage on the forecast and the boat's sailing speeds")
                     .clicked()
-            {
-                actions.push(UiAction::PlanCancel);
-            }
-            // A message about the last plan stops being true once the
-            // plan's fields change — an error about a malformed destination
-            // must not outlive the fix.
-            if (from_edit.changed() || to_edit.changed()) && !weather.busy {
-                weather.status.clear();
-            }
-            ui.separator();
-            // One line, cut to fit: a long summary or error would otherwise
-            // push the row wider than a plotter's screen. All of it on hover.
-            let line = |ui: &mut egui::Ui, text: &str, weak: bool| {
-                let mut rt = RichText::new(text).small();
-                if weak {
-                    rt = rt.weak();
+                    || entered)
+                    && !weather.busy
+                {
+                    actions.push(go(true));
                 }
-                ui.add(egui::Label::new(rt).truncate()).on_hover_text(text);
-            };
-            if weather.busy {
-                ui.spinner();
-                line(ui, &weather.status, false);
-            } else if plan.picking.is_some() {
-                // The chip on the chart says what a tap does; nothing to add.
-            } else if routes.editing.is_some() {
-                line(ui, "tap the chart to add a waypoint", false);
-            } else if !weather.status.is_empty() {
-                line(ui, &weather.status, true);
-            } else {
-                line(ui, "tap the chart to identify an object", true);
-            }
+                if ui
+                    .add_enabled(!weather.busy, egui::Button::new("Motor"))
+                    .on_hover_text("Shortest safe route, no weather")
+                    .clicked()
+                {
+                    actions.push(go(false));
+                }
+            });
+            ui.separator();
+            ui.label(RichText::new("When sailing").strong());
+            super::ui_routes::routing_options(ui, weather, boat_name, actions);
         });
-    });
+    plan.open = open;
+    // A message about the last plan stops being true once the plan's
+    // fields change — an error about a malformed destination must not
+    // outlive the fix.
+    if changed && !weather.busy && weather.planned.is_none() {
+        weather.status.clear();
+    }
 }
 
 /// Free charts: NOAA's packages, one row per state.
@@ -1005,7 +1524,7 @@ fn chart_shop(
         // over the menu bar hides the very button that closes it.
         .constrain_to(ctx.available_rect())
         .collapsible(false)
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             // Two ways to get a chart: buy one, or point at the folder the
             // last purchase was unpacked into. The second is the common case
             // and had no way in at all before — the charts could only be named
@@ -1182,9 +1701,11 @@ fn chart_shop(
                     ui.label(RichText::new("2. Identify this system").strong());
                     ui.label(
                         RichText::new(
-                            "A chart licence is assigned to a named computer, usually five \
-                             of them. Registering a name costs nothing — a slot is spent only \
-                             when a chart set is assigned to it.",
+                            "A chart licence is assigned to named computers: two or five \
+                             of them, depending on the chart. Registering a name costs \
+                             nothing — a slot is spent only when a chart set is assigned to \
+                             it. One name is one real machine: a cloned system or a virtual \
+                             machine sharing a slot breaks the licence.",
                         )
                         .small()
                         .weak(),
@@ -1311,6 +1832,11 @@ fn chart_shop(
                 ui.separator();
                 ui.label(RichText::new(&shop.status).small());
             }
+            // o-charts' conditions: the agreement can be had at any moment.
+            ui.add_space(6.0);
+            if ui.button("o-charts licence agreement (EULA)").clicked() {
+                actions.push(UiAction::EulaRead);
+            }
             // o-charts supports OpenCPN only, and sends Manx questions back
             // to us: said where the user would otherwise go looking for help.
             ui.add_space(6.0);
@@ -1375,12 +1901,7 @@ fn step_nav(ui: &mut egui::Ui, shop: &mut ShopView, step: u8, reached: u8) {
     });
 }
 
-/// Put a lapsed set's download to the user before sending it.
-///
-/// The shop will not grant the edition it currently publishes to a licence
-/// that expired before that edition existed. Manx can ask for an older one
-/// — the last this machine actually received — but which edition to claim is
-/// the user's business, so it is shown, named, and confirmed.
+/// Put a download that spends a licence slot to the user before sending it.
 fn confirm_download(
     ui: &mut egui::Ui,
     pending: &mut crate::render::ui::PendingDownload,
@@ -1391,7 +1912,7 @@ fn confirm_download(
         let title = if pending.new_slot {
             format!("{} — use a licence slot?", pending.chart_name)
         } else {
-            format!("{} — subscription lapsed", pending.chart_name)
+            format!("{} — install?", pending.chart_name)
         };
         ui.label(RichText::new(title).strong());
         // Spending a slot is said first and in colour, whatever else is
@@ -1411,49 +1932,33 @@ fn confirm_download(
                 "I understand these charts will work in Manx only",
             );
         }
-        let may_assign = !per_app || pending.understood;
         ui.label(RichText::new(&pending.because).small());
+        // o-charts' conditions: the licence agreement is accepted before the
+        // install, and the user understands what the charts are not. The
+        // set's own copy of the agreement is shown in full, and accepted
+        // again, before its charts are first opened.
+        ui.add_space(4.0);
+        ui.label(
+            "Installing these charts means accepting o-charts' licence agreement (EULA). \
+             It comes with the chart set and is shown in full before the charts are opened.",
+        );
+        ui.label(RichText::new(crate::shop::eula::NOT_OFFICIAL).strong());
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Read the agreement").clicked() {
+                actions.push(UiAction::EulaRead);
+            }
+            ui.label(RichText::new(crate::shop::eula::URL).small().weak());
+        });
+        ui.checkbox(&mut pending.accepted, "I accept the agreement and understand this");
+        let may_assign = (!per_app || pending.understood) && pending.accepted;
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            if !pending.expired {
-                if ui
-                    .add_enabled(may_assign, egui::Button::new("Assign and download"))
-                    .clicked()
-                {
-                    actions.push(UiAction::ShopDownload {
-                        chart_id: pending.chart_id.clone(),
-                        edition: None,
-                    });
-                }
-            }
-            // One button per edition the licence demonstrably covered, each
-            // saying where it was seen: which to claim is the user's call.
-            for (edition, source) in &pending.choices {
-                let label = format!("Ask for {edition} ({source})");
-                if ui.add_enabled(may_assign, egui::Button::new(label)).clicked() {
-                    actions.push(UiAction::ShopDownload {
-                        chart_id: pending.chart_id.clone(),
-                        edition: Some(edition.clone()),
-                    });
-                }
-            }
-            if pending.expired {
-                // The shop's current edition was published after the licence
-                // lapsed. Asking will almost certainly be refused, but the
-                // shop's answer is more use than Manx's guess about it.
-                if ui
-                    .add_enabled(may_assign, egui::Button::new("Ask for the current edition anyway"))
-                    .on_hover_text(
-                        "Expect a refusal — the licence expired before this edition \
-                         was published. o-charts' exact answer is worth having.",
-                    )
-                    .clicked()
-                {
-                    actions.push(UiAction::ShopDownload {
-                        chart_id: pending.chart_id.clone(),
-                        edition: None,
-                    });
-                }
+            let go = if pending.new_slot { "Assign and download" } else { "Download" };
+            if ui.add_enabled(may_assign, egui::Button::new(go)).clicked()
+            {
+                actions.push(UiAction::ShopDownload {
+                    chart_id: pending.chart_id.clone(),
+                });
             }
             if ui.button("Cancel").clicked() {
                 actions.push(UiAction::ShopCancelDownload);
@@ -1523,53 +2028,38 @@ fn chart_table(ui: &mut egui::Ui, shop: &ShopView, actions: &mut Vec<UiAction>) 
                             holders.join(", ")
                         ));
                     }
-                    // Offered even for an expired subscription. Whether the
-                    // last edition it covered may still be fetched is the
-                    // shop's decision, and the only way to learn it is to ask.
-                    let can_ask =
-                        shop.system_name.is_some() && !shop.busy && !c.is_fully_assigned();
+                    // Not for an expired licence: an install can only
+                    // happen during the licensing period (o-charts'
+                    // conditions). What is installed keeps working.
+                    let can_ask = shop.system_name.is_some()
+                        && !shop.busy
+                        && !c.is_fully_assigned()
+                        && !c.expired;
                     let button = ui
                         .add_enabled(can_ask, egui::Button::new("Download"))
-                        .on_disabled_hover_text(if shop.system_name.is_none() {
+                        .on_disabled_hover_text(if c.expired {
+                            crate::shop::protocol::LICENCE_EXPIRED
+                        } else if shop.system_name.is_none() {
                             "register this machine first"
                         } else if c.is_fully_assigned() {
                             "every slot on this licence is assigned to another machine"
                         } else {
                             "busy"
                         });
-                    let button = if c.expired {
-                        button.on_hover_text(
-                            "This subscription has lapsed. o-charts decides whether the \
-                             last edition it covered may still be fetched — pressing this \
-                             asks, and shows the answer.",
-                        )
-                    } else {
-                        button
-                    };
                     if button.clicked() {
-                        // A lapsed set cannot have the shop's current edition,
-                        // so Manx must ask for a different one. That is a
-                        // decision about the user's licence, so it is put to
-                        // them rather than made silently.
-                        // So is the first download to this machine: it spends
-                        // a licence slot that can never be taken back.
-                        actions.push(if c.expired || mine.is_none() {
-                            UiAction::ShopConfirmDownload {
-                                chart_id: c.id.clone(),
-                            }
-                        } else {
-                            UiAction::ShopDownload {
-                                chart_id: c.id.clone(),
-                                edition: None,
-                            }
+                        // The first download to this machine spends a
+                        // licence slot that can never be taken back, so it
+                        // is put to the user first.
+                        // And every install is preceded by the licence
+                        // agreement, slot or no slot.
+                        actions.push(UiAction::ShopConfirmDownload {
+                            chart_id: c.id.clone(),
                         });
                     }
                     ui.end_row();
                     // The provenance of the licence, on its own row: what was
                     // bought, when it lapsed, and which edition this machine's
-                    // slot actually holds. For an expired set that last figure
-                    // is the whole question — it is the edition the licence
-                    // paid for, and the only one worth asking the shop for.
+                    // slot actually holds.
                     let held = mine
                         .map(|(_, s)| s.last_requested.trim())
                         .filter(|v| !v.is_empty())
@@ -1656,7 +2146,7 @@ fn object_query(
         None => window.anchor(Align2::RIGHT_TOP, [-8.0, 8.0]),
     };
 
-    window.show(ctx, |ui| {
+    window.show_fitted(ctx, |ui| {
         if objects.is_empty() {
             ui.label("Nothing charted here.");
             return;
@@ -1673,7 +2163,7 @@ fn object_query(
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("Copy all")
+                    .button("Copy all")
                     .on_hover_text("Copy every object listed here")
                     .clicked()
                 {
@@ -1742,7 +2232,7 @@ fn object(ui: &mut egui::Ui, o: &PickedObject, index: usize) {
             // class, chart, every attribute and any chart note — which is what
             // you want when reporting a chart error or asking someone ashore.
             if ui
-                .small_button("Copy")
+                .button("Copy")
                 .on_hover_text("Copy this object's details")
                 .clicked()
             {
@@ -1846,6 +2336,117 @@ fn geometry_name(kind: FeatureType) -> &'static str {
         FeatureType::Line => "line",
         FeatureType::Area => "area",
         FeatureType::Multipoint => "soundings",
+    }
+}
+
+#[cfg(test)]
+mod pick_card_tests {
+    use super::{headline, range_text};
+    use crate::pick::PickedObject;
+
+    fn object(acronym: &str, title: &str, attrs: &[(&str, &str)], summary: Option<&str>) -> PickedObject {
+        PickedObject {
+            acronym: acronym.into(),
+            title: title.into(),
+            chart: "X".into(),
+            chart_scale: 12_000,
+            geometry: crate::senc::FeatureType::Point,
+            attributes: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            notes: Vec::new(),
+            distance_m: 0.0,
+            summary: summary.map(str::to_string),
+            duplicates: 0,
+        }
+    }
+
+    /// The card says what a thing is in a sailor's words: a contour by its
+    /// depth, a light by its name and character — not by attribute codes.
+    /// Kalvebodbroen as the Danish cell charts it: CATBRG 1 (fixed),
+    /// VERCLR 16, HORCLR 35. And an opening bridge by S-57's own
+    /// attributes: VERCCL is the clearance closed, VERCOP open.
+    #[test]
+    fn a_bridge_says_whether_it_opens_and_how_much_air_there_is() {
+        let fixed = object(
+            "BRIDGE",
+            "Bridge",
+            &[("CATBRG", "fixed bridge"), ("HORCLR", "35"), ("VERCLR", "16")],
+            None,
+        );
+        assert_eq!(headline(&fixed), "Fixed bridge · clearance 16 m · 35 m wide");
+        let bascule = object(
+            "BRIDGE",
+            "Bridge",
+            &[("CATBRG", "bascule bridge"), ("OBJNAM", "Knippelsbro"), ("VERCCL", "5.4")],
+            None,
+        );
+        assert_eq!(
+            headline(&bascule),
+            "Knippelsbro · Bascule bridge · clearance 5.4 m closed, no limit charted when open"
+        );
+        let lifting = object(
+            "BRIDGE",
+            "Bridge",
+            &[("CATBRG", "lifting bridge"), ("VERCCL", "3"), ("VERCOP", "42.5")],
+            None,
+        );
+        assert_eq!(headline(&lifting), "Lifting bridge · clearance 3 m closed, 42.5 m open");
+        let bare = object("BRIDGE", "Bridge", &[], None);
+        assert_eq!(headline(&bare), "Bridge · clearance not charted");
+        // A power cable: the safe clearance is the one to sail by.
+        let cable = object("CBLOHD", "Cable, overhead", &[("VERCLR", "30"), ("VERCSA", "26")], None);
+        assert_eq!(headline(&cable), "Overhead cable or pipe · safe clearance 26 m");
+    }
+
+    #[test]
+    fn the_card_names_things_in_plain_words() {
+        let contour = object("DEPCNT", "Depth contour", &[("VALDCO", "6")], None);
+        assert_eq!(headline(&contour), "Depth contour 6 m");
+        let area = object("DEPARE", "Depth area", &[("DRVAL1", "5"), ("DRVAL2", "10")], None);
+        assert_eq!(headline(&area), "Depth area 5–10 m");
+        let light = object("LIGHTS", "Light", &[("OBJNAM", "Trekroner")], Some("Iso 2s 20m"));
+        assert_eq!(headline(&light), "Trekroner · Light · Iso 2s 20m");
+        let buoy = object("BOYLAT", "Buoy, lateral", &[("OBJNAM", "  ")], None);
+        assert_eq!(headline(&buoy), "Buoy, lateral", "a blank name is no name");
+    }
+
+    /// A cable is 185 m: nearer than that reads in metres, beyond in miles.
+    #[test]
+    fn range_reads_in_metres_close_to_and_miles_beyond() {
+        assert_eq!(range_text(120.0, 47.4), "120 m · 047°T from the boat");
+        assert_eq!(range_text(2222.4, 359.6), "1.20 NM · 000°T from the boat");
+        assert_eq!(range_text(46_300.0, 180.0), "25.0 NM · 180°T from the boat");
+    }
+}
+
+#[cfg(test)]
+mod scale_bar_tests {
+    use super::scale_bar_length;
+
+    /// The bar is the longest round distance that fits in 120 points.
+    /// A nautical mile is 1852 m.
+    #[test]
+    fn the_scale_bar_is_the_longest_round_distance_that_fits() {
+        let at = |m_per_pt: f32| scale_bar_length(m_per_pt, 120.0).map(|(pt, l)| ((pt * 10.0).round() / 10.0, l));
+        // 10 m a point: 1200 m of room. Half a mile (926 m) fits, a mile does not.
+        assert_eq!(at(10.0), Some((92.6, "0.5 NM".into())));
+        // 1 m a point: 120 m of room. 100 m fits; a cable (185 m) does not.
+        assert_eq!(at(1.0), Some((100.0, "100 m".into())));
+        // Zoomed right in, 5 cm a point: 6 m of room.
+        assert_eq!(at(0.05), Some((100.0, "5 m".into())));
+        // 100 m a point: 12 km of room. 5 NM (9260 m) fits, 10 NM does not.
+        assert_eq!(at(100.0), Some((92.6, "5 NM".into())));
+        // 2 m a point: a cable is 92.6 points.
+        assert_eq!(at(2.0), Some((92.6, "0.1 NM".into())));
+    }
+
+    #[test]
+    fn no_scale_no_bar() {
+        assert_eq!(scale_bar_length(0.0, 120.0), None);
+        assert_eq!(scale_bar_length(f32::NAN, 120.0), None);
+        assert_eq!(scale_bar_length(-1.0, 120.0), None);
+        // Zoomed out so far that not even 500 NM fits... the largest is
+        // still the answer while anything fits, and nothing when none does.
+        assert_eq!(scale_bar_length(1.0e9, 120.0), None);
     }
 }
 

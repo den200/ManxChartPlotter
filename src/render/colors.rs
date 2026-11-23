@@ -195,18 +195,23 @@ pub fn depth_color(drval1: Option<f64>, drval2: Option<f64>) -> Color {
 mod tests {
     use super::*;
 
+    /// Each depth falls in its own band, the breakpoint itself belonging to
+    /// the deeper one: drying ground is DEPIT, under 2 m DEPVS, 20 m and
+    /// beyond DEPDW.
     #[test]
     fn depth_colors_gradient() {
         let palette = DepthPalette::default();
-
-        // S-52 depth colors: shallow is saturated blue, deep is pale/light
-        let shallow = palette.color_for_depth(1.0);
-        let deep = palette.color_for_depth(50.0);
-
-        // Deep water is lighter (higher green component) in S-52 palette
-        // DEPVS (shallow) = [0.451, 0.714, 0.937]
-        // DEPDW (deep)    = [0.831, 0.918, 0.933]
-        assert!(deep[1] >= shallow[1]); // Deep is lighter/paler
+        assert_eq!(palette.color_for_depth(-0.5), WATER_INTERTIDAL);
+        assert_eq!(palette.color_for_depth(0.0), WATER_SHALLOW);
+        assert_eq!(palette.color_for_depth(1.9), WATER_SHALLOW);
+        assert_eq!(palette.color_for_depth(2.0), palette.colors[2]);
+        assert_eq!(palette.color_for_depth(7.0), WATER_MEDIUM);
+        assert_eq!(palette.color_for_depth(19.9), palette.colors[4]);
+        assert_eq!(palette.color_for_depth(20.0), WATER_DEEP);
+        assert_eq!(palette.color_for_depth(500.0), WATER_DEEP);
+        // An area's colour comes from the middle of its depth range.
+        assert_eq!(depth_color(Some(30.0), Some(50.0)), WATER_DEEP);
+        assert_eq!(depth_color(Some(-2.0), Some(0.0)), WATER_INTERTIDAL);
     }
 
     #[test]
@@ -215,5 +220,8 @@ mod tests {
         assert!((mid[0] - 0.5).abs() < 0.01);
         assert!((mid[1] - 0.5).abs() < 0.01);
         assert!((mid[2] - 0.5).abs() < 0.01);
+        // The ends are the colours themselves.
+        assert_eq!(lerp_color(WATER_SHALLOW, WATER_DEEP, 0.0), WATER_SHALLOW);
+        assert_eq!(lerp_color(WATER_SHALLOW, WATER_DEEP, 1.0), WATER_DEEP);
     }
 }

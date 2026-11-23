@@ -554,27 +554,11 @@ impl Grid {
         let Some((a, b)) = clip_segment(a, b, lo, hi) else {
             return;
         };
-        let steps = ((b[0] - a[0]).hypot(b[1] - a[1]) / (self.res * 0.45)).ceil() as usize;
-        let steps = steps.max(1);
-        let mut last: Option<(i64, i64)> = None;
-        for i in 0..=steps {
-            let t = i as f64 / steps as f64;
-            let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-            let x = ((p[0] - self.origin[0]) / self.res).floor() as i64;
-            let y = ((p[1] - self.origin[1]) / self.res).floor() as i64;
-            if last == Some((x, y)) {
-                continue;
-            }
-            // Half-step sampling can still hop a corner; fill the elbow so
-            // the cover is a true supercover.
-            if let Some((lx, ly)) = last {
-                if (x - lx).abs() == 1 && (y - ly).abs() == 1 {
-                    f(self, lx, y);
-                }
-            }
+        let (origin, res) = (self.origin, self.res);
+        traverse(origin, res, a, b, |x, y| {
             f(self, x, y);
-            last = Some((x, y));
-        }
+            true
+        });
     }
 
     /// Build the distance-to-hazard field. Chamfer 3-4: two passes, ~2 %
@@ -691,39 +675,83 @@ impl Grid {
         ok: impl Fn(&Self, usize, usize) -> bool,
     ) -> bool {
         let mut clear = true;
-        // Walk on a clone-free path: reimplement the walk read-only.
-        let steps = ((b[0] - a[0]).hypot(b[1] - a[1]) / (self.res * 0.45)).ceil() as usize;
-        let steps = steps.max(1);
-        let mut last: Option<(i64, i64)> = None;
-        for i in 0..=steps {
-            let t = i as f64 / steps as f64;
-            let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-            let x = ((p[0] - self.origin[0]) / self.res).floor() as i64;
-            let y = ((p[1] - self.origin[1]) / self.res).floor() as i64;
-            if last == Some((x, y)) {
-                continue;
-            }
-            let mut check = |cx: i64, cy: i64| {
-                if cx < 0 || cy < 0 || cx as usize >= self.w || cy as usize >= self.h {
-                    clear = false;
-                    return;
-                }
-                if !ok(self, cx as usize, cy as usize) {
-                    clear = false;
-                }
-            };
-            if let Some((lx, ly)) = last {
-                if (x - lx).abs() == 1 && (y - ly).abs() == 1 {
-                    check(lx, y);
-                }
-            }
-            check(x, y);
-            if !clear {
-                return false;
-            }
-            last = Some((x, y));
+        traverse(self.origin, self.res, a, b, |x, y| {
+            clear = x >= 0
+                && y >= 0
+                && (x as usize) < self.w
+                && (y as usize) < self.h
+                && ok(self, x as usize, y as usize);
+            clear
+        });
+        clear
+    }
+}
+
+/// Every grid cell the segment `a`→`b` passes through, in order — an exact
+/// traversal (Amanatides & Woo), stopped early when `visit` returns false.
+///
+/// Where the segment passes exactly through a cell corner, both cells beside
+/// that corner are visited as well: a line grazing the corner of a wall
+/// touches the wall. This replaced sampling the segment every 0.45 cells and
+/// patching diagonal hops with one of the two elbow cells, which let a leg
+/// cut a metre into the corner of a charted wall whenever the elbow it
+/// skipped was the blocked one.
+fn traverse(
+    origin: [f64; 2],
+    res: f64,
+    a: [f64; 2],
+    b: [f64; 2],
+    mut visit: impl FnMut(i64, i64) -> bool,
+) {
+    let cell = |v: f64, o: f64| ((v - o) / res).floor() as i64;
+    let (mut x, mut y) = (cell(a[0], origin[0]), cell(a[1], origin[1]));
+    let (ex, ey) = (cell(b[0], origin[0]), cell(b[1], origin[1]));
+    if !visit(x, y) {
+        return;
+    }
+    let d = [b[0] - a[0], b[1] - a[1]];
+    let sign = |v: f64| (v > 0.0) as i64 - (v < 0.0) as i64;
+    let (sx, sy) = (sign(d[0]), sign(d[1]));
+    // The segment parameter at which it next crosses a vertical (x) or
+    // horizontal (y) grid line, and the parameter step between lines.
+    let first = |c: i64, s: i64, o: f64, av: f64, dv: f64| {
+        if s == 0 {
+            return (f64::INFINITY, f64::INFINITY);
         }
-        true
+        let line = o + (c + (s > 0) as i64) as f64 * res;
+        ((line - av) / dv, res / dv.abs())
+    };
+    let (mut tx, dtx) = first(x, sx, origin[0], a[0], d[0]);
+    let (mut ty, dty) = first(y, sy, origin[1], a[1], d[1]);
+    // A corner is "exact" to within a billionth of the segment: closer than
+    // that, floating-point rounding decides which side it passed.
+    const CORNER: f64 = 1e-9;
+    // Each step moves one cell nearer the end in x or y; the bound only
+    // guards against rounding leaving the walk a cell short.
+    let mut budget = (ex - x).abs() + (ey - y).abs() + 2;
+    while (x, y) != (ex, ey) && budget > 0 {
+        budget -= 1;
+        if (tx - ty).abs() <= CORNER {
+            if !visit(x + sx, y) || !visit(x, y + sy) {
+                return;
+            }
+            x += sx;
+            y += sy;
+            tx += dtx;
+            ty += dty;
+        } else if tx < ty {
+            x += sx;
+            tx += dtx;
+        } else {
+            y += sy;
+            ty += dty;
+        }
+        if !visit(x, y) {
+            return;
+        }
+    }
+    if (x, y) != (ex, ey) {
+        visit(ex, ey);
     }
 }
 
@@ -1141,6 +1169,41 @@ mod tests {
         let goal = grid.cell_of([100.0, 900.0]).unwrap();
         let p = SearchParams::fixed(0.0, 0.0);
         assert_eq!(find_path(&grid, start, goal, &p), Err(SearchError::Unreachable));
+        // The loose pass may cut a blocked corner, so only a truly
+        // edge-connected stamp stops it: a breakwater is a line feature and
+        // closes the loose raster too.
+        let mut loose = SearchParams::fixed(0.0, 0.0);
+        loose.loose = true;
+        assert_eq!(find_path(&grid, start, goal, &loose), Err(SearchError::Unreachable));
+    }
+
+    /// A wall of cells that touch only at their corners — a row of charted
+    /// rocks or piles, stamped one cell each — is still a wall: no search
+    /// step and no straight leg may slip between two cells across their
+    /// shared corner.
+    #[test]
+    fn cells_touching_only_at_corners_still_make_a_wall() {
+        let mut grid = Grid::new([0.0, 0.0], [1_000.0, 1_000.0], 50.0);
+        for i in 0..grid.w.max(grid.h) {
+            let c = grid.centre(i, i);
+            grid.stamp_point(c, true);
+        }
+        grid.finalize();
+        let (below, above) = ([900.0, 100.0], [100.0, 900.0]);
+        let p = SearchParams::fixed(0.0, 0.0);
+        assert_eq!(
+            find_path(&grid, grid.cell_of(below).unwrap(), grid.cell_of(above).unwrap(), &p),
+            Err(SearchError::Unreachable)
+        );
+        // Straight legs across the wall at every offset along it, crossing
+        // close to the corners as well as through the middle of cells. (The
+        // legs are lopsided about the wall so that the walk's samples do not
+        // land on the diagonal itself, where any walk would find the wall.)
+        for i in 0..400 {
+            let s = 100.0 + i as f64 * 2.0;
+            let (a, b) = ([s + 60.0, s - 60.0], [s - 43.0, s + 43.0]);
+            assert!(!grid.segment_clear(a, b, 0.0), "a leg crossed the wall at {s} m");
+        }
     }
 
     #[test]
@@ -1415,8 +1478,10 @@ mod tests {
         assert!(clip_segment([-10.0, -10.0], [-5.0, 20.0], lo, hi).is_none());
     }
 
+    /// A soft area is a cost, not a wall: a band across the whole passage is
+    /// crossed, and the crossing is reported.
     #[test]
-    fn soft_areas_are_avoided_when_avoidance_is_cheap() {
+    fn a_soft_band_across_the_whole_passage_is_crossed_not_a_wall() {
         let mut grid = open();
         // A soft band across the middle (an exercise area, say).
         let (a, b, c, d) = (
@@ -1428,23 +1493,34 @@ mod tests {
         grid.stamp_triangle([a, b, c], false);
         grid.stamp_triangle([a, c, d], false);
         grid.finalize();
+        let (x, y) = grid.cell_of([5_000.0, 5_000.0]).unwrap();
+        assert!(!grid.is_blocked(x, y) && grid.soft_cost(x, y) > 0.0);
 
-        // Crossing is unavoidable start-to-goal here, but the path through
-        // should be near-perpendicular — minimal length inside the band.
         let start = grid.cell_of([5_000.0, 1_000.0]).unwrap();
         let goal = grid.cell_of([5_000.0, 9_000.0]).unwrap();
+        let path = find_path(&grid, start, goal, &params()).expect("soft is not hard");
+        let pulled = string_pull(&grid, &path, &params());
+        assert!(pulled.windows(2).any(|w| grid.segment_touches_soft(w[0], w[1])));
+    }
+
+    /// Where going round a soft area costs little, the route goes round.
+    /// The straight line here runs four kilometres through it; the way
+    /// round, a few hundred metres longer, touches it at most at a corner.
+    #[test]
+    fn soft_areas_are_avoided_when_avoidance_is_cheap() {
+        let mut grid = open();
+        block_soft(&mut grid, 3_000.0, 4_500.0, 7_000.0, 5_500.0);
+        grid.finalize();
+        let start = grid.cell_of([500.0, 5_000.0]).unwrap();
+        let goal = grid.cell_of([9_500.0, 5_000.0]).unwrap();
         let path = find_path(&grid, start, goal, &params()).unwrap();
-        let inside = path
-            .iter()
-            .filter(|&&(x, y)| {
-                let c = grid.centre(x, y);
-                (4_500.0..5_500.0).contains(&c[1])
-            })
-            .count() as f64;
-        let band_cells = 1_000.0 / grid.res;
-        assert!(
-            inside <= band_cells * 1.6,
-            "crossed at {inside} cells for a {band_cells}-cell band"
-        );
+        let soft_cells = path.iter().filter(|&&(x, y)| grid.soft_cost(x, y) > 0.0).count();
+        assert!(soft_cells <= 2, "{soft_cells} cells of the route lie in the soft area");
+    }
+
+    /// A soft axis-aligned block.
+    fn block_soft(grid: &mut Grid, x0: f64, y0: f64, x1: f64, y1: f64) {
+        grid.stamp_triangle([[x0, y0], [x1, y0], [x1, y1]], false);
+        grid.stamp_triangle([[x0, y0], [x1, y1], [x0, y1]], false);
     }
 }

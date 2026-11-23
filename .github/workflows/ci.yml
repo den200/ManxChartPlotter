@@ -1,10 +1,10 @@
 # Build and test on every push and pull request.
 #
-# Two machines: ordinary x86 Linux, and 64-bit ARM Linux — the Raspberry
+# Three machines: ordinary x86 Linux, 64-bit ARM Linux — the Raspberry
 # Pi 5's architecture — so a change that would not build on the plotter is
-# caught before it reaches main. The charts, licence and vendor binaries are
-# not in the repository (see .gitignore), so tests that need real cells are
-# not run here.
+# caught before it reaches main, and macOS, which is where Manx is developed
+# and run day to day. The charts, licence and vendor binaries are not in the
+# repository (see .gitignore), so tests that need real cells are not run here.
 name: CI
 
 on:
@@ -22,11 +22,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: System libraries
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -38,3 +39,4 @@ jobs:
         run: cargo build --locked --all-targets
       - name: Test
         run: cargo test --locked
+

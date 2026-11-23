@@ -24,6 +24,7 @@
 //! 5. `assign` — claim one of the chart's slots for this machine
 //! 6. `request_download` — a signed link to the package and to its keys
 
+pub mod eula;
 pub mod install;
 pub mod noaa;
 pub mod installed;
@@ -104,10 +105,31 @@ pub struct Session {
     pub system_name: Option<String>,
 }
 
+/// How long one request of a package download may run.
+///
+/// ureq has no idle timeout, and its "receive response" limit keeps running
+/// through the body: the twenty seconds this used to allow for the reply to
+/// *start* cut every package off twenty seconds in, so any chart set that
+/// took longer than that to arrive could never be downloaded. So, as for the
+/// NOAA packages (`noaa.rs`), each request gets a minute and the download
+/// continues with a Range request: a slow link finishes in several pieces,
+/// and a dead one is noticed within minutes rather than never.
+const DOWNLOAD_CALL: Duration = Duration::from_secs(60);
+/// Requests in a row that may bring nothing new before a download gives up.
+const MAX_STALLS: u32 = 3;
+
+fn download_agent(per_call: Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(TIMEOUT))
+        .timeout_per_call(Some(per_call))
+        .build()
+        .into()
+}
+
 pub struct ShopClient {
     agent: ureq::Agent,
-    /// Chart packages: no whole-call deadline, only one for the reply to
-    /// start. See [`ShopClient::new`].
+    /// Chart packages: each request is bounded, and the download carries
+    /// on from where a request stopped. See [`DOWNLOAD_CALL`].
     downloads: ureq::Agent,
 }
 
@@ -122,15 +144,7 @@ impl ShopClient {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(TIMEOUT))
             .build();
-        // A second agent for the chart packages. `timeout_global` is a cap on
-        // the *whole* call including the body, so the twenty seconds that
-        // suit a small XML reply guarantee that a few hundred megabytes over
-        // a marina's wifi fails every time. This one bounds the wait for the
-        // response to start, and then lets the transfer take as long as the
-        // link takes.
-        let downloads = ureq::Agent::config_builder()
-            .timeout_recv_response(Some(TIMEOUT))
-            .build();
+        let downloads = download_agent(DOWNLOAD_CALL);
         Self {
             agent: config.into(),
             downloads: downloads.into(),
@@ -302,33 +316,78 @@ impl ShopClient {
     ) -> Result<Vec<u8>, Error> {
         use sha2::{Digest, Sha256};
 
-        let mut response = self
-            .downloads
-            .get(url)
-            .call()
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        let total = response
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-
-        let mut reader = response.body_mut().as_reader();
-        let mut out = Vec::new();
+        let header = |resp: &ureq::http::Response<ureq::Body>, name: &str| {
+            resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+        };
+        let mut out: Vec<u8> = Vec::new();
+        let mut total = 0u64;
+        // What names this version of the file, so a resumed request cannot
+        // be answered with the rest of a different one.
+        let mut validator = String::new();
+        // The most that has ever arrived: only getting past it is progress,
+        // so a server that keeps starting over cannot keep us for ever.
+        let mut best = 0usize;
+        let mut stalls = 0;
         let mut chunk = vec![0u8; 64 * 1024];
-        let mut hasher = Sha256::new();
         loop {
-            let n = reader
-                .read(&mut chunk)
-                .map_err(|e| Error::Transport(e.to_string()))?;
-            if n == 0 {
+            let mut req = self.downloads.get(url);
+            if !out.is_empty() {
+                req = req.header("Range", &format!("bytes={}-", out.len()));
+                if !validator.is_empty() {
+                    req = req.header("If-Range", &validator);
+                }
+            }
+            let mut last_error = None;
+            match req.call() {
+                Err(e) => last_error = Some(e.to_string()),
+                Ok(mut response) => {
+                    if response.status() != 206 {
+                        // The whole file, from the top.
+                        out.clear();
+                        total = header(&response, "content-length")
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0);
+                        validator = header(&response, "etag")
+                            .or_else(|| header(&response, "last-modified"))
+                            .unwrap_or_default();
+                    }
+                    let mut reader = response.body_mut().as_reader();
+                    loop {
+                        match reader.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                out.extend_from_slice(&chunk[..n]);
+                                progress(out.len() as u64, total);
+                            }
+                            Err(e) => {
+                                last_error = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if total > 0 && out.len() as u64 >= total {
                 break;
             }
-            hasher.update(&chunk[..n]);
-            out.extend_from_slice(&chunk[..n]);
-            progress(out.len() as u64, total);
+            if total == 0 && last_error.is_none() {
+                // No length given: the end of the body is the end.
+                break;
+            }
+            if out.len() > best {
+                best = out.len();
+                stalls = 0;
+            } else {
+                stalls += 1;
+                if stalls >= MAX_STALLS {
+                    return Err(Error::Transport(
+                        last_error.unwrap_or_else(|| "the download stopped short".into()),
+                    ));
+                }
+            }
         }
+        let mut hasher = Sha256::new();
+        hasher.update(&out);
 
         // A truncated download that still unpacks is the worst outcome: a chart
         // set with holes in it, and nothing to say so.
@@ -349,9 +408,157 @@ impl ShopClient {
 mod tests {
     use super::*;
 
+    fn session() -> Session {
+        Session {
+            username: "skipper@example.org".into(),
+            key: "k".into(),
+            system_name: Some("saloon-mac".into()),
+        }
+    }
+
+    /// Up to date means nothing is asked of the shop at all — no request,
+    /// so no slot is spent and no network is needed for the answer.
     #[test]
-    fn a_client_can_be_built_without_touching_the_network() {
-        let _ = ShopClient::new();
+    fn an_up_to_date_chart_asks_the_shop_nothing() {
+        let grant = ShopClient::new()
+            .request_download(&session(), "UU-1", "saloon-mac", DownloadTarget::UpToDate, "2025/1-20", None)
+            .expect("answered locally");
+        assert!(grant.files.is_empty());
+    }
+
+    /// Serve `response` verbatim to each of `connections` requests on a
+    /// loopback port, and return the URL. Enough HTTP to exercise the
+    /// download path without the internet.
+    fn serve(response: &'static [u8], connections: usize) -> String {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/pkg.zip", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(connections) {
+                let Ok(mut stream) = stream else { continue };
+                // Read the request head before answering.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let _ = stream.write_all(response);
+            }
+        });
+        url
+    }
+
+    /// SHA-256 of "abc", from FIPS 180-2's own test vectors.
+    const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    /// A package whose digest does not match what the shop promised is
+    /// refused — the truncated or tampered download that would otherwise
+    /// unpack into a chart set with holes in it.
+    #[test]
+    fn a_download_is_checked_against_the_shops_digest() {
+        let ok: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nabc";
+        let url = serve(ok, 3);
+        let client = ShopClient::new();
+
+        let mut seen = Vec::new();
+        let bytes = client
+            .download(&url, &ABC_SHA256.to_ascii_uppercase(), |n, total| seen.push((n, total)))
+            .expect("the digest matches, whatever its case");
+        assert_eq!(bytes, b"abc");
+        assert_eq!(seen.last(), Some(&(3, 3)));
+
+        let wrong = ABC_SHA256.replace('b', "c");
+        let err = client.download(&url, &wrong, |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+
+        // No digest offered: nothing to check against, and the bytes come
+        // through as they are.
+        assert_eq!(client.download(&url, "", |_, _| {}).unwrap(), b"abc");
+    }
+
+    /// A server whose connection drops after every `PIECE` bytes of body:
+    /// it promises the whole length and delivers ten bytes of it. Asked to
+    /// carry on from where it stopped (a Range request) it does — unless it
+    /// is `stubborn`, which ignores the Range and starts from the top every
+    /// time. Nothing here depends on timing.
+    fn serve_in_pieces(body: &'static [u8], stubborn: bool) -> String {
+        use std::io::Write;
+        const PIECE: usize = 10;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/pkg.zip", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(1) => head.push(byte[0]),
+                        _ => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                let from = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("range: bytes="))
+                    .and_then(|r| r.trim_end_matches('-').trim().parse::<usize>().ok())
+                    .filter(|_| !stubborn)
+                    .unwrap_or(0);
+                let rest = &body[from.min(body.len())..];
+                let status = if from > 0 {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {from}-{}/{}\r\n",
+                        body.len() - 1,
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 200 OK\r\nETag: \"v1\"\r\n".to_string()
+                };
+                let _ = write!(stream, "{status}Content-Length: {}\r\nConnection: close\r\n\r\n", rest.len());
+                let _ = stream.write_all(&rest[..rest.len().min(PIECE)]);
+                // Dropped here, short of what was promised.
+            }
+        });
+        url
+    }
+
+    const FORTY: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyzABCD";
+
+    /// A package whose connection keeps dropping still arrives, whole and
+    /// in order: each request carries on from where the last one stopped.
+    /// This is what lets a request be bounded in time at all — the limit
+    /// that used to cut every download off after twenty seconds.
+    #[test]
+    fn a_download_that_arrives_in_pieces_is_resumed() {
+        let url = serve_in_pieces(FORTY, false);
+        let mut seen = Vec::new();
+        let bytes = ShopClient::new()
+            .download(&url, "", |n, total| seen.push((n, total)))
+            .expect("resumed");
+        assert_eq!(bytes, FORTY);
+        assert_eq!(seen.last().map(|(n, _)| *n), Some(40));
+        assert!(seen.windows(2).all(|w| w[1].0 > w[0].0), "progress never goes back: {seen:?}");
+    }
+
+    /// A server that answers every resume by starting over never gets past
+    /// its first ten bytes: the download gives up instead of going round
+    /// for ever.
+    #[test]
+    fn a_download_that_never_gets_further_gives_up() {
+        let url = serve_in_pieces(FORTY, true);
+        assert!(ShopClient::new().download(&url, "", |_, _| {}).is_err());
+    }
+
+    /// A body cut short of its declared length is an error even when there
+    /// is no digest to catch it.
+    #[test]
+    fn a_download_cut_short_is_an_error() {
+        let short: &'static [u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc";
+        let url = serve(short, 1);
+        assert!(ShopClient::new().download(&url, "", |_, _| {}).is_err());
     }
 
     #[test]

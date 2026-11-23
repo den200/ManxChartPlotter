@@ -267,4 +267,86 @@ mod tests {
         assert_eq!(parse_string(b"hello"), "hello");
         assert_eq!(parse_string(b""), "");
     }
+
+    fn record(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&((payload.len() + 6) as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    /// A header as OpenCPN writes one: version, name, scale, an extent of
+    /// four corners (SW, NW, NE, SE — each latitude first), then the first
+    /// feature record.
+    fn senc(version: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        record(&mut out, 1, &version.to_le_bytes());
+        record(&mut out, 2, b"DK4KATKS\0");
+        record(&mut out, 7, &180_000u32.to_le_bytes());
+        let mut extent = Vec::new();
+        for v in [55.0f64, 10.0, 56.5, 10.0, 56.5, 12.0, 55.0, 12.0] {
+            extent.extend_from_slice(&v.to_le_bytes());
+        }
+        record(&mut out, 100, &extent);
+        record(&mut out, 3, b"20240101\0");
+        record(&mut out, 64, &[7, 0, 1, 0]);
+        out
+    }
+
+    #[test]
+    fn a_header_reads_name_scale_extent_and_hands_back_the_first_feature() {
+        let mut reader = SencReader::from_bytes(senc(201));
+        let (header, overflow) = reader.read_header().unwrap();
+        assert_eq!(header.version, 201);
+        assert_eq!(header.cell_name, "DK4KATKS");
+        assert_eq!(header.native_scale, 180_000);
+        let e = header.extent.expect("extent");
+        // South-west and north-east corners, not the north-west one.
+        assert_eq!((e.min_lat, e.min_lon, e.max_lat, e.max_lon), (55.0, 10.0, 56.5, 12.0));
+        assert_eq!((header.ref_lat, header.ref_lon), (55.75, 11.0));
+        // The record that ended the header is not lost.
+        let first = overflow.expect("the first feature record");
+        assert_eq!(first.raw_type, 64);
+        assert_eq!(first.payload, vec![7, 0, 1, 0]);
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    /// Corrupt or foreign input is an error, never a panic, and a stream cut
+    /// short anywhere is either a clean error or a clean stop.
+    #[test]
+    fn bad_headers_are_refused() {
+        assert!(matches!(
+            SencReader::parse_header_only(&senc(199)),
+            Err(SencError::UnsupportedVersion(199))
+        ));
+        // A stream that does not start with the version record.
+        let mut no_version = Vec::new();
+        record(&mut no_version, 2, b"X\0");
+        assert!(matches!(SencReader::parse_header_only(&no_version), Err(SencError::Format(_))));
+        assert!(matches!(SencReader::parse_header_only(&[]), Err(SencError::UnexpectedEof)));
+        // A record whose length runs past the end of the data.
+        let mut long = Vec::new();
+        record(&mut long, 1, &201u16.to_le_bytes());
+        long.extend_from_slice(&[2, 0, 100, 0, 0, 0, b'X']);
+        assert!(matches!(SencReader::parse_header_only(&long), Err(SencError::Io(_))));
+        let full = senc(201);
+        for n in 0..full.len() {
+            let _ = SencReader::parse_header_only(&full[..n]);
+        }
+    }
+
+    /// Six zero bytes end the records; so does a length too small to hold
+    /// its own header, rather than looping on it.
+    #[test]
+    fn the_record_stream_stops_cleanly() {
+        let mut data = Vec::new();
+        record(&mut data, 64, &[1, 2]);
+        data.extend_from_slice(&[0; 6]);
+        record(&mut data, 64, &[3]);
+        let mut reader = SencReader::from_bytes(data);
+        assert_eq!(reader.next_record().unwrap().unwrap().payload, vec![1, 2]);
+        assert!(reader.next_record().unwrap().is_none());
+
+        let mut reader = SencReader::from_bytes(vec![64, 0, 3, 0, 0, 0, 9, 9, 9]);
+        assert!(reader.next_record().unwrap().is_none());
+    }
 }

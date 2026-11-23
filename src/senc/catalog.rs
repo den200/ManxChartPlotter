@@ -91,22 +91,26 @@ impl ChartInfo {
     /// Returns None if header has no extent (invalid chart)
     pub fn from_header(header: SencHeader, path: PathBuf) -> Option<Self> {
         let extent = header.extent?;
+        Some(Self::new(path, header.cell_name.clone(), header.native_scale, extent, header.ref_lat, header.ref_lon))
+    }
+
+    fn new(path: PathBuf, name: String, native_scale: u32, extent: CellExtent, ref_lat: f64, ref_lon: f64) -> Self {
         let id = Self::id_from_path(&path);
 
         // Convert WGS84 extent to Mercator bounds
         let (min_x, min_y) = latlon_to_mercator(extent.min_lat, extent.min_lon);
         let (max_x, max_y) = latlon_to_mercator(extent.max_lat, extent.max_lon);
 
-        Some(Self {
+        Self {
             id,
             path,
-            name: header.cell_name.clone(),
-            native_scale: header.native_scale,
+            name,
+            native_scale,
             extent_wgs84: extent,
             extent_mercator: TileBounds::new(min_x, max_x, min_y, max_y),
-            ref_lat: header.ref_lat,
-            ref_lon: header.ref_lon,
-        })
+            ref_lat,
+            ref_lon,
+        }
     }
 
     /// Check if this chart intersects tile bounds
@@ -120,6 +124,107 @@ impl ChartInfo {
             && x <= self.extent_mercator.max_x
             && y >= self.extent_mercator.min_y
             && y <= self.extent_mercator.max_y
+    }
+}
+
+/// The catalogue of a folder of o-charts cells, kept between starts.
+///
+/// Without it every start decrypts every cell only to read its name, scale
+/// and bounding box — sixteen seconds for the Danish set on a laptop, more
+/// on a plotter. Decrypted cells themselves are never stored (o-charts'
+/// conditions; see [`crate::cache`]), so this holds just those catalogue
+/// facts and no chart content: which cells exist and where they lie, as
+/// OpenCPN's chart database does. A cell is trusted to the index only
+/// while its file has the size and date it had when it was read.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CellIndex {
+    cells: std::collections::BTreeMap<String, IndexedCell>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct IndexedCell {
+    /// The cell file's size and modification time (seconds), as read.
+    size: u64,
+    modified: u64,
+    name: String,
+    native_scale: u32,
+    /// min_lat, max_lat, min_lon, max_lon.
+    extent: [f64; 4],
+    ref_lat: f64,
+    ref_lon: f64,
+}
+
+impl CellIndex {
+    /// Where the index for a chart folder is kept.
+    fn file_for(dir: &Path) -> Option<PathBuf> {
+        let mut h = DefaultHasher::new();
+        dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).hash(&mut h);
+        Some(crate::paths::cache_dir()?.join("index").join(format!("{:016x}.json", h.finish())))
+    }
+
+    fn load(file: &Path) -> Self {
+        std::fs::read(file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, file: &Path) {
+        let Ok(json) = serde_json::to_vec(self) else { return };
+        if let Some(parent) = file.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+        if std::fs::write(&tmp, json).and_then(|_| std::fs::rename(&tmp, file)).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    /// The size and date of a cell file, as the index records them.
+    fn stamp(path: &Path) -> Option<(u64, u64)> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?;
+        Some((meta.len(), modified.as_secs()))
+    }
+
+    /// The catalogue entry for a cell file, if the file is the one indexed.
+    fn info(&self, path: &Path) -> Option<ChartInfo> {
+        let cell = self.cells.get(path.file_name()?.to_str()?)?;
+        let (size, modified) = Self::stamp(path)?;
+        if (cell.size, cell.modified) != (size, modified) {
+            return None;
+        }
+        let [min_lat, max_lat, min_lon, max_lon] = cell.extent;
+        Some(ChartInfo::new(
+            path.to_path_buf(),
+            cell.name.clone(),
+            cell.native_scale,
+            CellExtent { min_lat, max_lat, min_lon, max_lon },
+            cell.ref_lat,
+            cell.ref_lon,
+        ))
+    }
+
+    fn remember(&mut self, info: &ChartInfo) {
+        let (Some(file), Some((size, modified))) = (
+            info.path.file_name().and_then(|n| n.to_str()),
+            Self::stamp(&info.path),
+        ) else {
+            return;
+        };
+        let e = info.extent_wgs84;
+        self.cells.insert(
+            file.to_string(),
+            IndexedCell {
+                size,
+                modified,
+                name: info.name.clone(),
+                native_scale: info.native_scale,
+                extent: [e.min_lat, e.max_lat, e.min_lon, e.max_lon],
+                ref_lat: info.ref_lat,
+                ref_lon: info.ref_lon,
+            },
+        );
     }
 }
 
@@ -140,15 +245,45 @@ impl ChartCatalog {
         }
     }
 
-    /// Scan directory for .oesu files and load headers only
+    /// Scan a directory for cells and read their headers.
     ///
-    /// Uses disk caching to speed up subsequent runs - first run decrypts all charts,
-    /// subsequent runs read from ~/.cache/manx/senc/
+    /// The first time, every o-charts cell is decrypted for its header; the
+    /// catalogue facts are then indexed ([`CellIndex`]) so later starts
+    /// decrypt nothing until a cell is drawn.
     pub fn from_directory(
         dir: &Path,
         keys: &KeyStore,
         decryptor: &mut CachedDecryptor,
     ) -> Result<Self, CatalogError> {
+        Self::scan(dir, None, keys, decryptor, CellIndex::file_for(dir).as_deref())
+    }
+
+    /// The chart folder a user opened, plus the free charts Manx downloaded
+    /// for them, which live in a folder of their own
+    /// ([`crate::shop::noaa::library`]) whatever chart folder is open. Free
+    /// charts an older Manx left inside this folder are moved out first.
+    pub fn from_chart_folder(
+        dir: &Path,
+        keys: &KeyStore,
+        decryptor: &mut CachedDecryptor,
+    ) -> Result<Self, CatalogError> {
+        let library = crate::shop::noaa::library();
+        if let Some(ref library) = library {
+            crate::shop::noaa::adopt(dir, library);
+        }
+        let free = library.map(|l| l.join("noaa"));
+        Self::scan(dir, free.as_deref(), keys, decryptor, CellIndex::file_for(dir).as_deref())
+    }
+
+    fn scan(
+        dir: &Path,
+        extra_s57: Option<&Path>,
+        keys: &KeyStore,
+        decryptor: &mut CachedDecryptor,
+        index_file: Option<&Path>,
+    ) -> Result<Self, CatalogError> {
+        let mut index = index_file.map(CellIndex::load).unwrap_or_default();
+        let mut fresh = CellIndex::default();
         let mut charts = Vec::new();
         let mut combined = None::<TileBounds>;
 
@@ -165,7 +300,10 @@ impl ChartCatalog {
 
         // Unencrypted S-57 cells, wherever they sit below the folder: NOAA
         // and most hydrographic offices ship `ENC_ROOT/<cell>/<cell>.000`.
-        let s57_cells = find_s57_cells(dir, 5);
+        let mut s57_cells = find_s57_cells(dir, 5);
+        if let Some(extra) = extra_s57.filter(|e| !e.starts_with(dir)) {
+            s57_cells.extend(find_s57_cells(extra, 5));
+        }
 
         if entries.is_empty() && s57_cells.is_empty() {
             return Err(CatalogError::EmptyDirectory);
@@ -220,6 +358,17 @@ impl ChartCatalog {
                 }
             };
 
+            // Indexed, and the file unchanged: nothing to decrypt.
+            if let Some(info) = index.info(&path) {
+                fresh.remember(&info);
+                combined = Some(match combined {
+                    Some(c) => c.union(&info.extent_mercator),
+                    None => info.extent_mercator,
+                });
+                charts.push(info);
+                continue;
+            }
+
             // Decrypt chart
             let senc_bytes = match decryptor.decrypt_chart(&path, &install_key) {
                 Ok(b) => b,
@@ -252,7 +401,17 @@ impl ChartCatalog {
                 None => info.extent_mercator,
             });
 
+            fresh.remember(&info);
             charts.push(info);
+        }
+
+        // Only what is in the folder now is kept: a cell that has gone
+        // leaves the index with it.
+        index.cells = fresh.cells;
+        if let Some(file) = index_file {
+            if !index.cells.is_empty() || file.exists() {
+                index.save(file);
+            }
         }
 
         if charts.is_empty() {
@@ -587,6 +746,53 @@ mod tests {
         assert!(some.len() < 50);
     }
 
+    /// A cell in the index is catalogued without decrypting it — here
+    /// there is no helper at all — and only while its file is the one that
+    /// was indexed: a changed file is not trusted to old facts. The index
+    /// holds the catalogue facts and nothing else.
+    #[test]
+    fn an_indexed_cell_is_catalogued_without_decrypting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cells = dir.path().join("set");
+        std::fs::create_dir_all(&cells).unwrap();
+        let cell = cells.join("OC-45-TEST.oesu");
+        std::fs::write(&cell, b"encrypted bytes").unwrap();
+        let index_file = dir.path().join("index.json");
+
+        let extent = CellExtent { min_lat: 55.0, max_lat: 56.0, min_lon: 12.0, max_lon: 13.0 };
+        let mut index = CellIndex::default();
+        index.remember(&ChartInfo::new(cell.clone(), "DK4TEST".into(), 22_000, extent, 55.5, 12.5));
+        index.save(&index_file);
+        let text = std::fs::read_to_string(&index_file).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut fields: Vec<&str> = entry["cells"]["OC-45-TEST.oesu"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort();
+        assert_eq!(fields, ["extent", "modified", "name", "native_scale", "ref_lat", "ref_lon", "size"]);
+
+        let mut keys = KeyStore::new();
+        keys.insert("OC-45-TEST", "KEY");
+        let scan = |file: &Path| {
+            let mut d = CachedDecryptor::s57_only_in(dir.path().join("cache"));
+            ChartCatalog::scan(&cells, None, &keys, &mut d, Some(file))
+        };
+        let catalog = scan(&index_file).expect("the indexed cell");
+        assert_eq!(catalog.charts.len(), 1);
+        assert_eq!(catalog.charts[0].name, "DK4TEST");
+        assert_eq!(catalog.charts[0].native_scale, 22_000);
+        assert_eq!(catalog.charts[0].extent_wgs84.max_lat, 56.0);
+
+        // The file changes (a new edition): the index no longer speaks for it.
+        std::fs::write(&cell, b"a different, longer encrypted file").unwrap();
+        assert!(matches!(scan(&index_file), Err(CatalogError::EmptyDirectory)));
+        // And with no index there is nothing to go on either.
+        assert!(matches!(scan(&dir.path().join("none.json")), Err(CatalogError::EmptyDirectory)));
+    }
+
     #[test]
     fn chart_info_id_is_stable() {
         let path1 = PathBuf::from("/some/path/chart.oesu");
@@ -712,19 +918,18 @@ mod tests {
     }
 
     /// The tile's scale is a ground scale: at 55.7°N a tile is shown at a
-    /// scale 1.78x larger than the Mercator metres per pixel alone suggest.
+    /// scale 1/cos 55.7° = 1.776x larger than the Mercator metres per pixel
+    /// alone suggest.
     #[test]
     fn a_tile_scale_is_measured_on_the_ground() {
         use crate::tiles::{latlon_to_mercator, tile_scale_denominator, TileId};
         let (mx, my) = latlon_to_mercator(55.7, 12.6);
         let z = 10u8;
-        let size = crate::tiles::meters_per_pixel(z) * 256.0;
-        let x = ((mx + 20_037_508.342789244) / size).floor() as u32;
-        let y = ((20_037_508.342789244 - my) / size).floor() as u32;
-        let ground = tile_scale_denominator(TileId::new(z, x, y), 4.0);
+        let ground = tile_scale_denominator(TileId::from_mercator(mx, my, z), 4.0);
         let mercator = crate::tiles::meters_per_pixel(z) * 4.0 * 1000.0;
         let ratio = mercator / ground;
-        assert!((1.7..1.85).contains(&ratio), "Mercator/ground = {ratio}");
+        // A z10 tile here is about 0.2° tall, which moves 1/cos by under 1 %.
+        assert!((ratio - 1.776).abs() < 0.015, "Mercator/ground = {ratio}");
     }
 
     #[test]
@@ -739,6 +944,7 @@ mod tests {
         assert_eq!(region.len(), 2);
         assert!(region.iter().any(|r| r.max_y <= 40.0));
         assert!(region.iter().any(|r| r.min_y >= 60.0));
+        assert!((area(&region) - 8000.0).abs() < 1e-9, "{region:?}");
 
         // A cut that misses changes nothing and reports so.
         let before = region.clone();
@@ -756,6 +962,84 @@ mod tests {
             0.01
         ));
         assert!(region.is_empty());
+    }
+
+    fn area(region: &[TileBounds]) -> f64 {
+        region.iter().map(|r| (r.max_x - r.min_x) * (r.max_y - r.min_y)).sum()
+    }
+
+    /// What is left after a cut is exactly the rectangle minus the cut — no
+    /// strip counted twice, none lost — or a chart would be kept (or dropped)
+    /// for ground that is not there.
+    #[test]
+    fn subtract_rect_keeps_exactly_what_the_cut_leaves() {
+        let whole = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        // A corner, an edge bite, a hole in the middle, and a sliver.
+        for (cut, left) in [
+            (TileBounds::new(50.0, 150.0, 50.0, 150.0), 7500.0),
+            (TileBounds::new(-10.0, 30.0, 20.0, 60.0), 8800.0),
+            (TileBounds::new(40.0, 60.0, 30.0, 70.0), 9200.0),
+        ] {
+            let mut region = vec![whole];
+            assert!(subtract_rect(&mut region, &cut, 0.01));
+            assert!((area(&region) - left).abs() < 1e-9, "{cut:?}: {region:?}");
+            // The pieces stay disjoint, so the next cut is measured right.
+            for (i, a) in region.iter().enumerate() {
+                for b in &region[i + 1..] {
+                    let overlap = (a.max_x.min(b.max_x) - a.min_x.max(b.min_x)).max(0.0)
+                        * (a.max_y.min(b.max_y) - a.min_y.max(b.min_y)).max(0.0);
+                    assert!(overlap < 1e-9, "{a:?} overlaps {b:?}");
+                }
+            }
+        }
+        // A strip thinner than eps is dropped as noise.
+        let mut region = vec![whole];
+        subtract_rect(&mut region, &TileBounds::new(0.005, 200.0, -1.0, 200.0), 0.01);
+        assert!(region.is_empty(), "{region:?}");
+    }
+
+    /// The world basemap stays under every tile it touches even when a
+    /// detailed chart's extent claims the whole tile: an extent is a
+    /// rectangle, and where the chart charts nothing the basemap is all
+    /// there is to draw.
+    #[test]
+    fn the_world_basemap_stays_under_a_covering_chart() {
+        let tile = TileBounds::new(0.0, 1000.0, 0.0, 1000.0);
+        let big = TileBounds::new(-9000.0, 9000.0, -9000.0, 9000.0);
+        let mut catalog = ChartCatalog::new();
+        let mut world = chart_at("world", crate::s57::basemap::SCALE, big);
+        world.path = crate::s57::basemap::path();
+        catalog.charts.push(world);
+        catalog.charts.push(chart_at("coarse", 180_000, big));
+        catalog.charts.push(chart_at("detailed", 12_000, big));
+        let names: Vec<&str> = catalog.charts_for_tile(&tile).iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["world", "detailed"], "basemap first, coarse chart hidden");
+    }
+
+    /// The cell search skips hidden folders and the ones that never hold
+    /// charts, stops at its depth, takes only `.000` base cells (not their
+    /// updates), and lists them sorted.
+    #[test]
+    fn the_cell_search_skips_what_it_should() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |rel: &str| {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"").unwrap();
+        };
+        put("ENC_ROOT/B/B.000");
+        put("ENC_ROOT/B/B.001");
+        put("ENC_ROOT/A/A.000");
+        put(".hidden/H.000");
+        put("node_modules/N.000");
+        put("Library/L.000");
+        put("a/b/c/d/DEEP.000");
+        let found = find_s57_cells(dir.path(), 2);
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| p.strip_prefix(dir.path()).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["ENC_ROOT/A/A.000", "ENC_ROOT/B/B.000"]);
     }
 
     #[test]

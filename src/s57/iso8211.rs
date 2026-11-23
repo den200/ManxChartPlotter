@@ -528,4 +528,25 @@ mod tests {
         assert!(m.records.iter().any(|r| r.field("VRID").is_some()));
         assert!(m.records.iter().any(|r| r.field("FRID").is_some()));
     }
+
+    /// Every length in an ISO 8211 file comes from the file. Cut short at
+    /// any byte, or with a leader whose lengths are nonsense, the parser
+    /// must return an error rather than index past the end.
+    #[test]
+    fn truncated_or_garbled_modules_do_not_panic() {
+        let bytes = include_bytes!("../../tests/fixtures/s57/US4MA1BD.000");
+        for n in 0..bytes.len() {
+            let _ = Module::parse(&bytes[..n]);
+        }
+        assert!(Module::parse(&bytes[..10]).is_err());
+        assert!(Module::parse(&[]).is_err());
+        // Flip each leader byte to a digit that makes its field absurd.
+        for i in 0..24 {
+            let mut b = bytes.to_vec();
+            b[i] = b'9';
+            let _ = Module::parse(&b);
+            b[i] = b'0';
+            let _ = Module::parse(&b);
+        }
+    }
 }

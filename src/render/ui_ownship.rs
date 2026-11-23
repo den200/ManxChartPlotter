@@ -117,23 +117,22 @@ fn unit(bearing: f32) -> Vec2 {
 mod tests {
     use super::*;
 
+    /// The four cardinal points land exactly where the screen puts them —
+    /// y grows downward, so north is negative y. Exact components rather
+    /// than signs, so a vector of the wrong length (a heading line drawn at
+    /// twice its reach) fails too.
     #[test]
     fn bearings_map_to_screen_directions() {
-        let north = unit(0.0);
-        assert!(north.x.abs() < 1e-6 && north.y < 0.0, "{north:?}");
-        let east = unit(std::f32::consts::FRAC_PI_2);
-        assert!(east.x > 0.0 && east.y.abs() < 1e-6, "{east:?}");
-        let south = unit(std::f32::consts::PI);
-        assert!(south.y > 0.0, "{south:?}");
-        let west = unit(3.0 * std::f32::consts::FRAC_PI_2);
-        assert!(west.x < 0.0, "{west:?}");
-    }
-
-    #[test]
-    fn a_unit_vector_stays_unit_length() {
-        for step in 0..16 {
-            let b = step as f32 * std::f32::consts::TAU / 16.0;
-            assert!((unit(b).length() - 1.0).abs() < 1e-5);
+        use std::f32::consts::{FRAC_PI_2, PI};
+        for (bearing, want) in [
+            (0.0, Vec2::new(0.0, -1.0)),
+            (FRAC_PI_2, Vec2::new(1.0, 0.0)),
+            (PI, Vec2::new(0.0, 1.0)),
+            (3.0 * FRAC_PI_2, Vec2::new(-1.0, 0.0)),
+            (PI / 4.0, Vec2::new(0.5f32.sqrt(), -(0.5f32.sqrt()))),
+        ] {
+            let got = unit(bearing);
+            assert!((got - want).length() < 1e-6, "{bearing} rad: {got:?}, wanted {want:?}");
         }
     }
 }

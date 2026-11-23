@@ -258,6 +258,56 @@ mod tests {
         assert_eq!(depare02(&feature, &settings), DepthColorToken::VeryShallow);
     }
 
+    /// Each shade starts *at* its contour: s52cnsy.cpp tests `drval1 >=`.
+    /// An area whose shallow limit is exactly the safety contour is safe
+    /// water; drawing it in the shallow shade (or the reverse, for an area
+    /// starting just short of it) is the fault this pins down.
+    #[test]
+    fn shade_boundaries_are_inclusive_of_the_contour() {
+        let settings = test_contours(); // shallow 2, safety 10, deep 30
+        let shade = |d1, d2| depare02(&make_depare(d1, d2), &settings);
+        assert_eq!(shade(0.0, 2.0), DepthColorToken::VeryShallow);
+        assert_eq!(shade(2.0, 5.0), DepthColorToken::MediumShallow);
+        assert_eq!(shade(9.9, 10.0), DepthColorToken::MediumShallow);
+        assert_eq!(shade(10.0, 15.0), DepthColorToken::MediumDeep);
+        assert_eq!(shade(29.9, 30.0), DepthColorToken::MediumDeep);
+        assert_eq!(shade(30.0, 50.0), DepthColorToken::DeepWater);
+    }
+
+    #[test]
+    fn two_shades_boundary_is_the_safety_contour() {
+        let mut settings = test_contours();
+        settings.depth_shade_mode = DepthShadeMode::TwoShades;
+        assert_eq!(
+            depare02(&make_depare(10.0, 15.0), &settings),
+            DepthColorToken::DeepWater
+        );
+        assert_eq!(
+            depare02(&make_depare(9.9, 15.0), &settings),
+            DepthColorToken::VeryShallow
+        );
+        // Drying ground stays DEPIT in either mode.
+        assert_eq!(
+            depare02(&make_depare(-1.0, 0.0), &settings),
+            DepthColorToken::Drying
+        );
+    }
+
+    #[test]
+    fn missing_depth_values_follow_opencpn_defaults() {
+        let settings = test_contours();
+        // No DRVAL1 at all: OpenCPN's default is -1 m, i.e. drying.
+        let mut f = make_depare(0.0, 0.0);
+        f.attributes = crate::senc::Attributes::new();
+        assert_eq!(depare02(&f, &settings), DepthColorToken::Drying);
+
+        // DRVAL1 but no DRVAL2: the shade follows DRVAL1 alone.
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("DRVAL1", AttributeValue::Float(12.0));
+        f.attributes = attributes;
+        assert_eq!(depare02(&f, &settings), DepthColorToken::MediumDeep);
+    }
+
     #[test]
     fn test_drgare_instructions() {
         let feature = make_drgare(5.0, 10.0);
@@ -265,13 +315,25 @@ mod tests {
         let instrs = depare02_instructions(&feature, &settings);
 
         // AC(depth shade) + AP(DRGARE01) + LS(DASH,1,CHGRF), per s52cnsy.cpp
-        assert_eq!(instrs.len(), 3);
-        assert!(matches!(instrs[0], RenderInstruction::AreaColor { .. }));
-        assert!(matches!(instrs[1], RenderInstruction::AreaPattern { .. }));
-        if let RenderInstruction::LineStyle { pattern, .. } = &instrs[2] {
-            assert_eq!(*pattern, LinePattern::Dashed);
-        } else {
-            panic!("Expected LineStyle");
-        }
+        let text: Vec<String> = instrs.iter().map(|i| i.to_s52()).collect();
+        assert_eq!(text, ["AC(DEPMS)", "AP(DRGARE01)", "LS(DASH,1,CHGRF)"]);
+    }
+
+    #[test]
+    fn drgare_without_drval1_is_painted_medium_deep() {
+        // s52cnsy.cpp: a dredged area with no DRVAL1 falls back to DEPMD
+        // rather than the drying shade a DEPARE would get.
+        let mut feature = make_drgare(0.0, 0.0);
+        feature.attributes = crate::senc::Attributes::new();
+        let instrs = depare02_instructions(&feature, &test_contours());
+        let text: Vec<String> = instrs.iter().map(|i| i.to_s52()).collect();
+        assert_eq!(text, ["AC(DEPMD)", "AP(DRGARE01)", "LS(DASH,1,CHGRF)"]);
+    }
+
+    #[test]
+    fn plain_depth_area_gets_only_its_shade() {
+        let instrs = depare02_instructions(&make_depare(12.0, 20.0), &test_contours());
+        let text: Vec<String> = instrs.iter().map(|i| i.to_s52()).collect();
+        assert_eq!(text, ["AC(DEPMD)"]);
     }
 }

@@ -11,7 +11,10 @@
 //!
 //! Five lanes, top to bottom, in the order a sailor asks the questions:
 //!
-//! * **Wind** — columns for the mean, a paler cap for the gust, arrows above.
+//! * **Wind** — columns for the median of the models, a paler cap for the
+//!   gust, arrows above; over them a band from the lightest model to the
+//!   strongest, and a line for the worst gust any of them gave. Under it a
+//!   thin strip says how far the models agree: green, amber, red.
 //! * **Sea** — the significant height as a filled curve, with its direction.
 //! * **Set** — the surface current, as a colour strip with arrows on it.
 //! * **Rain** — bars, because rain is a thing that happens in an hour.
@@ -28,7 +31,7 @@ use egui::{Align2, Color32, Context, FontId, Pos2, Rect, RichText, Sense, Stroke
 use super::spectrum;
 use super::ui::UiAction;
 use super::ui_batch::Batch;
-use crate::nav::pointfx::{self, PointForecast, Sample};
+use crate::nav::pointfx::{self, Confidence, PointForecast, Sample};
 
 /// Time spans the axis offers. Twelve hours is "this watch"; three days is
 /// "this passage".
@@ -40,12 +43,14 @@ const GUTTER: f32 = 58.0;
 /// each carry a strip of direction arrows across the top, so they need the
 /// height of that strip on top of the height of their plot.
 const H_WIND: f32 = 56.0;
+/// The models' agreement, tucked under the wind it is about.
+const H_AGREE: f32 = 7.0;
 const H_WAVE: f32 = 50.0;
 const H_CURRENT: f32 = 30.0;
 const H_RAIN: f32 = 20.0;
 const H_TIDE: f32 = 58.0;
 /// The lanes at their full size, in drawing order.
-const LANE_TALL: [f32; 5] = [H_WIND, H_WAVE, H_CURRENT, H_RAIN, H_TIDE];
+const LANE_TALL: [f32; 6] = [H_WIND, H_AGREE, H_WAVE, H_CURRENT, H_RAIN, H_TIDE];
 /// …and squeezed as far as they may go.
 ///
 /// A 7-inch Pi panel is 800×480, and between the menu bar and the instrument
@@ -54,8 +59,9 @@ const LANE_TALL: [f32; 5] = [H_WIND, H_WAVE, H_CURRENT, H_RAIN, H_TIDE];
 /// the bottom: the hour axis, which is the one thing that makes five stacked
 /// curves mean anything. So the lanes give way instead — proportionally,
 /// down to these floors — and the axis keeps its height whatever happens.
-const LANE_SHORT: [f32; 5] = [
+const LANE_SHORT: [f32; 6] = [
     ARROW_STRIP + 16.0,
+    5.0,
     ARROW_STRIP + 14.0,
     18.0,
     12.0,
@@ -68,6 +74,9 @@ const H_AXIS: f32 = 20.0;
 /// the sea lane's arrows sat close enough under the wind columns to read as
 /// part of them.
 const LANE_GAP: f32 = 11.0;
+/// The space under each lane. The agreement strip sits close under the wind
+/// columns, since it is their footnote and not a lane of its own.
+const GAPS: [f32; 6] = [3.0, LANE_GAP, LANE_GAP, LANE_GAP, LANE_GAP, LANE_GAP];
 
 /// The sheet's own state. Runtime only, like the wind field it replaced: a
 /// forecast belongs to a place and a moment, and a plotter that silently
@@ -131,6 +140,14 @@ impl SheetView {
     /// Is the cursor riding the present rather than parked?
     pub fn on_now(&self) -> bool {
         self.cursor_ms.is_none()
+    }
+
+    /// Is the whole sheet on the present: the cursor riding it and the
+    /// window following it? "Now" is what brings it back when either has
+    /// been moved — paging the window on with ▶ parks it in the future with
+    /// the cursor untouched, and the button must still work from there.
+    pub fn at_present(&self) -> bool {
+        self.cursor_ms.is_none() && self.window_start_ms.is_none()
     }
 
     /// The visible time window, clamped to whatever the forecast covers.
@@ -327,7 +344,7 @@ fn controls(
             if ui
                 .add_enabled(
                     !view.busy && !field.busy,
-                    egui::Button::new("Here").small(),
+                    egui::Button::new("Here"),
                 )
                 .on_hover_text(
                     "Take the whole forecast for what is on screen now — \
@@ -371,19 +388,19 @@ fn controls(
                 }
             }
             let step = view.span_hours * 3_600_000 / 2;
-            if ui.small_button("▶").on_hover_text("Later").clicked() {
+            if ui.button("▶").on_hover_text("Later").clicked() {
                 let (start, _) = view.window(now);
                 view.window_start_ms = Some(start + step);
             }
             if ui
-                .add_enabled(!view.on_now(), egui::Button::new("Now").small())
+                .add_enabled(!view.at_present(), egui::Button::new("Now"))
                 .on_hover_text("Put the cursor back on the present")
                 .clicked()
             {
                 view.cursor_ms = None;
                 view.window_start_ms = None;
             }
-            if ui.small_button("◀").on_hover_text("Earlier").clicked() {
+            if ui.button("◀").on_hover_text("Earlier").clicked() {
                 let (start, _) = view.window(now);
                 view.window_start_ms = Some(start - step);
             }
@@ -403,11 +420,14 @@ fn readout(
 ) {
     // In the speed unit the instruments use. The barbs and lanes stay in
     // knots — a barb's feathers are knots by definition — and say so.
-    let speed = |kt: f32, decimals: usize| {
+    let in_units = |kt: f32| {
         let kt = kt as f64;
         let r = crate::signalk::Quantity::Speed.format(kt * crate::geo::METRES_PER_NM / 3600.0, units);
-        let v: f64 = r.value.parse().unwrap_or(kt);
-        format!("{v:.decimals$} {}", r.unit)
+        (r.value.parse::<f64>().unwrap_or(kt), r.unit)
+    };
+    let speed = |kt: f32, decimals: usize| {
+        let (v, unit) = in_units(kt);
+        format!("{v:.decimals$} {unit}")
     };
     ui.horizontal_wrapped(|ui| {
         let t = view.cursor(now);
@@ -439,11 +459,49 @@ fn readout(
                 .filter(|g| *g > kt + 1.0)
                 .map(|g| format!(" gusts {}", speed(g, 0)))
                 .unwrap_or_default();
+            // The models' range, when it is a range worth printing.
+            let range = match (s.wind_lo_kt, s.wind_hi_kt) {
+                (Some(lo), Some(hi)) if hi - lo >= 1.0 => {
+                    format!(" ({:.0}–{:.0})", in_units(lo).0, in_units(hi).0)
+                }
+                _ => String::new(),
+            };
             chip(
                 ui,
                 spectrum::WIND_KT.paint(kt),
-                &format!("{}{gust} {}", speed(kt, 0), compass(from)),
-                "Wind: mean, gust, and the point it blows from",
+                &format!("{}{range}{gust} {}", speed(kt, 0), compass(from)),
+                "Wind: the models' median, their range in brackets, the gust, \
+                 and the point it blows from",
+            );
+        }
+        if let Some(n) = s.models.filter(|&n| n > 1) {
+            any = true;
+            let theme = crate::render::theme::current();
+            let (word, colour) = match s.confidence() {
+                Some(Confidence::Good) => ("agree", confidence_colour(Confidence::Good)),
+                Some(Confidence::Fair) => ("differ", confidence_colour(Confidence::Fair)),
+                Some(Confidence::Poor) => ("disagree", confidence_colour(Confidence::Poor)),
+                None => ("", theme.ink_dim),
+            };
+            let names = view
+                .data
+                .as_ref()
+                .map(|d| d.models.join(", "))
+                .unwrap_or_default();
+            let spread = match (s.wind_spread_kt, s.dir_spread_deg) {
+                (Some(kt), Some(deg)) => {
+                    format!("\nThe middle of the pack is {} and {deg:.0}° apart.", speed(kt, 0))
+                }
+                _ => String::new(),
+            };
+            chip(
+                ui,
+                colour,
+                format!("{n} models {word}").trim_end(),
+                &format!(
+                    "{names}.{spread}\nGreen: they agree — trust the forecast. Amber: they \
+                     differ — allow for it. Red: they disagree — plan for either."
+                ),
             );
         }
         if let Some(m) = s.wave_m {
@@ -514,7 +572,7 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
     }
     let (t0, t1) = view.window(now);
     let heights = lane_heights(ui.available_height());
-    let total = heights.iter().sum::<f32>() + H_AXIS + LANE_GAP * 5.0;
+    let total = heights.iter().sum::<f32>() + H_AXIS + GAPS.iter().sum::<f32>();
     let width = ui.available_width().max(GUTTER + 80.0);
     let (resp, painter) = ui.allocate_painter(Vec2::new(width, total), Sense::click_and_drag());
     let block = resp.rect;
@@ -594,7 +652,8 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
     }
 
     let mut y = block.top();
-    let mut lane = |h: f32| {
+    let mut lane = |i: usize| {
+        let h = heights[i];
         let r = Rect::from_min_max(
             Pos2::new(plot_left, y),
             Pos2::new(plot_right, y + h),
@@ -603,15 +662,16 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
             Pos2::new(block.left(), y),
             Pos2::new(plot_left - 4.0, y + h),
         );
-        y += h + LANE_GAP;
+        y += h + GAPS[i];
         (r, label)
     };
 
-    let (wind_r, wind_l) = lane(heights[0]);
-    let (wave_r, wave_l) = lane(heights[1]);
-    let (cur_r, cur_l) = lane(heights[2]);
-    let (rain_r, rain_l) = lane(heights[3]);
-    let (tide_r, tide_l) = lane(heights[4]);
+    let (wind_r, wind_l) = lane(0);
+    let (agree_r, agree_l) = lane(1);
+    let (wave_r, wave_l) = lane(2);
+    let (cur_r, cur_l) = lane(3);
+    let (rain_r, rain_l) = lane(4);
+    let (tide_r, tide_l) = lane(5);
 
     // One line, right-aligned, centred on the lane. Two lines collided with
     // the lane below on the short ones, and stacking a unit under a name was
@@ -626,12 +686,16 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
         );
     };
     name(wind_l, "Wind (kn)");
+    if data.models.len() > 1 {
+        name(agree_l, "Agree");
+    }
     name(wave_l, "Sea m");
     name(cur_l, "Set (kn)");
     name(rain_l, "Rain mm");
     name(tide_l, "Tide m");
 
     draw_wind(&mut b, &p, wind_r, data, ax, ink, faint);
+    draw_agree(&mut b, agree_r, data, ax);
     draw_wave(&mut b, &p, wave_r, data, ax, faint);
     draw_current(&mut b, cur_r, data, ax);
     draw_rain(&mut b, rain_r, data, ax);
@@ -689,8 +753,8 @@ fn lanes(ui: &mut egui::Ui, view: &mut SheetView, now: i64) {
 /// height, so the sheet keeps its proportions as it shrinks rather than
 /// collapsing one lane at a time. Room for everything means everything at
 /// full size; the arithmetic below only ever runs on a small screen.
-fn lane_heights(available: f32) -> [f32; 5] {
-    let fixed = H_AXIS + LANE_GAP * 5.0;
+fn lane_heights(available: f32) -> [f32; 6] {
+    let fixed = H_AXIS + GAPS.iter().sum::<f32>();
     let tall: f32 = LANE_TALL.iter().sum();
     let short: f32 = LANE_SHORT.iter().sum();
     // A panel that has not been measured yet reports nothing useful; full
@@ -753,11 +817,21 @@ fn arrow_step(px_per_ms: f32) -> i64 {
 /// The hours in the window that fall on a multiple of `step` hours UTC —
 /// a stable grid that does not shift as the window pans.
 fn stepped_hours(t0: i64, t1: i64, step: i64) -> impl Iterator<Item = i64> {
+    stepped_local_hours(t0, t1, step, 0)
+}
+
+/// The same grid counted from *local* midnight, for a clock `offset_ms`
+/// ahead of UTC: the axis is labelled in local hours, so its ticks belong
+/// on local hours. On the UTC grid, an hour ahead of UTC and stepping by
+/// six, the ticks fell on 01, 07, 13, 19 — never on midnight, so the day's
+/// name was never drawn; and in a half-hour zone the tick marked "05" stood
+/// at half past.
+fn stepped_local_hours(t0: i64, t1: i64, step: i64, offset_ms: i64) -> impl Iterator<Item = i64> {
     let h = 3_600_000i64;
     // A zero step would divide by zero building the grid; callers never send
     // one, and this is cheaper than trusting them.
     let span = step.max(1) * h;
-    let first = (t0.div_euclid(span) + 1) * span;
+    let first = ((t0 + offset_ms).div_euclid(span) + 1) * span - offset_ms;
     (0i64..)
         .map(move |i| first + i * span)
         .take_while(move |t| *t <= t1)
@@ -839,9 +913,9 @@ fn draw_wind(
     ink: Color32,
     faint: Color32,
 ) {
-    let peak = PointForecast::peak(&d.gust_kt)
+    let peak = [&d.gust_kt, &d.wind_kt, &d.wind_hi_kt, &d.gust_hi_kt]
         .into_iter()
-        .chain(PointForecast::peak(&d.wind_kt))
+        .filter_map(|s| PointForecast::peak(s))
         .fold(0.0f32, f32::max);
     if peak <= 0.0 {
         return;
@@ -880,6 +954,41 @@ fn draw_wind(
             ),
             colour,
         );
+    }
+
+    // Every model's answer, over the median's columns: a translucent band
+    // from the lightest to the strongest, and a line along the worst gust.
+    // A narrow band over a column is a forecast to trust; a wide one is a
+    // forecast to plan both ways for.
+    let y_of = |v: f32| bars.bottom() - h_of(v);
+    let pair = |s: &[Option<f32>], w: usize| {
+        Some((s.get(w).copied().flatten()?, s.get(w + 1).copied().flatten()?))
+    };
+    for w in 0..d.times.len().saturating_sub(1) {
+        let (ta, tb) = (d.times[w], d.times[w + 1]);
+        if tb < ax.t0 || ta > ax.t1 {
+            continue;
+        }
+        let (xa, xb) = (ax.x_of(ta), ax.x_of(tb));
+        if let (Some((loa, lob)), Some((hia, hib))) = (pair(&d.wind_lo_kt, w), pair(&d.wind_hi_kt, w)) {
+            if hia > loa || hib > lob {
+                b.quad(
+                    Pos2::new(xa, y_of(hia)),
+                    Pos2::new(xb, y_of(hib)),
+                    Pos2::new(xb, y_of(lob)),
+                    Pos2::new(xa, y_of(loa)),
+                    ink.gamma_multiply(0.16),
+                );
+            }
+        }
+        if let Some((ga, gb)) = pair(&d.gust_hi_kt, w) {
+            b.line(
+                Pos2::new(xa, y_of(ga)),
+                Pos2::new(xb, y_of(gb)),
+                1.0,
+                ink.gamma_multiply(0.45),
+            );
+        }
     }
 
     for t in ax.arrow_hours() {
@@ -929,6 +1038,35 @@ fn draw_wind(
         FontId::proportional(9.0),
         ink.gamma_multiply(0.7),
     );
+}
+
+/// The colour for an hour's agreement, shared by the strip and the readout.
+fn confidence_colour(c: Confidence) -> Color32 {
+    let theme = crate::render::theme::current();
+    match c {
+        Confidence::Good => theme.green,
+        Confidence::Fair => theme.amber,
+        Confidence::Poor => theme.red,
+    }
+}
+
+/// One block per hour, coloured by how far the models agree. An hour with
+/// too few models to judge is left empty rather than guessed green.
+fn draw_agree(b: &mut Batch, r: Rect, d: &PointForecast, ax: Axis) {
+    let hour = 3_600_000i64;
+    for &t in &d.times {
+        if t < ax.t0 - hour || t > ax.t1 + hour {
+            continue;
+        }
+        let Some(c) = d.at(t).confidence() else { continue };
+        b.rect(
+            Rect::from_min_max(
+                Pos2::new(ax.x_of(t - hour / 2), r.top()),
+                Pos2::new(ax.x_of(t + hour / 2), r.bottom()),
+            ),
+            confidence_colour(c).gamma_multiply(0.85),
+        );
+    }
 }
 
 fn draw_wave(
@@ -1062,7 +1200,8 @@ fn draw_rain(b: &mut Batch, r: Rect, d: &PointForecast, ax: Axis) {
         if mm < 0.05 {
             continue;
         }
-        let x = ax.x_of(t);
+        // Over the hour it fell in, which is the hour before its stamp.
+        let x = ax.x_of(t - hour / 2);
         let h = r.height() * (mm.sqrt() / top).clamp(0.08, 1.0);
         b.rect(
             Rect::from_min_max(
@@ -1204,7 +1343,8 @@ fn draw_axis(b: &mut Batch, p: &egui::Painter, r: Rect, ax: Axis, ink: Color32, 
         .unwrap_or(24);
 
     use chrono::Timelike as _;
-    for t in stepped_hours(ax.t0, ax.t1, step) {
+    let offset_ms = local_of(ax.t0).offset().local_minus_utc() as i64 * 1000;
+    for t in stepped_local_hours(ax.t0, ax.t1, step, offset_ms) {
         let x = ax.x_of(t);
         let local = local_of(t);
         let midnight = local.hour() == 0;
@@ -1353,7 +1493,7 @@ mod tests {
     /// overflow was clipped, and what fell off the bottom was the hour axis.
     #[test]
     fn a_short_panel_squeezes_the_lanes_and_keeps_the_axis() {
-        let fixed = H_AXIS + LANE_GAP * 5.0;
+        let fixed = H_AXIS + GAPS.iter().sum::<f32>();
         let full: f32 = LANE_TALL.iter().sum::<f32>() + fixed;
 
         // Room to spare changes nothing.
@@ -1369,10 +1509,20 @@ mod tests {
             "lanes still overflow: {:?}",
             h
         );
-        // Every lane gives way, none collapses, and the order holds.
-        for i in 0..5 {
+        // …and use all of it: squeezing harder than needed would pass the
+        // check above while throwing away room the curves could have had.
+        assert!(
+            (h.iter().sum::<f32>() + fixed - cramped).abs() < 0.01,
+            "lanes {:?} leave room unused",
+            h
+        );
+        // Every lane gives way together, none collapses: each sits the same
+        // fraction of the way from its floor to its full height.
+        let t = |i: usize| (h[i] - LANE_SHORT[i]) / (LANE_TALL[i] - LANE_SHORT[i]);
+        for i in 0..LANE_TALL.len() {
             assert!(h[i] >= LANE_SHORT[i] - 0.01, "lane {i} below its floor");
-            assert!(h[i] <= LANE_TALL[i] + 0.01, "lane {i} above full size");
+            assert!(h[i] < LANE_TALL[i], "lane {i} did not give way");
+            assert!((t(i) - t(0)).abs() < 1e-4, "lane {i} squeezed out of step");
         }
         // Squeezed further, they stop at their floors rather than vanishing.
         assert_eq!(lane_heights(10.0), LANE_SHORT);
@@ -1451,16 +1601,89 @@ mod tests {
         assert!(arrow_step(120.0 / (72.0 * 3_600_000.0)) >= 6);
     }
 
+    /// Paged on with ▶ the window is parked in the future although the
+    /// cursor was never touched: the sheet is not at the present, and "Now"
+    /// has something to undo.
+    #[test]
+    fn a_paged_window_is_not_at_the_present() {
+        let mut v = view_with_span(24);
+        assert!(v.at_present());
+        v.window_start_ms = Some(12 * HOUR);
+        assert!(v.on_now(), "the cursor still rides the present");
+        assert!(!v.at_present());
+        v.window_start_ms = None;
+        v.cursor_ms = Some(5_000);
+        assert!(!v.at_present());
+    }
+
+    /// An hour ahead of UTC (Copenhagen in winter), stepping by six: the
+    /// ticks are local 00, 06, 12 and 18 — UTC 23, 05, 11 and 17 — so one of
+    /// them is local midnight and carries the day's name. Five and a half
+    /// hours ahead (India), they are still on whole local hours.
+    #[test]
+    fn the_axis_ticks_fall_on_local_hours() {
+        let day = 24 * HOUR;
+        let local_hour = |t: i64, offset: i64| (t + offset).rem_euclid(day) as f64 / HOUR as f64;
+
+        let cet = HOUR;
+        let ticks: Vec<i64> = stepped_local_hours(100 * day, 101 * day, 6, cet).collect();
+        let hours: Vec<f64> = ticks.iter().map(|t| local_hour(*t, cet)).collect();
+        // The window opens at 00:00 UTC, which is 01:00 local.
+        assert_eq!(hours, [6.0, 12.0, 18.0, 0.0]);
+        assert_eq!(ticks[3], 100 * day + 23 * HOUR, "local midnight is 23:00 UTC");
+
+        let ist = 5 * HOUR + HOUR / 2;
+        let ticks: Vec<i64> = stepped_local_hours(100 * day, 101 * day, 3, ist).collect();
+        assert_eq!(ticks.len(), 8);
+        for t in ticks {
+            let h = local_hour(t, ist);
+            assert_eq!(h.fract(), 0.0, "a tick at local {h}");
+            assert_eq!(h % 3.0, 0.0);
+        }
+        // West of Greenwich too.
+        let nst = -(3 * HOUR + HOUR / 2);
+        assert!(stepped_local_hours(0, day, 12, nst).all(|t| local_hour(t, nst) % 12.0 == 0.0));
+    }
+
     #[test]
     fn the_hour_grid_is_anchored_to_the_clock_not_to_the_window() {
-        // Whatever the window's edge, ticks land on multiples of the step.
-        for offset in [0i64, 7 * 60_000, 59 * 60_000] {
-            let ticks: Vec<i64> =
-                stepped_hours(offset, offset + 12 * HOUR, 3).collect();
-            assert!(!ticks.is_empty());
-            for t in ticks {
-                assert_eq!(t % (3 * HOUR), 0, "tick {t} is off the grid");
-            }
+        // Whatever the window's edge, ticks land on multiples of the step —
+        // and every one of them inside the window is there, none skipped.
+        let minutes = 60_000i64;
+        for offset in [7 * minutes, 59 * minutes, 100 * HOUR + 7 * minutes] {
+            let ticks: Vec<i64> = stepped_hours(offset, offset + 12 * HOUR, 3).collect();
+            let base = offset - offset.rem_euclid(3 * HOUR);
+            let want: Vec<i64> = (1..=4).map(|k| base + k * 3 * HOUR).collect();
+            assert_eq!(ticks, want, "window from {offset}");
+        }
+        // Before 1970 the grid still holds (euclidean, not truncating, division).
+        let ticks: Vec<i64> = stepped_hours(-5 * HOUR, HOUR, 3).collect();
+        assert_eq!(ticks, [-3 * HOUR, 0]);
+        // A zero step must not divide by zero; it reads as hourly.
+        assert_eq!(stepped_hours(0, 2 * HOUR, 0).collect::<Vec<_>>(), [HOUR, 2 * HOUR]);
+    }
+
+    /// Day dividers fall on local midnight, whatever zone this runs in —
+    /// checked as a property, not against one zone's numbers, so the test
+    /// cannot pass by luck on the developer's machine and fail on the Pi.
+    #[test]
+    fn day_dividers_fall_on_local_midnight_and_inside_the_window() {
+        use chrono::Timelike as _;
+        // A fixed instant, so the result does not depend on today's date.
+        let t0 = 1_790_000_000_000i64 + 13 * 60_000;
+        let t1 = t0 + 72 * HOUR;
+        let m = midnights(t0, t1);
+        // Three days wide, starting off midnight: three dividers, give or
+        // take a zone whose clocks skip midnight on a changeover.
+        assert!((2..=3).contains(&m.len()), "{m:?}");
+        for w in m.windows(2) {
+            let gap = w[1] - w[0];
+            assert!((23 * HOUR..=25 * HOUR).contains(&gap), "dividers {gap} ms apart");
+        }
+        for &t in &m {
+            assert!(t >= t0 && t <= t1, "{t} outside the window");
+            let local = local_of(t);
+            assert_eq!((local.hour(), local.minute(), local.second()), (0, 0, 0), "{local}");
         }
     }
 
@@ -1498,6 +1721,13 @@ mod tests {
         let hi_y = tide_y(r, -1.0, 1.0, 1.0);
         let lo_y = tide_y(r, -1.0, 1.0, -1.0);
         assert!(hi_y < lo_y, "high water must draw higher on the screen");
+        // The extremes sit exactly at the padded edges — 20 % of 58 points,
+        // room for the labels — and mean water halfway between.
+        assert!((hi_y - 11.6).abs() < 1e-4, "{hi_y}");
+        assert!((lo_y - 46.4).abs() < 1e-4, "{lo_y}");
+        assert!((tide_y(r, -1.0, 1.0, 0.0) - 29.0).abs() < 1e-4);
+        // A reading past the range stays inside the lane.
+        assert_eq!(tide_y(r, -1.0, 1.0, 3.0), hi_y);
         // And a flat series must not divide by zero into infinity.
         assert!(tide_y(r, 0.5, 0.5, 0.5).is_finite());
     }

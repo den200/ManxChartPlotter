@@ -275,37 +275,123 @@ fn draw_one(batch: &mut Batch, barb: &WindBarb, colour: Color32, w: f32) {
 mod tests {
     use super::*;
 
+    /// The vertices one barb's colour pass draws, as they reach the screen.
+    fn drawn(kt: f32) -> Vec<egui::epaint::Vertex> {
+        let ctx = egui::Context::default();
+        let barb = WindBarb {
+            screen: [100.0, 100.0],
+            // From the north, so the shaft runs straight up the screen and
+            // the feathers hang off to the right.
+            from_deg: 0.0,
+            kt,
+            gust_kt: None,
+            alpha: 1.0,
+            label: 0.0,
+        };
+        let out = ctx.run(Default::default(), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::background());
+            let mut batch = Batch::new(ctx);
+            draw_one(&mut batch, &barb, Color32::WHITE, STROKE);
+            batch.paint(&painter);
+        });
+        out.shapes
+            .into_iter()
+            .find_map(|c| match c.shape {
+                egui::Shape::Mesh(m) => Some(m.vertices),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    /// Read a drawn barb back as (pennants, full barbs, half barbs), plus
+    /// how far each feather's root sits from the shaft's outer tip.
+    ///
+    /// A batched line is eight vertices, its first one the transparent rim;
+    /// a pennant is six, its first one solid. The first line is the shaft.
+    fn feathers(v: &[egui::epaint::Vertex]) -> ((usize, usize, usize), Vec<f32>) {
+        let mid = |a: egui::Pos2, b: egui::Pos2| egui::pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+        let tip = egui::pos2(100.0, 100.0 - SHAFT_PX);
+        let (mut pennants, mut fulls, mut halves) = (0, 0, 0);
+        let mut roots = Vec::new();
+        let mut i = 8;
+        while i < v.len() {
+            if v[i].color.a() == 0 {
+                let a = mid(v[i + 1].pos, v[i + 2].pos);
+                let b = mid(v[i + 5].pos, v[i + 6].pos);
+                if (b - a).length() > FEATHER_PX * 0.75 {
+                    fulls += 1;
+                } else {
+                    halves += 1;
+                }
+                roots.push((a - tip).length());
+                i += 8;
+            } else {
+                pennants += 1;
+                i += 6;
+            }
+        }
+        ((pennants, fulls, halves), roots)
+    }
+
     /// The feather count is the whole point of a barb: it must quantise the
-    /// way the convention says, or the display lies about the wind.
+    /// way the convention says, or the display lies about the wind. Read off
+    /// what `draw_one` actually draws — the test this replaced recomputed
+    /// the rule in a closure of its own and never called the drawing code.
     #[test]
     fn barb_feathers_quantise_to_the_convention() {
-        // (knots, pennants, full barbs, half barb)
-        let expect = |kt: f32| {
-            let mut r = (kt / 5.0).round() * 5.0;
-            let pennants = (r / 50.0).floor() as i32;
-            r -= pennants as f32 * 50.0;
-            let fulls = (r / 10.0).floor() as i32;
-            r -= fulls as f32 * 10.0;
-            (pennants, fulls, r >= 5.0)
-        };
-        assert_eq!(expect(5.0), (0, 0, true));
-        assert_eq!(expect(10.0), (0, 1, false));
-        assert_eq!(expect(15.0), (0, 1, true));
-        assert_eq!(expect(25.0), (0, 2, true));
-        assert_eq!(expect(50.0), (1, 0, false));
-        assert_eq!(expect(65.0), (1, 1, true));
-        // Rounding to the nearest five, not truncation: 12 kt is a full barb,
-        // 13 kt is a full barb and a half.
-        assert_eq!(expect(12.0), (0, 1, false));
-        assert_eq!(expect(13.0), (0, 1, true));
+        for (kt, want) in [
+            (5.0, (0, 0, 1)),
+            (10.0, (0, 1, 0)),
+            (15.0, (0, 1, 1)),
+            (25.0, (0, 2, 1)),
+            (50.0, (1, 0, 0)),
+            (65.0, (1, 1, 1)),
+            (110.0, (2, 1, 0)),
+            // Rounding to the nearest five, not truncation: 12 kt is a full
+            // barb, 13 kt is a full barb and a half, 47.6 is a pennant.
+            (12.0, (0, 1, 0)),
+            (13.0, (0, 1, 1)),
+            (47.6, (1, 0, 0)),
+        ] {
+            let v = drawn(kt);
+            assert!(v.len() >= 8, "{kt} kt drew no shaft");
+            assert_eq!(feathers(&v).0, want, "{kt} kt");
+        }
+    }
+
+    /// A half barb at the very tip reads as a full one at a glance, so on
+    /// its own it is set one gap in; after full barbs it follows them.
+    #[test]
+    fn a_lone_half_barb_stands_off_the_tip() {
+        let (_, roots) = feathers(&drawn(5.0));
+        assert_eq!(roots.len(), 1);
+        assert!((roots[0] - FEATHER_GAP).abs() < 0.01, "half barb {} from the tip", roots[0]);
+
+        let (_, roots) = feathers(&drawn(25.0));
+        assert!(roots[0].abs() < 0.01, "the first full barb belongs at the tip: {roots:?}");
+        assert!((roots[2] - 2.0 * FEATHER_GAP).abs() < 0.01, "{roots:?}");
+    }
+
+    /// A calm is a circle round the station point and nothing else — no
+    /// shaft pointing in an invented direction.
+    #[test]
+    fn a_calm_is_a_circle_with_no_shaft() {
+        let v = drawn(1.0);
+        assert!(!v.is_empty());
+        let centre = egui::pos2(100.0, 100.0);
+        let reach = v.iter().map(|p| (p.pos - centre).length()).fold(0.0f32, f32::max);
+        assert!(reach < 3.0 + STROKE + 1.0, "something reaches {reach} points out");
     }
 
     /// A barb on the water and a column in the sheet must agree, or the two
     /// displays are quietly telling different stories.
     #[test]
     fn a_barb_takes_its_colour_from_the_shared_ramp() {
+        // `paint` is what the sheet's wind lane calls; comparing with it
+        // rather than with the bare ramp keeps this true under any palette,
+        // whichever theme is live when the test runs.
         for kt in [0.0f32, 7.0, 18.5, 33.0, 70.0] {
-            assert_eq!(colour_for(kt), spectrum::WIND_KT.at(kt));
+            assert_eq!(colour_for(kt), spectrum::WIND_KT.paint(kt));
         }
     }
 
@@ -329,11 +415,36 @@ mod tests {
         assert!((label_reach(size, diag) - 7.0 * 2f32.sqrt()).abs() < 1e-3);
     }
 
+    /// The wash may never be drawn so faint it is pointless nor so solid it
+    /// hides a rock, whatever the setting says.
     #[test]
-    fn the_colours_climb_with_the_wind() {
-        let ordered = [3.0, 9.0, 16.0, 25.0, 40.0].map(colour_for);
-        for w in ordered.windows(2) {
-            assert_ne!(w[0], w[1], "each step must be distinguishable");
-        }
+    fn the_fill_opacity_is_held_inside_its_band() {
+        assert_eq!(fill_alpha(0.5), 128);
+        assert_eq!(fill_alpha(1.0), 230, "fully opaque would hide the chart");
+        assert_eq!(fill_alpha(0.0), 26, "fully clear would hide the weather");
+        assert_eq!(fill_alpha(f32::INFINITY), 230);
+    }
+
+    /// An empty fill is skipped before it reaches egui, where a mesh with no
+    /// triangles panics the renderer.
+    #[test]
+    fn a_fill_with_nothing_to_draw_is_empty() {
+        let grid = |kt: Vec<Option<f32>>, outside: Vec<bool>| WindFill {
+            screen: vec![[0.0, 0.0]; 4],
+            cols: 2,
+            rows: 2,
+            kt,
+            outside,
+            opacity: 0.5,
+        };
+        assert!(!grid(vec![Some(5.0); 4], vec![false; 4]).is_empty());
+        // A missing `outside` list means every corner is inside.
+        assert!(!grid(vec![Some(5.0); 4], Vec::new()).is_empty());
+        assert!(grid(vec![None; 4], vec![false; 4]).is_empty());
+        // Wind only on corners past the edge: nothing visible.
+        assert!(grid(vec![Some(5.0); 4], vec![true; 4]).is_empty());
+        // Fewer speeds than corners, or a single row: not a grid.
+        assert!(grid(vec![Some(5.0); 3], vec![false; 3]).is_empty());
+        assert!(WindFill { rows: 1, ..grid(vec![Some(5.0); 4], vec![false; 4]) }.is_empty());
     }
 }

@@ -387,10 +387,15 @@ fn worker_loop(
                     &catalog, &keys, &decryptor, &chart_cache, &coverage_cache,
                 );
                 let mut objects = Vec::new();
+                // Every cell the grab can reach into, not only the one the
+                // tap is in: a buoy just inside the next cell, tapped a few
+                // pixels this side of the edge, is within the tolerance and
+                // was never looked for.
+                let reach = tolerance_m * crate::pick::LINE_GRAB;
                 for info in catalog
                     .charts
                     .iter()
-                    .filter(|c| c.contains_point(mercator[0], mercator[1]))
+                    .filter(|c| c.extent_mercator.reaches(mercator[0], mercator[1], reach))
                 {
                     chart_last_used.insert(info.id, chart_tick);
                     match builder.load_chart(info) {

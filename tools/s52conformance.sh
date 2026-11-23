@@ -1,7 +1,15 @@
 #!/bin/sh
 # S-52 conformance run: diff manx's symbology resolution against OpenCPN's.
 #
-#   tools/s52conformance.sh <chart_dir_or_file> [out_dir] [max_charts]
+#   tools/s52conformance.sh <chart_dir_or_file> [out_dir] [max_charts] [-v]
+#
+# Free S-57 charts only (NOAA ENCs): `--dump-ir` writes chart features to
+# files, which o-charts' conditions do not allow for their charts.
+#
+# Exits non-zero when any feature diverges from OpenCPN for a reason that is
+# not one of the known deviations listed in tools/s52oracle/README.md — and
+# when the oracle itself fails, which once went unnoticed because its
+# errors were thrown away.
 #
 # Pipeline:
 #   manx --dump-ir   -> <out>.features.ndjson  (class/primitive/attributes)
@@ -13,7 +21,7 @@
 # divergence is always an engine difference, never a configuration difference.
 
 set -e
-CHARTS="${1:-charts/oeuSENC-DK-2025-1-20-base-macbook/}"
+CHARTS="${1:-charts/noaa-conformance/MA}"
 OUT="${2:-/tmp/s52conf}"
 MAX="${3:-}"
 
@@ -68,8 +76,19 @@ echo "== s52oracle (OpenCPN s52plib)"
     --depth-unit 1 \
     --display-cat "$DISPLAY_CAT" \
     ${VIEW_SCALE:+--view-scale $VIEW_SCALE} \
-    < "$OUT.features.ndjson" > "$OUT.oracle.ndjson" 2>/dev/null
+    < "$OUT.features.ndjson" > "$OUT.oracle.ndjson" 2> "$OUT.oracle.err" || {
+        echo "FAIL: s52oracle exited with an error:" >&2
+        tail -5 "$OUT.oracle.err" >&2
+        exit 2
+    }
+nfeat=$(wc -l < "$OUT.features.ndjson")
+nora=$(wc -l < "$OUT.oracle.ndjson")
+if [ "$nora" -ne "$nfeat" ]; then
+    echo "FAIL: the oracle resolved $nora of $nfeat features" >&2
+    exit 2
+fi
 
 echo "== diff"
 python3 "$ROOT/tools/s52diff.py" "$OUT.manx.ndjson" "$OUT.oracle.ndjson" \
-    --features "$OUT.features.ndjson" "$4"
+    --features "$OUT.features.ndjson" \
+    --safety-contour "$SAFETY_CONTOUR" --deep-contour "$DEEP_CONTOUR" ${4:+"$4"}

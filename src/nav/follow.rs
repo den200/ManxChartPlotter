@@ -13,7 +13,7 @@
 
 use uuid::Uuid;
 
-use super::model::{Route, WaypointSet};
+use super::model::{LegKind, Route, WaypointSet};
 use crate::geo::{self, LatLon, METRES_PER_NM};
 
 /// Following-level configuration.
@@ -39,6 +39,16 @@ pub struct Following {
     /// Index into the route's legs.
     pub leg: usize,
     pub config: FollowConfig,
+}
+
+/// A route as the follower saw it before an edit. See
+/// [`Following::retarget`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarksAhead {
+    /// The mark being steered to, then each after it.
+    ahead: Vec<Uuid>,
+    /// Every mark of the route, so that a new one can be told from an old.
+    known: Vec<Uuid>,
 }
 
 /// One update's answer: everything a helm or an autopilot needs.
@@ -93,10 +103,14 @@ impl Following {
         route.legs.get(self.leg).map(|l| l.to)
     }
 
-    /// The marks still ahead: the one being steered to, then each after it.
-    /// Taken before an edit and handed to [`retarget`](Self::retarget) after.
-    pub fn marks_ahead(&self, route: &Route) -> Vec<Uuid> {
-        route.legs.iter().skip(self.leg).map(|l| l.to).collect()
+    /// The marks still ahead — the one being steered to, then each after
+    /// it — with every mark the route has now. Taken before an edit and
+    /// handed to [`retarget`](Self::retarget) after.
+    pub fn marks_ahead(&self, route: &Route) -> MarksAhead {
+        MarksAhead {
+            ahead: route.legs.iter().skip(self.leg).map(|l| l.to).collect(),
+            known: route.waypoints.clone(),
+        }
     }
 
     /// Re-point the follower after the route's waypoint list was edited.
@@ -108,11 +122,21 @@ impl Following {
     /// ahead ([`marks_ahead`](Self::marks_ahead)), this steers to the first
     /// of them the route still has: the same mark if it survived, the next
     /// one if it was deleted — never skipping to the end of the route.
-    pub fn retarget(&mut self, route: &Route, ahead: &[Uuid]) {
-        self.leg = ahead
+    ///
+    /// And a mark *added* just before that one comes first: a waypoint put
+    /// in between the boat and the mark she was steering to is a dog-leg
+    /// round something, and steering straight past it at the old mark is
+    /// the one thing the crew asked not to do.
+    pub fn retarget(&mut self, route: &Route, before: &MarksAhead) {
+        let mut leg = before
+            .ahead
             .iter()
             .find_map(|mark| route.legs.iter().position(|l| l.to == *mark))
             .unwrap_or(route.legs.len().saturating_sub(1));
+        while leg > 0 && !before.known.contains(&route.legs[leg - 1].to) {
+            leg -= 1;
+        }
+        self.leg = leg;
     }
 
     /// Advance the state with a new fix and report guidance.
@@ -143,10 +167,24 @@ impl Following {
             let radius_nm = to
                 .arrival_radius_nm
                 .unwrap_or(self.config.default_arrival_radius_nm);
-            if dist_m / METRES_PER_NM > radius_nm {
-                break;
-            }
-            if self.leg + 1 >= route.legs.len() {
+            let last = self.leg + 1 >= route.legs.len();
+            // `<=` written so that a distance that is not a number (a mark
+            // with a broken position) never counts as arrival.
+            let inside = dist_m / METRES_PER_NM <= radius_nm;
+            if !inside {
+                // The spec's second trigger (§8.3): the perpendicular through
+                // the waypoint is crossed. A boat tacking, or set by current,
+                // that passes the mark outside its circle has still passed it.
+                // Not for the last mark: the route ends by arriving, and
+                // sailing past the end is something the crew should see.
+                let passed = !last
+                    && set
+                        .get(leg.from)
+                        .is_some_and(|from| passed_abeam(from.position, to.position, position));
+                if !passed {
+                    break;
+                }
+            } else if last {
                 finished = true;
                 break;
             }
@@ -158,14 +196,20 @@ impl Following {
         let to = set.get(leg.to)?;
 
         let (dtw_m, btw_rad) = geo::range_bearing(position, to.position);
-        let (_, bod_rad) = geo::range_bearing(from.position, to.position);
+        let bod_rad = match leg.kind {
+            LegKind::GreatCircle => geo::range_bearing(from.position, to.position).1,
+            LegKind::RhumbLine => super::model::rhumb(from.position, to.position).1,
+        };
         let btw_deg = btw_rad.to_degrees();
         let dtw_nm = dtw_m / METRES_PER_NM;
         let radius_nm = to
             .arrival_radius_nm
             .unwrap_or(self.config.default_arrival_radius_nm);
 
-        let xte_nm = cross_track_nm(from.position, to.position, position);
+        let xte_nm = match leg.kind {
+            LegKind::GreatCircle => cross_track_nm(from.position, to.position, position),
+            LegKind::RhumbLine => rhumb_cross_track_nm(from.position, to.position, position),
+        };
 
         let vmg_kt = match (sog_kt, cog_deg) {
             (Some(sog), Some(cog)) => Some(sog * (cog - btw_deg).to_radians().cos()),
@@ -198,6 +242,15 @@ impl Following {
     }
 }
 
+/// Whether `at` lies beyond the line through `to` at right angles to the leg
+/// `from → to`: seen from the mark, the boat and the leg's start are on
+/// opposite sides. A leg with no length has no such line.
+fn passed_abeam(from: LatLon, to: LatLon, at: LatLon) -> bool {
+    let (leg_m, back) = geo::range_bearing(to, from);
+    let (off_m, out) = geo::range_bearing(to, at);
+    leg_m > 1.0 && off_m.is_finite() && (out - back).cos() < 0.0
+}
+
 /// Signed cross-track distance from the leg `from → to`, in nautical miles.
 /// Positive to starboard of the leg.
 ///
@@ -212,6 +265,28 @@ fn cross_track_nm(from: LatLon, to: LatLon, at: LatLon) -> f64 {
     let (_, theta12) = geo::range_bearing(from, to);
     let xte_m = ((d13_m / R).sin() * (theta13 - theta12).sin()).asin() * R;
     xte_m / METRES_PER_NM
+}
+
+/// Signed distance from the rhumb line `from → to`, in nautical miles.
+/// Positive to starboard of the leg.
+///
+/// A rhumb line is straight on the Mercator chart, so the distance is
+/// measured there and brought back to the ground by the Mercator scale at
+/// the boat, cos(latitude). Exact for the small distances XTE is about.
+fn rhumb_cross_track_nm(from: LatLon, to: LatLon, at: LatLon) -> f64 {
+    const R: f64 = 6_371_008.8;
+    let north = |p: LatLon| (std::f64::consts::FRAC_PI_4 + p.lat.to_radians() / 2.0).tan().ln();
+    // East of `from`, the short way round.
+    let east = |p: LatLon| (p.lon - from.lon + 180.0).rem_euclid(360.0).to_radians() - std::f64::consts::PI;
+    let (lx, ly) = (east(to), north(to) - north(from));
+    let (px, py) = (east(at), north(at) - north(from));
+    let length = lx.hypot(ly);
+    if length < 1e-12 {
+        return 0.0;
+    }
+    // x east, y north: a positive cross product puts the boat to port.
+    let off = -(lx * py - ly * px) / length;
+    off * at.lat.to_radians().cos() * R / METRES_PER_NM
 }
 
 #[cfg(test)]
@@ -246,6 +321,80 @@ mod tests {
         (route, set)
     }
 
+    /// A 30 nm leg due east along 56°N. The rhumb line is the parallel
+    /// itself; the great circle bulges north of it by d²·tan φ / 8R at the
+    /// middle — 55 560² × tan 56° / (8 × 6 371 009) = 90 m. A boat on the
+    /// parallel at mid-leg is on a rhumb leg, and 90 m to starboard of a
+    /// great-circle one.
+    #[test]
+    fn a_rhumb_leg_is_followed_along_the_rhumb_line() {
+        let dlon = 30.0 / (60.0 * 56f64.to_radians().cos());
+        let mut set = WaypointSet::default();
+        let mut route = Route::new("east");
+        route.waypoints.push(set.insert(Waypoint::new("w", 56.0, 11.0)));
+        route.waypoints.push(set.insert(Waypoint::new("e", 56.0, 11.0 + dlon)));
+        route.recompute_legs(&set);
+        let mid = LatLon::new(56.0, 11.0 + dlon / 2.0);
+
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let g = f.update(&route, &set, mid, None, None).unwrap();
+        let great_m = g.xte_nm * METRES_PER_NM;
+        assert!((great_m - 90.0).abs() < 2.0, "great circle: {great_m} m");
+
+        route.make_legs_rhumb(&set);
+        assert_eq!(route.legs[0].kind, LegKind::RhumbLine);
+        let g = f.update(&route, &set, mid, None, None).unwrap();
+        assert!((g.xte_nm * METRES_PER_NM).abs() < 0.5, "rhumb: {} m", g.xte_nm * METRES_PER_NM);
+        assert!((g.bod_deg - 90.0).abs() < 1e-6, "{}", g.bod_deg);
+
+        // And the sign and size hold: 100 m south of the parallel is 100 m
+        // to starboard of an eastbound leg.
+        let south = geo::advance(mid, 180f64.to_radians(), 100.0);
+        let g = f.update(&route, &set, south, None, None).unwrap();
+        assert!((g.xte_nm * METRES_PER_NM - 100.0).abs() < 0.5, "{}", g.xte_nm * METRES_PER_NM);
+    }
+
+    /// Spec §8.3: advance "when inside the arrival circle or when the
+    /// perpendicular through the waypoint is crossed". Marks a-b-c-d lie on
+    /// 11°E; b is at 56.2°N. The boat passes b 0.15 nm to the west, outside
+    /// the default 0.1 nm circle.
+    #[test]
+    fn passing_a_mark_outside_its_circle_still_advances() {
+        let (route, set) = four_marks();
+        let b = LatLon::new(56.2, 11.0);
+        let abeam = geo::advance(b, 270f64.to_radians(), 0.15 * METRES_PER_NM);
+
+        // 0.05 nm short of the line through b: still steering to b.
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let before = geo::advance(abeam, 180f64.to_radians(), 0.05 * METRES_PER_NM);
+        let g = f.update(&route, &set, before, None, None).unwrap();
+        assert_eq!(g.to_name, "b");
+
+        // 0.05 nm beyond it: b is astern, the mark is now c.
+        let after = geo::advance(abeam, 0f64.to_radians(), 0.05 * METRES_PER_NM);
+        let g = f.update(&route, &set, after, None, None).unwrap();
+        assert_eq!(g.to_name, "c");
+        assert_eq!(f.leg, 1);
+        assert!(!g.finished);
+    }
+
+    /// Sailing past the last mark outside its circle does not end the route:
+    /// only arriving does.
+    #[test]
+    fn passing_the_last_mark_outside_its_circle_does_not_finish() {
+        let (route, set) = north_leg();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let end = LatLon::new(57.0, 11.0);
+        let past = geo::advance(
+            geo::advance(end, 270f64.to_radians(), 0.15 * METRES_PER_NM),
+            0.0,
+            0.05 * METRES_PER_NM,
+        );
+        let g = f.update(&route, &set, past, None, None).unwrap();
+        assert_eq!(g.to_name, "end");
+        assert!(!g.finished && !g.arrived);
+    }
+
     /// Editing the route under a follower must not silently retarget it.
     /// The crew chose a mark, not a leg number.
     #[test]
@@ -264,12 +413,12 @@ mod tests {
         assert_eq!(f.leg, 1);
         assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "d");
 
-        // Reverse the whole route: "d" leads it, so nothing follows it and
+        // Reverse the whole route: "d" leads it, so no leg ends at it and
         // the follower lands on the last leg rather than off the end.
         route.waypoints.reverse();
         route.recompute_legs(&set);
         f.retarget(&route, &ahead);
-        assert!(f.leg < route.legs.len(), "leg {} is past the end", f.leg);
+        assert_eq!(f.leg, route.legs.len() - 1, "leg {} of {}", f.leg, route.legs.len());
 
         // Delete the mark we were steering to: land on the last leg, and
         // never index past it.
@@ -284,6 +433,53 @@ mod tests {
         f.retarget(&route, &ahead);
         assert_eq!(f.leg, route.legs.len() - 1);
         assert!(f.update(&route, &set, LatLon::new(56.1, 11.0), None, None).is_some());
+    }
+
+    /// On a-b-c-d, steering to b, the crew puts X between a and b to go
+    /// round something. The boat steers to X, then b — not straight at b.
+    #[test]
+    fn a_mark_added_before_the_target_is_steered_to_first() {
+        let (mut route, mut set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "b");
+        let before = f.marks_ahead(&route);
+        let x = set.insert(Waypoint::new("x", 56.1, 11.05));
+        route.waypoints.insert(1, x);
+        route.recompute_legs(&set);
+        f.retarget(&route, &before);
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "x");
+
+        // Two added in a row: the first of them.
+        let before = f.marks_ahead(&route);
+        let y = set.insert(Waypoint::new("y", 56.05, 11.05));
+        let z = set.insert(Waypoint::new("z", 56.07, 11.05));
+        route.waypoints.insert(1, z);
+        route.waypoints.insert(1, y);
+        route.recompute_legs(&set);
+        f.retarget(&route, &before);
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "y");
+
+        // A mark added *after* the target changes nothing…
+        let (mut route, mut set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let before = f.marks_ahead(&route);
+        let later = set.insert(Waypoint::new("later", 56.3, 11.05));
+        route.waypoints.insert(2, later);
+        route.recompute_legs(&set);
+        f.retarget(&route, &before);
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "b");
+
+        // …and nor does one put ahead of the whole route while steering to
+        // c: the marks between are old ones, already passed.
+        let (mut route, mut set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        f.leg = 1;
+        let before = f.marks_ahead(&route);
+        let first = set.insert(Waypoint::new("first", 55.9, 11.0));
+        route.waypoints.insert(0, first);
+        route.recompute_legs(&set);
+        f.retarget(&route, &before);
+        assert_eq!(set.get(f.target(&route).unwrap()).unwrap().name, "c");
     }
 
     /// Deleting the mark being steered to moves on to the *next* mark, not
@@ -356,26 +552,32 @@ mod tests {
         route.recompute_legs(&set);
         let mut f = Following::start(&route, FollowConfig::default()).unwrap();
 
-        // Approaching b but outside 0.1 nm: still leg 0.
+        // Approaching b, just outside the 0.1 nm circle: still leg 0. (Close
+        // to the edge on purpose — a circle measured in kilometres or
+        // metres instead of miles would put the boat on the wrong side.)
         let near_b = geo::advance(
             LatLon::new(56.5, 11.0),
             180f64.to_radians(),
-            0.3 * METRES_PER_NM,
+            0.11 * METRES_PER_NM,
         );
         let g = f.update(&route, &set, near_b, None, None).unwrap();
         assert_eq!(g.leg, 0);
         assert_eq!(g.to_name, "b");
         assert!(!g.arrived && !g.finished);
 
-        // Inside the circle: the follower moves to the next leg in the same
-        // update — the guidance already points at c.
+        // Just inside the circle: the follower moves to the next leg in the
+        // same update — the guidance already points at c.
         let at_b = geo::advance(
             LatLon::new(56.5, 11.0),
             180f64.to_radians(),
-            0.05 * METRES_PER_NM,
+            0.09 * METRES_PER_NM,
         );
         let g = f.update(&route, &set, at_b, None, None).unwrap();
         assert_eq!(g.leg, 1);
+        assert_eq!(g.to_name, "c");
+        assert!(!g.arrived && !g.finished, "arrival is judged against c now");
+        // Drifting back out of b's circle does not undo the advance.
+        let g = f.update(&route, &set, near_b, None, None).unwrap();
         assert_eq!(g.to_name, "c");
 
         // Inside the final circle: finished, and it stays finished.
@@ -478,8 +680,8 @@ mod tests {
         let g = f
             .update(&route, &set, LatLon::new(56.1, 11.0), Some(5.0), Some(0.0))
             .unwrap();
-        let later: f64 = route.legs[1..].iter().map(|l| l.distance_nm).sum();
-        assert!((g.dtg_nm - (g.dtw_nm + later)).abs() < 1e-9);
+        // 0.1° to b, then 0.2° and 0.2° more: half a degree of latitude.
+        assert!((g.dtw_nm - 6.0).abs() < 0.05, "{}", g.dtw_nm);
         assert!((g.dtg_nm - 30.0).abs() < 0.2, "{}", g.dtg_nm);
         assert_eq!(g.sog_kt, Some(5.0));
 
@@ -489,5 +691,130 @@ mod tests {
             .update(&route, &set, LatLon::new(56.5, 11.0), None, None)
             .unwrap();
         assert!((g.dtg_nm - g.dtw_nm).abs() < 1e-9);
+    }
+
+    /// A leg index left past the end — the route was shortened and nobody
+    /// retargeted — steers the last leg, not off the end of the list.
+    #[test]
+    fn a_leg_index_past_the_end_steers_the_last_leg() {
+        let (route, set) = four_marks();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        f.leg = 7;
+        let g = f
+            .update(&route, &set, LatLon::new(56.1, 11.0), None, None)
+            .expect("guidance on the last leg");
+        assert_eq!(g.leg, 2);
+        assert_eq!(g.to_name, "d");
+        assert_eq!(f.leg, 2);
+    }
+
+    /// Exactly on the arrival circle is inside it: `arrived` is
+    /// `dtw <= radius`, and on the last mark arriving is finishing. The two
+    /// flags must not disagree on the circle's edge.
+    #[test]
+    fn exactly_on_the_final_circle_is_arrived_and_finished() {
+        let mut set = WaypointSet::default();
+        let mut route = Route::new("edge");
+        route.waypoints.push(set.insert(Waypoint::new("start", 56.0, 11.0)));
+        let fix = LatLon::new(56.9, 11.02);
+        let (d_m, _) = geo::range_bearing(fix, LatLon::new(57.0, 11.0));
+        let mut end = Waypoint::new("end", 57.0, 11.0);
+        // The circle drawn through the fix itself.
+        end.arrival_radius_nm = Some(d_m / METRES_PER_NM);
+        route.waypoints.push(set.insert(end));
+        route.recompute_legs(&set);
+
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let g = f.update(&route, &set, fix, None, None).unwrap();
+        assert!(g.arrived, "on the circle is inside it");
+        assert!(g.finished, "arrived at the last mark but not finished");
+    }
+
+    /// An eastbound leg along the equator, from 0°E to 1°E, so the mark
+    /// bears exactly 090° from anywhere on it.
+    fn east_leg() -> (Route, WaypointSet) {
+        let mut set = WaypointSet::default();
+        let mut route = Route::new("east");
+        route.waypoints.push(set.insert(Waypoint::new("west", 0.0, 0.0)));
+        route.waypoints.push(set.insert(Waypoint::new("east", 0.0, 1.0)));
+        route.recompute_legs(&set);
+        (route, set)
+    }
+
+    /// VMG is SOG times the cosine of the angle between the course and the
+    /// bearing to the mark. With the mark at 090° (not 000°, where adding
+    /// and subtracting the bearing agree): course 090° closes at full speed,
+    /// 030° and 150° at half, 270° opens at full speed.
+    #[test]
+    fn vmg_measures_the_course_against_the_bearing_to_the_mark() {
+        let (route, set) = east_leg();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let at = LatLon::new(0.0, 0.5);
+        let g = f.update(&route, &set, at, Some(6.0), Some(90.0)).unwrap();
+        assert!((g.btw_deg - 90.0).abs() < 1e-6, "btw {}", g.btw_deg);
+        for (cog, want) in [(90.0, 6.0), (30.0, 3.0), (150.0, 3.0), (270.0, -6.0)] {
+            let g = f.update(&route, &set, at, Some(6.0), Some(cog)).unwrap();
+            let vmg = g.vmg_kt.unwrap();
+            assert!((vmg - want).abs() < 0.01, "cog {cog}: vmg {vmg}, want {want}");
+        }
+    }
+
+    /// Looking east along an eastbound leg, north is to port: negative XTE.
+    /// The distance from the equator to 0.1°N is the meridian arc, 0.1° on
+    /// a meridian radius of a(1 − e²) = 6 335 439 m: 11 057 m, 5.971 NM.
+    /// (A due-north leg cannot tell the leg's bearing added from subtracted;
+    /// an eastbound one can.)
+    #[test]
+    fn north_of_an_eastbound_leg_is_port() {
+        let (route, set) = east_leg();
+        let mut f = Following::start(&route, FollowConfig::default()).unwrap();
+        let arc_nm = 6_335_439.0 * 0.1f64.to_radians() / METRES_PER_NM;
+        let g = f.update(&route, &set, LatLon::new(0.1, 0.5), None, None).unwrap();
+        assert!((g.xte_nm + arc_nm).abs() < 0.01, "north: {} want {}", g.xte_nm, -arc_nm);
+        let g = f.update(&route, &set, LatLon::new(-0.1, 0.5), None, None).unwrap();
+        assert!((g.xte_nm - arc_nm).abs() < 0.01, "south: {} want {}", g.xte_nm, arc_nm);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Anywhere on the globe (away from the poles), on any leg: a boat
+        /// put a known distance to starboard of a point on the leg reads
+        /// that distance, positive; the same distance to port reads it
+        /// negative; and the distance off a line can never exceed the
+        /// distance to either of the line's ends.
+        #[test]
+        fn xte_changes_sign_across_the_track_and_never_exceeds_the_range_to_either_end(
+            lat in -60.0f64..60.0,
+            lon in -170.0f64..170.0,
+            leg_deg in 0.0f64..360.0,
+            leg_nm in 1.0f64..50.0,
+            frac in 0.1f64..0.9,
+            off_nm in 0.01f64..2.0,
+        ) {
+            use std::f64::consts::FRAC_PI_2;
+            let from = LatLon::new(lat, lon);
+            let to = geo::advance(from, leg_deg.to_radians(), leg_nm * METRES_PER_NM);
+            let on = geo::advance(from, leg_deg.to_radians(), frac * leg_nm * METRES_PER_NM);
+            // The leg's own direction at this point, which on a geodesic
+            // is not the direction it started in.
+            let (_, track) = geo::range_bearing(on, to);
+            let stbd = geo::advance(on, track + FRAC_PI_2, off_nm * METRES_PER_NM);
+            let port = geo::advance(on, track - FRAC_PI_2, off_nm * METRES_PER_NM);
+            let xs = cross_track_nm(from, to, stbd);
+            let xp = cross_track_nm(from, to, port);
+            prop_assert!(xs > 0.0, "starboard read {xs}");
+            prop_assert!(xp < 0.0, "port read {xp}");
+            prop_assert!((xs - off_nm).abs() < 0.01 * off_nm + 1e-4, "{xs} for {off_nm}");
+            prop_assert!((xp + off_nm).abs() < 0.01 * off_nm + 1e-4, "{xp} for {off_nm}");
+            for (p, x) in [(stbd, xs), (port, xp)] {
+                let d_from = geo::distance_m(from, p) / METRES_PER_NM;
+                let d_to = geo::distance_m(to, p) / METRES_PER_NM;
+                // 1% for the sphere-versus-ellipsoid difference in scale.
+                prop_assert!(x.abs() <= d_from.min(d_to) * 1.01, "|{x}| vs {d_from}, {d_to}");
+            }
+        }
     }
 }

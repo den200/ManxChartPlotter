@@ -233,6 +233,20 @@ impl Route {
     /// Existing [`LegPlan`]s survive only where a leg still joins the same two
     /// waypoints — editing the middle of a route must not leave stale plans
     /// claiming ETAs for legs that no longer exist.
+    /// Make every leg a rhumb line, and measure it as one.
+    ///
+    /// For routes the planners generate: they prove a leg clear of hazards
+    /// along the straight line on the Mercator chart, which is the rhumb
+    /// line. Followed as a great circle instead, a 30-mile east–west leg at
+    /// 56°N would have the boat 90 m off the line that was checked while
+    /// the cross-track error read zero.
+    pub fn make_legs_rhumb(&mut self, set: &WaypointSet) {
+        for leg in &mut self.legs {
+            leg.kind = LegKind::RhumbLine;
+        }
+        self.recompute_legs(set);
+    }
+
     pub fn recompute_legs(&mut self, set: &WaypointSet) {
         let old: Vec<Leg> = std::mem::take(&mut self.legs);
         self.legs = self
@@ -290,7 +304,7 @@ pub fn leg_measure(kind: LegKind, from: LatLon, to: LatLon) -> (f64, f64) {
 /// wherever accuracy matters. The standard loxodrome formulas: the bearing
 /// comes from the meridional-parts stretch, and the east–west term uses the
 /// mean-latitude correction `q`.
-fn rhumb(a: LatLon, b: LatLon) -> (f64, f64) {
+pub(crate) fn rhumb(a: LatLon, b: LatLon) -> (f64, f64) {
     const R: f64 = 6_371_008.8;
     let phi1 = a.lat.to_radians();
     let phi2 = b.lat.to_radians();
@@ -341,9 +355,9 @@ mod tests {
         assert_eq!(route.legs.len(), 2);
         assert_eq!(route.legs[0].from, ids[0]);
         assert_eq!(route.legs[0].to, ids[1]);
-        // Each leg is roughly 35 nm (half a degree of lat and lon at 56 N),
+        // Each leg is about 34 nm (half a degree of lat and lon at 56 N),
         // and the total is their sum.
-        assert!((30.0..40.0).contains(&route.legs[0].distance_nm));
+        assert!((33.5..35.0).contains(&route.legs[0].distance_nm), "{}", route.legs[0].distance_nm);
         let total = route.total_distance_nm();
         assert!((total - route.legs[0].distance_nm - route.legs[1].distance_nm).abs() < 1e-9);
         // First leg heads north-east, second north-west.
@@ -373,10 +387,14 @@ mod tests {
         assert_eq!(route.legs.len(), 1);
         assert!(route.legs[0].plan.is_none());
 
-        // But an untouched leg keeps its plan.
+        // But a leg whose two marks survive keeps its plan and its kind,
+        // even when an edit elsewhere renumbers the legs: here a new first
+        // mark pushes b→c from leg 1 to leg 2.
+        let (mut set, ids) = set_of(&[("a", 56.0, 11.0), ("b", 56.5, 11.5), ("c", 57.0, 11.0)]);
         let mut route = Route::new("again");
         route.waypoints = ids.clone();
         route.recompute_legs(&set);
+        route.legs[1].kind = LegKind::RhumbLine;
         route.legs[1].plan = Some(LegPlan {
             eta: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
             twa_deg: 90.0,
@@ -385,8 +403,14 @@ mod tests {
             expected_stw_kt: 6.5,
             tack_state: TackState::Port,
         });
+        let new_first = set.insert(Waypoint::new("z", 55.5, 11.0));
+        route.waypoints.insert(0, new_first);
         route.recompute_legs(&set);
-        assert!(route.legs[1].plan.is_some());
+        assert_eq!(route.legs.len(), 3);
+        assert!(route.legs[0].plan.is_none() && route.legs[1].plan.is_none());
+        assert_eq!((route.legs[2].from, route.legs[2].to), (ids[1], ids[2]));
+        assert_eq!(route.legs[2].plan.as_ref().map(|p| p.tws_kt), Some(10.0));
+        assert_eq!(route.legs[2].kind, LegKind::RhumbLine);
     }
 
     #[test]
@@ -408,9 +432,15 @@ mod tests {
         let expected = 6_371_008.8 * (56f64).to_radians().cos() * (1f64).to_radians();
         assert!((rm - expected).abs() < 1.0, "{rm} vs {expected}");
 
-        // Crossing the antimeridian goes the short way, west.
-        let (_, rb) = rhumb(LatLon::new(0.0, 179.5), LatLon::new(0.0, -179.5));
+        // Crossing the antimeridian goes the short way: east, one degree of
+        // the equator, not 359 of them west.
+        let (rm, rb) = rhumb(LatLon::new(0.0, 179.5), LatLon::new(0.0, -179.5));
         assert!((rb.to_degrees() - 90.0).abs() < 1e-9, "{}", rb.to_degrees());
+        let one_degree = 6_371_008.8 * 1f64.to_radians();
+        assert!((rm - one_degree).abs() < 1.0, "{rm} vs {one_degree}");
+        // And back the other way, west.
+        let (_, rb) = rhumb(LatLon::new(0.0, -179.5), LatLon::new(0.0, 179.5));
+        assert!((rb.to_degrees() - 270.0).abs() < 1e-9, "{}", rb.to_degrees());
     }
 
     #[test]

@@ -1,12 +1,12 @@
 <img src="doc/logo/logo.png" alt="Manx" width="420">
 
-# Manx
+# Manx chart plotter
 
-A fast, light chart plotter for the Raspberry Pi, Linux, macOS, Windows and Android.
+Manx is a free, open-source chart plotter for boats. It runs on the Raspberry Pi 5, Linux, macOS, Windows and Android, draws official S-57 charts to the S-52 standard at 60 frames a second, reads boat data from Signal K, and plans routes with weather routing. Written in Rust.
 
 **Beta. Not for navigation.** [Download](https://github.com/den200/ManxChartPlotter/releases/latest) · [Features](#features) · [Screenshots](#screenshots) · [Performance](#performance)
 
-![Manx on the approach to Copenhagen](doc/img/hero.png)
+![Manx in Hingham Bay, Massachusetts](doc/img/hero.png)
 
 ## Why Manx
 
@@ -37,9 +37,11 @@ A chart plotter can be blazing fast. Manx proves it.
 |---|---|
 | ![Dusk](doc/img/dusk.png) | ![Night](doc/img/night.png) |
 
-| Wind and gusts over the Kattegat | Forecast for where you are |
+| Wind and gusts | Forecast for where you are |
 |---|---|
 | ![Wind barbs with gusts](doc/img/wind.png) | ![The weather sheet](doc/img/sheet.png) |
+
+The screenshots show free NOAA charts of Hingham Bay, Massachusetts.
 
 ## Performance
 
@@ -86,11 +88,18 @@ To build it yourself: `cargo run --release -- /path/to/charts`. Raspberry Pi: [d
 
 ## o-charts terms
 
-o-charts licenses its charts for OpenCPN and for programs derived from OpenCPN's presentation and encryption code. Manx is one of those. Their [terms](https://o-charts.org) apply as for OpenCPN, with three points to know:
+o-charts licenses its charts for OpenCPN and for programs derived from OpenCPN's presentation and encryption code. Manx is one of those. o-charts set out the conditions for such programs in October 2026; this is how they apply in Manx.
 
+- **You accept o-charts' licence agreement (EULA) before the charts are installed and used.** It comes with every chart set. Manx shows it before a download and again, in full, before a set is first opened. You can read it at any time in Charts → My o-charts → o-charts licence agreement. It is [published here](https://o-charts.org/manuals/docs/EN_rrc_eula_ChartSetsForOpenCPN.html).
+- **o-charts chart sets are not official charts.** They cannot be used to meet carriage requirements.
+- **Each machine uses one of your installs.** A licence allows two or five, depending on the chart. Manx shows how many are used and asks before it uses one. Cloning a system, or running Manx in a virtual machine to share an install, breaks the licence.
+- **On Android, each app uses its own install.** Charts installed in Manx can't be shared with any other app, OpenCPN included.
+- **A chart set can only be installed while its licence runs.** Charts already installed keep working after it expires; Manx will not download or install a set on an expired licence.
+- **Nothing decrypted is kept.** The charts stay encrypted on disk and are decrypted into memory while Manx runs. Manx stores no decrypted chart data and no picture of the charts, and its developer tools refuse to export either.
+- **No chart service for others.** The licence does not cover serving the charts to third parties over a network, and Manx does not do it.
 - **Support for Manx is ours, not o-charts'.** o-charts supports OpenCPN only. Questions about using o-charts in Manx go to [Manx's issues](https://github.com/den200/ManxChartPlotter/issues), not to o-charts.
-- **Each machine uses a licence slot**, as in OpenCPN.
-- **On Android, each app uses its own slot.** Charts installed in Manx count as one of your permitted installations and can't be shared with any other app, OpenCPN included. To use the same charts in OpenCPN on that device, OpenCPN needs another slot.
+
+Manx is free software under the GPL, as OpenCPN is. o-charts neither endorses nor supports Manx.
 
 ## The name
 

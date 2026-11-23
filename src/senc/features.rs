@@ -1193,6 +1193,25 @@ mod tests {
         assert_eq!(s57_attribute_name(13), Some("CATCAM"));
     }
 
+    /// A SENC cut short anywhere — a cache file half written, a helper that
+    /// died mid-reply — fails or yields fewer features; it never panics.
+    #[test]
+    fn a_truncated_senc_never_panics() {
+        let path = std::path::PathBuf::from(format!(
+            "{}/tests/fixtures/s57/US4MA1BD.000",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let cell = crate::s57::cell::Cell::open(&path).unwrap();
+        let bytes = crate::s57::senc_encode::encode(&cell);
+        let whole = ChartData::parse(bytes.clone()).unwrap().features.len();
+        assert!(whole > 0);
+        for n in (0..bytes.len()).step_by(3) {
+            if let Ok(chart) = ChartData::parse(bytes[..n].to_vec()) {
+                assert!(chart.features.len() <= whole, "{n} bytes gave more features");
+            }
+        }
+    }
+
     #[test]
     fn maps_vertical_clearance_attributes() {
         assert_eq!(s57_attribute_name(181), Some("VERCLR"));

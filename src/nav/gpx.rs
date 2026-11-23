@@ -108,14 +108,8 @@ pub fn parse(text: &str) -> Result<GpxDocument, GpxError> {
                     doc.loose.push(wp.id);
                     doc.waypoints.insert(wp);
                 }
-                // Tracks are a recorder's output, not a plan; Manx neither
-                // edits nor rewrites files containing them (see the store),
-                // so skipping is safe rather than lossy.
-                b"trk" => {
-                    reader
-                        .read_to_end(QName(b"trk"))
-                        .map_err(|e| GpxError::Xml(e.to_string()))?;
-                }
+                // An empty `<trk/>` has no end tag to read to, and nothing
+                // in it to skip.
                 _ => {}
             },
             Ok(Event::Eof) => break,
@@ -153,6 +147,11 @@ fn point_from_attrs(
         }
     }
     match (lat, lon) {
+        // "NaN" and "inf" parse as numbers. A mark at no position poisons
+        // every distance reckoned from it, so it is refused here.
+        (Some(lat), Some(lon)) if !(lat.abs() <= 90.0 && lon.abs() <= 180.0) => Err(
+            GpxError::Malformed(format!("<{tag}> at lat {lat}, lon {lon}: not a position")),
+        ),
         (Some(lat), Some(lon)) => Ok(Waypoint::new("", lat, lon)),
         _ => Err(GpxError::Malformed(format!("<{tag}> without lat/lon"))),
     }
@@ -594,6 +593,36 @@ fn esc(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// GPX 1.1: latitude is −90…90 and longitude −180…180 decimal degrees.
+    /// Rust reads "NaN" and "inf" as numbers; neither is a place.
+    #[test]
+    fn a_point_that_is_not_a_position_is_refused() {
+        for (lat, lon) in [("NaN", "10.9"), ("56.4", "inf"), ("95.0", "10.9"), ("56.4", "-181")] {
+            let xml = format!(
+                r#"<gpx version="1.1"><rte><rtept lat="56.4" lon="10.9"/><rtept lat="{lat}" lon="{lon}"/></rte></gpx>"#
+            );
+            assert!(
+                matches!(super::parse(&xml), Err(super::GpxError::Malformed(_))),
+                "lat {lat} lon {lon}"
+            );
+        }
+        // The limits themselves are positions.
+        let xml = r#"<gpx version="1.1"><wpt lat="-90" lon="180"/></gpx>"#;
+        assert_eq!(super::parse(xml).expect("parses").waypoints.len(), 1);
+    }
+
+    /// A track with nothing in it, written self-closed, is still a file
+    /// whose route can be read.
+    #[test]
+    fn an_empty_self_closed_track_does_not_spoil_the_file() {
+        let xml = r#"<gpx version="1.1"><trk/>
+  <rte><name>R</name><rtept lat="56.4" lon="10.9"/><rtept lat="56.7" lon="11.5"/></rte>
+</gpx>"#;
+        let doc = super::parse(xml).expect("parses");
+        assert_eq!(doc.routes.len(), 1);
+        assert_eq!(doc.routes[0].waypoints.len(), 2);
+    }
+
     /// Some plotters write names in CDATA to avoid escaping ampersands. The
     /// promise of this module is a lossless round-trip, so those names must
     /// survive.
@@ -640,7 +669,7 @@ mod tests {
             if i == 5 {
                 wp.arrival_radius_nm = Some(0.05);
                 wp.symbol = Some("harbor".into());
-                wp.description = Some("Small harbour, 2 m at the entrance".into());
+                wp.description = Some("Small harbour, 2 m at the \"entrance\" & <no> lights".into());
             }
             route.waypoints.push(set.insert(wp));
         }
@@ -692,6 +721,12 @@ mod tests {
         let last = doc.waypoints.get(back.waypoints[5]).unwrap();
         assert_eq!(last.arrival_radius_nm, Some(0.05));
         assert_eq!(last.symbol.as_deref(), Some("harbor"));
+        assert_eq!(
+            last.description.as_deref(),
+            Some("Small harbour, 2 m at the \"entrance\" & <no> lights")
+        );
+        // Points without a radius do not grow one.
+        assert_eq!(doc.waypoints.get(back.waypoints[0]).unwrap().arrival_radius_nm, None);
         // Leg order: same from→to sequence.
         for (a, b) in route.legs.iter().zip(&back.legs) {
             assert_eq!((a.from, a.to), (b.from, b.to));
@@ -744,6 +779,13 @@ mod tests {
         // …and still preserved verbatim for OpenCPN's own benefit.
         assert!(route.foreign_extensions.contains("opencpn:guid"));
         assert!(route.foreign_extensions.contains("planned_speed"));
+        // The route points adopt their own guids, and keep name, symbol and
+        // position to the last digit OpenCPN wrote.
+        let first = doc.waypoints.get(route.waypoints[0]).unwrap();
+        assert_eq!(first.id, Uuid::parse_str("7a1b2c3d-0000-4a17-8f4e-9b0a3c5d7e22").unwrap());
+        assert_eq!((first.name.as_str(), first.symbol.as_deref()), ("001", Some("diamond")));
+        assert_eq!((first.position.lat, first.position.lon), (56.1234567, 11.7654321));
+        assert_eq!(route.legs.len(), 1);
 
         let xml = write_route(route, &doc.waypoints, &doc.root_attrs);
         assert!(xml.contains("<opencpn:guid>2f0d80a2-91c1-4a17-8f4e-9b0a3c5d7e11</opencpn:guid>"));
@@ -778,7 +820,20 @@ mod tests {
         assert_eq!(back.id, wp.id);
         assert_eq!(back.name, wp.name);
         assert_eq!(back.position, wp.position);
+        assert_eq!(back.symbol.as_deref(), Some("anchor"));
         assert_eq!(back.arrival_radius_nm, Some(0.02));
+        assert!(doc.routes.is_empty());
+    }
+
+    /// West and south are negative, and full f64 precision survives: a
+    /// writer that rounded to some decimal count, or dropped the sign, would
+    /// move the mark.
+    #[test]
+    fn west_and_south_positions_round_trip_to_the_bit() {
+        let wp = Waypoint::new("Horn", -55.983765432198, -67.275123456789);
+        let doc = parse(&write_waypoints(&[&wp], &[])).unwrap();
+        let back = doc.waypoints.get(doc.loose[0]).unwrap();
+        assert_eq!(back.position, wp.position);
     }
 
     #[test]
@@ -800,9 +855,15 @@ mod tests {
         assert_eq!(back.legs[1].kind, LegKind::RhumbLine);
         assert_eq!(back.legs[0].kind, LegKind::GreatCircle);
         let plan = back.legs[2].plan.as_ref().expect("plan survived");
-        assert_eq!(plan.tws_kt, 14.0);
-        assert_eq!(plan.tack_state, TackState::Port);
+        assert_eq!(plan, route.legs[2].plan.as_ref().unwrap());
         assert!(back.legs[3].plan.is_none());
+        // A rhumb-line leg is measured as one when read back, not left with
+        // the great-circle measure of the first pass.
+        let (a, b) = (set.get(back.legs[1].from).unwrap(), set.get(back.legs[1].to).unwrap());
+        let (rhumb_nm, _) = crate::nav::model::leg_measure(LegKind::RhumbLine, a.position, b.position);
+        let (gc_nm, _) = crate::nav::model::leg_measure(LegKind::GreatCircle, a.position, b.position);
+        assert!((rhumb_nm - gc_nm).abs() > 1e-4, "the fixture cannot tell the measures apart");
+        assert!((back.legs[1].distance_nm - rhumb_nm).abs() < 1e-9);
     }
 
     #[test]

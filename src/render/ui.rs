@@ -59,6 +59,19 @@ pub enum UiAction {
     FollowSet { on: bool },
     /// Which way up the chart is drawn.
     ChartUpSet { mode: ChartUp },
+    /// Zoom about the middle of the chart: above 1 is in, below 1 is out.
+    Zoom { factor: f32 },
+    /// Put the whole of a route on the screen.
+    RouteShow { route_id: uuid::Uuid },
+    /// Plan a passage from the boat (or the planner's start, if one is
+    /// set) to this position — "go here", from a tap on the chart.
+    PlanTo { lat: f64, lon: f64, sail: bool },
+    /// Add this position to the route being drawn, starting one if none is.
+    RouteAddPoint { lat: f64, lon: f64 },
+    /// Take the forecast for this position.
+    WeatherAt { lat: f64, lon: f64 },
+    /// Put away the card about the last plan.
+    PlanDismiss,
     /// Sign in to the chart shop and list what the account owns.
     ShopSignIn {
         email: String,
@@ -72,16 +85,15 @@ pub enum UiAction {
     ShopSignOut,
     /// Register this machine with the account under a name.
     ShopRegister { system_name: String },
-    /// Claim a slot for a chart and ask the shop for a download.
-    ///
-    /// `edition` names the edition to ask for; `None` means the shop's
-    /// current one, which is right for a live subscription and wrong for a
-    /// lapsed one.
-    ShopDownload {
-        chart_id: String,
-        edition: Option<String>,
-    },
-    /// Put a lapsed chart's download to the user before sending it.
+    /// Claim a slot for a chart and ask the shop for its current edition.
+    ShopDownload { chart_id: String },
+    /// The user accepted the o-charts licence agreement on screen.
+    EulaAccept,
+    /// The user would not: the charts stay closed.
+    EulaDecline,
+    /// Open the licence agreement of the charts in use, to read.
+    EulaRead,
+    /// Put a download that spends a licence slot to the user first.
     ShopConfirmDownload { chart_id: String },
     /// Drop the pending confirmation.
     ShopCancelDownload,
@@ -314,8 +326,11 @@ mod chart_folder_tests {
     /// is drawn sixty times a second and a chart set is six hundred entries.
     #[test]
     fn a_folder_is_read_once_and_then_left_alone() {
-        let dir = std::env::temp_dir().join("manx-chart-folder-test");
-        let _ = std::fs::remove_dir_all(&dir);
+        // A fresh folder of its own: a fixed name under the shared temp
+        // directory collides with any other run of the suite going at the
+        // same moment, which then deletes this one's files mid-test.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
         std::fs::create_dir_all(dir.join("Denmark")).unwrap();
         std::fs::create_dir_all(dir.join(".hidden")).unwrap();
         std::fs::write(dir.join("OC-45-A.oesu"), b"x").unwrap();
@@ -343,8 +358,6 @@ mod chart_folder_tests {
         v.rescan();
         assert_eq!(v.cells, 0);
         assert!(v.entries.is_empty());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A folder that is not there must say so rather than look empty: an
@@ -381,6 +394,33 @@ pub struct WeatherView {
     pub busy: bool,
     #[serde(skip)]
     pub status: String,
+    /// The passage just planned, until the crew has said what to do with
+    /// it: follow it, look at it, or throw it away.
+    #[serde(skip)]
+    pub planned: Option<PlannedView>,
+}
+
+/// A finished passage plan, as the card under the chart shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedView {
+    pub route_id: uuid::Uuid,
+    /// When she gets there and how long it takes, where the plan says —
+    /// "Arrive Tue 16:40 · 4 h 50 min". Weather-routed plans do; the
+    /// shortest safe route is a distance and no more.
+    pub arrival: Option<String>,
+}
+
+/// "50 min", "4 h 50 min", "2 d 3 h": a passage's length as a crew says it.
+pub fn duration_text(minutes: i64) -> String {
+    let minutes = minutes.max(0);
+    let (d, h, m) = (minutes / 1440, minutes % 1440 / 60, minutes % 60);
+    if d > 0 {
+        format!("{d} d {h} h")
+    } else if h > 0 {
+        format!("{h} h {m:02} min")
+    } else {
+        format!("{m} min")
+    }
 }
 
 impl Default for WeatherView {
@@ -392,6 +432,7 @@ impl Default for WeatherView {
             use_currents: true,
             busy: false,
             status: String::new(),
+            planned: None,
         }
     }
 }
@@ -487,6 +528,8 @@ pub struct PlanView {
     /// Armed pin: the next chart tap fills this field instead of running
     /// the object query. One tap, then it disarms itself.
     pub picking: Option<PlanPickTarget>,
+    /// The Go to window is open.
+    pub open: bool,
 }
 
 /// A planner endpoint, projected for drawing: the pin that shows where the
@@ -515,9 +558,12 @@ pub struct RoutesView {
     /// The route open in the editor. While one is open its waypoints are
     /// listed and a chart tap appends to it.
     pub editing: Option<uuid::Uuid>,
-    /// The waypoint removed last, so a mistaken Del can be taken back:
-    /// (route, where it was, the mark, its name).
-    pub undo: Option<(uuid::Uuid, usize, uuid::Uuid, String)>,
+    /// What Undo would take back, in words — "Moved WP 3" — while there is
+    /// an edit to the route being drawn that can be.
+    pub undo: Option<String>,
+    /// The waypoint of the route being drawn that was tapped last, by its
+    /// place in the route: the one the strip offers to rename or remove.
+    pub selected: Option<usize>,
     /// A publish or fetch is on the wire. Their buttons wait for it rather
     /// than inviting a second click that would send the same PUT twice.
     pub net_busy: bool,
@@ -555,6 +601,23 @@ pub enum Palette {
 }
 
 impl Palette {
+    /// The next one as the light goes: day, dusk, night, and round to day.
+    pub fn next(self) -> Self {
+        match self {
+            Palette::Day => Palette::Dusk,
+            Palette::Dusk => Palette::Night,
+            Palette::Night => Palette::Day,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Palette::Day => "Day",
+            Palette::Dusk => "Dusk",
+            Palette::Night => "Night",
+        }
+    }
+
     /// The colour table's name in chartsymbols.xml.
     pub fn table(self) -> &'static str {
         match self {
@@ -601,6 +664,118 @@ pub struct DisplayView {
     /// colour at a glance, not so much that it hides a rock: where that line
     /// falls depends on the screen and the light, so it is the user's.
     pub weather_opacity: f32,
+    /// How big the interface is drawn.
+    pub size: UiSize,
+}
+
+/// How big the interface is drawn: its text and everything tapped.
+///
+/// The right size depends on the screen and how far away the crew stands
+/// from it, which only they know: the same 1920 × 1080 picture is a 24-inch
+/// monitor at the chart table or a 10-inch panel at the helm, and a button
+/// that is a fingertip across on one is under four millimetres on the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UiSize {
+    Small,
+    #[default]
+    Medium,
+    Large,
+    Larger,
+}
+
+impl UiSize {
+    pub const ALL: [UiSize; 4] = [UiSize::Small, UiSize::Medium, UiSize::Large, UiSize::Larger];
+
+    /// What the interface is scaled by. Medium is 1: buttons 44 points
+    /// high, the size a finger needs on a screen at arm's length.
+    pub fn factor(self) -> f32 {
+        match self {
+            UiSize::Small => 0.8,
+            UiSize::Medium => 1.0,
+            UiSize::Large => 1.25,
+            UiSize::Larger => 1.5,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UiSize::Small => "Small",
+            UiSize::Medium => "Medium",
+            UiSize::Large => "Large",
+            UiSize::Larger => "Larger",
+        }
+    }
+}
+
+/// A number with a button either side of it: tap − or + to step it, or tap
+/// the number to type one. Answers whether it changed.
+///
+/// A bare number field is set by dragging across it, which is a mouse's
+/// gesture: a finger on a moving boat lands on a value by luck.
+pub fn stepper(
+    ui: &mut egui::Ui,
+    value: &mut f64,
+    step: f64,
+    range: std::ops::RangeInclusive<f64>,
+    decimals: usize,
+    suffix: &str,
+) -> bool {
+    let before = *value;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        let (lo, hi) = (*range.start(), *range.end());
+        let side = ui.spacing().interact_size.y;
+        if ui.add_sized([side, side], egui::Button::new("−")).clicked() {
+            *value = step_value(*value, -step, lo, hi);
+        }
+        ui.add(
+            egui::DragValue::new(value)
+                .speed(0.0)
+                .range(lo..=hi)
+                .fixed_decimals(decimals)
+                .suffix(suffix),
+        );
+        if ui.add_sized([side, side], egui::Button::new("+")).clicked() {
+            *value = step_value(*value, step, lo, hi);
+        }
+    });
+    *value != before
+}
+
+/// As [`stepper`], for the settings kept as `f32`.
+pub fn stepper_f32(
+    ui: &mut egui::Ui,
+    value: &mut f32,
+    step: f32,
+    range: std::ops::RangeInclusive<f32>,
+    decimals: usize,
+    suffix: &str,
+) -> bool {
+    let mut v = *value as f64;
+    let changed = stepper(
+        ui,
+        &mut v,
+        step as f64,
+        (*range.start() as f64)..=(*range.end() as f64),
+        decimals,
+        suffix,
+    );
+    if changed {
+        *value = v as f32;
+    }
+    changed
+}
+
+/// One step from `value`, landing on a whole number of steps and inside
+/// the limits: from 2.04 a step of 0.1 up is 2.1, not 2.14, so a value
+/// typed in by hand comes back onto the grid at the first press.
+fn step_value(value: f64, step: f64, lo: f64, hi: f64) -> f64 {
+    if step == 0.0 {
+        return value.clamp(lo, hi);
+    }
+    let n = value / step.abs();
+    let next = if step > 0.0 { (n + 1e-9).floor() + 1.0 } else { (n - 1e-9).ceil() - 1.0 };
+    (next * step.abs()).clamp(lo, hi)
 }
 
 /// Which way up the chart is drawn.
@@ -647,6 +822,7 @@ impl Default for DisplayView {
             show_soundings: m.show_soundings,
             chart_up: ChartUp::North,
             weather_opacity: DEFAULT_WEATHER_OPACITY,
+            size: UiSize::Medium,
         }
     }
 }
@@ -662,7 +838,18 @@ impl DisplayView {
     /// reproducible whatever the user last chose. `draft_m` is the boat's;
     /// zero means unknown, and then the manual depths are used.
     pub fn apply(&self, base: &crate::s52::MarinerSettings, draft_m: f64) -> crate::s52::MarinerSettings {
-        let pinned = |k: &str| std::env::var(k).is_ok();
+        self.apply_unless_pinned(base, draft_m, |k| std::env::var(k).is_ok())
+    }
+
+    /// [`Self::apply`] with the question "is this setting pinned?" asked of
+    /// `pinned` rather than of the process environment — so a test answers
+    /// it, and not whatever happens to be exported in the shell running it.
+    fn apply_unless_pinned(
+        &self,
+        base: &crate::s52::MarinerSettings,
+        draft_m: f64,
+        pinned: impl Fn(&str) -> bool,
+    ) -> crate::s52::MarinerSettings {
         let mut s = base.clone();
         if !pinned("MANX_DISPLAY_CAT") {
             (s.show_standard, s.show_other) = match self.detail {
@@ -839,21 +1026,12 @@ impl InstrumentView {
     }
 }
 
-/// A download awaiting the user's word.
-///
-/// A lapsed subscription cannot have the shop's current edition, so Manx
-/// asks for an older one — a decision worth showing rather than making
-/// silently, because it is the user's licence and the user's money.
+/// A download awaiting the user's word: the first one to this machine
+/// spends a licence slot, which cannot be taken back.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingDownload {
     pub chart_id: String,
     pub chart_name: String,
-    /// The subscription has lapsed, so the shop's current edition is not
-    /// covered and an older one has to be named.
-    pub expired: bool,
-    /// Editions the licence is known to have covered, each with where that
-    /// is known from ("as last sent to macbook"), for the user to choose.
-    pub choices: Vec<(String, String)>,
     /// Why, in words.
     pub because: String,
     /// The download claims a new licence slot for this machine.
@@ -862,6 +1040,18 @@ pub struct PendingDownload {
     pub slot_note: Option<String>,
     /// On Android, the user has ticked that the slot is for Manx alone.
     pub understood: bool,
+    /// The user has ticked that they accept o-charts' licence agreement.
+    pub accepted: bool,
+}
+
+/// The o-charts licence agreement on screen.
+#[derive(Default)]
+pub struct EulaView {
+    /// An agreement that must be accepted before its charts are used.
+    /// Nothing else can be used while it is up.
+    pub gate: Option<crate::shop::eula::Pending>,
+    /// An agreement opened to be read: the chart set's name and the text.
+    pub reading: Option<(String, String)>,
 }
 
 /// What the shop panel is showing.
@@ -870,6 +1060,9 @@ pub struct PendingDownload {
 /// the renderer fills in the rest as the worker answers.
 #[derive(Default)]
 pub struct ShopView {
+    /// The o-charts licence agreement: waiting to be accepted, or open to
+    /// be read.
+    pub eula: EulaView,
     pub open: bool,
     pub email: String,
     /// Kept only for as long as it takes to send. Never written to disk.
@@ -903,8 +1096,16 @@ pub struct ShopView {
 pub struct UiState<'a> {
     /// Objects under the last tap, if the bubble is open.
     pub picked: Option<&'a [crate::pick::PickedObject]>,
+    /// No chart is loaded: the chart area says so and offers the way to
+    /// get some.
+    pub no_charts: bool,
     /// Where the picked position currently is on screen, in *logical* points.
     pub pick_anchor: Option<[f32; 2]>,
+    /// The picked position itself: latitude, longitude.
+    pub pick_geo: Option<[f64; 2]>,
+    /// From the boat to the picked position — metres and degrees true —
+    /// while the boat has a fresh fix.
+    pub pick_from_boat: Option<(f64, f64)>,
     /// Which query the bubble answers. Each one gets its own window, so a
     /// new tap opens beside itself rather than where the first one did.
     pub pick_id: u64,
@@ -954,6 +1155,8 @@ pub struct Ui {
     actions: Vec<UiAction>,
     /// egui asked to be drawn again, and how soon.
     repaint_after: Option<std::time::Duration>,
+    /// What the panels left for the chart, last frame.
+    chart_area: Option<egui::Rect>,
     /// The chart shop panel's own state.
     pub shop: ShopView,
     /// Which folder the charts came from, and the browser for changing it.
@@ -1005,6 +1208,7 @@ impl Ui {
             renderer,
             actions: Vec::new(),
             repaint_after: None,
+            chart_area: None,
             // Whatever was arranged last time, or the four readings a plotter
             // is expected to answer without being asked.
             instruments: crate::render::state::RenderState::load_settings().unwrap_or_default(),
@@ -1083,7 +1287,13 @@ impl Ui {
     /// pin on the chart behind it: the bar's background is not a widget, egui
     /// did not claim the click, and it fell through.
     pub fn pointer_over_ui(&self) -> bool {
-        self.ctx.is_pointer_over_area()
+        self.ctx.pointer_interact_pos().is_some_and(|pos| self.covers_point(pos))
+    }
+
+    fn covers_point(&self, pos: egui::Pos2) -> bool {
+        self.ctx
+            .layer_id_at(pos)
+            .is_some_and(|layer| layer_is_interface(layer, self.ctx.available_rect().contains(pos)))
     }
 
     /// Whether a physical-pixel position is under the interface: a window
@@ -1091,14 +1301,7 @@ impl Ui {
     /// `is_pointer_over_area` makes, for a position rather than the pointer.
     pub fn covers(&self, x: f32, y: f32) -> bool {
         let ppp = self.ctx.pixels_per_point().max(0.01);
-        let pos = egui::pos2(x / ppp, y / ppp);
-        match self.ctx.layer_id_at(pos) {
-            Some(layer) if layer.order == egui::Order::Background => {
-                !self.ctx.available_rect().contains(pos)
-            }
-            Some(_) => true,
-            None => false,
-        }
+        self.covers_point(egui::pos2(x / ppp, y / ppp))
     }
 
     /// The chart still showing between the panels, in logical points.
@@ -1143,11 +1346,17 @@ impl Ui {
         let free = &mut self.free;
         let safety = &mut self.safety;
         let logbook = &mut self.logbook;
+        // The interface size, kept current: cheap, and it means a change in
+        // the Display window takes hold on the next frame.
+        self.ctx.set_zoom_factor(display.size.factor());
+        let mut chart_area = egui::Rect::NOTHING;
         let output = self.ctx.run(input, |ctx| {
             super::ui_panels::build(
                 ctx, &state, shop, charts, instruments, routes, weather, plan, boat, wind, sheet,
                 display, free, safety, logbook, fleet, actions,
             );
+            // Read inside the pass: afterwards egui no longer knows it.
+            chart_area = ctx.available_rect();
         });
         #[cfg(target_os = "android")]
         android_keyboard(output.platform_output.ime.is_some());
@@ -1157,6 +1366,17 @@ impl Ui {
             .viewport_output
             .get(&egui::ViewportId::ROOT)
             .map(|v| v.repaint_delay);
+        // A docked card is laid out at the height it had the frame before:
+        // the first frame of a new one is a single row, and it only gets
+        // its real height on the next. egui asks for no second frame, and
+        // Manx draws on demand, so the tap card opened with its position
+        // and its buttons cut off — until a mouse moved. A finger does not
+        // hover. So: while the chart area the panels leave is still
+        // changing, draw again.
+        if self.chart_area != Some(chart_area) {
+            self.chart_area = Some(chart_area);
+            self.repaint_after = Some(std::time::Duration::ZERO);
+        }
 
         let jobs = self
             .ctx
@@ -1200,6 +1420,84 @@ impl Ui {
 
 /// Manx's look: bigger than egui's default, because this is read at arm's
 /// length on a boat, often through spray and often through reading glasses.
+/// Whether a press on `layer` is a press on the interface and not on the
+/// chart. `in_chart` says the position is inside the chart's rectangle,
+/// the part of the window no panel has taken.
+///
+/// The background layer is the chart where the chart shows, and a panel
+/// (which paints on that same layer) elsewhere. Every other layer is
+/// interface — including one that merely sits at background *order*, which
+/// is how the MOB button stays under the windows. Judged by order alone, a
+/// press on that button was taken for a press on the chart: the chart then
+/// panned with the pointer after the click and dropped the follow that
+/// MOB had just switched on.
+fn layer_is_interface(layer: egui::LayerId, in_chart: bool) -> bool {
+    layer != egui::LayerId::background() || !in_chart
+}
+
+/// The height of a window's title bar, and the size of its close button.
+const TITLE_BAR: f32 = 44.0;
+const CLOSE_BUTTON: f32 = 24.0;
+
+/// `Window::show`, with a title bar that fits its title.
+///
+/// egui 0.29 paints the bar as tall as the title's font plus the window
+/// margins, but lays the title and the close button out in a row at least
+/// `interact_size` high. With controls at 44 points the two disagree, and
+/// the title sat on the line under the bar. So the window is opened with a
+/// row exactly one line high and margins that make the bar 44 points, and
+/// the contents get the usual sizes back.
+///
+/// It also keeps the window inside the screen and scrolls what does not fit.
+pub(crate) trait ShowWindow {
+    fn show_fitted<R>(
+        self,
+        ctx: &egui::Context,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> Option<egui::InnerResponse<Option<R>>>;
+}
+
+impl ShowWindow for egui::Window<'_> {
+    fn show_fitted<R>(
+        self,
+        ctx: &egui::Context,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> Option<egui::InnerResponse<Option<R>>> {
+        let usual = ctx.style().spacing.clone();
+        // The font is resolved first: asking the context for its style
+        // inside `fonts` would lock it twice.
+        let body = egui::TextStyle::Body.resolve(&ctx.style());
+        let line = ctx.fonts(|f| f.row_height(&body));
+        let margin = ((TITLE_BAR - line) / 2.0).max(usual.window_margin.top);
+        ctx.style_mut(|s| {
+            s.spacing.interact_size.y = 0.0;
+            s.spacing.icon_width = CLOSE_BUTTON;
+            s.spacing.window_margin = egui::Margin {
+                left: 10.0,
+                right: 10.0,
+                top: margin,
+                bottom: margin,
+            };
+        });
+        let (interact, icon) = (usual.interact_size, usual.icon_width);
+        // No window taller than the space between the bars, and what does
+        // not fit scrolls. On the Pi the Display window ran off the bottom
+        // of the screen; a finger dragged across it to see the rest moved
+        // the whole window, and its title bar and close button went under
+        // the menu bar, out of reach.
+        let room = ctx.available_rect();
+        let body = (room.height() - TITLE_BAR - 2.0 * margin).max(120.0);
+        let fitted = self.constrain_to(room).max_height(body).vscroll(true);
+        let shown = fitted.show(ctx, |ui| {
+            ui.spacing_mut().interact_size = interact;
+            ui.spacing_mut().icon_width = icon;
+            add_contents(ui)
+        });
+        ctx.style_mut(|s| s.spacing = usual);
+        shown
+    }
+}
+
 fn style(ctx: &egui::Context) {
     use egui::{FontFamily, FontId, TextStyle};
     ctx.set_visuals(super::theme::current().visuals());
@@ -1215,9 +1513,12 @@ fn style(ctx: &egui::Context) {
     .into();
     // Touch first: a finger is about 9 mm, so controls get room. These are the
     // numbers to revisit if the UI ever feels cramped on the plotter.
-    style.spacing.button_padding = egui::vec2(10.0, 8.0);
+    // 44 points: the least a finger hits reliably, and what every control
+    // gets — there is no smaller kind of button. (Smaller on purpose is the
+    // Small interface size, for a mouse at a desk.)
+    style.spacing.button_padding = egui::vec2(12.0, 10.0);
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.interact_size.y = 32.0;
+    style.spacing.interact_size = egui::vec2(44.0, 44.0);
     style.visuals.window_rounding = egui::Rounding::same(6.0);
     ctx.set_style(style);
 }
@@ -1226,8 +1527,83 @@ fn style(ctx: &egui::Context) {
 mod display_tests {
     use super::*;
 
+    /// A press steps to the next whole step and stops at the limits.
+    #[test]
+    fn a_stepper_steps_onto_the_grid_and_stops_at_its_limits() {
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(step_value(2.0, 0.1, 0.0, 5.0), 2.1));
+        assert!(near(step_value(2.04, 0.1, 0.0, 5.0), 2.1), "back onto the grid");
+        assert!(near(step_value(2.04, -0.1, 0.0, 5.0), 2.0));
+        assert!(near(step_value(2.0, -0.1, 0.0, 5.0), 1.9));
+        assert!(near(step_value(4.95, 0.1, 0.0, 5.0), 5.0));
+        assert!(near(step_value(5.0, 0.1, 0.0, 5.0), 5.0), "no further than the top");
+        assert!(near(step_value(0.0, -0.1, 0.0, 5.0), 0.0));
+        assert!(near(step_value(40.0, 5.0, 10.0, 500.0), 45.0));
+    }
+
+    /// Medium is the interface at its designed size; the others scale it.
+    #[test]
+    fn the_interface_sizes_run_from_smaller_to_larger() {
+        assert_eq!(UiSize::default(), UiSize::Medium);
+        assert_eq!(UiSize::Medium.factor(), 1.0);
+        let f: Vec<f32> = UiSize::ALL.iter().map(|s| s.factor()).collect();
+        assert!(f.windows(2).all(|w| w[0] < w[1]), "{f:?}");
+    }
+
+    #[test]
+    fn a_passage_length_reads_as_a_crew_says_it() {
+        assert_eq!(duration_text(50), "50 min");
+        assert_eq!(duration_text(290), "4 h 50 min");
+        assert_eq!(duration_text(65), "1 h 05 min");
+        assert_eq!(duration_text(51 * 60), "2 d 3 h");
+        assert_eq!(duration_text(-5), "0 min");
+    }
+
+    /// Three palettes, one button: every press moves on, and three presses
+    /// come back to where they began.
+    #[test]
+    fn the_palette_button_goes_round_day_dusk_night() {
+        assert_eq!(Palette::Day.next(), Palette::Dusk);
+        assert_eq!(Palette::Dusk.next(), Palette::Night);
+        assert_eq!(Palette::Night.next(), Palette::Day);
+    }
+
+    /// A press belongs to the chart only on the true background layer, and
+    /// only where the chart shows. The MOB button is an area of its own at
+    /// background order: a press on it is a press on the interface.
+    #[test]
+    fn a_press_on_the_mob_button_is_not_a_press_on_the_chart() {
+        let chart = egui::LayerId::background();
+        let mob = egui::LayerId::new(egui::Order::Background, egui::Id::new("mob-button"));
+        let window = egui::LayerId::new(egui::Order::Middle, egui::Id::new("Routes"));
+        assert!(!layer_is_interface(chart, true), "the chart itself");
+        assert!(layer_is_interface(chart, false), "a panel paints on the background layer");
+        assert!(layer_is_interface(mob, true));
+        assert!(layer_is_interface(window, true));
+    }
+
     /// Safety depth follows the draft, and the S-52 ordering holds whatever
     /// was typed: shallow <= safety contour <= deep, contour >= depth.
+    #[test]
+    fn a_setting_pinned_by_the_environment_is_left_alone() {
+        let mut base = crate::s52::MarinerSettings::default();
+        base.safety_depth = 7.0;
+        base.show_other = false;
+        let d = DisplayView {
+            safety_depth_m: 3.0,
+            detail: ChartDetail::All,
+            ..DisplayView::default()
+        };
+        let pinned = |k: &str| k == "MANX_SAFETY_DEPTH" || k == "MANX_DISPLAY_CAT";
+        let s = d.apply_unless_pinned(&base, 0.0, pinned);
+        assert_eq!(s.safety_depth, 7.0, "the pinned depth is kept");
+        assert!(!s.show_other, "the pinned display category is kept");
+        // Unpinned, the same view's choices win.
+        let s = d.apply_unless_pinned(&base, 0.0, |_| false);
+        assert_eq!(s.safety_depth, 3.0);
+        assert!(s.show_other);
+    }
+
     #[test]
     fn display_choices_become_consistent_mariner_settings() {
         let base = crate::s52::MarinerSettings::default();
@@ -1239,18 +1615,31 @@ mod display_tests {
             show_text: false,
             ..DisplayView::default()
         };
-        let s = d.apply(&base, 2.1);
-        assert!((s.safety_depth - 2.6).abs() < 1e-6);
-        assert!(s.safety_contour >= s.safety_depth);
-        assert!(s.shallow_contour <= s.safety_contour);
-        assert!(s.deep_contour >= s.safety_contour);
+        let s = d.apply_unless_pinned(&base, 2.1, |_| false);
+        // Draft plus clearance, and the typed contours (shallow 9 above deep
+        // 1, the wrong way round) pulled onto it — exactly, not merely into
+        // order, or a clamp to the wrong bound would pass.
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-5;
+        assert!(near(s.safety_depth, 2.6), "{}", s.safety_depth);
+        assert!(near(s.safety_contour, 2.6), "{}", s.safety_contour);
+        assert!(near(s.shallow_contour, 2.6), "{}", s.shallow_contour);
+        assert!(near(s.deep_contour, 2.6), "{}", s.deep_contour);
         assert!(s.show_standard && !s.show_other && s.show_displaybase);
         assert!(!s.show_text);
 
+        // Contours already in order are the user's to keep.
+        let sane = DisplayView { shallow_contour_m: 2.0, deep_contour_m: 30.0, ..d.clone() };
+        let s = sane.apply_unless_pinned(&base, 2.1, |_| false);
+        assert_eq!((s.shallow_contour, s.deep_contour), (2.0, 30.0));
+
         // Unknown draft: the manual values are used instead.
-        let manual = DisplayView { safety_depth_m: 4.0, safety_contour_m: 5.0, ..d };
-        let s = manual.apply(&base, 0.0);
+        let manual = DisplayView { safety_depth_m: 4.0, safety_contour_m: 5.0, ..d.clone() };
+        let s = manual.apply_unless_pinned(&base, 0.0, |_| false);
         assert_eq!((s.safety_depth, s.safety_contour), (4.0, 5.0));
+        // A contour typed shallower than the safety depth is raised to it:
+        // otherwise the shading calls water safe that the soundings do not.
+        let shoal = DisplayView { safety_depth_m: 4.0, safety_contour_m: 3.0, ..d };
+        assert_eq!(shoal.apply_unless_pinned(&base, 0.0, |_| false).safety_contour, 4.0);
     }
 }
 

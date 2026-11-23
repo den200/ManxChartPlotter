@@ -5,6 +5,7 @@
 //! renderer, which owns the camera and the boat, hands over positions already
 //! projected and alarms already decided (see `RenderState::update_watch`).
 
+use crate::render::ui::ShowWindow as _;
 use egui::{Align2, Color32, Context, FontId, Pos2, RichText, Stroke, Vec2};
 
 use super::ui::UiAction;
@@ -35,6 +36,9 @@ pub struct SafetyView {
 
     #[serde(skip)]
     pub open: bool,
+    /// The Anchor window is open.
+    #[serde(skip)]
+    pub anchor_open: bool,
     #[serde(skip)]
     pub guide_open: bool,
     /// The notice, shown again from the Safety window.
@@ -54,6 +58,7 @@ impl Default for SafetyView {
             depth_alarm_m: 2.0,
             anchor_radius_m: 40.0,
             open: false,
+            anchor_open: false,
             guide_open: false,
             notice_open: false,
             mob_clear_armed: false,
@@ -126,7 +131,7 @@ pub fn notice(ctx: &Context, safety: &mut SafetyView, actions: &mut Vec<UiAction
     if !first {
         window = window.open(&mut open);
     }
-    window.show(ctx, |ui| {
+    window.show_fitted(ctx, |ui| {
         ui.label(
             "Manx is beta software. It is not a certified navigation system (it is not \
              an ECDIS) and must not be your only means of navigation.",
@@ -145,8 +150,19 @@ pub fn notice(ctx: &Context, safety: &mut SafetyView, actions: &mut Vec<UiAction
                 ui.label(line);
             });
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("•");
+            ui.label(crate::shop::eula::NOT_OFFICIAL);
+        });
         ui.add_space(6.0);
         ui.label(RichText::new("You use Manx at your own risk.").strong());
+        if !first {
+            // o-charts' conditions: the agreement can be had at any moment.
+            ui.add_space(6.0);
+            if ui.button("o-charts licence agreement (EULA)").clicked() {
+                actions.push(UiAction::EulaRead);
+            }
+        }
         if first {
             ui.add_space(10.0);
             ui.vertical_centered(|ui| {
@@ -201,14 +217,19 @@ pub fn banner(ctx: &Context, alarms: &[AlarmLine], actions: &mut Vec<UiAction>) 
 
 /// The MOB button: bottom left of the chart, red, always there. One tap
 /// marks — a confirmation costs seconds nobody has; clearing asks twice.
-pub fn mob_button(ctx: &Context, active: bool, actions: &mut Vec<UiAction>) {
-    let area = ctx.available_rect();
+///
+/// `floor` is the rectangle the menu bar and the instruments leave, and the
+/// button sits in its corner whatever else is open: over the weather sheet
+/// and the guidance strip, which keep that corner clear, not above them.
+/// It used to ride on top of whichever panel was showing, so it was in one
+/// of three places depending on what the crew had last looked at.
+pub fn mob_button(ctx: &Context, floor: egui::Rect, active: bool, actions: &mut Vec<UiAction>) {
     egui::Area::new(egui::Id::new("mob-button"))
-        .fixed_pos(egui::pos2(area.left() + 10.0, area.bottom() - 10.0))
+        .fixed_pos(egui::pos2(floor.left() + 10.0, floor.bottom() - 10.0))
         .pivot(Align2::LEFT_BOTTOM)
-        // Under the windows: a window opened over it must stay usable, and
-        // the button is back the moment the window moves or closes.
-        .order(egui::Order::Background)
+        // Among the windows, not under the panels: a panel paints over
+        // anything at background order, and the sheet would hide it.
+        .order(egui::Order::Middle)
         .show(ctx, |ui| {
             let size = Vec2::new(64.0, 44.0);
             let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -234,8 +255,13 @@ pub fn mob_button(ctx: &Context, active: bool, actions: &mut Vec<UiAction>) {
 }
 
 /// The man overboard panel: time since, the way back, and the guide.
-pub fn mob_panel(ctx: &Context, mob: &MobView, safety: &mut SafetyView, actions: &mut Vec<UiAction>) {
-    let area = ctx.available_rect();
+pub fn mob_panel(
+    ctx: &Context,
+    area: egui::Rect,
+    mob: &MobView,
+    safety: &mut SafetyView,
+    actions: &mut Vec<UiAction>,
+) {
     egui::Area::new(egui::Id::new("mob-panel"))
         .fixed_pos(egui::pos2(area.left() + 10.0, area.bottom() - 64.0))
         .pivot(Align2::LEFT_BOTTOM)
@@ -373,10 +399,11 @@ pub fn window(
     let before = safety.clone();
     let cpa_before = (instruments.cpa_alarm_nm, instruments.tcpa_alarm_min);
     let mut open = safety.open;
-    egui::Window::new("Safety")
+    egui::Window::new("Alarms")
         .open(&mut open)
+        .collapsible(false)
         .default_width(340.0)
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             ui.horizontal(|ui| {
                 if ui.button(RichText::new("Man overboard — recovery guide").strong()).clicked() {
                     safety.guide_open = true;
@@ -386,15 +413,15 @@ pub fn window(
 
             ui.label(RichText::new("Alarms").strong());
             ui.checkbox(&mut safety.sound, "Alarms make a sound");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Collision: closer than");
-                ui.add(egui::DragValue::new(&mut instruments.cpa_alarm_nm).speed(0.05).range(0.02..=5.0).fixed_decimals(2).suffix(" NM"));
+                crate::render::ui::stepper_f32(ui, &mut instruments.cpa_alarm_nm, 0.05, 0.05..=5.0, 2, " NM");
                 ui.label("within");
-                ui.add(egui::DragValue::new(&mut instruments.tcpa_alarm_min).speed(1.0).range(1.0..=60.0).fixed_decimals(0).suffix(" min"));
+                crate::render::ui::stepper_f32(ui, &mut instruments.tcpa_alarm_min, 1.0, 1.0..=60.0, 0, " min");
             });
             ui.horizontal(|ui| {
                 ui.checkbox(&mut safety.depth_alarm, "Shallow: less than");
-                ui.add(egui::DragValue::new(&mut safety.depth_alarm_m).speed(0.1).range(0.3..=50.0).fixed_decimals(1).suffix(" m"));
+                crate::render::ui::stepper_f32(ui, &mut safety.depth_alarm_m, 0.5, 0.5..=50.0, 1, " m");
             });
             ui.label(
                 RichText::new(match watch.depth_m {
@@ -405,40 +432,70 @@ pub fn window(
             );
             ui.separator();
 
-            ui.label(RichText::new("Anchor watch").strong());
-            match watch.anchor {
-                Some(a) => {
-                    ui.label(match a.distance_m {
-                        Some(d) => format!("Watching: {d:.0} m from the anchor, circle {:.0} m", a.radius_m),
-                        None => format!("Watching a {:.0} m circle — no position fix", a.radius_m),
-                    });
-                    if ui.button("Stop the anchor watch").clicked() {
-                        actions.push(UiAction::AnchorUp);
-                    }
-                }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.label("Circle");
-                        ui.add(egui::DragValue::new(&mut safety.anchor_radius_m).speed(1.0).range(10.0..=500.0).fixed_decimals(0).suffix(" m"));
-                        let drop = ui.add_enabled(watch.has_fix, egui::Button::new("Anchor here"));
-                        if drop
-                            .on_hover_text("Watch a circle round the boat's position now. Allow for the scope of the chain.")
-                            .on_disabled_hover_text("Needs a position fix")
-                            .clicked()
-                        {
-                            actions.push(UiAction::AnchorDrop);
-                        }
-                    });
-                }
-            }
-            ui.separator();
-
             if ui.link("About Manx beta — not for navigation").clicked() {
                 safety.notice_open = true;
             }
         });
     safety.open = open;
     if *safety != before || (instruments.cpa_alarm_nm, instruments.tcpa_alarm_min) != cpa_before {
+        actions.push(UiAction::SafetyChanged);
+    }
+}
+
+/// Circles worth offering for an anchor watch, metres: scope plus swinging
+/// room for a small boat in ordinary depths. Picked with a tap — dragging a
+/// number to its value is not something a wet finger does.
+const ANCHOR_CIRCLES: [f32; 7] = [20.0, 30.0, 40.0, 50.0, 60.0, 80.0, 100.0];
+
+/// The Anchor window: drop, watch, weigh. On its own button in the bar,
+/// because it is used every night at anchor and was three levels into
+/// Safety.
+pub fn anchor_window(
+    ctx: &Context,
+    safety: &mut SafetyView,
+    watch: &WatchState<'_>,
+    actions: &mut Vec<UiAction>,
+) {
+    let before = safety.clone();
+    let mut open = safety.anchor_open;
+    egui::Window::new("Anchor")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .default_width(340.0)
+        .show_fitted(ctx, |ui| match watch.anchor {
+            Some(a) => {
+                ui.label(match a.distance_m {
+                    Some(d) => format!("Watching: {d:.0} m from the anchor, circle {:.0} m", a.radius_m),
+                    None => format!("Watching a {:.0} m circle — no position fix", a.radius_m),
+                });
+                if ui.button("Anchor is up — stop watching").clicked() {
+                    actions.push(UiAction::AnchorUp);
+                }
+            }
+            None => {
+                ui.label("Watch a circle round where the boat is now, and ring if she leaves it.");
+                ui.label(RichText::new("Circle — allow for the scope of the chain").weak());
+                ui.horizontal_wrapped(|ui| {
+                    for r in ANCHOR_CIRCLES {
+                        ui.selectable_value(&mut safety.anchor_radius_m, r, format!("{r:.0} m"));
+                    }
+                    // A radius set before the list existed is still shown.
+                    if !ANCHOR_CIRCLES.contains(&safety.anchor_radius_m) {
+                        let _ = ui.selectable_label(true, format!("{:.0} m", safety.anchor_radius_m));
+                    }
+                });
+                let drop = ui.add_enabled(watch.has_fix, egui::Button::new("Anchor here"));
+                if drop.clicked() {
+                    actions.push(UiAction::AnchorDrop);
+                }
+                if !watch.has_fix {
+                    ui.label(RichText::new("Needs a position fix from the boat.").weak());
+                }
+            }
+        });
+    safety.anchor_open = open;
+    if *safety != before {
         actions.push(UiAction::SafetyChanged);
     }
 }
@@ -455,7 +512,7 @@ pub fn guide(ctx: &Context, safety: &mut SafetyView) {
         .default_width(560.0)
         .default_height(560.0)
         .order(egui::Order::Foreground)
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             let mut scroll = egui::ScrollArea::vertical();
             // MANX_GUIDE_SCROLL=<points> opens it scrolled, for captures.
             if let Some(y) = std::env::var("MANX_GUIDE_SCROLL").ok().and_then(|v| v.parse().ok()) {

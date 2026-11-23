@@ -72,10 +72,14 @@ pub const METRES_PER_NM: f64 = 1852.0;
 /// two latitudes — is `None`, never a guess.
 pub fn parse_latlon(s: &str) -> Option<LatLon> {
     let s = s.trim();
-    let text = if s.contains(';') {
-        s.replace(',', ".").replace(';', " ")
+    // The mark between latitude and longitude: a semicolon when commas are
+    // decimal points, a comma otherwise. It is kept, not thrown away as
+    // space — with it gone, `56 24 36 1, 10 0` re-split its six numbers
+    // three and three and read a position nobody typed.
+    let (text, sep) = if s.contains(';') {
+        (s.replace(',', "."), ';')
     } else {
-        s.replace(',', " ")
+        (s.to_string(), ',')
     };
 
     #[derive(Clone, Copy, PartialEq)]
@@ -84,6 +88,8 @@ pub fn parse_latlon(s: &str) -> Option<LatLon> {
         Hemi(char),
     }
     let mut toks = Vec::new();
+    // How many tokens came before the separator, when there is one.
+    let mut split: Option<usize> = None;
     let mut cur = String::new();
     let flush = |cur: &mut String, toks: &mut Vec<Tok>| -> Option<()> {
         if !cur.is_empty() {
@@ -94,7 +100,13 @@ pub fn parse_latlon(s: &str) -> Option<LatLon> {
     };
     for ch in text.chars() {
         let up = ch.to_ascii_uppercase();
-        if matches!(up, 'N' | 'S' | 'E' | 'W') {
+        if ch == sep {
+            flush(&mut cur, &mut toks)?;
+            if split.is_some() {
+                return None;
+            }
+            split = Some(toks.len());
+        } else if matches!(up, 'N' | 'S' | 'E' | 'W') {
             flush(&mut cur, &mut toks)?;
             toks.push(Tok::Hemi(up));
         } else if ch.is_ascii_digit() || matches!(ch, '.' | '-' | '+') {
@@ -147,13 +159,21 @@ pub fn parse_latlon(s: &str) -> Option<LatLon> {
             match nums.len() {
                 2 | 4 | 6 => {
                     let half = nums.len() / 2;
+                    if split.is_some_and(|at| at != half) {
+                        return None;
+                    }
                     (angle(&nums[..half])?, angle(&nums[half..])?)
                 }
                 _ => return None,
             }
         }
         2 => {
-            // Letters all before their numbers, or all after.
+            // Letters all before their numbers, or all after; a separator,
+            // if there is one, must fall between the two halves.
+            let boundary = if hemis[0] == 0 { hemis[1] } else { hemis[0] + 1 };
+            if split.is_some_and(|at| at != boundary) {
+                return None;
+            }
             let parts: Vec<(char, &[Tok])> = if hemis[0] == 0 {
                 vec![
                     (letter(toks[0])?, &toks[1..hemis[1]]),
@@ -171,8 +191,9 @@ pub fn parse_latlon(s: &str) -> Option<LatLon> {
             let mut lon = None;
             for (h, ts) in parts {
                 let nums = nums_of(ts)?;
-                // With a hemisphere letter a sign would say it twice.
-                if nums.first().is_some_and(|d| *d < 0.0) {
+                // With a hemisphere letter a sign would say it twice — and
+                // `-0°30'N` is a sign too, though −0 is not less than 0.
+                if nums.first().is_some_and(|d| d.is_sign_negative()) {
                     return None;
                 }
                 let v = angle(&nums)?;
@@ -302,6 +323,30 @@ mod tests {
         assert!(distance_m(LatLon::new(56.0, 11.0), LatLon::new(56.0, 11.0)) < 1e-6);
     }
 
+    /// Published WGS84 figures, not ones worked out here. The tolerances
+    /// above would also pass a spherical (haversine) distance; these would
+    /// not — on a sphere of mean radius the quarter meridian is 5.6 km long.
+    #[test]
+    fn distances_match_the_published_ellipsoid() {
+        // Equator to pole along a meridian: 10 001 965.729 m.
+        let d = distance_m(LatLon::new(0.0, 0.0), LatLon::new(90.0, 0.0));
+        assert!((d - 10_001_965.729).abs() < 0.01, "{d} m");
+        // One degree along the equator: a·π/180 = 111 319.491 m.
+        let d = distance_m(LatLon::new(0.0, 10.0), LatLon::new(0.0, 11.0));
+        assert!((d - 111_319.491).abs() < 0.01, "{d} m");
+    }
+
+    /// Across the antimeridian two points a degree apart are a degree apart,
+    /// not 359 degrees, and east is still east.
+    #[test]
+    fn the_antimeridian_is_just_another_meridian() {
+        let (d, b) = range_bearing(LatLon::new(0.0, 179.5), LatLon::new(0.0, -179.5));
+        assert!((d - 111_319.491).abs() < 0.01, "{d} m");
+        assert!((b.to_degrees() - 90.0).abs() < 1e-9, "{}", b.to_degrees());
+        let there = advance(LatLon::new(0.0, 179.5), b, d);
+        assert!((there.lon + 179.5).abs() < 1e-9, "{there:?}");
+    }
+
     #[test]
     fn bearings_point_the_right_way() {
         let here = LatLon::new(56.0, 11.0);
@@ -368,6 +413,15 @@ mod tests {
         // No relative motion at all: there is no approach to compute.
         assert!(cpa(own, other).is_none());
 
+        // The doc's line is "no relative motion", and the code's noise floor
+        // is a squared relative speed of 1e-9 m²/s². Exactly at it — a boat
+        // stopped beside one creeping at 31 µm/s, which squares to that
+        // floor exactly — there is still motion, so still an approach.
+        let stopped = Motion { speed: 0.0, ..own };
+        let creeping = Motion { speed: 3.162_277_660_168_379_5e-5, course: 0.0, ..other };
+        assert_eq!(creeping.speed * creeping.speed, 1e-9);
+        assert!(cpa(stopped, creeping).is_some());
+
         // Same but slightly slower: they open, so the closest point is now.
         let other = Motion { speed: 4.0, ..other };
         let c = cpa(own, other).expect("relative motion exists");
@@ -393,11 +447,12 @@ mod tests {
             speed: 5.0,
         };
         let c = cpa(own, other).expect("they are closing");
-        assert!(c.seconds > 0.0, "the approach is ahead of us");
-        assert!(
-            c.distance_m < 2.0 * METRES_PER_NM,
-            "it should close from two miles"
-        );
+        // Relative motion is 5 m/s west and 5 m/s south from two miles east:
+        // closest after 2 nm × 5 / 50 = 370.4 s, at a mile each way off —
+        // √2 nm. A sine and cosine swapped anywhere moves either figure.
+        assert!((c.seconds - 370.4).abs() < 1e-3, "{} s", c.seconds);
+        let expected = METRES_PER_NM * std::f64::consts::SQRT_2;
+        assert!((c.distance_m - expected).abs() < 1e-3, "{} m", c.distance_m);
         assert!(!c.past);
     }
 
@@ -462,5 +517,294 @@ mod tests {
         let c = cpa(own, other).expect("relative motion exists");
         assert!(c.past, "the closest approach was behind us");
         assert_eq!(c.seconds, 0.0);
+    }
+
+    /// Steering straight for a buoy on a course that is not a cardinal point
+    /// meets it: both halves of our own velocity count. The earlier CPA tests
+    /// all steer due north, where our east component is zero and the north
+    /// one is the whole speed, so a slip in either went unseen.
+    #[test]
+    fn steering_straight_for_a_buoy_on_a_diagonal_meets_it() {
+        for course_deg in [45.0_f64, 100.0, 222.0, 300.0] {
+            let course = course_deg.to_radians();
+            let start = LatLon::new(56.0, 11.0);
+            let buoy = Motion { at: advance(start, course, METRES_PER_NM), course: 0.0, speed: 0.0 };
+            let own = Motion { at: start, course, speed: 5.0 };
+            let c = cpa(own, buoy).expect("we are closing the buoy");
+            assert!(c.distance_m < 1e-3, "{course_deg}°: {} m", c.distance_m);
+            // A mile at five metres a second.
+            assert!((c.seconds - 370.4).abs() < 1e-3, "{course_deg}°: {} s", c.seconds);
+            assert!(!c.past);
+        }
+    }
+
+    /// Two vessels at the same spot are as close as they will ever be right
+    /// now. That is a collision, not an approach behind us: callers hide the
+    /// CPA of a `past` approach, and this one must not be hidden.
+    #[test]
+    fn a_vessel_on_top_of_us_is_not_behind_us() {
+        let here = LatLon::new(56.0, 11.0);
+        let own = Motion { at: here, course: 0.0, speed: 5.0 };
+        let other = Motion { at: here, course: std::f64::consts::FRAC_PI_2, speed: 3.0 };
+        let c = cpa(own, other).expect("relative motion exists");
+        assert!(!c.past, "{c:?}");
+        assert_eq!(c.seconds, 0.0);
+        assert!(c.distance_m < 1e-9, "{c:?}");
+    }
+
+    /// A sign on the degrees is the hemisphere for anyone who writes signed
+    /// positions: −33.9 is 33.9° S, and −12°15′ is 12°15′ W, the minutes
+    /// going the same way as the degrees.
+    #[test]
+    fn a_minus_sign_means_south_or_west_and_carries_the_minutes() {
+        let p = parse_latlon("-33.9, 151.2").unwrap();
+        assert!((p.lat + 33.9).abs() < 1e-9 && (p.lon - 151.2).abs() < 1e-9, "{p:?}");
+        let p = parse_latlon("55 40.5, -12 15").unwrap();
+        assert!((p.lat - 55.675).abs() < 1e-9 && (p.lon + 12.25).abs() < 1e-9, "{p:?}");
+        let p = parse_latlon("-12 15 36, 55 40 30").unwrap();
+        assert!((p.lat + 12.26).abs() < 1e-9 && (p.lon - 55.675).abs() < 1e-9, "{p:?}");
+    }
+
+    /// Near the equator or the prime meridian the degrees are zero, and an
+    /// unsigned zero is north or east like any other unsigned number.
+    #[test]
+    fn zero_degrees_and_some_minutes_stay_north_and_east() {
+        let p = parse_latlon("0 30, 0 15").unwrap();
+        assert_eq!((p.lat, p.lon), (0.5, 0.25));
+        let p = parse_latlon("00°30.00'N 000°15.00'E").unwrap();
+        assert_eq!((p.lat, p.lon), (0.5, 0.25));
+        let p = parse_latlon("0°30'S 0°15'W").unwrap();
+        assert_eq!((p.lat, p.lon), (-0.5, -0.25));
+        let p = parse_latlon("S0 30 W0 15").unwrap();
+        assert_eq!((p.lat, p.lon), (-0.5, -0.25));
+    }
+
+    /// Signed degrees-and-minutes have no other way to say "half a degree
+    /// south" than −0°30′: the minus sign on a zero must still count.
+    #[test]
+    fn minus_zero_degrees_is_still_south_or_west() {
+        let p = parse_latlon("-0 30, -0 15").unwrap();
+        assert_eq!((p.lat, p.lon), (-0.5, -0.25));
+        let p = parse_latlon("-0°30', -0°15'").unwrap();
+        assert_eq!((p.lat, p.lon), (-0.5, -0.25));
+    }
+
+    /// A whole degree is written with zero minutes — `57°00'N` — and that
+    /// zero is a minute like any other. Only the degrees may carry a sign,
+    /// so a negative minute is a typo, not a position.
+    #[test]
+    fn zero_minutes_are_minutes_and_negative_ones_are_not() {
+        let p = parse_latlon("57°00'N 011°00'E").unwrap();
+        assert_eq!((p.lat, p.lon), (57.0, 11.0));
+        let p = parse_latlon("57 0, 11 0").unwrap();
+        assert_eq!((p.lat, p.lon), (57.0, 11.0));
+        let p = parse_latlon("57 0 0, 11 0 0").unwrap();
+        assert_eq!((p.lat, p.lon), (57.0, 11.0));
+        let p = parse_latlon("57 30 0N 11 0 30E").unwrap();
+        assert!((p.lat - 57.5).abs() < 1e-12 && (p.lon - (11.0 + 30.0 / 3600.0)).abs() < 1e-12);
+        assert!(parse_latlon("56 -24.6, 10 58.8").is_none());
+        assert!(parse_latlon("56 24 -36, 10 58 48").is_none());
+        assert!(parse_latlon("56°-24.6'N 10°58.8'E").is_none());
+    }
+
+    /// The poles and the antimeridian are real places; a hair beyond them
+    /// is not. Sixty minutes is the next degree, written as such.
+    #[test]
+    fn positions_at_the_edges_of_the_globe() {
+        let p = parse_latlon("90°00'N 180°00'E").unwrap();
+        assert_eq!((p.lat, p.lon), (90.0, 180.0));
+        let p = parse_latlon("-90, -180").unwrap();
+        assert_eq!((p.lat, p.lon), (-90.0, -180.0));
+        assert!(parse_latlon("90.0001, 0").is_none());
+        assert!(parse_latlon("0, 180.0001").is_none());
+        assert!(parse_latlon("90°00.1'N 0°00'E").is_none());
+        assert!(parse_latlon("0°00'N 180°00.1'W").is_none());
+        assert!(parse_latlon("56°60'N 10°00'E").is_none(), "sixty minutes is 57°");
+        assert!(parse_latlon("56 24 60N 10 0 0E").is_none(), "sixty seconds is a minute");
+    }
+
+    /// Lower-case letters and no gaps are how positions get typed on a phone.
+    #[test]
+    fn hemisphere_letters_in_any_case_and_without_spaces() {
+        let p = parse_latlon("56 24.6 n 10 58.8 e").unwrap();
+        assert!((p.lat - 56.41).abs() < 1e-9 && (p.lon - 10.98).abs() < 1e-9, "{p:?}");
+        let p = parse_latlon("56°24.6'N10°58.8'W").unwrap();
+        assert!((p.lat - 56.41).abs() < 1e-9 && (p.lon + 10.98).abs() < 1e-9, "{p:?}");
+    }
+
+    /// Half a position, or a position with its parts muddled, is refused
+    /// rather than guessed at.
+    #[test]
+    fn missing_or_muddled_parts_are_refused() {
+        for s in [
+            "N56 24.6",            // a latitude alone
+            "56 24.6 N",           // likewise, letter after
+            "56.41N, 10.98",       // one letter for two numbers
+            "N E",                 // letters, no numbers
+            "N56 24.6 10 58.8E",   // a letter before one half, after the other
+            "56 24.6 N E 10 58.8", // the second letter belongs to nothing
+            "56°24.6'E 10°58.8'W", // two longitudes
+            "56.5 30, 10 0",       // fractional degrees and minutes as well
+            "56 24.5 30, 10 0 0",  // fractional minutes and seconds as well
+            "56 24 36 1 10",       // five numbers: no way to halve them
+            "56.4.1, 10",          // not a number
+            "56.41; 10.98; 3",     // three numbers
+            "56.41 10.98 x",       // stray character
+            "  ",
+        ] {
+            assert!(parse_latlon(s).is_none(), "{s:?} parsed as {:?}", parse_latlon(s));
+        }
+    }
+
+    /// `-0°30'N` writes a sign and a letter at once, exactly like
+    /// `-56°24'N`, which is refused because the two would say the hemisphere
+    /// twice. The zero must not slip through: it currently parses as
+    /// 0°30' *south* despite the N.
+    #[test]
+    fn a_minus_zero_with_a_hemisphere_letter_is_refused_like_any_other_sign() {
+        assert_eq!(parse_latlon("-0°30'N 0°15'E"), None);
+        assert_eq!(parse_latlon("0°30'N -0°15'E"), None);
+    }
+
+    /// When a comma separates the halves it says where one angle ends, so
+    /// four numbers before it cannot be one angle. The parser drops the
+    /// comma and halves the six numbers instead, reading this as
+    /// 56°24'36" and 1°10'00" — a guess, which the doc rules out.
+    #[test]
+    fn a_comma_in_the_wrong_place_is_not_ignored() {
+        assert_eq!(parse_latlon("56 24 36 1, 10 0"), None);
+    }
+
+    use proptest::prelude::*;
+
+    fn any_position() -> impl Strategy<Value = LatLon> {
+        (-90.0..=90.0_f64, -180.0..=180.0_f64).prop_map(|(lat, lon)| LatLon::new(lat, lon))
+    }
+
+    /// Smallest angle between two bearings in radians, whatever their wrap.
+    fn bearing_gap(a: f64, b: f64) -> f64 {
+        let d = (a - b).rem_euclid(std::f64::consts::TAU);
+        d.min(std::f64::consts::TAU - d)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn distance_is_symmetric_and_never_negative(a in any_position(), b in any_position()) {
+            let ab = distance_m(a, b);
+            let ba = distance_m(b, a);
+            prop_assert!(ab >= 0.0);
+            prop_assert!((ab - ba).abs() < 1e-6, "{ab} vs {ba}");
+            // No two points on the Earth are further apart than half the
+            // equator, a·π = 20 037 508.34 m.
+            prop_assert!(ab <= 20_037_508.35, "{ab}");
+        }
+
+        #[test]
+        fn no_detour_is_shorter_than_the_direct_way(
+            a in any_position(), b in any_position(), c in any_position()
+        ) {
+            let direct = distance_m(a, c);
+            let detour = distance_m(a, b) + distance_m(b, c);
+            prop_assert!(direct <= detour + 1e-6, "{direct} > {detour}");
+        }
+
+        /// Away from the poles, where a bearing stops meaning much.
+        #[test]
+        fn advancing_then_measuring_gives_back_the_distance_and_bearing(
+            lat in -80.0..80.0_f64,
+            lon in -180.0..180.0_f64,
+            bearing in 0.0..std::f64::consts::TAU,
+            d in 1.0..2_000_000.0_f64,
+        ) {
+            let start = LatLon::new(lat, lon);
+            let there = advance(start, bearing, d);
+            prop_assert!(there.lat.abs() <= 90.0 && there.lon.abs() <= 180.0, "{there:?}");
+            let (back, b) = range_bearing(start, there);
+            prop_assert!((back - d).abs() < 1e-6 * d.max(1.0), "{back} vs {d}");
+            prop_assert!(bearing_gap(b, bearing) < 1e-8, "{b} vs {bearing}");
+            prop_assert!((0.0..std::f64::consts::TAU).contains(&b), "{b}");
+        }
+
+        /// Sailing east over the date line lands at a western longitude a
+        /// short way off, never most of the way round the world.
+        #[test]
+        fn sailing_east_over_the_date_line_lands_just_across_it(
+            lat in -60.0..60.0_f64,
+            lon in 179.0..180.0_f64,
+            d in 150_000.0..300_000.0_f64,
+        ) {
+            let start = LatLon::new(lat, lon);
+            let there = advance(start, std::f64::consts::FRAC_PI_2, d);
+            prop_assert!(there.lon < -170.0 && there.lon >= -180.0, "{there:?}");
+            prop_assert!((distance_m(start, there) - d).abs() < 1e-6 * d, "{there:?}");
+            let (_, b) = range_bearing(there, start);
+            // Going back is westward.
+            prop_assert!(bearing_gap(b, 1.5 * std::f64::consts::PI) < 0.1, "{b}");
+        }
+
+        /// Hundredths of a minute is the printed precision: half of one is
+        /// 1/12 000 of a degree.
+        #[test]
+        fn a_shown_position_types_back_in_to_the_printed_precision(p in any_position()) {
+            let shown = format_latlon(p.lat, p.lon);
+            let back = parse_latlon(&shown);
+            prop_assert!(back.is_some(), "{shown}");
+            let back = back.unwrap();
+            let tol = 1.0 / 12_000.0 + 1e-9;
+            prop_assert!((back.lat - p.lat).abs() <= tol, "{shown} -> {back:?} from {p:?}");
+            prop_assert!((back.lon - p.lon).abs() <= tol, "{shown} -> {back:?} from {p:?}");
+        }
+
+        /// Signed decimal degrees, as Rust prints them, read back exactly.
+        #[test]
+        fn decimal_degrees_read_back_exactly(p in any_position()) {
+            let typed = format!("{}, {}", p.lat, p.lon);
+            prop_assert_eq!(parse_latlon(&typed), Some(p), "{}", typed);
+            let typed = format!("{} {}", p.lat, p.lon);
+            prop_assert_eq!(parse_latlon(&typed), Some(p), "{}", typed);
+        }
+
+        /// The closest approach is never further than the range now, and an
+        /// approach marked past is happening now, at the present range.
+        #[test]
+        fn the_closest_approach_is_never_further_than_now(
+            bearing in 0.0..std::f64::consts::TAU,
+            range in 0.0..20_000.0_f64,
+            own_course in 0.0..std::f64::consts::TAU,
+            own_speed in 0.0..15.0_f64,
+            their_course in 0.0..std::f64::consts::TAU,
+            their_speed in 0.0..15.0_f64,
+        ) {
+            let here = LatLon::new(56.0, 11.0);
+            let own = Motion { at: here, course: own_course, speed: own_speed };
+            let other = Motion { at: advance(here, bearing, range), course: their_course, speed: their_speed };
+            if let Some(c) = cpa(own, other) {
+                let now = distance_m(own.at, other.at);
+                prop_assert!(c.distance_m >= 0.0 && c.seconds >= 0.0, "{c:?}");
+                prop_assert!(c.distance_m <= now + 1e-6, "{c:?} vs {now}");
+                if c.past {
+                    prop_assert_eq!(c.seconds, 0.0);
+                    prop_assert!((c.distance_m - now).abs() < 1e-6, "{c:?} vs {now}");
+                }
+            }
+        }
+
+        /// Heading straight at a stationary mark from any direction meets it,
+        /// after range ÷ speed seconds.
+        #[test]
+        fn heading_straight_at_a_mark_meets_it(
+            course in 0.0..std::f64::consts::TAU,
+            range in 100.0..20_000.0_f64,
+            speed in 0.5..15.0_f64,
+        ) {
+            let here = LatLon::new(56.0, 11.0);
+            let mark = Motion { at: advance(here, course, range), course: 0.0, speed: 0.0 };
+            let c = cpa(Motion { at: here, course, speed }, mark).unwrap();
+            prop_assert!(c.distance_m < 1e-3, "{c:?}");
+            prop_assert!((c.seconds - range / speed).abs() < 1e-6 * c.seconds.max(1.0), "{c:?}");
+            prop_assert!(!c.past);
+        }
     }
 }

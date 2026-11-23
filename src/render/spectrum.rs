@@ -154,6 +154,11 @@ mod tests {
         assert!(between(c.b(), a.b(), b.b()), "blue {} not between", c.b());
         assert_ne!(c, a);
         assert_ne!(c, b);
+        // Exactly where it should be, a quarter of the way along: a ramp
+        // read backwards (or a mix that ignored its fraction) still lands
+        // "between" the two stops, but not here.
+        assert_eq!(WIND_KT.at(2.0), Color32::from_rgb(36, 102, 211));
+        assert_eq!(WIND_KT.at(6.0), Color32::from_rgb(12, 134, 204));
     }
 
     #[test]

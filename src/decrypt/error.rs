@@ -29,6 +29,9 @@ pub enum DecryptError {
     #[error("No install key available for chart {0}")]
     MissingKey(String),
 
+    #[error("the o-charts licence agreement for {0} has not been accepted")]
+    EulaNotAccepted(String),
+
     #[error("XML parse error: {0}")]
     Xml(String),
 }

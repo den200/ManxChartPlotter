@@ -675,6 +675,157 @@ mod tests {
         assert!(light_sector_info(&feature).is_none());
     }
 
+    /// LIGHTS06: a light without sectors is a flare below 10 NM nominal range
+    /// and an all-round light from 10 NM up (`valnmr < 10.0`). A missing
+    /// VALNMR defaults to 9 NM, i.e. a flare.
+    #[test]
+    fn ten_nautical_miles_is_the_flare_to_all_round_boundary() {
+        let settings = MarinerSettings::default();
+        let sym = |v| lights06(&make_light(Some("3"), v, None), &settings);
+        assert_eq!(sym(Some(9.9)), LightSymbol::RedFlare);
+        assert_eq!(sym(Some(10.0)), LightSymbol::RedAllRound);
+        assert_eq!(sym(None), LightSymbol::RedFlare);
+    }
+
+    /// `_selSYcol`'s flare colours: one colour picks its own flare, white
+    /// paired with red or green picks the coloured one, anything else (and no
+    /// COLOUR at all, which OpenCPN treats as magenta) is the default flare.
+    #[test]
+    fn flare_symbol_follows_the_colour_list() {
+        let settings = MarinerSettings::default();
+        let sym = |c: Option<&str>| lights06_symbol(&make_light(c, Some(5.0), None), &settings);
+        assert_eq!(sym(Some("3")), "LIGHTS11");
+        assert_eq!(sym(Some("4")), "LIGHTS12");
+        assert_eq!(sym(Some("1")), "LIGHTS13");
+        assert_eq!(sym(Some("6")), "LIGHTS13");
+        assert_eq!(sym(Some("1,3")), "LIGHTS11");
+        assert_eq!(sym(Some("4,1")), "LIGHTS12");
+        assert_eq!(sym(Some("3,4")), "LITDEF11");
+        assert_eq!(sym(Some("1,3,4")), "LITDEF11");
+        assert_eq!(sym(Some("5")), "LITDEF11");
+        assert_eq!(sym(None), "LITDEF11");
+    }
+
+    #[test]
+    fn special_light_categories_override_colour() {
+        let settings = MarinerSettings::default();
+        // CATLIT 8 (floodlight) and 11 (strobe) draw LIGHTS82, 9 (spotlight)
+        // LIGHTS81 — before colour or range are looked at.
+        for (catlit, name) in [("8", "LIGHTS82"), ("11", "LIGHTS82"), ("9", "LIGHTS81"), ("4,9", "LIGHTS81")] {
+            let f = make_light(Some("4"), Some(15.0), Some(catlit));
+            assert_eq!(lights06_symbol(&f, &settings), name, "CATLIT {catlit}");
+            assert!(light_sector_info(&f).is_none(), "CATLIT {catlit} has no ring");
+        }
+    }
+
+    /// LIGHTS06 appends ",135)" to every non-directional flare so it leans
+    /// toward the structure it sits on. All-round lights are not rotated.
+    #[test]
+    fn flares_are_rotated_135_degrees_and_all_round_lights_are_not() {
+        let settings = MarinerSettings::default();
+        let flare = light_render_info(&make_light(Some("4"), Some(5.0), None), &settings);
+        assert_eq!(flare.symbol_name, "LIGHTS12");
+        assert_eq!(flare.rotation_deg, Some(135.0));
+        assert_eq!(flare.orient_text, None);
+
+        let ring = light_render_info(&make_light(Some("4"), Some(15.0), None), &settings);
+        assert_eq!(ring.rotation_deg, None);
+    }
+
+    /// A directional light (CATLIT 1 or 16) points along its ORIENT, which
+    /// S-57 gives *from seaward*: the symbol is turned 180 degrees from it,
+    /// wrapping at 360, and the bearing is printed as three digits.
+    #[test]
+    fn directional_light_points_away_from_its_orient() {
+        let settings = MarinerSettings::default();
+        let mut f = make_light(Some("1"), Some(5.0), Some("1"));
+        f.attributes.insert("ORIENT", AttributeValue::Float(45.0));
+        let info = light_render_info(&f, &settings);
+        assert_eq!(info.rotation_deg, Some(225.0));
+        assert_eq!(info.orient_text.as_deref(), Some("045\u{00b0}"));
+        assert_eq!(info.symbol_name, "LIGHTS13");
+
+        let mut f = make_light(Some("1"), Some(5.0), Some("16"));
+        f.attributes.insert("ORIENT", AttributeValue::Float(270.0));
+        assert_eq!(light_render_info(&f, &settings).rotation_deg, Some(90.0));
+    }
+
+    #[test]
+    fn directional_light_without_orient_is_a_question_mark() {
+        // Without a bearing a directional light cannot be drawn honestly.
+        let f = make_light(Some("1"), Some(5.0), Some("1"));
+        let info = light_render_info(&f, &MarinerSettings::default());
+        assert_eq!(info.symbol_name, "QUESMRK1");
+        assert_eq!(info.rotation_deg, None);
+    }
+
+    /// `_selSYcol` with bsectr=1: the ring radius steps with nominal range
+    /// (3/10/15/20 mm) and is nudged per colour so co-located lights draw
+    /// concentric rings: red +1, green +0, white/yellow +2, magenta +3.
+    #[test]
+    fn all_round_ring_radius_follows_range_and_colour() {
+        let ring = |c: Option<&str>, v: f64| {
+            light_sector_info(&make_light(c, Some(v), None)).expect("all-round light is ringed")
+        };
+        let r = ring(Some("4"), 10.0);
+        assert_eq!((r.sectr1, r.sectr2), (0.0, 360.0));
+        assert_eq!(r.arc_radius_mm, 10.0);
+        assert_eq!(r.arc_color_token, "LITGN");
+        assert_eq!(r.sector_radius_mm, 0.0);
+
+        assert_eq!(ring(Some("3"), 10.0).arc_radius_mm, 11.0);
+        assert_eq!(ring(Some("1"), 14.9).arc_radius_mm, 12.0);
+        assert_eq!(ring(Some("4"), 15.0).arc_radius_mm, 15.0);
+        assert_eq!(ring(Some("4"), 30.0).arc_radius_mm, 20.0);
+        let magenta = ring(None, 20.0);
+        assert_eq!(magenta.arc_radius_mm, 18.0);
+        assert_eq!(magenta.arc_color_token, "CHMGD");
+
+        // A flare (under 10 NM) is a symbol, not a ring.
+        assert!(light_sector_info(&make_light(Some("4"), Some(9.0), None)).is_none());
+    }
+
+    /// Sector arcs: radius by nominal range (OpenCPN: 10/15/20 mm, 20 mm when
+    /// unknown), colour from the light, and LITVIS 3/7/8 marks a faint or
+    /// obscured sector.
+    #[test]
+    fn sector_arc_radius_colour_and_visibility() {
+        let sector = |valnmr: Option<f64>, colour: &str, litvis: Option<&str>| {
+            let mut f = make_sector_light(90.0, 180.0);
+            f.attributes.insert("COLOUR", AttributeValue::String(colour.to_string()));
+            if let Some(v) = valnmr {
+                f.attributes.insert("VALNMR", AttributeValue::Float(v));
+            }
+            if let Some(v) = litvis {
+                f.attributes.insert("LITVIS", AttributeValue::String(v.to_string()));
+            }
+            light_sector_info(&f).expect("valid sector")
+        };
+        let s = sector(Some(12.0), "3", None);
+        assert_eq!((s.sectr1, s.sectr2), (90.0, 180.0));
+        assert_eq!(s.arc_radius_mm, 10.0);
+        assert_eq!(s.arc_color_token, "LITRD");
+        assert!(!s.faint);
+        assert_eq!(sector(Some(15.0), "4", None).arc_radius_mm, 15.0);
+        assert_eq!(sector(Some(30.0), "1", None).arc_radius_mm, 20.0);
+        assert_eq!(sector(Some(30.0), "1", None).arc_color_token, "LITYW");
+        assert_eq!(sector(Some(0.0), "1,3", None).arc_radius_mm, 20.0);
+        assert_eq!(sector(Some(0.0), "1,3", None).arc_color_token, "LITRD");
+        assert!(sector(Some(12.0), "3", Some("3")).faint);
+        assert!(sector(Some(12.0), "3", Some("1,7")).faint);
+        assert!(!sector(Some(12.0), "3", Some("1")).faint);
+    }
+
+    #[test]
+    fn sector_sweeping_through_north_is_valid() {
+        // 350 -> 10 crosses north: a 20-degree sector, not a negative one.
+        let f = make_sector_light(350.0, 10.0);
+        let info = light_sector_info(&f).expect("sector through north");
+        assert_eq!((info.sectr1, info.sectr2), (350.0, 10.0));
+        // Equal limits sweep a full circle, which is no sector at all.
+        assert!(light_sector_info(&make_sector_light(45.0, 45.0)).is_none());
+    }
+
     // ============================================================
     // LITDSN01 Tests
     // ============================================================

@@ -30,6 +30,9 @@ pub enum StoreError {
     /// The waypoint is used by routes and cannot simply vanish.
     WaypointInUse { routes: Vec<String> },
     UnknownRoute(Uuid),
+    /// A second file in the folder holds a route already read from another.
+    /// The first is used; this one is left where it is, unread.
+    Duplicate { path: PathBuf, name: String },
 }
 
 impl std::fmt::Display for StoreError {
@@ -41,6 +44,11 @@ impl std::fmt::Display for StoreError {
                 write!(f, "waypoint is used by: {}", routes.join(", "))
             }
             StoreError::UnknownRoute(id) => write!(f, "no route {id}"),
+            StoreError::Duplicate { path, name } => write!(
+                f,
+                "{}: another file already holds the route \"{name}\"; this one was not read",
+                path.display()
+            ),
         }
     }
 }
@@ -131,8 +139,20 @@ impl RouteStore {
                 self.loose.push(*id);
             }
         }
-        let route_count = doc.routes.len();
+        // One route, one file. Two files with the same route would each be
+        // "the" route to a different operation — a save would go to one, a
+        // delete would remove one and the other would bring the route back
+        // at the next start. The first read is kept; the other is reported.
+        let mut routes = Vec::new();
         for route in doc.routes {
+            if self.routes.iter().any(|s| s.route.id == route.id) {
+                problems.push(StoreError::Duplicate { path: path.to_path_buf(), name: route.name.clone() });
+            } else {
+                routes.push(route);
+            }
+        }
+        let route_count = routes.len();
+        for route in routes {
             let target = if foreign_shape {
                 self.route_path(&route)
             } else {
@@ -209,6 +229,75 @@ impl RouteStore {
         self.save_route_at(i)
     }
 
+    /// Take in a route read from the Signal K server, with its waypoints.
+    ///
+    /// Publish and fetch round-trip the same id, and the server keeps only
+    /// names and positions. So there are three cases:
+    ///
+    /// - unknown here: stored as it came;
+    /// - known and unchanged (same name, same marks in the same places):
+    ///   left exactly as it is — writing the server's copy over it would
+    ///   strip symbols, arrival circles, leg kinds and the weather router's
+    ///   plan, none of which the server ever had;
+    /// - known and different: the local route is kept, and the server's is
+    ///   stored beside it as "… (Signal K)". Answers the kept route's name.
+    pub fn merge_fetched(
+        &mut self,
+        mut route: Route,
+        mut wps: Vec<Waypoint>,
+    ) -> Result<Option<String>, StoreError> {
+        type Mark<'a> = (crate::geo::LatLon, &'a str);
+        let mut kept = None;
+        if let Some(local) = self.route(route.id) {
+            let fetched: Vec<Mark> = route
+                .waypoints
+                .iter()
+                .filter_map(|id| wps.iter().find(|w| w.id == *id))
+                .map(|w| (w.position, w.name.as_str()))
+                .collect();
+            let mine: Vec<Mark> = local
+                .waypoints
+                .iter()
+                .filter_map(|id| self.waypoints.get(*id))
+                .map(|w| (w.position, w.name.as_str()))
+                .collect();
+            let same = local.name == route.name
+                && mine.len() == fetched.len()
+                && mine.iter().zip(&fetched).all(|((a, an), (b, bn))| {
+                    (a.lat - b.lat).abs() < 1e-7 && (a.lon - b.lon).abs() < 1e-7 && an == bn
+                });
+            if same {
+                return Ok(None);
+            }
+            kept = Some(local.name.clone());
+            let copy = format!("{} (Signal K)", route.name);
+            // A later fetch refreshes the same copy rather than stacking
+            // up new ones.
+            route.id = self
+                .routes()
+                .find(|r| r.name == copy)
+                .map(|r| r.id)
+                .unwrap_or_else(Uuid::new_v4);
+            route.name = copy;
+            // Its marks come back under the local marks' ids; inserted as
+            // they are they would move the kept route's waypoints.
+            for wp in wps.iter_mut() {
+                let fresh = Uuid::new_v4();
+                for id in route.waypoints.iter_mut() {
+                    if *id == wp.id {
+                        *id = fresh;
+                    }
+                }
+                wp.id = fresh;
+            }
+        }
+        for wp in wps {
+            self.waypoints.insert(wp);
+        }
+        self.upsert_route(route)?;
+        Ok(kept)
+    }
+
     /// Delete a route and its file. Its waypoints stay: they may be shared,
     /// and a mark on the water does not stop existing because a plan did.
     pub fn delete_route(&mut self, id: Uuid) -> Result<(), StoreError> {
@@ -265,6 +354,19 @@ impl RouteStore {
         Ok(())
     }
 
+    /// Move a mark without writing anything: for a waypoint being dragged
+    /// across the chart, which moves sixty times a second and must be
+    /// written once, when it is let go ([`update_waypoint`](Self::update_waypoint)).
+    /// The legs through it are measured again, so the chart and the route's
+    /// length follow the finger.
+    pub fn move_waypoint_unsaved(&mut self, id: Uuid, to: crate::geo::LatLon) {
+        let Some(wp) = self.waypoints.get_mut(id) else { return };
+        wp.position = to;
+        for stored in self.routes.iter_mut().filter(|s| s.route.waypoints.contains(&id)) {
+            stored.route.recompute_legs(&self.waypoints);
+        }
+    }
+
     /// Remove a standalone waypoint. Refused while a route still uses it —
     /// deleting a mark out from under a plan is a decision the caller must
     /// make explicitly, by editing the route first.
@@ -300,14 +402,26 @@ impl RouteStore {
         for route in doc.routes {
             // Same id replaces — importing the same file twice is idempotent,
             // which the guid adoption in the GPX layer exists to make true.
-            self.routes.retain(|s| s.route.id != route.id);
-            let route_path = self.route_path(&route);
-            self.routes.push(StoredRoute {
-                route,
-                path: route_path,
-                root_attrs: doc.root_attrs.clone(),
-            });
-            self.save_route_at(self.routes.len() - 1)?;
+            // And it replaces *in its file*: a route that comes back under
+            // another name would otherwise be written to a second file with
+            // the first left behind, and both read at the next start.
+            let at = match self.routes.iter().position(|s| s.route.id == route.id) {
+                Some(i) => {
+                    self.routes[i].route = route;
+                    self.routes[i].root_attrs = doc.root_attrs.clone();
+                    i
+                }
+                None => {
+                    let route_path = self.route_path(&route);
+                    self.routes.push(StoredRoute {
+                        route,
+                        path: route_path,
+                        root_attrs: doc.root_attrs.clone(),
+                    });
+                    self.routes.len() - 1
+                }
+            };
+            self.save_route_at(at)?;
         }
         if !doc.loose.is_empty() {
             self.save_loose()?;
@@ -402,6 +516,7 @@ fn slug(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nav::model::{LegKind, LegPlan, PointOfSail, TackState};
 
     fn count_gpx(dir: &Path) -> usize {
         std::fs::read_dir(dir)
@@ -427,6 +542,90 @@ mod tests {
                 .push(store.waypoints.insert(Waypoint::new(name, lat, lon)));
         }
         route
+    }
+
+    /// What Signal K hands back for a route: its id and name, and marks
+    /// that carry a name and a position and nothing else.
+    fn as_the_server_returns_it(store: &RouteStore, id: Uuid) -> (Route, Vec<Waypoint>) {
+        let local = store.route(id).unwrap();
+        let mut route = Route::new(local.name.clone());
+        route.id = local.id;
+        route.waypoints = local.waypoints.clone();
+        let wps = local
+            .waypoints
+            .iter()
+            .map(|w| {
+                let w = store.waypoints.get(*w).unwrap();
+                let mut bare = Waypoint::new(w.name.clone(), w.position.lat, w.position.lon);
+                bare.id = w.id;
+                bare
+            })
+            .collect();
+        (route, wps)
+    }
+
+    /// Fetching back a route that was published and not changed since must
+    /// leave it alone: the server never held the symbol, the arrival circle,
+    /// the leg kind or the weather plan, so its copy cannot improve on ours.
+    #[test]
+    fn fetching_an_unchanged_route_keeps_what_the_server_never_had() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = RouteStore::open(dir.path()).unwrap();
+        let route = kattegat_route(&mut store);
+        let id = route.id;
+        let first = route.waypoints[0];
+        {
+            let wp = store.waypoints.get_mut(first).unwrap();
+            wp.symbol = Some("diamond".into());
+            wp.arrival_radius_nm = Some(0.25);
+        }
+        store.upsert_route(route).unwrap();
+        let mut planned = store.route(id).unwrap().clone();
+        planned.legs[0].kind = LegKind::RhumbLine;
+        planned.legs[0].plan = Some(LegPlan {
+            eta: chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            twa_deg: 60.0,
+            tws_kt: 12.0,
+            point_of_sail: PointOfSail::CloseReach,
+            expected_stw_kt: 6.0,
+            tack_state: TackState::Port,
+        });
+        store.upsert_route(planned.clone()).unwrap();
+        let before = store.route(id).unwrap().clone();
+        assert_eq!(before.legs[0].kind, LegKind::RhumbLine, "the fixture holds");
+
+        let (route, wps) = as_the_server_returns_it(&store, id);
+        assert_eq!(store.merge_fetched(route, wps).unwrap(), None);
+
+        assert_eq!(store.route(id).unwrap(), &before);
+        let wp = store.waypoints.get(first).unwrap();
+        assert_eq!(wp.symbol.as_deref(), Some("diamond"));
+        assert_eq!(wp.arrival_radius_nm, Some(0.25));
+        assert_eq!(store.routes().count(), 1);
+    }
+
+    /// A route changed here since it was published is kept, and the
+    /// server's version arrives beside it under its own marks.
+    #[test]
+    fn fetching_a_route_changed_here_keeps_ours_and_adds_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = RouteStore::open(dir.path()).unwrap();
+        let route = kattegat_route(&mut store);
+        let id = route.id;
+        store.upsert_route(route).unwrap();
+        let (route, wps) = as_the_server_returns_it(&store, id);
+
+        // Our copy loses its last mark after the publish.
+        let mut mine = store.route(id).unwrap().clone();
+        mine.waypoints.pop();
+        store.upsert_route(mine).unwrap();
+
+        let kept = store.merge_fetched(route, wps).unwrap();
+        assert_eq!(kept.as_deref(), Some("Grenaa – Anholt"));
+        assert_eq!(store.route(id).unwrap().waypoints.len(), 5);
+        let theirs = store.routes().find(|r| r.name == "Grenaa – Anholt (Signal K)").unwrap();
+        assert_eq!(theirs.waypoints.len(), 6);
+        assert!(theirs.waypoints.iter().all(|w| !store.route(id).unwrap().waypoints.contains(w)));
     }
 
     #[test]
@@ -558,6 +757,8 @@ mod tests {
             }
             other => panic!("expected WaypointInUse, got {other:?}"),
         }
+        // Refused means untouched: the mark is still there for the route.
+        assert!(store.waypoints.get(used).is_some());
     }
 
     #[test]
@@ -581,15 +782,22 @@ mod tests {
         let (store, problems) = RouteStore::open(dir.path()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(store.routes().count(), 2);
-        // The original was moved aside, not destroyed.
-        assert!(dir.path().join("dropped-in.gpx.imported").exists());
+        // The original was moved aside, not destroyed — byte for byte.
+        let aside = dir.path().join("dropped-in.gpx.imported");
+        assert_eq!(std::fs::read_to_string(&aside).unwrap(), both);
         assert!(!dir.path().join("dropped-in.gpx").exists());
+        assert_eq!(count_gpx(dir.path()), 2, "one file per route");
 
-        // And a second open finds two clean single-route files, no re-split.
+        // And a second open finds two clean single-route files, no re-split,
+        // with both routes whole.
         drop(store);
         let (store, problems) = RouteStore::open(dir.path()).unwrap();
         assert!(problems.is_empty());
         assert_eq!(store.routes().count(), 2);
+        for (id, name, legs) in [(r1.id, "Grenaa – Anholt", 5), (r2.id, "Second", 1)] {
+            let r = store.route(id).expect("both routes keep their identity");
+            assert_eq!((r.name.as_str(), r.legs.len()), (name, legs));
+        }
     }
 
     #[test]
@@ -602,9 +810,106 @@ mod tests {
         store.export_route(route.id, &exported).unwrap();
 
         let (mut fresh, _) = RouteStore::open(dir.path().join("fresh")).unwrap();
-        fresh.import(&exported).unwrap();
+        assert_eq!(fresh.import(&exported).unwrap(), (1, 0));
         fresh.import(&exported).unwrap();
         assert_eq!(fresh.routes().count(), 1, "same guid, same route");
+        assert!(fresh.route(route.id).is_some());
+        // On disk too: a second file for the same route would come back as
+        // a duplicate at the next start.
+        assert_eq!(count_gpx(&dir.path().join("fresh")), 1);
+        drop(fresh);
+        let (fresh, _) = RouteStore::open(dir.path().join("fresh")).unwrap();
+        assert_eq!(fresh.routes().count(), 1);
+    }
+
+    /// A mark moved in passing changes the route's length at once and
+    /// nothing on the disk; writing it then makes it last.
+    #[test]
+    fn a_dragged_mark_is_measured_at_once_and_written_when_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut store, _) = RouteStore::open(dir.path()).unwrap();
+        let route = kattegat_route(&mut store);
+        let id = route.id;
+        let last = *route.waypoints.last().unwrap();
+        store.upsert_route(route).unwrap();
+        let before = store.route(id).unwrap().total_distance_nm();
+
+        // One minute of latitude further north: the last leg changes.
+        let at = store.waypoints.get(last).unwrap().position;
+        let moved = crate::geo::LatLon::new(at.lat + 1.0 / 60.0, at.lon);
+        store.move_waypoint_unsaved(last, moved);
+        let after = store.route(id).unwrap().total_distance_nm();
+        assert!((after - before).abs() > 0.5, "{before} -> {after}");
+        let (reread, _) = RouteStore::open(dir.path()).unwrap();
+        assert!((reread.route(id).unwrap().total_distance_nm() - before).abs() < 1e-9, "not written yet");
+
+        let wp = store.waypoints.get(last).unwrap().clone();
+        store.update_waypoint(wp).unwrap();
+        let (reread, _) = RouteStore::open(dir.path()).unwrap();
+        assert!((reread.route(id).unwrap().total_distance_nm() - after).abs() < 1e-6);
+    }
+
+    /// A route exported, renamed in another program and brought back is
+    /// the same route under its new name — in one file, so that it is still
+    /// one route, and still the renamed one, after a restart.
+    #[test]
+    fn a_route_reimported_under_a_new_name_stays_one_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("store");
+        let (mut store, _) = RouteStore::open(&home).unwrap();
+        let route = kattegat_route(&mut store);
+        let id = route.id;
+        store.upsert_route(route).unwrap();
+        let exported = dir.path().join("exported.gpx");
+        store.export_route(id, &exported).unwrap();
+        let text = std::fs::read_to_string(&exported).unwrap();
+        assert!(text.contains("Grenaa – Anholt"));
+        std::fs::write(&exported, text.replace("Grenaa – Anholt", "To Anholt, by the north")).unwrap();
+
+        store.import(&exported).unwrap();
+        assert_eq!(store.route(id).unwrap().name, "To Anholt, by the north");
+        assert_eq!(count_gpx(&home), 1);
+
+        drop(store);
+        let (mut store, problems) = RouteStore::open(&home).unwrap();
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(store.routes().count(), 1);
+        assert_eq!(store.route(id).unwrap().name, "To Anholt, by the north");
+        // And deleting it deletes it: nothing left to come back.
+        store.delete_route(id).unwrap();
+        drop(store);
+        let (store, _) = RouteStore::open(&home).unwrap();
+        assert_eq!(store.routes().count(), 0);
+    }
+
+    /// Two files holding the same route (copied by hand, say): one route is
+    /// read, the other file is reported and neither is touched.
+    #[test]
+    fn a_second_file_with_the_same_route_is_reported_not_loaded_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("store");
+        let (mut store, _) = RouteStore::open(&home).unwrap();
+        let route = kattegat_route(&mut store);
+        let id = route.id;
+        store.upsert_route(route).unwrap();
+        let original = std::fs::read_dir(&home)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "gpx"))
+            .unwrap();
+        let copy = home.join("zz-copy.gpx");
+        std::fs::copy(&original, &copy).unwrap();
+        drop(store);
+
+        let (store, problems) = RouteStore::open(&home).unwrap();
+        assert_eq!(store.routes().count(), 1);
+        assert!(store.route(id).is_some());
+        assert!(
+            matches!(problems.as_slice(), [StoreError::Duplicate { path, .. }] if *path == copy),
+            "{problems:?}"
+        );
+        assert!(original.exists() && copy.exists());
     }
 
     #[test]
@@ -614,9 +919,10 @@ mod tests {
         std::fs::write(&bad, "<gpx><rte><rtept></rte>").unwrap();
         let (store, problems) = RouteStore::open(dir.path()).unwrap();
         assert_eq!(problems.len(), 1);
+        assert!(matches!(&problems[0], StoreError::Gpx(p, _) if *p == bad), "{problems:?}");
         assert_eq!(store.routes().count(), 0);
         // Still there, still broken, still the user's.
-        assert!(bad.exists());
+        assert_eq!(std::fs::read_to_string(&bad).unwrap(), "<gpx><rte><rtept></rte>");
     }
 
     #[test]

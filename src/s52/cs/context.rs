@@ -316,4 +316,166 @@ mod tests {
         };
         assert!(ctx.indicates_danger(10.0, 1));
     }
+
+    /// The two halves of `_UDWHAZ03` have opposite boundaries: an area is
+    /// "safe water" from `drval1 >= safety_contour`, a line is a danger only
+    /// when `drval2 < safety_contour`.
+    #[test]
+    fn udwhaz03_boundaries_at_the_safety_contour() {
+        let area = |d: f64| CsContext {
+            area_drval1: vec![d],
+            ..Default::default()
+        };
+        assert!(area(10.0).indicates_danger(10.0, 0));
+        assert!(!area(9.9).indicates_danger(10.0, 0));
+
+        let line = |d: f64| CsContext {
+            line_drval2: vec![d],
+            ..Default::default()
+        };
+        assert!(line(9.9).indicates_danger(10.0, 0));
+        assert!(!line(10.0).indicates_danger(10.0, 0));
+    }
+
+    #[test]
+    fn any_safe_area_among_several_raises_the_danger() {
+        // An object straddling a 0-5 m and a 10-20 m area lies partly in safe
+        // water, as s52cnsy.cpp's loop over associated objects concludes.
+        let ctx = CsContext {
+            area_drval1: vec![0.0, 10.0],
+            ..Default::default()
+        };
+        assert!(ctx.indicates_danger(10.0, 0));
+    }
+
+    /// The resolve and CS caches key on this hash, so surroundings that
+    /// symbolise differently must hash differently — including the same
+    /// value moved between the area and line lists.
+    #[test]
+    fn different_surroundings_hash_differently() {
+        let a = CsContext {
+            area_drval1: vec![10.0],
+            ..Default::default()
+        };
+        let b = CsContext {
+            area_drval1: vec![0.0],
+            ..Default::default()
+        };
+        let c = CsContext {
+            line_drval2: vec![10.0],
+            ..Default::default()
+        };
+        let d = CsContext {
+            area_drval1: vec![10.0],
+            safety_contour: Some(10.0),
+            ..Default::default()
+        };
+        let hashes = [a.hash_value(), b.hash_value(), c.hash_value(), d.hash_value()];
+        for i in 0..hashes.len() {
+            for j in i + 1..hashes.len() {
+                assert_ne!(hashes[i], hashes[j], "contexts {i} and {j} collide");
+            }
+        }
+        assert_eq!(a.hash_value(), a.clone().hash_value());
+        assert!(CsContext::EMPTY.is_empty());
+        assert!(!a.is_empty());
+    }
+
+    const REF_LAT: f64 = 55.0;
+    const REF_LON: f64 = 10.0;
+
+    /// A depth area covering +-1 km around the chart reference point, as
+    /// a two-triangle fan in reference-relative Mercator metres.
+    fn square_area(class: crate::senc::ObjectClass, drval1: Option<f64>, prim: crate::senc::TriPrimType) -> crate::senc::Feature {
+        use crate::senc::{AttributeValue, Attributes, AreaGeometry, BBox, Feature, FeatureType, TriPrim, TriPrimType};
+        let vertices = match prim {
+            // Fan and Triangles listed so both cover the same square.
+            TriPrimType::TriangleFan => vec![[-1000.0, -1000.0], [1000.0, -1000.0], [1000.0, 1000.0], [-1000.0, 1000.0]],
+            TriPrimType::TriangleStrip => vec![[-1000.0, -1000.0], [1000.0, -1000.0], [-1000.0, 1000.0], [1000.0, 1000.0]],
+            TriPrimType::Triangles => vec![
+                [-1000.0, -1000.0], [1000.0, -1000.0], [1000.0, 1000.0],
+                [-1000.0, -1000.0], [1000.0, 1000.0], [-1000.0, 1000.0],
+            ],
+        };
+        let mut attributes = Attributes::new();
+        if let Some(d) = drval1 {
+            attributes.insert("DRVAL1", AttributeValue::Float(d));
+        }
+        Feature {
+            type_code: 0,
+            object_class: class,
+            feature_type: FeatureType::Area,
+            attributes,
+            area_geometry: Some(AreaGeometry {
+                extent: BBox::default(),
+                triangles: vec![TriPrim { prim_type: prim, vertices }],
+                edge_refs: Vec::new(),
+            }),
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        }
+    }
+
+    fn reference_point(dx: f64, dy: f64) -> [f64; 2] {
+        let (x, y) = crate::tiles::latlon_to_mercator(REF_LAT, REF_LON);
+        [x + dx, y + dy]
+    }
+
+    #[test]
+    fn depth_area_index_reports_the_areas_around_a_point() {
+        use crate::senc::{ObjectClass, TriPrimType};
+        let features = vec![
+            square_area(ObjectClass::DepthArea, Some(10.0), TriPrimType::TriangleFan),
+            square_area(ObjectClass::DredgedArea, Some(15.0), TriPrimType::TriangleStrip),
+            square_area(ObjectClass::DepthArea, None, TriPrimType::Triangles),
+            // Land is not a depth area and must not count as water.
+            square_area(ObjectClass::LandArea, Some(30.0), TriPrimType::TriangleFan),
+        ];
+        let index = DepthAreaIndex::build(&features, REF_LAT, REF_LON);
+
+        let mut inside = index.context_at(reference_point(500.0, -500.0)).area_drval1;
+        inside.sort_by(f64::total_cmp);
+        // A depth area without DRVAL1 counts as 0 m, like OpenCPN's default.
+        assert_eq!(inside, [0.0, 10.0, 15.0]);
+
+        assert!(index.context_at(reference_point(1500.0, 0.0)).area_drval1.is_empty());
+        assert!(index.context_at(reference_point(0.0, -1500.0)).area_drval1.is_empty());
+    }
+
+    #[test]
+    fn build_near_skips_areas_outside_the_tile() {
+        use crate::senc::{ObjectClass, TriPrimType};
+        let features = vec![square_area(ObjectClass::DepthArea, Some(10.0), TriPrimType::TriangleFan)];
+        let far = (reference_point(5000.0, 5000.0), reference_point(6000.0, 6000.0));
+        assert!(DepthAreaIndex::build_near(&features, REF_LAT, REF_LON, Some(far)).is_empty());
+
+        let near = (reference_point(900.0, 900.0), reference_point(2000.0, 2000.0));
+        let index = DepthAreaIndex::build_near(&features, REF_LAT, REF_LON, Some(near));
+        assert_eq!(index.context_at(reference_point(0.0, 0.0)).area_drval1, [10.0]);
+    }
+
+    #[test]
+    fn context_for_probes_the_centre_of_an_area_feature() {
+        use crate::senc::{ObjectClass, TriPrimType};
+        let features = vec![square_area(ObjectClass::DepthArea, Some(10.0), TriPrimType::TriangleFan)];
+        let index = DepthAreaIndex::build(&features, REF_LAT, REF_LON);
+
+        // An area obstruction whose extent is centred on the reference point.
+        let mut obstruction = square_area(ObjectClass::Obstruction, None, TriPrimType::TriangleFan);
+        if let Some(ag) = obstruction.area_geometry.as_mut() {
+            ag.extent = crate::senc::BBox {
+                min_x: REF_LON - 0.001,
+                max_x: REF_LON + 0.001,
+                min_y: REF_LAT - 0.001,
+                max_y: REF_LAT + 0.001,
+            };
+        }
+        assert_eq!(index.context_for(&obstruction).area_drval1, [10.0]);
+
+        // A feature with no geometry has no surroundings.
+        let mut bare = obstruction.clone();
+        bare.area_geometry = None;
+        assert!(index.context_for(&bare).is_empty());
+    }
 }

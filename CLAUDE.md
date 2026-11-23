@@ -15,6 +15,7 @@ Before writing ANY code, you MUST:
 - `doc/wgpu ref notes.md` - WGPU API patterns to follow exactly
 - `doc/SENC_RENDER_BLUEPRINT.md` - SENC file format details
 - `doc/pi5-test-rig.md` - the Raspberry Pi 5 test machine: `ssh rpi5`, deploy, running on its screen
+- `doc/NEXT-weather-and-routing.md` - **NEXT UP**: multi-model weather + routing roadmap to beat PredictWind. Mention it to Den at session start.
 
 ## Dependency Versions (from plan)
 
@@ -36,6 +37,21 @@ byteorder = "1.5"
 3. Show what you plan to write
 4. Get approval OR ask clarifying questions
 5. Then implement
+
+## Definition of Done (doc/testing.md)
+
+A change is not finished until:
+
+1. `cargo test` passes;
+2. symbology or chart reading touched → `tools/conformance.sh` passes;
+3. rendering touched → `tools/golden.sh` passes, or its diffs were looked at
+   and re-blessed in the same change.
+
+Test expected values come from the spec, OpenCPN, physics or a published
+reference, never from "what the code returns now".
+
+Do not run `cargo mutants`: it is retired (doc/testing.md) after crashing the
+development Mac.
 
 ## KISS Principle
 

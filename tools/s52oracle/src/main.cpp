@@ -24,7 +24,9 @@
 
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 #include <list>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -432,10 +434,55 @@ int main(int argc, char **argv) {
   ctx.chart_scale = 10000;
   ctx.chart_type = 0;
 
-  std::string line;
+  // OpenCPN does not draw the mariner's safety contour as given: each chart
+  // draws the next contour it actually has at or below that depth
+  // (s57chart::BuildDepthContourArray + SetSafetyContour, which DEPCNT02 and
+  // DEPARE02 read back through m_chart_context->safety_contour). That needs
+  // every DEPCNT in a chart before any of its features is resolved, so the
+  // whole stream is read first and the value worked out chart by chart.
+  std::vector<std::string> lines;
+  std::map<std::string, std::vector<double>> valdcos;
+  auto chart_of = [](const mj::Value &rec) -> std::string {
+    const mj::Value *vid = rec.find("id");
+    if (!vid || vid->type != mj::Type::Str) return std::string();
+    return vid->str.substr(0, vid->str.find('#'));
+  };
+  for (std::string l; std::getline(std::cin, l);) {
+    if (l.empty()) continue;
+    mj::Value rec;
+    if (mj::Parser(l).parse(rec) && rec.type == mj::Type::Obj) {
+      const mj::Value *vobj = rec.find("obj");
+      const mj::Value *attrs = rec.find("attrs");
+      if (vobj && vobj->str == "DEPCNT" && attrs) {
+        if (const mj::Value *v = attrs->find("VALDCO")) {
+          if (v->type == mj::Type::Arr && v->arr.size() == 2 &&
+              v->arr[1].type == mj::Type::Num) {
+            valdcos[chart_of(rec)].push_back(v->arr[1].num);
+          }
+        }
+      }
+    }
+    lines.push_back(std::move(l));
+  }
+  // SetSafetyContour: the smallest VALDCO >= the mariner's safety contour,
+  // none (1e6) when there is no such contour or it lies deeper than the deep
+  // contour.
+  std::map<std::string, double> next_safe;
+  for (auto &kv : valdcos) {
+    std::sort(kv.second.begin(), kv.second.end());
+    double n = 1e6;
+    for (double v : kv.second) {
+      if (v >= opt.safety_contour) {
+        n = v;
+        break;
+      }
+    }
+    if (n > opt.deep_contour) n = 1e6;
+    next_safe[kv.first] = n;
+  }
+
   long nread = 0, nresolved = 0;
-  while (std::getline(std::cin, line)) {
-    if (line.empty()) continue;
+  for (const std::string &line : lines) {
     mj::Value rec;
     if (!mj::Parser(line).parse(rec) || rec.type != mj::Type::Obj) {
       fprintf(stderr, "s52oracle: bad input line: %s\n", line.c_str());
@@ -460,6 +507,10 @@ int main(int argc, char **argv) {
     std::string prim = vprim->str;
 
     S57Obj obj(objname.c_str());
+    {
+      auto it = next_safe.find(chart_of(rec));
+      ctx.safety_contour = it == next_safe.end() ? 1e6 : it->second;
+    }
     obj.m_chart_context = &ctx;
 
     LUPname tname;

@@ -11,7 +11,7 @@
 //! giving up or hammering.
 
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -20,8 +20,30 @@ use super::delta;
 
 /// What the UI asks of the connection.
 pub enum Request {
-    Connect { url: String },
-    Disconnect,
+    Connect { url: String, order: u64 },
+    Disconnect { order: u64 },
+}
+
+/// Whether the worker should drop what it is doing.
+///
+/// The worker blocks — in a socket read, in a back-off sleep — and cannot
+/// watch its request channel from there. Every instruction from the UI is
+/// numbered, and the newest number is kept where the worker can glance at
+/// it: when it is no longer the one being carried out, there is a newer
+/// instruction waiting, and whatever is in hand stops.
+///
+/// A plain "stop" flag could not tell a Connect from a Disconnect: a new
+/// address typed while connected was not acted on at all, and the
+/// Disconnect that followed it then connected to that address.
+struct Orders<'a> {
+    newest: &'a AtomicU64,
+    mine: u64,
+}
+
+impl Orders<'_> {
+    fn superseded(&self) -> bool {
+        self.newest.load(Ordering::Relaxed) != self.mine
+    }
 }
 
 /// What the connection tells the UI.
@@ -66,10 +88,8 @@ impl Status {
 pub struct SignalKService {
     tx: Sender<Request>,
     rx: Receiver<Event>,
-    /// Set when the UI wants the current socket dropped. The worker blocks in
-    /// `read()`, so it cannot poll the request channel; this is how a
-    /// disconnect reaches it.
-    stop: Arc<AtomicBool>,
+    /// The number of the newest instruction sent. See [`Orders`].
+    newest: Arc<AtomicU64>,
     _thread: thread::JoinHandle<()>,
 }
 
@@ -83,28 +103,28 @@ impl SignalKService {
     pub fn new() -> Self {
         let (tx, request_rx) = channel::<Request>();
         let (event_tx, rx) = channel::<Event>();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = Arc::clone(&stop);
+        let newest = Arc::new(AtomicU64::new(0));
+        let worker_newest = Arc::clone(&newest);
         let thread = thread::Builder::new()
             .name("signalk".into())
-            .spawn(move || worker(request_rx, event_tx, worker_stop))
+            .spawn(move || worker(request_rx, event_tx, worker_newest))
             .expect("spawn signalk thread");
         Self {
             tx,
             rx,
-            stop,
+            newest,
             _thread: thread,
         }
     }
 
     pub fn connect(&self, url: String) {
-        self.stop.store(false, Ordering::Relaxed);
-        let _ = self.tx.send(Request::Connect { url });
+        let order = self.newest.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(Request::Connect { url, order });
     }
 
     pub fn disconnect(&self) {
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = self.tx.send(Request::Disconnect);
+        let order = self.newest.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(Request::Disconnect { order });
     }
 
     /// Everything that has arrived since the last call.
@@ -176,35 +196,47 @@ pub fn normalise_url(input: &str) -> String {
     format!("{scheme}://{authority}/signalk/v1/stream?subscribe=none")
 }
 
-fn worker(requests: Receiver<Request>, events: Sender<Event>, stop: Arc<AtomicBool>) {
+fn worker(requests: Receiver<Request>, events: Sender<Event>, newest: Arc<AtomicU64>) {
     let mut url: Option<String> = None;
     // Backoff doubles to a ceiling: a boat at anchor with the server off
     // should not spin, but a server coming back after a reboot should be
     // picked up within a few seconds, not a few minutes.
     const BACKOFF: &[u64] = &[1, 2, 5, 10, 20, 30];
     let mut attempt = 0usize;
+    let mut mine = 0u64;
 
     loop {
-        // Take the latest instruction. Blocks when idle so the thread costs
-        // nothing while disconnected.
-        let next = if url.is_some() {
+        // Take the latest instruction — the last of whatever is queued, for
+        // only the newest still means anything. Blocks when idle so the
+        // thread costs nothing while disconnected.
+        let mut next = if url.is_some() {
             requests.try_recv().ok()
         } else {
             requests.recv().ok()
         };
+        while let Ok(later) = requests.try_recv() {
+            next = Some(later);
+        }
         match next {
-            Some(Request::Connect { url: u }) => {
+            Some(Request::Connect { url: u, order }) => {
                 url = Some(u);
                 attempt = 0;
-                stop.store(false, Ordering::Relaxed);
+                mine = order;
             }
-            Some(Request::Disconnect) => {
+            Some(Request::Disconnect { order }) => {
                 url = None;
+                mine = order;
                 let _ = events.send(Event::Status(Status::Disconnected));
                 continue;
             }
             None if url.is_none() => return, // channel closed
             None => {}
+        }
+        let orders = Orders { newest: &newest, mine };
+        if orders.superseded() {
+            // A newer instruction is on its way down the channel.
+            thread::sleep(Duration::from_millis(5));
+            continue;
         }
 
         let Some(ref target) = url else { continue };
@@ -216,51 +248,45 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, stop: Arc<AtomicBo
                 "simulated boat at {:.3}, {:.3}",
                 course.lat, course.lon
             ))));
-            simulate(course, &events, &stop);
-            url = None;
-            let _ = events.send(Event::Status(Status::Disconnected));
+            simulate(course, &events, &orders);
+            // Only a newer instruction ends a simulation; it says what next.
             continue;
         }
 
         let _ = events.send(Event::Status(Status::Connecting(target.clone())));
 
-        match run_once(target, &events, &stop) {
-            Ok(()) => {
-                // A clean close still means reconnecting: the server restarted
-                // or the subscription lapsed, and the boat is still moving.
-                if stop.load(Ordering::Relaxed) {
-                    url = None;
-                    let _ = events.send(Event::Status(Status::Disconnected));
-                    continue;
-                }
-                attempt = 0;
-                let _ = events.send(Event::Status(Status::Retrying {
-                    because: "The server closed the connection".into(),
-                    in_seconds: BACKOFF[0],
-                }));
-                thread::sleep(Duration::from_secs(BACKOFF[0]));
-            }
+        let mut connected = false;
+        let outcome = run_once(target, &events, &orders, &mut connected);
+        if orders.superseded() {
+            continue;
+        }
+        // Having got through once, the next failure is a fresh one: the
+        // wait starts short again instead of at wherever the trouble before
+        // the connection had pushed it.
+        if connected {
+            attempt = 0;
+        }
+        let (because, wait) = match outcome {
+            // A clean close still means reconnecting: the server restarted
+            // or the subscription lapsed, and the boat is still moving.
+            Ok(()) => ("The server closed the connection".to_string(), BACKOFF[0]),
             Err(e) => {
-                if stop.load(Ordering::Relaxed) {
-                    url = None;
-                    let _ = events.send(Event::Status(Status::Disconnected));
-                    continue;
-                }
                 let wait = BACKOFF[attempt.min(BACKOFF.len() - 1)];
                 attempt += 1;
-                let _ = events.send(Event::Status(Status::Retrying {
-                    because: e,
-                    in_seconds: wait,
-                }));
-                // Sleep in slices so a disconnect is honoured promptly rather
-                // than after the whole backoff has run.
-                for _ in 0..wait * 10 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
+                (e, wait)
             }
+        };
+        let _ = events.send(Event::Status(Status::Retrying {
+            because,
+            in_seconds: wait,
+        }));
+        // Sleep in slices so a new instruction is honoured promptly rather
+        // than after the whole backoff has run.
+        for _ in 0..wait * 10 {
+            if orders.superseded() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -269,14 +295,14 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, stop: Arc<AtomicBo
 ///
 /// One second of boat per tick, ticked four times a second — fast enough that
 /// the marker moves visibly, slow enough that the numbers are readable.
-fn simulate(course: super::sim::Course, events: &Sender<Event>, stop: &AtomicBool) {
+fn simulate(course: super::sim::Course, events: &Sender<Event>, orders: &Orders) {
     const TICK: Duration = Duration::from_millis(250);
     let mut sim = super::sim::Simulator::new(course);
     // Traffic too, so the AIS layer can be seen without standing up a server.
     // The own boat's deltas carry no context, which is how a server says "my
     // vessel", so the fleet routes everything correctly without a greeting.
     let mut traffic = super::sim::traffic_around(course);
-    while !stop.load(Ordering::Relaxed) {
+    while !orders.superseded() {
         let dt = TICK.as_secs_f64();
         if events.send(Event::Delta(sim.step(dt))).is_err() {
             return; // UI gone
@@ -290,8 +316,30 @@ fn simulate(course: super::sim::Course, events: &Sender<Event>, stop: &AtomicBoo
     }
 }
 
+/// What is asked of the server once the stream is open (it is opened with
+/// `subscribe=none`, so nothing arrives unasked).
+///
+/// Our own boat, everything, at the fastest the server will give: a plotter
+/// wants position and heading as often as they exist, and on a local network
+/// a fast stream costs nothing but bandwidth.
+///
+/// And every other vessel — the AIS traffic. A subscription to
+/// `vessels.self` alone brings no other vessel at all: checked against the
+/// public demo server, it delivered one context where this pair delivers
+/// 161. Traffic is asked for more slowly; a ship's AIS report is seconds
+/// old by the time it is received anyway.
+const SUBSCRIPTIONS: &[&str] = &[
+    r#"{"context":"vessels.self","subscribe":[{"path":"*","period":500}]}"#,
+    r#"{"context":"vessels.*","subscribe":[{"path":"*","period":2000}]}"#,
+];
+
 /// One connection, from handshake to close.
-fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), String> {
+fn run_once(
+    url: &str,
+    events: &Sender<Event>,
+    orders: &Orders,
+    connected: &mut bool,
+) -> Result<(), String> {
     use tungstenite::Message;
 
     let (mut socket, _response) =
@@ -304,20 +352,18 @@ fn run_once(url: &str, events: &Sender<Event>, stop: &AtomicBool) -> Result<(), 
     // its stop check, so the retry never ran, Disconnect did nothing, and the
     // bar kept saying Connected over a frozen position.
     set_read_timeout(&mut socket, READ_TIMEOUT);
+    *connected = true;
     let _ = events.send(Event::Status(Status::Connected(url.to_string())));
 
-    // Ask for everything at the fastest the server will give. A plotter wants
-    // position and heading as often as they exist; the bar is redrawn from
-    // whatever has arrived, so a fast stream costs nothing but bandwidth on a
-    // local network.
-    let subscribe = r#"{"context":"vessels.self","subscribe":[{"path":"*","period":500}]}"#;
-    if let Err(e) = socket.send(Message::Text(subscribe.into())) {
-        return Err(describe(&e.to_string()));
+    for subscribe in SUBSCRIPTIONS {
+        if let Err(e) = socket.send(Message::Text((*subscribe).into())) {
+            return Err(describe(&e.to_string()));
+        }
     }
 
     let mut silent_reads = 0u32;
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if orders.superseded() {
             let _ = socket.close(None);
             return Ok(());
         }
@@ -416,6 +462,24 @@ fn describe(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The Signal K subscription protocol addresses vessels by context:
+    /// `vessels.self` is our own, `vessels.*` every vessel. Without the
+    /// second there is no AIS traffic, so no targets and no collision alarm.
+    #[test]
+    fn the_stream_asks_for_our_boat_and_for_the_traffic() {
+        let contexts: Vec<String> = SUBSCRIPTIONS
+            .iter()
+            .map(|m| {
+                let v: serde_json::Value = serde_json::from_str(m).expect("valid JSON");
+                assert_eq!(v["subscribe"][0]["path"], "*");
+                assert!(v["subscribe"][0]["period"].as_u64().is_some());
+                v["context"].as_str().unwrap().to_string()
+            })
+            .collect();
+        assert!(contexts.iter().any(|c| c == "vessels.self"));
+        assert!(contexts.iter().any(|c| c == "vessels.*"));
+    }
+
     #[test]
     fn a_bare_host_becomes_a_stream_url_on_the_default_port() {
         assert_eq!(
@@ -484,9 +548,115 @@ mod tests {
     }
 
     #[test]
-    fn a_service_starts_and_stops_without_a_server() {
+    fn other_schemes_and_a_simulated_boat_are_understood() {
+        // http maps to ws, and a host without a port gets Signal K's 3000.
+        assert_eq!(
+            normalise_url("http://boat.local"),
+            "ws://boat.local:3000/signalk/v1/stream?subscribe=none"
+        );
+        // https is TLS on its own port: adding 3000 would break it.
+        assert_eq!(
+            normalise_url("https://boat.example.org/"),
+            "wss://boat.example.org/signalk/v1/stream?subscribe=none"
+        );
+        // A simulator address is not a host and must reach the worker as
+        // typed, or it becomes ws://sim:3000/ and fails for ever.
+        assert_eq!(normalise_url(" sim:56.1,11.2 "), "sim:56.1,11.2");
+        assert_eq!(normalise_url("sim"), "sim");
+    }
+
+    /// Wait for the worker to say something matching `want`, collecting
+    /// everything it said on the way.
+    fn wait_for(s: &SignalKService, want: impl Fn(&Event) -> bool) -> Vec<Event> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let batch = s.poll();
+            let done = batch.iter().any(&want);
+            seen.extend(batch);
+            if done {
+                return seen;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the worker never said what was expected; it said {seen:?}");
+    }
+
+    /// A new address given while connected is gone to at once, and a
+    /// disconnect after it disconnects — it does not start the connection
+    /// that was asked for before it.
+    #[test]
+    fn a_new_address_while_connected_is_gone_to_and_a_disconnect_stays_disconnected() {
         let s = SignalKService::new();
-        assert!(s.poll().is_empty());
+        s.connect("sim:56.1,11.2".into());
+        wait_for(&s, |e| matches!(e, Event::Status(st) if st.is_connected()));
+
+        s.connect("sim:57.5,10.0".into());
+        let seen = wait_for(
+            &s,
+            |e| matches!(e, Event::Status(st) if st.summary().contains("57.500, 10.000")),
+        );
+        assert!(
+            !seen.iter().any(|e| matches!(e, Event::Status(Status::Disconnected))),
+            "going to a new address is not a disconnect"
+        );
+
+        // Two instructions at once: only the last counts.
+        s.connect("sim:58.0,11.0".into());
         s.disconnect();
+        wait_for(&s, |e| matches!(e, Event::Status(Status::Disconnected)));
+        thread::sleep(Duration::from_millis(600));
+        let after = s.poll();
+        assert!(
+            !after.iter().any(|e| matches!(e, Event::Delta(_) | Event::Status(Status::Connected(_)))),
+            "connected again after the disconnect: {after:?}"
+        );
+    }
+
+    /// The whole worker loop, end to end, without a socket: a simulated boat
+    /// connects, streams our own vessel and the traffic around it, and a
+    /// disconnect actually stops it.
+    #[test]
+    fn a_simulated_boat_streams_until_disconnected() {
+        let s = SignalKService::new();
+        assert!(s.poll().is_empty(), "nothing is said before anything is asked");
+
+        s.connect("sim:56.1,11.2".into());
+        let seen = wait_for(&s, |e| matches!(e, Event::Delta(d) if d.context.is_some()));
+        let connected = seen.iter().find_map(|e| match e {
+            Event::Status(st) if st.is_connected() => Some(st.summary()),
+            _ => None,
+        });
+        assert_eq!(
+            connected.as_deref(),
+            Some("Connected to simulated boat at 56.100, 11.200")
+        );
+        // Our own boat speaks with no context, which the fleet reads as us,
+        // and sails where it was told to.
+        let own = seen
+            .iter()
+            .find_map(|e| match e {
+                Event::Delta(d) if d.context.is_none() => Some(d),
+                _ => None,
+            })
+            .expect("a delta for our own boat");
+        let pos = own
+            .updates
+            .iter()
+            .find_map(|u| match u.value {
+                delta::Value::Position { lat, lon } => Some((lat, lon)),
+                _ => None,
+            })
+            .expect("a position");
+        assert!((pos.0 - 56.1).abs() < 0.01 && (pos.1 - 11.2).abs() < 0.01, "{pos:?}");
+
+        s.disconnect();
+        wait_for(&s, |e| matches!(e, Event::Status(Status::Disconnected)));
+        // Stopped means stopped: no more of the boat after the last word.
+        thread::sleep(Duration::from_millis(600));
+        assert!(
+            !s.poll().iter().any(|e| matches!(e, Event::Delta(_))),
+            "the simulator kept sailing after the disconnect"
+        );
     }
 }

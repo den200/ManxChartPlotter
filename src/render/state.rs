@@ -326,6 +326,24 @@ fn create_msaa_view(
 
 
 /// Complete render state for chart visualization
+/// A route as it stood before an edit: which marks, in what order, and
+/// where each was. Enough to take any edit back — an added, removed,
+/// reordered or moved waypoint alike.
+struct RouteSnapshot {
+    route_id: uuid::Uuid,
+    waypoints: Vec<uuid::Uuid>,
+    positions: Vec<(uuid::Uuid, crate::geo::LatLon)>,
+    /// What the edit was, for the Undo button: "Moved WP 3".
+    what: String,
+}
+
+/// A waypoint being dragged across the chart.
+struct RouteDrag {
+    waypoint: uuid::Uuid,
+    /// Whether it has moved yet: a press that never moves is a tap.
+    moved: bool,
+}
+
 /// What a route network job (Signal K resources) reports back.
 pub(crate) enum RouteNetEvent {
     Status(String),
@@ -421,6 +439,9 @@ pub struct RenderState {
     pub pattern_renderer: Option<PatternRenderer>,
     /// A chart folder loading on a worker thread.
     chart_load: Option<ChartLoad>,
+    /// A chart folder waiting for its o-charts licence agreement to be
+    /// accepted, and whether opening it keeps the view.
+    eula_waiting: Option<(std::path::PathBuf, bool)>,
     /// Answers from the free-chart (NOAA) workers.
     free_rx: std::sync::mpsc::Receiver<FreeEvent>,
     free_tx: std::sync::mpsc::Sender<FreeEvent>,
@@ -501,6 +522,16 @@ pub struct RenderState {
     /// The world position the bubble is pinned to, so it tracks the object as
     /// the chart pans rather than sitting still on the glass.
     pick_anchor: Option<[f64; 2]>,
+    /// The route as it was before each edit made on the chart, newest
+    /// last: what Undo steps back through.
+    /// The interface size in force this frame ([`crate::render::ui::UiSize::factor`]).
+    ui_zoom: f32,
+    route_undo: Vec<RouteSnapshot>,
+    /// The waypoint under the finger, while one is being dragged.
+    route_drag: Option<RouteDrag>,
+    /// A place the next point forecast was asked for by name ("Weather
+    /// here" on a tap), instead of the middle of the screen. Taken once.
+    weather_at: Option<crate::geo::LatLon>,
     pick_objects: Vec<crate::pick::PickedObject>,
     /// The query the open bubble is answering.
     pick_shown: u64,
@@ -743,14 +774,14 @@ fn lod_fade(x: f32) -> f32 {
 impl RenderState {
     /// Lay a world-anchored lattice over `area`, about `spacing` points apart.
     fn sample_grid(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
-        sample_grid_for(&self.camera, self.scale_factor, spacing, area, Octave::Nearest)
+        sample_grid_for(&self.camera, self.points_scale(), spacing, area, Octave::Nearest)
     }
 
     /// The same lattice for marks that fade by [`SampleGrid::fade`]: one
     /// octave finer than [`Self::sample_grid`] would pick, so there are
     /// points to fade in.
     fn sample_grid_faded(&self, spacing: f32, area: egui::Rect) -> SampleGrid {
-        sample_grid_for(&self.camera, self.scale_factor, spacing, area, Octave::Finer)
+        sample_grid_for(&self.camera, self.points_scale(), spacing, area, Octave::Finer)
     }
 }
 
@@ -1493,6 +1524,7 @@ impl RenderState {
             pattern_renderer,
             clear_colour: OCEAN_BACKGROUND,
             chart_load: None,
+            eula_waiting: None,
             free_rx,
             free_tx,
             free_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1525,6 +1557,10 @@ impl RenderState {
             current_forecast: None,
             route_net_jobs: 0,
             pick_anchor: None,
+            ui_zoom: 1.0,
+            route_undo: Vec::new(),
+            route_drag: None,
+            weather_at: None,
             pick_objects: Vec::new(),
             pick_shown: 0,
             pick_pending: None,
@@ -1997,14 +2033,19 @@ impl RenderState {
     /// Remember where chart sets live, so a download lands beside them —
     /// and so the next session opens the same charts without an argument.
     pub fn set_chart_root(&mut self, root: std::path::PathBuf) {
+        // Not remembered from here: this is also how the first-run folder
+        // and a folder named once on the command line are loaded, and
+        // neither is the boat's choice of charts. Choosing a folder in the
+        // Charts window is (`poll_chart_load`).
+        self.chart_root = Some(root);
+        // Loading a folder may have moved stray free charts into the
+        // library; say what is there now.
+        let free = self.free_root();
         if let Some(ref mut ui) = self.ui {
-            ui.charts.chosen = root.display().to_string();
-            // What is installed depends on which folder is in use.
             for row in ui.free.rows.iter_mut() {
-                row.installed = crate::shop::noaa::installed(&root, row.code);
+                row.installed = crate::shop::noaa::installed(&free, row.code);
             }
         }
-        self.chart_root = Some(root);
     }
 
     /// Load a folder of charts now, replacing whatever is on screen.
@@ -2026,6 +2067,19 @@ impl RenderState {
     /// `keep_view` holds the camera where it is (a reload after an install);
     /// otherwise the view frames the new charts.
     pub fn start_chart_folder_load(&mut self, dir: std::path::PathBuf, keep_view: bool) {
+        // o-charts' conditions: the licence agreement that comes with a
+        // chart set is accepted before the charts are used. Until it is,
+        // the folder is not opened; accepting comes back here.
+        if let Some(pending) = crate::shop::eula::pending(&dir) {
+            self.eula_waiting = Some((dir, keep_view));
+            if let Some(ref mut ui) = self.ui {
+                ui.shop.eula.gate = Some(pending);
+                ui.charts.loading = false;
+                ui.charts.status = "Waiting for the o-charts licence agreement".into();
+            }
+            self.needs_redraw = true;
+            return;
+        }
         if let Some(ref mut ui) = self.ui {
             ui.charts.loading = true;
             ui.charts.status = "Loading charts…".into();
@@ -2041,6 +2095,14 @@ impl RenderState {
 
     /// Take a finished chart load, if one has arrived.
     fn poll_chart_load(&mut self) {
+        // A folder waiting for its licence agreement: keep the question on
+        // screen (the interface may not have existed when it was first put).
+        if let (Some((dir, _)), Some(ui)) = (&self.eula_waiting, self.ui.as_mut()) {
+            if ui.shop.eula.gate.is_none() {
+                ui.shop.eula.gate = crate::shop::eula::pending(dir);
+                self.needs_redraw = true;
+            }
+        }
         let Some(ref load) = self.chart_load else { return };
         let result = match load.rx.try_recv() {
             Ok(r) => r,
@@ -2082,12 +2144,17 @@ impl RenderState {
 
     /// Where free charts go: the chart folder in use, or — before there is
     /// one — Manx's own, which then becomes the chart folder.
+    /// Where free charts install: Manx's own folder, never the open chart
+    /// set — see [`crate::shop::noaa::library`].
     fn free_root(&self) -> std::path::PathBuf {
-        self.chart_root.clone().unwrap_or_else(|| {
-            crate::paths::data_dir()
-                .unwrap_or_else(|| std::env::temp_dir().join(crate::paths::APP))
-                .join("charts")
-        })
+        crate::shop::noaa::library()
+            .unwrap_or_else(|| std::env::temp_dir().join(crate::paths::APP).join("charts"))
+    }
+
+    /// The folder to reload so a free-chart change shows: the one open, or
+    /// the library itself when nothing is.
+    fn free_reload_root(&self) -> std::path::PathBuf {
+        self.chart_root.clone().unwrap_or_else(|| self.free_root())
     }
 
     /// List the packages with what is installed, and ask NOAA for sizes
@@ -2165,7 +2232,7 @@ impl RenderState {
                 &cancel,
             );
             let _ = tx.send(match result {
-                Ok(inst) => FreeEvent::Installed(code, root, inst),
+                Ok(inst) => FreeEvent::Installed(code, inst),
                 Err(e) => FreeEvent::Failed(code, e),
             });
             installing.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2189,7 +2256,7 @@ impl RenderState {
         }
         // Take the removed cells off the map.
         if self.chart_root.is_some() && self.chart_load.is_none() {
-            self.start_chart_folder_load(root, true);
+            self.start_chart_folder_load(self.free_reload_root(), true);
         }
     }
 
@@ -2199,7 +2266,7 @@ impl RenderState {
         if events.is_empty() {
             return;
         }
-        let mut reload: Option<std::path::PathBuf> = None;
+        let mut reload = false;
         for event in events {
             let Some(ref mut ui) = self.ui else { continue };
             match event {
@@ -2215,14 +2282,14 @@ impl RenderState {
                         ui.free.active = Some((code, done, total));
                     }
                 }
-                FreeEvent::Installed(code, root, inst) => {
+                FreeEvent::Installed(code, inst) => {
                     let name = ui.free.rows.iter().find(|r| r.code == code).map(|r| r.name).unwrap_or("");
                     ui.free.status = format!("{name} installed — loading the charts…");
                     if let Some(row) = ui.free.rows.iter_mut().find(|r| r.code == code) {
                         row.installed = Some(inst);
                     }
                     ui.free.active = None;
-                    reload = Some(root);
+                    reload = true;
                 }
                 FreeEvent::Failed(code, e) => {
                     ui.free.active = None;
@@ -2236,12 +2303,12 @@ impl RenderState {
                 FreeEvent::Done => self.free_jobs = self.free_jobs.saturating_sub(1),
             }
         }
-        if let Some(root) = reload {
+        if reload {
             // Keep the view where it is when adding to charts already on
             // screen; frame the new ones when they are the first.
             let keep_view = self.chart_root.is_some();
             if self.chart_load.is_none() {
-                self.start_chart_folder_load(root, keep_view);
+                self.start_chart_folder_load(self.free_reload_root(), keep_view);
             }
         }
         self.needs_redraw = true;
@@ -2268,19 +2335,21 @@ impl RenderState {
     /// Read straight from the settings file rather than through the UI, because
     /// `main` needs it before there is a window to hold a UI at all.
     pub fn remembered_chart_folder() -> Option<std::path::PathBuf> {
-        let path = Self::settings_path()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        #[derive(serde::Deserialize)]
-        struct Persisted {
-            charts: crate::render::ui::ChartFolderView,
-        }
-        let p: Persisted = serde_json::from_str(&text).ok()?;
-        // A folder remembered from before the rename may have moved with
-        // the rest of Manx's files.
-        let dir = crate::paths::moved(std::path::Path::new(p.charts.chosen.trim()));
         // A folder on a memory stick that is no longer plugged in must not
         // stop the plotter starting.
-        dir.is_dir().then_some(dir)
+        Self::saved_chart_folder().filter(|dir| dir.is_dir())
+    }
+
+    /// The folder the settings file names, whether or not it is there now.
+    ///
+    /// This, not [`remembered_chart_folder`](Self::remembered_chart_folder),
+    /// is what the settings are seeded with: charts on a stick that mounts
+    /// late, or is out for one start, are still the boat's charts. Seeded
+    /// only when present, the first setting saved in that session wrote the
+    /// folder out of the file for good.
+    fn saved_chart_folder() -> Option<std::path::PathBuf> {
+        let text = std::fs::read_to_string(Self::settings_path()?).ok()?;
+        chart_folder_in_settings(&text)
     }
 
     /// `MANX_PLAN="from;to[;motor]"` types the passage planner's fields
@@ -2512,6 +2581,40 @@ impl RenderState {
             }
         }
 
+        // `MANX_ROUTE_TAP="lat,lon;lat,lon"` taps the chart at each place
+        // in turn, and `MANX_ROUTE_DRAG="lat,lon>lat,lon"` presses on the
+        // first and lets go on the second — the same paths a finger takes
+        // (`tap_at_screen`, `route_drag_*`), so that drawing a route on the
+        // chart can be captured, and checked, without a pointer.
+        let on_screen = |s: &Self, text: &str| {
+            let p = crate::geo::parse_latlon(text)?;
+            let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
+            let at = s.camera.world_to_screen(x, y);
+            Some((at.x, at.y))
+        };
+        if let Ok(spec) = std::env::var("MANX_ROUTE_TAP") {
+            for point in spec.split(';').filter(|p| !p.trim().is_empty()) {
+                match on_screen(self, point) {
+                    Some((x, y)) => self.tap_at_screen(x, y),
+                    None => log::warn!("MANX_ROUTE_TAP: cannot read '{point}'"),
+                }
+            }
+        }
+        if let Ok(spec) = std::env::var("MANX_ROUTE_DRAG") {
+            let ends = spec.split_once('>').and_then(|(a, b)| Some((on_screen(self, a)?, on_screen(self, b)?)));
+            match ends {
+                Some(((x0, y0), (x1, y1))) => {
+                    if self.route_drag_begin(x0, y0) {
+                        self.route_drag_to(x1, y1);
+                        self.route_drag_end();
+                    } else {
+                        log::warn!("MANX_ROUTE_DRAG: no waypoint of the route being drawn at the start");
+                    }
+                }
+                None => log::warn!("MANX_ROUTE_DRAG must be 'lat,lon>lat,lon'; ignoring {spec:?}"),
+            }
+        }
+
         self.catalog = Some(catalog_arc);
         self.keys = Some(keys_arc);
         // decryptor is now owned by worker - clear main thread reference
@@ -2563,6 +2666,16 @@ impl RenderState {
             self.camera.resize(new_size.width as f32, new_size.height as f32);
             self.needs_redraw = true;
         }
+    }
+
+    /// Physical pixels per point of the interface: the display's own scale
+    /// times the interface size chosen in Display. Everything handed to the
+    /// interface as a position — the boat, the traffic, a route's marks —
+    /// is in these points, so it must be divided by this and not by the
+    /// display's scale alone, or it would be drawn in the wrong place at
+    /// any size but Medium.
+    fn points_scale(&self) -> f32 {
+        (self.scale_factor * self.ui_zoom).max(0.01)
     }
 
     /// Update scale factor for HiDPI display changes
@@ -2945,6 +3058,9 @@ impl RenderState {
 
         // The UI, in its own pass over the resolved surface. After this point
         // the chart is finished with the frame.
+        if let Some(ref ui) = self.ui {
+            self.ui_zoom = ui.display.size.factor();
+        }
         // Projected before the take: routes_display reads ui.routes for the
         // visible set, and inside the block self.ui is temporarily None.
         // Projected before the take, like routes_display: inside the block
@@ -2965,12 +3081,24 @@ impl RenderState {
         let ui_actions = if let Some(mut ui) = self.ui.take() {
             let anchor = self.pick_anchor.map(|a| {
                 let s = self.camera.world_to_screen(a[0], a[1]);
-                let ppp = self.scale_factor.max(0.01);
+                let ppp = self.points_scale();
                 [s.x / ppp, s.y / ppp]
+            });
+            let pick_geo = self.pick_anchor.map(|a| {
+                let (lat, lon) = crate::render::projection::Projection::to_wgs84(a[0], a[1]);
+                [lat, lon]
+            });
+            let pick_from_boat = pick_geo.and_then(|[lat, lon]| {
+                let boat = crate::nav::alarms::live(self.own_fix())?;
+                let (m, b) = crate::geo::range_bearing(boat, crate::geo::LatLon::new(lat, lon));
+                Some((m, b.to_degrees().rem_euclid(360.0)))
             });
             let own_ship = self.own_ship_view();
             let ais = self.ais_targets();
-            let mpp = self.camera.zoom * self.scale_factor.max(0.01);
+            // Ground metres per point at the middle of the view: the
+            // traffic's vectors are distances over the ground too.
+            let view_lat = crate::render::projection::Projection::y_to_lat(self.camera.position.y);
+            let mpp = self.camera.ground_metres_per_pixel(view_lat) * self.points_scale();
             let (alarms, mob, anchor_view, track_view) = self.watch_views();
             let depth_m = self.depth_under_boat();
             let actions = ui.run(
@@ -2982,7 +3110,10 @@ impl RenderState {
                 [self.config.width, self.config.height],
                 crate::render::ui::UiState {
                     picked: self.pick_anchor.map(|_| self.pick_objects.as_slice()),
+                    no_charts: self.catalog.as_ref().is_none_or(|c| c.charts.is_empty()),
                     pick_anchor: anchor,
+                    pick_geo,
+                    pick_from_boat,
                     pick_id: self.pick_shown,
                     own_ship,
                     ais,
@@ -3049,7 +3180,7 @@ impl RenderState {
                         }
                     }
                 }
-                crate::render::ui::UiAction::ShopDownload { chart_id, edition } => {
+                crate::render::ui::UiAction::ShopDownload { chart_id } => {
                     let installed = self
                         .ui
                         .as_ref()
@@ -3061,12 +3192,11 @@ impl RenderState {
                     self.shop_send(crate::shop::service::Request::Download {
                         chart_id,
                         installed,
-                        edition,
                         root,
                     });
                 }
                 crate::render::ui::UiAction::ShopConfirmDownload { chart_id } => {
-                    self.prepare_lapsed_download(&chart_id);
+                    self.prepare_download(&chart_id);
                 }
                 crate::render::ui::UiAction::ShopCancelDownload => {
                     if let Some(ref mut ui) = self.ui {
@@ -3285,38 +3415,53 @@ impl RenderState {
                 crate::render::ui::UiAction::ChartUpSet { mode } => {
                     self.set_chart_up(mode);
                 }
+                crate::render::ui::UiAction::PlanTo { lat, lon, sail } => {
+                    let to = crate::geo::format_latlon(lat, lon);
+                    let from = self.ui.as_ref().map(|u| u.plan.from.clone()).unwrap_or_default();
+                    if let Some(ref mut ui) = self.ui {
+                        ui.plan.to = to.clone();
+                    }
+                    self.dismiss_pick();
+                    self.plan_passage(&from, &to, sail);
+                }
+                crate::render::ui::UiAction::RouteAddPoint { lat, lon } => {
+                    if self.ui.as_ref().and_then(|u| u.routes.editing).is_none() {
+                        self.create_route();
+                    }
+                    let (x, y) = crate::render::projection::Projection::to_mercator(lat, lon);
+                    self.route_edit_append(x, y);
+                    self.dismiss_pick();
+                }
+                crate::render::ui::UiAction::WeatherAt { lat, lon } => {
+                    self.weather_at = Some(crate::geo::LatLon::new(lat.clamp(-89.0, 89.0), lon));
+                    if let Some(ref mut ui) = self.ui {
+                        // A forecast asked for by place replaces the one
+                        // showing, as moving the chart and pressing Here does.
+                        ui.sheet.data = None;
+                    }
+                    self.spawn_point_fetch();
+                    self.dismiss_pick();
+                }
+                crate::render::ui::UiAction::RouteShow { route_id } => {
+                    self.show_route(route_id);
+                }
+                crate::render::ui::UiAction::PlanDismiss => {
+                    if let Some(ref mut ui) = self.ui {
+                        ui.weather.planned = None;
+                        ui.weather.status.clear();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::Zoom { factor } => {
+                    let (w, h) = (self.camera.viewport_width, self.camera.viewport_height);
+                    self.camera.zoom_at(factor, w * 0.5, h * 0.5);
+                    self.needs_redraw = true;
+                }
                 crate::render::ui::UiAction::FollowSet { on } => {
                     self.set_follow(on);
                 }
                 crate::render::ui::UiAction::RouteCreate => {
-                    self.finish_route_edit();
-                    self.ensure_route_store();
-                    let route = crate::nav::Route::new(unique_route_name(
-                        self.route_store.as_ref(),
-                    ));
-                    let id = route.id;
-                    let saved = self
-                        .route_store
-                        .as_mut()
-                        .map(|s| s.upsert_route(route))
-                        .transpose();
-                    match saved {
-                        Ok(_) => {
-                            if let Some(ref mut ui) = self.ui {
-                                ui.routes.editing = Some(id);
-                                ui.routes.visible.insert(id);
-                                ui.routes.status =
-                                    "tap the chart to place the first waypoint".into();
-                            }
-                            self.refresh_route_rows();
-                            self.needs_redraw = true;
-                        }
-                        Err(e) => {
-                            if let Some(ref mut ui) = self.ui {
-                                ui.routes.status = format!("could not create the route: {e}");
-                            }
-                        }
-                    }
+                    self.create_route();
                 }
                 crate::render::ui::UiAction::RouteDelete { route_id } => {
                     self.ensure_route_store();
@@ -3366,6 +3511,12 @@ impl RenderState {
                             Some(_) => "tap the chart to add a waypoint".into(),
                             None => String::new(),
                         };
+                        // Drawing happens on the chart: the window that was
+                        // covering it gets out of the way, and the strip
+                        // under the chart takes over. (List brings it back.)
+                        if route_id.is_some() {
+                            ui.routes.open = false;
+                        }
                         if let Some(id) = route_id {
                             ui.routes.visible.insert(id);
                         }
@@ -3377,45 +3528,31 @@ impl RenderState {
                     index,
                     waypoint,
                 } => {
-                    let mut removed_at = None;
+                    let name = self
+                        .route_store
+                        .as_ref()
+                        .and_then(|s| s.waypoints.get(waypoint))
+                        .map(|w| w.name.clone())
+                        .unwrap_or_default();
+                    let before = self.route_snapshot(route_id, &format!("Removed {name}"));
+                    let mut removed = false;
                     self.edit_route(route_id, |route| {
                         let Some(at) = resolve_waypoint(route, index, waypoint) else {
                             return false;
                         };
                         route.waypoints.remove(at);
-                        removed_at = Some(at);
+                        removed = true;
                         true
                     });
-                    if let Some(at) = removed_at {
-                        let name = self
-                            .route_store
-                            .as_ref()
-                            .and_then(|s| s.waypoints.get(waypoint))
-                            .map(|w| w.name.clone())
-                            .unwrap_or_default();
+                    if removed {
+                        self.push_route_undo(before);
                         if let Some(ref mut ui) = self.ui {
-                            ui.routes.undo = Some((route_id, at, waypoint, name));
+                            ui.routes.selected = None;
                         }
                     }
                 }
                 crate::render::ui::UiAction::RouteWaypointUndo => {
-                    let undo = self.ui.as_mut().and_then(|u| u.routes.undo.take());
-                    if let Some((route_id, at, waypoint, _)) = undo {
-                        // The mark itself was never deleted — a route
-                        // dropping a waypoint does not unmake the place —
-                        // so putting it back is only a matter of order.
-                        let exists = self
-                            .route_store
-                            .as_ref()
-                            .is_some_and(|s| s.waypoints.get(waypoint).is_some());
-                        if exists {
-                            self.edit_route(route_id, |route| {
-                                let at = at.min(route.waypoints.len());
-                                route.waypoints.insert(at, waypoint);
-                                true
-                            });
-                        }
-                    }
+                    self.undo_route_edit();
                 }
                 crate::render::ui::UiAction::RouteWaypointMove {
                     route_id,
@@ -3423,6 +3560,8 @@ impl RenderState {
                     waypoint,
                     delta,
                 } => {
+                    let before = self.route_snapshot(route_id, "Reordered");
+                    let mut done = false;
                     self.edit_route(route_id, |route| {
                         let Some(at) = resolve_waypoint(route, index, waypoint) else {
                             return false;
@@ -3434,8 +3573,12 @@ impl RenderState {
                             return false;
                         }
                         route.waypoints.swap(at, to);
+                        done = true;
                         true
                     });
+                    if done {
+                        self.push_route_undo(before);
+                    }
                 }
                 crate::render::ui::UiAction::RouteWaypointRename {
                     route_id,
@@ -3464,10 +3607,12 @@ impl RenderState {
                     self.needs_redraw = true;
                 }
                 crate::render::ui::UiAction::RouteReverse { route_id } => {
+                    let before = self.route_snapshot(route_id, "Reversed");
                     self.edit_route(route_id, |route| {
                         route.waypoints.reverse();
                         true
                     });
+                    self.push_route_undo(before);
                 }
                 crate::render::ui::UiAction::WindToggle => {
                     let showing = self
@@ -3483,6 +3628,46 @@ impl RenderState {
                     let empty = self.wind_forecast.is_none();
                     if showing && empty {
                         self.spawn_wind_fetch();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::EulaAccept => {
+                    let gate = self.ui.as_mut().and_then(|u| u.shop.eula.gate.take());
+                    if let Some(pending) = gate {
+                        crate::shop::eula::accept(&pending.id);
+                        self.save_settings();
+                    }
+                    if let Some((dir, keep_view)) = self.eula_waiting.take() {
+                        self.start_chart_folder_load(dir, keep_view);
+                    }
+                }
+                crate::render::ui::UiAction::EulaDecline => {
+                    self.eula_waiting = None;
+                    if let Some(ref mut ui) = self.ui {
+                        ui.shop.eula.gate = None;
+                        ui.charts.status = "These charts are not open: the o-charts licence \
+                             agreement was not accepted."
+                            .into();
+                    }
+                    self.needs_redraw = true;
+                }
+                crate::render::ui::UiAction::EulaRead => {
+                    let reading = match self.chart_root.as_deref() {
+                        Some(dir) if crate::shop::eula::file_in(dir).is_some() => {
+                            crate::shop::eula::read(dir)
+                        }
+                        _ => (
+                            "o-charts".to_string(),
+                            format!(
+                                "No o-charts chart set is open. Each set carries its licence \
+                                 agreement, shown here once the set is open. o-charts publishes \
+                                 the agreement at:\n\n{}",
+                                crate::shop::eula::URL
+                            ),
+                        ),
+                    };
+                    if let Some(ref mut ui) = self.ui {
+                        ui.shop.eula.reading = Some(reading);
                     }
                     self.needs_redraw = true;
                 }
@@ -3870,7 +4055,11 @@ impl RenderState {
                     uploads_this_frame += 1;
                     self.needs_redraw = true;
                 }
-                Err(e) => log::warn!("Tile {:?} failed: {}", response.tile_id, e),
+                Err(e) => {
+                    log::warn!("Tile {:?} failed: {}", response.tile_id, e);
+                    let key = TileCacheKey::new(response.tile_id, self.style_hash);
+                    self.tile_cache.mark_failed(&key, Instant::now());
+                }
             }
         }
 
@@ -3904,7 +4093,11 @@ impl RenderState {
                         uploads_this_frame += 1;
                         self.needs_redraw = true;
                     }
-                    Err(e) => log::warn!("Tile {:?} failed: {}", response.tile_id, e),
+                    Err(e) => {
+                    log::warn!("Tile {:?} failed: {}", response.tile_id, e);
+                    let key = TileCacheKey::new(response.tile_id, self.style_hash);
+                    self.tile_cache.mark_failed(&key, Instant::now());
+                }
                 }
             }
         }
@@ -4069,10 +4262,12 @@ impl RenderState {
 
         // 3. Find missing tiles not in cache AND not already requested from worker
         let mut missing = Vec::new();
+        let now = Instant::now();
         for tile_id in &self.visible_tiles_cache {
             let key = TileCacheKey::new(*tile_id, self.style_hash);
             if !self.tile_cache.contains(&key)
                 && !self.tile_cache.is_known_empty(&key)
+                && !self.tile_cache.failed_recently(&key, now)
                 && !self.pending_tiles.contains(tile_id)
             {
                 // Quick pre-filter: skip tiles with no scale-appropriate charts.
@@ -4683,7 +4878,7 @@ impl RenderState {
             // user moves an instrument — and an empty field written then
             // would quietly forget the boat's own charts.
             if let (Some(ref mut ui), Some(dir)) =
-                (self.ui.as_mut(), Self::remembered_chart_folder())
+                (self.ui.as_mut(), Self::saved_chart_folder())
             {
                 ui.charts.chosen = dir.display().to_string();
             }
@@ -4698,7 +4893,6 @@ impl RenderState {
                     let _ = store.upsert_route(route);
                 }
                 if let Some(ref mut ui) = self.ui {
-                    ui.routes.open = true;
                     ui.routes.editing = Some(id);
                     ui.routes.visible.insert(id);
                 }
@@ -4808,9 +5002,15 @@ impl RenderState {
                         self.log_samples = crate::nav::logbook::read_day(self.logbook.dir(), day);
                     }
                 }
-                // `MANX_SAFETY=window|guide` opens the Safety window or
+                // `MANX_SAFETY=window|anchor|guide` opens the Alarms window,
+                // the Anchor window or
                 // the man overboard guide, for captures.
+                // `MANX_GOTO=1` opens the Go to window, for captures.
+                if std::env::var("MANX_GOTO").is_ok_and(|v| v != "0") {
+                    ui.plan.open = true;
+                }
                 match std::env::var("MANX_SAFETY").as_deref() {
+                    Ok("anchor") => ui.safety.anchor_open = true,
                     Ok("window") => ui.safety.open = true,
                     Ok("guide") => ui.safety.guide_open = true,
                     _ => {}
@@ -4931,7 +5131,7 @@ impl RenderState {
     pub fn tap_at_screen(&mut self, x: f32, y: f32) {
         let world = self.camera.screen_to_world(x, y);
         let (wx, wy) = (world.x as f64, world.y as f64);
-        if self.plan_pick_fill(wx, wy) || self.route_edit_append(wx, wy) {
+        if self.plan_pick_fill(wx, wy) || self.route_edit_tap(x, y, wx, wy) {
             self.dismiss_pick();
             return;
         }
@@ -4999,7 +5199,7 @@ impl RenderState {
     /// `self.ui`, or it would see None and draw nothing.
     fn plan_pins(&self) -> Vec<crate::render::ui::PlanPin> {
         let Some(ref ui) = self.ui else { return Vec::new() };
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let mut pins = Vec::new();
         for (text, is_start) in [(&ui.plan.from, true), (&ui.plan.to, false)] {
             let Some(p) = crate::geo::parse_latlon(text) else { continue };
@@ -5095,6 +5295,8 @@ impl RenderState {
             display: &'a crate::render::ui::DisplayView,
             safety: &'a crate::render::ui_safety::SafetyView,
             logbook: &'a crate::render::ui_logbook::LogView,
+            /// o-charts licence agreements accepted on this machine.
+            ocharts_eula: Vec<String>,
         }
         // An env override is for this run; the file keeps what the user set.
         let mut instruments = ui.instruments.clone();
@@ -5109,6 +5311,7 @@ impl RenderState {
             display: &ui.display,
             safety: &ui.safety,
             logbook: &ui.logbook,
+            ocharts_eula: crate::shop::eula::accepted_ids(),
         }) else {
             return;
         };
@@ -5160,9 +5363,19 @@ impl RenderState {
             #[serde(default)]
             weather: crate::render::ui::WeatherView,
         }
-        serde_json::from_str::<Persisted>(&text)
+        let mut weather = serde_json::from_str::<Persisted>(&text)
             .map(|p| p.weather)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // A polar chosen before the rename moved with the rest of Manx's
+        // files. The router already followed it there; the Boat window went
+        // on naming a folder that no longer exists.
+        let polar = weather.polar_path.trim();
+        if !polar.is_empty() {
+            weather.polar_path = crate::paths::moved(std::path::Path::new(polar))
+                .display()
+                .to_string();
+        }
+        weather
     }
 
     pub(crate) fn load_display_settings() -> crate::render::ui::DisplayView {
@@ -5193,6 +5406,7 @@ impl RenderState {
     /// changed.
     pub fn apply_display(&mut self) {
         let Some(ref ui) = self.ui else { return };
+        self.ui_zoom = ui.display.size.factor();
         let display = ui.display.clone();
         let draft = ui.boat.draft_m;
         if std::env::var("MANX_PALETTE").is_err()
@@ -5268,7 +5482,8 @@ impl RenderState {
         use crate::nav::logbook::{self, Note};
         let note = match day {
             None => {
-                let at = self.own_fix().map(|(p, _)| p);
+                // Where the boat is, not where she last was heard from.
+                let at = crate::nav::alarms::live(self.own_fix());
                 Note { t: chrono::Utc::now().timestamp(), lat: at.map(|p| p.lat), lon: at.map(|p| p.lon), text }
             }
             Some(d) => {
@@ -5296,11 +5511,47 @@ impl RenderState {
                 [x, y]
             })
             .collect();
+        self.fit_points(&pts);
+    }
+
+    /// Put the whole of a route on the screen.
+    fn show_route(&mut self, route_id: uuid::Uuid) {
+        self.ensure_route_store();
+        let pts: Vec<[f64; 2]> = self
+            .route_store
+            .as_ref()
+            .and_then(|store| {
+                let route = store.route(route_id)?;
+                Some(
+                    route
+                        .waypoints
+                        .iter()
+                        .filter_map(|id| store.waypoints.get(*id))
+                        .map(|w| {
+                            let (x, y) = crate::render::projection::Projection::to_mercator(
+                                w.position.lat,
+                                w.position.lon,
+                            );
+                            [x, y]
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.visible.insert(route_id);
+        }
+        self.fit_points(&pts);
+    }
+
+    /// Move and zoom the chart so these Mercator points are all on it, with
+    /// some sea round them.
+    fn fit_points(&mut self, pts: &[[f64; 2]]) {
         if pts.is_empty() {
             return;
         }
         let (mut lo, mut hi) = ([f64::MAX; 2], [f64::MIN; 2]);
-        for p in &pts {
+        for p in pts {
             for i in 0..2 {
                 lo[i] = lo[i].min(p[i]);
                 hi[i] = hi[i].max(p[i]);
@@ -5394,7 +5645,7 @@ impl RenderState {
         }
         self.log_state.has_fix = self.own_fix().is_some_and(|(_, f)| f);
 
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let project = |p: crate::geo::LatLon| {
             let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
             let s = self.camera.world_to_screen(x, y);
@@ -5518,10 +5769,22 @@ impl RenderState {
         }
 
         if let Some((anchor, radius)) = self.anchor_watch {
-            self.alarms.set(AlarmKey::Anchor, alarms::anchor_check(anchor, radius, fix), now);
+            self.alarms.set_held(
+                AlarmKey::Anchor,
+                alarms::anchor_check(anchor, radius, fix),
+                alarms::anchor_held(anchor, radius, fix),
+                now,
+            );
         }
-        let depth = if depth_alarm { alarms::depth_check(self.depth_under_boat(), depth_limit) } else { None };
-        self.alarms.set(AlarmKey::Depth, depth, now);
+        // Switched off, the alarm goes at once; switched on, it is held
+        // through a reading that hovers at the limit.
+        let under = self.depth_under_boat();
+        let (depth, held) = if depth_alarm {
+            (alarms::depth_check(under, depth_limit), alarms::depth_held(under, depth_limit))
+        } else {
+            (None, None)
+        };
+        self.alarms.set_held(AlarmKey::Depth, depth, held, now);
 
         // Collision: every target the CPA rule calls dangerous, whether or
         // not AIS is drawn — hiding the targets must not hide the danger.
@@ -5563,7 +5826,7 @@ impl RenderState {
         crate::render::ui_safety::TrackView,
     ) {
         use crate::render::ui_safety::{AlarmLine, AnchorView, MobView, TrackView};
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let project = |p: crate::geo::LatLon| {
             let (x, y) = crate::render::projection::Projection::to_mercator(p.lat, p.lon);
             let s = self.camera.world_to_screen(x, y);
@@ -5576,13 +5839,16 @@ impl RenderState {
             .collect();
         let fix = self.own_fix();
         let mob = self.mob.map(|(at, since)| {
-            let way = at.zip(fix).map(|(m, (own, _))| crate::geo::range_bearing(own, m));
+            // Only a live fix: a bearing from where the boat was when the
+            // GPS dropped out would send the helm the wrong way.
+            let live = crate::nav::alarms::live(fix);
+            let way = crate::nav::alarms::way_back(at, fix);
             MobView {
                 screen: at.map(project),
                 bearing_deg: way.map(|(_, b)| b.to_degrees().rem_euclid(360.0)),
                 distance_m: way.map(|(d, _)| d),
                 elapsed_s: since.elapsed().as_secs(),
-                own_screen: fix.map(|(p, _)| project(p)),
+                own_screen: live.map(project),
             }
         });
         let anchor = self.anchor_watch.map(|(at, radius)| {
@@ -5635,7 +5901,7 @@ impl RenderState {
         let (lat, lon) = self.fleet.own.position()?;
         let (wx, wy) = crate::render::projection::Projection::to_mercator(lat, lon);
         let screen = self.camera.world_to_screen(wx, wy);
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let turn = self.camera.rotation;
 
         // The fix, not the heading, decides staleness: a boat that has lost
@@ -5662,9 +5928,9 @@ impl RenderState {
                 .own
                 .number("navigation.speedOverGround")
                 .map(|s| s as f32),
-            // Metres per *logical point*, so the course vector is a real
-            // distance whatever the display's pixel density.
-            mpp: self.camera.zoom * ppp,
+            // Metres *on the ground* per logical point, so the course vector
+            // is a real distance whatever the latitude and pixel density.
+            mpp: self.camera.ground_metres_per_pixel(lat) * ppp,
             stale,
         })
     }
@@ -5748,7 +6014,7 @@ impl RenderState {
             if target.is_lost() {
                 push(
                     "Lost",
-                    format!("no report for {:.0} min", target.last_report.elapsed().as_secs_f64() / 60.0),
+                    format!("no report for {:.0} min", target.silent_for().as_secs_f64() / 60.0),
                 );
             }
 
@@ -5830,7 +6096,7 @@ impl RenderState {
         let Some(ui) = self.ui.as_ref() else {
             return Vec::new();
         };
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let active = ui.routes.active;
         let active_leg = self.route_follow.as_ref().map(|f| f.leg);
         // Metres per logical point and the latitude stretch, for the arrival
@@ -5839,7 +6105,11 @@ impl RenderState {
 
         store
             .routes()
-            .filter(|r| ui.routes.visible.contains(&r.id) || active == Some(r.id))
+            .filter(|r| {
+                ui.routes.visible.contains(&r.id)
+                    || active == Some(r.id)
+                    || ui.routes.editing == Some(r.id)
+            })
             .map(|r| {
                 let is_active = active == Some(r.id);
                 let to_wp = is_active
@@ -5884,8 +6154,11 @@ impl RenderState {
                         })
                     })
                     .collect();
+                let editing = ui.routes.editing == Some(r.id);
                 crate::render::ui_routes::RouteDisplay {
                     name: r.name.clone(),
+                    editing,
+                    selected: ui.routes.selected.filter(|_| editing),
                     is_active,
                     active_leg: is_active.then(|| active_leg).flatten(),
                     points,
@@ -5913,26 +6186,27 @@ impl RenderState {
             return None;
         }
         let (lat, lon) = self.fleet.own.position()?;
+        // A speed with no course to go with it is not a motion: reckoned
+        // along a made-up course of north it would put the closest approach
+        // somewhere it is not. Without a course the boat is taken as
+        // stopped, and the approach is the other vessel's doing alone.
+        let course = self
+            .fleet
+            .own
+            .number("navigation.courseOverGroundTrue")
+            .or_else(|| self.fleet.own.heading_true());
+        let speed = self.fleet.own.number("navigation.speedOverGround").unwrap_or(0.0);
         Some(crate::geo::Motion {
             at: crate::geo::LatLon::new(lat, lon),
-            course: self
-                .fleet
-                .own
-                .number("navigation.courseOverGroundTrue")
-                .or_else(|| self.fleet.own.heading_true())
-                .unwrap_or(0.0),
-            speed: self
-                .fleet
-                .own
-                .number("navigation.speedOverGround")
-                .unwrap_or(0.0),
+            course: course.unwrap_or(0.0),
+            speed: if course.is_some() { speed } else { 0.0 },
         })
     }
 
     fn ais_targets(&self) -> Vec<crate::render::ui_ais::AisTarget> {
-        use crate::geo::{cpa, LatLon, Motion};
+        use crate::geo::cpa;
 
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let own = self.own_motion();
         let turn = self.camera.rotation;
 
@@ -5944,12 +6218,7 @@ impl RenderState {
                 let screen = self.camera.world_to_screen(wx, wy);
 
                 let approach = own.and_then(|own| {
-                    let theirs = Motion {
-                        at: LatLon::new(lat, lon),
-                        course: target.course()?,
-                        speed: target.speed()?,
-                    };
-                    let c = cpa(own, theirs)?;
+                    let c = cpa(own, target.motion_now()?)?;
                     (!c.past).then_some((c.distance_m as f32, c.seconds as f32))
                 });
 
@@ -6133,25 +6402,26 @@ impl RenderState {
         self.needs_redraw = true;
     }
 
-    /// Put a download that needs deciding to the user: one that spends a
-    /// licence slot, or one for a lapsed licence, which cannot have the
-    /// shop's current edition and must name an older one.
-    ///
-    /// For a lapsed licence every edition it is known to have covered is
-    /// offered — this machine's slot, what is installed here, and what each
-    /// of the account's other machines last received. The shop's current
-    /// edition is not among them, which is why asking for it is refused.
-    fn prepare_lapsed_download(&mut self, chart_id: &str) {
+    /// Put a download to the user before sending it, when it spends a
+    /// licence slot. A chart set whose licence has expired is not offered
+    /// at all: an install can only happen during the licensing period
+    /// (o-charts' conditions).
+    fn prepare_download(&mut self, chart_id: &str) {
         let Some(ref mut ui) = self.ui else { return };
         let Some(chart) = ui.shop.charts.iter().find(|c| c.id == chart_id) else {
             return;
         };
+        if chart.expired {
+            ui.shop.pending = None;
+            ui.shop.status = crate::shop::protocol::LICENCE_EXPIRED.to_string();
+            return;
+        }
         let machine = ui.shop.system_name.clone().unwrap_or_default();
 
-        // No slot here yet: the download spends one, for good, whether or
-        // not the subscription is live. Said before, not discovered after.
-        let mine = chart.slot_for(&machine).map(|(_, s)| s.clone());
-        let slot_note = mine.is_none().then(|| {
+        // No slot here yet: the download spends one, for good. Said before,
+        // not discovered after.
+        let mine = chart.slot_for(&machine).is_some();
+        let slot_note = (!mine).then(|| {
             format!(
                 "This assigns 1 of the {} free slot(s) on this licence to \"{machine}\", \
                  permanently: o-charts cannot move or cancel an assignment once a chart is \
@@ -6159,71 +6429,14 @@ impl RenderState {
                 chart.free_slots()
             )
         });
-
-        if !chart.expired {
-            ui.shop.pending = Some(crate::render::ui::PendingDownload {
-                chart_id: chart_id.to_string(),
-                chart_name: chart.name.clone(),
-                expired: false,
-                choices: Vec::new(),
-                because: format!("o-charts' current edition, {}.", chart.edition),
-                new_slot: mine.is_none(),
-                slot_note,
-                understood: false,
-            });
-            return;
-        }
-
-        // Every edition the licence is known to have covered: what this
-        // machine's slot last received, what is installed here, and what the
-        // account's other machines last received. The shop words a slot's
-        // edition its own way, sometimes without the year, so each is echoed
-        // back exactly as sent and labelled with where it came from; ordering
-        // them would mean guessing at a year the shop left out.
-        let mut choices: Vec<(String, String)> = Vec::new();
-        let mut add = |edition: &str, source: String| {
-            let edition = edition.trim();
-            if !edition.is_empty() && !choices.iter().any(|(e, _)| e == edition) {
-                choices.push((edition.to_string(), source));
-            }
-        };
-        if let Some(s) = &mine {
-            add(&s.last_requested, "last sent to this machine".into());
-        }
-        if let Some(e) = ui.shop.installed.get(chart_id) {
-            add(&e.to_string(), "installed here".into());
-        }
-        for q in &chart.quantities {
-            for s in &q.slots {
-                if s.assigned_system != machine {
-                    add(&s.last_requested, format!("as last sent to {}", s.assigned_system));
-                }
-            }
-        }
-
-        let because = if choices.is_empty() {
-            format!(
-                "o-charts has {}, published after your licence expired. No machine on the \
-                 account has recorded an earlier edition, so there is none to name.",
-                chart.edition
-            )
-        } else {
-            format!(
-                "o-charts has {}, published after your licence expired, and will likely \
-                 refuse it. Your licence did cover the editions below — ask for one of those.",
-                chart.edition
-            )
-        };
-
         ui.shop.pending = Some(crate::render::ui::PendingDownload {
             chart_id: chart_id.to_string(),
             chart_name: chart.name.clone(),
-            expired: true,
-            choices,
-            because,
-            new_slot: mine.is_none(),
+            because: format!("o-charts' current edition, {}.", chart.edition),
+            new_slot: !mine,
             slot_note,
             understood: false,
+            accepted: false,
         });
     }
 
@@ -6385,6 +6598,39 @@ impl RenderState {
         }
     }
 
+    /// Start a new, empty route and open it for drawing on the chart.
+    fn create_route(&mut self) {
+        self.finish_route_edit();
+        self.ensure_route_store();
+        let route = crate::nav::Route::new(unique_route_name(
+            self.route_store.as_ref(),
+        ));
+        let id = route.id;
+        let saved = self
+            .route_store
+            .as_mut()
+            .map(|s| s.upsert_route(route))
+            .transpose();
+        match saved {
+            Ok(_) => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.editing = Some(id);
+                    ui.routes.open = false;
+                    ui.routes.visible.insert(id);
+                    ui.routes.status =
+                        "tap the chart to place the first waypoint".into();
+                }
+                self.refresh_route_rows();
+                self.needs_redraw = true;
+            }
+            Err(e) => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.status = format!("could not create the route: {e}");
+                }
+            }
+        }
+    }
+
     /// Stop following, and forget the guidance the strip was drawing.
     fn deactivate_route(&mut self) {
         self.route_follow = None;
@@ -6453,7 +6699,10 @@ impl RenderState {
     fn finish_route_edit(&mut self) {
         if let Some(ref mut ui) = self.ui {
             ui.routes.undo = None;
+            ui.routes.selected = None;
         }
+        self.route_undo.clear();
+        self.route_drag = None;
         let Some(id) = self.ui.as_mut().and_then(|u| u.routes.editing.take()) else {
             return;
         };
@@ -6496,28 +6745,218 @@ impl RenderState {
             }
             return false;
         }
-        // One past the highest "WP n" already on the route, not the count:
-        // after a deletion the count would hand out a name already in use.
-        let n = store
-            .route(id)
-            .map(|r| {
-                r.waypoints
-                    .iter()
-                    .filter_map(|w| store.waypoints.get(*w))
-                    .filter_map(|w| w.name.strip_prefix("WP ")?.parse::<usize>().ok())
-                    .max()
-                    .unwrap_or(0)
-                    .max(r.waypoints.len())
-            })
-            .unwrap_or(0);
-        let wp = crate::nav::model::Waypoint::new(format!("WP {}", n + 1), lat, lon);
+        let name = next_waypoint_name(store, id);
+        let before = self.route_snapshot(id, &format!("Added {name}"));
+        let Some(store) = self.route_store.as_mut() else { return false };
+        let wp = crate::nav::model::Waypoint::new(name, lat, lon);
         let wp_id = wp.id;
         store.waypoints.insert(wp);
         self.edit_route(id, |route| {
             route.waypoints.push(wp_id);
             true
         });
+        self.push_route_undo(before);
         true
+    }
+
+    /// The route being drawn, as it lies on the screen: its id, its marks
+    /// and where each is, in physical pixels.
+    fn editing_route_on_screen(&self) -> Option<(uuid::Uuid, Vec<uuid::Uuid>, Vec<[f32; 2]>)> {
+        let id = self.ui.as_ref()?.routes.editing?;
+        let store = self.route_store.as_ref()?;
+        let route = store.route(id)?;
+        let (marks, points) = route
+            .waypoints
+            .iter()
+            .filter_map(|wid| {
+                let wp = store.waypoints.get(*wid)?;
+                let (x, y) = crate::render::projection::Projection::to_mercator(
+                    wp.position.lat,
+                    wp.position.lon,
+                );
+                let s = self.camera.world_to_screen(x, y);
+                Some((*wid, [s.x, s.y]))
+            })
+            .unzip();
+        Some((id, marks, points))
+    }
+
+    /// What of the route being drawn is under a press at this pixel. The
+    /// reach is a fingertip: 22 points round a waypoint, 14 either side of
+    /// a leg.
+    fn route_edit_hit(&self, x: f32, y: f32) -> Option<(uuid::Uuid, Vec<uuid::Uuid>, crate::render::ui_routes::RouteHit)> {
+        let (id, marks, points) = self.editing_route_on_screen()?;
+        let ppp = self.points_scale();
+        let hit = crate::render::ui_routes::hit_route(&points, [x, y], 22.0 * ppp, 14.0 * ppp)?;
+        Some((id, marks, hit))
+    }
+
+    /// A tap on the chart while a route is being drawn. On a waypoint it
+    /// picks that waypoint out (to rename or remove — or, tapped again, lets
+    /// it go); on a leg it puts a new waypoint into the leg there; on open
+    /// water it adds one to the end. Answers whether the tap was claimed.
+    fn route_edit_tap(&mut self, x: f32, y: f32, wx: f64, wy: f64) -> bool {
+        use crate::render::ui_routes::RouteHit;
+        match self.route_edit_hit(x, y) {
+            Some((_, _, RouteHit::Waypoint(i))) => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.selected = (ui.routes.selected != Some(i)).then_some(i);
+                }
+                self.needs_redraw = true;
+                true
+            }
+            Some((id, _, RouteHit::Leg(i))) => {
+                let (lat, lon) = crate::render::projection::Projection::to_wgs84(wx, wy);
+                let Some(store) = self.route_store.as_mut() else { return false };
+                let name = next_waypoint_name(store, id);
+                let wp = crate::nav::model::Waypoint::new(name.clone(), lat, lon);
+                let wp_id = wp.id;
+                let before = self.route_snapshot(id, &format!("Added {name}"));
+                if let Some(store) = self.route_store.as_mut() {
+                    store.waypoints.insert(wp);
+                }
+                self.edit_route(id, |route| {
+                    let at = (i + 1).min(route.waypoints.len());
+                    route.waypoints.insert(at, wp_id);
+                    true
+                });
+                self.push_route_undo(before);
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.selected = Some(i + 1);
+                }
+                true
+            }
+            None => {
+                if let Some(ref mut ui) = self.ui {
+                    ui.routes.selected = None;
+                }
+                self.route_edit_append(wx, wy)
+            }
+        }
+    }
+
+    /// A press on the chart: is it on a waypoint of the route being drawn?
+    /// If so the waypoint is taken hold of, and the moves that follow drag
+    /// it instead of panning the chart.
+    pub fn route_drag_begin(&mut self, x: f32, y: f32) -> bool {
+        use crate::render::ui_routes::RouteHit;
+        self.route_drag = match self.route_edit_hit(x, y) {
+            Some((_, marks, RouteHit::Waypoint(i))) => {
+                marks.get(i).map(|w| RouteDrag { waypoint: *w, moved: false })
+            }
+            _ => None,
+        };
+        self.route_drag.is_some()
+    }
+
+    /// Carry the waypoint in hand to this pixel. Nothing is written until
+    /// it is let go.
+    pub fn route_drag_to(&mut self, x: f32, y: f32) {
+        let Some(drag) = self.route_drag.as_ref() else { return };
+        let (waypoint, first_move) = (drag.waypoint, !drag.moved);
+        let Some(id) = self.ui.as_ref().and_then(|u| u.routes.editing) else { return };
+        if first_move {
+            let name = self
+                .route_store
+                .as_ref()
+                .and_then(|s| s.waypoints.get(waypoint))
+                .map(|w| w.name.clone())
+                .unwrap_or_default();
+            let before = self.route_snapshot(id, &format!("Moved {name}"));
+            self.push_route_undo(before);
+            if let Some(drag) = self.route_drag.as_mut() {
+                drag.moved = true;
+            }
+        }
+        let world = self.camera.screen_to_world(x, y);
+        let (lat, lon) =
+            crate::render::projection::Projection::to_wgs84(world.x as f64, world.y as f64);
+        if let Some(store) = self.route_store.as_mut() {
+            store.move_waypoint_unsaved(waypoint, crate::geo::LatLon::new(lat.clamp(-89.9, 89.9), lon));
+        }
+        self.refresh_route_rows();
+        self.needs_redraw = true;
+    }
+
+    /// Let go of the waypoint in hand, writing where it now is. Answers
+    /// whether it was moved at all; a press that never moved is a tap.
+    pub fn route_drag_end(&mut self) -> bool {
+        let Some(drag) = self.route_drag.take() else { return false };
+        if !drag.moved {
+            return false;
+        }
+        let saved = self.route_store.as_mut().and_then(|store| {
+            let wp = store.waypoints.get(drag.waypoint)?.clone();
+            Some(store.update_waypoint(wp))
+        });
+        if let Some(Err(e)) = saved {
+            if let Some(ref mut ui) = self.ui {
+                ui.routes.status = format!("could not save the route: {e}");
+            }
+        }
+        self.refresh_route_rows();
+        self.update_route_following();
+        self.needs_redraw = true;
+        true
+    }
+
+    /// The route as it stands, to be kept for Undo before an edit.
+    fn route_snapshot(&self, id: uuid::Uuid, what: &str) -> Option<RouteSnapshot> {
+        let store = self.route_store.as_ref()?;
+        let route = store.route(id)?;
+        Some(RouteSnapshot {
+            route_id: id,
+            waypoints: route.waypoints.clone(),
+            positions: route
+                .waypoints
+                .iter()
+                .filter_map(|w| Some((*w, store.waypoints.get(*w)?.position)))
+                .collect(),
+            what: what.to_string(),
+        })
+    }
+
+    /// Keep a snapshot for Undo, now that the edit it precedes has happened.
+    fn push_route_undo(&mut self, before: Option<RouteSnapshot>) {
+        let Some(before) = before else { return };
+        // Only for the route on the chart's drawing board: the list's
+        // buttons work on any route, and their Undo lives with the editor.
+        if self.ui.as_ref().and_then(|u| u.routes.editing) != Some(before.route_id) {
+            return;
+        }
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.undo = Some(before.what.clone());
+        }
+        self.route_undo.push(before);
+        // Fifty steps back is further than anyone retraces by hand.
+        if self.route_undo.len() > 50 {
+            self.route_undo.remove(0);
+        }
+    }
+
+    /// Take back the last edit made to the route being drawn.
+    fn undo_route_edit(&mut self) {
+        let Some(snapshot) = self.route_undo.pop() else { return };
+        if let Some(store) = self.route_store.as_mut() {
+            for (id, position) in &snapshot.positions {
+                let moved = store.waypoints.get(*id).is_some_and(|w| w.position != *position);
+                if moved {
+                    store.move_waypoint_unsaved(*id, *position);
+                    if let Some(wp) = store.waypoints.get(*id).cloned() {
+                        let _ = store.update_waypoint(wp);
+                    }
+                }
+            }
+        }
+        let waypoints = snapshot.waypoints;
+        self.edit_route(snapshot.route_id, |route| {
+            route.waypoints = waypoints;
+            true
+        });
+        if let Some(ref mut ui) = self.ui {
+            ui.routes.undo = self.route_undo.last().map(|s| s.what.clone());
+            ui.routes.selected = None;
+        }
     }
 
     /// The lat/lon box now on screen, padded a little so a small pan does
@@ -6765,7 +7204,7 @@ impl RenderState {
 
     /// Fetch the point forecast behind the sheet on a worker thread.
     fn spawn_point_fetch(&mut self) {
-        let at = self.weather_anchor_latlon();
+        let at = self.weather_at.take().unwrap_or_else(|| self.weather_anchor_latlon());
         let days = self
             .ui
             .as_ref()
@@ -6781,7 +7220,7 @@ impl RenderState {
             if ui.sheet.data.is_none() {
                 ui.sheet.anchor = Some([at.lat, at.lon]);
                 ui.sheet.place = crate::nav::pointfx::place_label(at.lat, at.lon);
-                ui.sheet.source = crate::nav::pointfx::POINT_SOURCE_LABEL.into();
+                ui.sheet.source = crate::nav::pointfx::POINT_SOURCE_PENDING.into();
             }
             ui.sheet.show = true;
         }
@@ -6872,7 +7311,7 @@ impl RenderState {
         let [lat, lon] = ui.sheet.anchor?;
         let (mx, my) = crate::render::projection::Projection::to_mercator(lat, lon);
         let s = self.camera.world_to_screen(mx, my);
-        let ppp = self.scale_factor.max(0.01);
+        let ppp = self.points_scale();
         let (x, y) = (s.x / ppp, s.y / ppp);
         let (w, h) = (
             self.config.width as f32 / ppp,
@@ -6961,11 +7400,10 @@ impl RenderState {
     /// means the boat, both positions must parse, and the verb picks the
     /// engine. Every refusal lands in the status line the bar shows.
     fn plan_passage(&mut self, from: &str, to: &str, sail: bool) {
+        // "From the boat" means from where she is now: a position last
+        // heard some time ago would plan a passage from somewhere else.
         let start = if from.trim().is_empty() {
-            self.fleet
-                .own
-                .position()
-                .map(|(lat, lon)| crate::geo::LatLon::new(lat, lon))
+            crate::nav::alarms::live(self.own_fix())
         } else {
             crate::geo::parse_latlon(from)
         };
@@ -6988,18 +7426,29 @@ impl RenderState {
                 } else {
                     self.spawn_motor_plan(a, b, name);
                 }
+                // The window has done its job, and it sits where the route
+                // is about to be drawn: the card under the chart takes over.
+                if let Some(ref mut ui) = self.ui {
+                    ui.plan.open = false;
+                }
             }
             (None, _) if from.trim().is_empty() => {
-                status(self, "no boat position yet — tap 📍 by \"from\" and tap the chart, \
-                              or type a start");
+                // The card's own words: there is no pin by "from" any more;
+                // the start is set in the Go to window.
+                status(self, "No boat position yet. Connect to the boat, or open Go to… \
+                              and set where to start from.");
             }
+            (None, _) if from.trim().is_empty() => status(
+                self,
+                "No position fix from the boat. Open Go to… and set where to start from.",
+            ),
             (None, _) => status(
                 self,
                 "can't read the start — try 56°24.6'N 10°58.8'E or 56.41, 10.98",
             ),
             (_, None) if to.trim().is_empty() => status(
                 self,
-                "where to? Tap 📍 by \"to\" and tap the chart, or type a position",
+                "Where to? Press \"Tap the chart\" beside To, or type a position.",
             ),
             (_, None) => status(
                 self,
@@ -7040,6 +7489,7 @@ impl RenderState {
         };
         if let Some(ref mut ui) = self.ui {
             ui.weather.busy = true;
+            ui.weather.planned = None;
             ui.weather.status = "starting…".into();
         }
         let safety = self.safety_from_boat();
@@ -7119,6 +7569,7 @@ impl RenderState {
         };
         if let Some(ref mut ui) = self.ui {
             ui.weather.busy = true;
+            ui.weather.planned = None;
             ui.weather.status = "planning…".into();
         }
         let safety = self.safety_from_boat();
@@ -7237,7 +7688,7 @@ impl RenderState {
                         ui.sheet.anchor = Some([point.lat, point.lon]);
                         ui.sheet.place =
                             crate::nav::pointfx::place_label(point.lat, point.lon);
-                        ui.sheet.source = crate::nav::pointfx::POINT_SOURCE_LABEL.into();
+                        ui.sheet.source = point.source_label();
                         ui.sheet.status = if point.has_sea {
                             String::new()
                         } else {
@@ -7314,6 +7765,16 @@ impl RenderState {
                 } => {
                     self.ensure_route_store();
                     let planned_id = route.id;
+                    // Where the plan gives a time of arrival (the weather
+                    // router's do), say it, and how long from now.
+                    let arrival = route.legs.last().and_then(|l| l.plan.as_ref()).map(|p| {
+                        let minutes = (p.eta - chrono::Utc::now()).num_minutes();
+                        format!(
+                            "Arrive {} · {}",
+                            p.eta.with_timezone(&chrono::Local).format("%a %H:%M"),
+                            crate::render::ui::duration_text(minutes)
+                        )
+                    });
                     if let Some(store) = self.route_store.as_mut() {
                         for wp in waypoints {
                             store.waypoints.insert(wp);
@@ -7325,6 +7786,10 @@ impl RenderState {
                     if let Some(ref mut ui) = self.ui {
                         ui.weather.busy = false;
                         ui.weather.status = summary;
+                        ui.weather.planned = Some(crate::render::ui::PlannedView {
+                            route_id: planned_id,
+                            arrival,
+                        });
                         // The plan someone just waited for belongs on the
                         // chart, not behind a checkbox.
                         ui.routes.visible.insert(planned_id);
@@ -7344,64 +7809,14 @@ impl RenderState {
                     let count = routes.len();
                     let mut kept_local: Vec<String> = Vec::new();
                     if let Some(store) = self.route_store.as_mut() {
-                        for (mut route, mut wps) in routes {
-                            // Publish and fetch round-trip the same id, so a
-                            // route edited here since it was published would
-                            // be silently replaced by the server's older copy.
-                            // When the two differ, keep the local one and
-                            // bring the server's in beside it.
-                            type Mark<'a> = (crate::geo::LatLon, &'a str);
-                            let fetched: Vec<Mark> = route
-                                .waypoints
-                                .iter()
-                                .filter_map(|id| wps.iter().find(|w| w.id == *id))
-                                .map(|w| (w.position, w.name.as_str()))
-                                .collect();
-                            if let Some(local) = store.route(route.id) {
-                                let mine: Vec<Mark> = local
-                                    .waypoints
-                                    .iter()
-                                    .filter_map(|id| store.waypoints.get(*id))
-                                    .map(|w| (w.position, w.name.as_str()))
-                                    .collect();
-                                let same = local.name == route.name
-                                    && mine.len() == fetched.len()
-                                    && mine.iter().zip(&fetched).all(|((a, an), (b, bn))| {
-                                        (a.lat - b.lat).abs() < 1e-7
-                                            && (a.lon - b.lon).abs() < 1e-7
-                                            && an == bn
-                                    });
-                                if !same {
-                                    kept_local.push(local.name.clone());
-                                    let copy = format!("{} (Signal K)", route.name);
-                                    // A later fetch refreshes the same copy
-                                    // rather than stacking up new ones.
-                                    route.id = store
-                                        .routes()
-                                        .find(|r| r.name == copy)
-                                        .map(|r| r.id)
-                                        .unwrap_or_else(uuid::Uuid::new_v4);
-                                    route.name = copy;
-                                    // Its marks come back under the local
-                                    // marks' ids; inserted as they are they
-                                    // would move the kept route's waypoints.
-                                    for wp in wps.iter_mut() {
-                                        let fresh = uuid::Uuid::new_v4();
-                                        for id in route.waypoints.iter_mut() {
-                                            if *id == wp.id {
-                                                *id = fresh;
-                                            }
-                                        }
-                                        wp.id = fresh;
+                        for (route, wps) in routes {
+                            match store.merge_fetched(route, wps) {
+                                Ok(Some(kept)) => kept_local.push(kept),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    if let Some(ref mut ui) = self.ui {
+                                        ui.routes.status = format!("Could not save: {e}");
                                     }
-                                }
-                            }
-                            for wp in wps {
-                                store.waypoints.insert(wp);
-                            }
-                            if let Err(e) = store.upsert_route(route) {
-                                if let Some(ref mut ui) = self.ui {
-                                    ui.routes.status = format!("Could not save: {e}");
                                 }
                             }
                         }
@@ -7724,6 +8139,13 @@ impl RenderState {
     }
 
     /// Request that the next rendered frame be saved to `path` as a PNG (headless capture).
+    /// Whether any o-charts cell is in the catalogue on screen.
+    pub fn licensed_charts_loaded(&self) -> bool {
+        self.catalog.as_ref().is_some_and(|c| {
+            c.charts.iter().any(|i| crate::shop::eula::is_licensed_cell(&i.path))
+        })
+    }
+
     pub fn request_capture(&mut self, path: String) {
         self.pending_capture = Some(path);
         self.needs_redraw = true;
@@ -7877,6 +8299,57 @@ fn resolve_waypoint(
     route.waypoints.iter().position(|w| *w == waypoint)
 }
 
+/// The name for the next waypoint added to a route: one past the highest
+/// "WP n" already on it, not the count — after a deletion the count would
+/// hand out a name already in use.
+fn next_waypoint_name(store: &crate::nav::RouteStore, id: uuid::Uuid) -> String {
+    let n = store
+        .route(id)
+        .map(|r| {
+            r.waypoints
+                .iter()
+                .filter_map(|w| store.waypoints.get(*w))
+                .filter_map(|w| w.name.strip_prefix("WP ")?.parse::<usize>().ok())
+                .max()
+                .unwrap_or(0)
+                .max(r.waypoints.len())
+        })
+        .unwrap_or(0);
+    format!("WP {}", n + 1)
+}
+
+/// The chart folder a settings file names, if it names one.
+fn chart_folder_in_settings(text: &str) -> Option<std::path::PathBuf> {
+    #[derive(serde::Deserialize)]
+    struct Persisted {
+        charts: crate::render::ui::ChartFolderView,
+    }
+    let p: Persisted = serde_json::from_str(text).ok()?;
+    let chosen = p.charts.chosen.trim();
+    // A folder remembered from before the rename may have moved with the
+    // rest of Manx's files.
+    (!chosen.is_empty()).then(|| crate::paths::moved(std::path::Path::new(chosen)))
+}
+
+#[cfg(test)]
+mod chart_folder_tests {
+    use super::chart_folder_in_settings;
+
+    /// Charts on a stick that is not plugged in are still the boat's
+    /// charts: the folder is read from the settings whether or not it is
+    /// there, so that the next save writes it back instead of dropping it.
+    #[test]
+    fn a_chart_folder_that_is_not_there_is_still_the_remembered_one() {
+        let gone = "/Volumes/no-such-stick-7c1e/charts";
+        assert!(!std::path::Path::new(gone).exists());
+        let text = format!(r#"{{"charts":{{"chosen":"{gone}"}}}}"#);
+        assert_eq!(chart_folder_in_settings(&text), Some(std::path::PathBuf::from(gone)));
+        // No folder chosen yet is no folder, not the current directory.
+        assert_eq!(chart_folder_in_settings(r#"{"charts":{"chosen":"  "}}"#), None);
+        assert_eq!(chart_folder_in_settings("not json"), None);
+    }
+}
+
 /// A name for a new route that no existing route already answers to.
 /// "Route 1", then "Route 2" — a plotter full of identical "New route"s is
 /// a plotter you cannot navigate by name.
@@ -8019,9 +8492,24 @@ mod fallback_tests {
         );
         // Nothing cached anywhere above it.
         assert_eq!(nearest_resident_ancestor(tile, |_| false), None);
-        // Four levels is the limit; a 5x-removed ancestor is too coarse to use.
+        // Four levels is the limit: the great-great-grandparent still serves,
+        // a 5x-removed ancestor is too coarse to use.
+        let fourth = TileId { z: 11, x: 1094, y: 641 };
+        assert_eq!(nearest_resident_ancestor(tile, |t| t == fourth), Some(fourth));
         let far = TileId { z: 10, x: 547, y: 320 };
         assert_eq!(nearest_resident_ancestor(tile, |t| t == far), None);
+        // The nearest wins when several are built.
+        assert_eq!(
+            nearest_resident_ancestor(tile, |t| t == grandparent || t == fourth),
+            Some(grandparent)
+        );
+        // The top of the pyramid has nothing above it, however near.
+        let near_top = TileId { z: 1, x: 1, y: 0 };
+        assert_eq!(
+            nearest_resident_ancestor(near_top, |t| t == TileId { z: 0, x: 0, y: 0 }),
+            Some(TileId { z: 0, x: 0, y: 0 })
+        );
+        assert_eq!(nearest_resident_ancestor(TileId { z: 0, x: 0, y: 0 }, |_| true), None);
         // It never offers the tile itself — the caller has already established
         // that one is missing.
         assert_eq!(nearest_resident_ancestor(tile, |t| t == tile), None);
@@ -8241,7 +8729,7 @@ fn load_chart_folder(
     let mut decryptor = CachedDecryptor::open("license");
     let keys = Arc::new(keys);
     let catalog =
-        ChartCatalog::from_directory(dir, &keys, &mut decryptor).map_err(|e| format!("{e}"))?;
+        ChartCatalog::from_chart_folder(dir, &keys, &mut decryptor).map_err(|e| format!("{e}"))?;
     Ok((catalog, keys, decryptor))
 }
 
@@ -8283,10 +8771,71 @@ enum FreeEvent {
     Probed(&'static str, Result<crate::shop::noaa::Remote, String>),
     /// Bytes so far and total, for the package downloading.
     Progress(String, u64, u64),
-    /// A package is in place under this chart folder.
-    Installed(String, std::path::PathBuf, crate::shop::noaa::Installed),
+    /// A package is in place in the free-charts library.
+    Installed(String, crate::shop::noaa::Installed),
     /// A download failed or was cancelled ("cancelled").
     Failed(String, String),
     /// A worker has finished.
     Done,
+}
+
+#[cfg(test)]
+mod shop_match_tests {
+    use super::match_installed;
+    use crate::shop::types::{Chart, Edition};
+
+    fn chart(id: &str, links: &[&str]) -> Chart {
+        Chart {
+            id: id.into(),
+            base_chart_lists: links.iter().map(|l| l.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn write_set(root: &std::path::Path, name: &str, edition: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("ChartList.XML"),
+            format!("<chartList><Edition>{edition}</Edition></chartList>"),
+        )
+        .unwrap();
+    }
+
+    /// Each listed chart is keyed to its own family on disk, newest edition
+    /// first — the edition a lapsed licence will then ask the shop for.
+    #[test]
+    fn charts_are_matched_to_their_own_family_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_set(tmp.path(), "oeuSENC-DK-2025-1-20-base-macbook", "2025/1-20");
+        write_set(tmp.path(), "oeuSENC-DK-2025-1-24-update-macbook", "2025/1-24");
+        write_set(tmp.path(), "oeuSENC-NO-2026-2-3-base-macbook", "2026/2-3");
+        let charts = [
+            chart("DK", &["https://o-charts.org/x/oeuSENC-DK-2026-1-29/ChartList.XML"]),
+            chart("NO", &["https://o-charts.org/x/oeuSENC-NO-2026-2-5/ChartList.XML"]),
+            chart("SE", &["https://o-charts.org/x/oeuSENC-SE-2026-1-1/ChartList.XML"]),
+        ];
+        let m = match_installed(&charts, tmp.path());
+        assert_eq!(m.get("DK"), Some(&Edition::parse("2025/1-24")));
+        assert_eq!(m.get("NO"), Some(&Edition::parse("2026/2-3")));
+        assert_eq!(m.get("SE"), None, "nothing of Sweden is on disk");
+        assert_eq!(m.len(), 2);
+    }
+
+    /// With no links to key by, one chart owned and one set installed is
+    /// unambiguous; two of either is not, and nothing is guessed.
+    #[test]
+    fn without_links_only_the_unambiguous_case_is_matched() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_set(tmp.path(), "oeuSENC-DK-2025-1-20-base-macbook", "2025/1-20");
+        let m = match_installed(&[chart("DK", &[])], tmp.path());
+        assert_eq!(m.get("DK"), Some(&Edition::parse("2025/1-20")));
+
+        let m = match_installed(&[chart("DK", &[]), chart("NO", &[])], tmp.path());
+        assert!(m.is_empty(), "guessed between two charts: {m:?}");
+
+        write_set(tmp.path(), "oeuSENC-NO-2026-2-3-base-macbook", "2026/2-3");
+        let m = match_installed(&[chart("DK", &[])], tmp.path());
+        assert!(m.is_empty(), "guessed between two sets: {m:?}");
+    }
 }

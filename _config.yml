@@ -1,0 +1,41 @@
+# The website (GitHub Pages builds it from this repository: the README is
+# the front page). These settings are what search engines read.
+title: Manx chart plotter
+tagline: Free, open-source chart plotter for the Raspberry Pi, Linux, macOS, Windows and Android
+description: >-
+  Manx is a free, open-source chart plotter for boats. Raspberry Pi 5, Linux,
+  macOS, Windows and Android. S-57 charts drawn to S-52 at 60 fps, Signal K,
+  AIS, routes and weather routing. Written in Rust.
+url: https://den200.github.io
+baseurl: /ManxChartPlotter
+lang: en
+author: Denis
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+# Only the README and the guides it links to are pages of the site.
+exclude:
+  - src
+  - tests
+  - tools
+  - android
+  - assets
+  - target
+  - Cargo.toml
+  - Cargo.lock
+  - CLAUDE.md
+  - COPYING
+  - doc/manx_plan_v2.md
+  - doc/SENC_RENDER_BLUEPRINT.md
+  - doc/OSENC_FORMAT_REFERENCE.md
+  - doc/DEPARE_openCPN_trace.md
+  - doc/NEXT-weather-and-routing.md
+  - doc/ux-review-2026-11-16.md
+  - doc/testing.md
+  - "doc/wgpu ref notes.md"
+  - "doc/rendering-*.md"
+  - "doc/*-analysis*.md"
+  - "doc/opencpn-*.md"
+  - "doc/orca-*.md"
+  - "doc/phase8_integration_plan.md"
+  - "doc/multichart-*.md"

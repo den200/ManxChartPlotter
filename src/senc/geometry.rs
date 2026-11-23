@@ -1185,6 +1185,26 @@ mod tests {
         assert!(stitch_closed_rings(frags).is_empty());
     }
 
+    /// Shared nodes differ in the last bits of their f32 metres, so ends
+    /// within half a metre join, and the closed ring's seam is made exact
+    /// for the point-in-polygon tests downstream. A metre apart is a gap.
+    #[test]
+    fn stitch_joins_within_tolerance_and_snaps_the_seam() {
+        let frags = vec![
+            vec![[0.0, 0.0], [10.0, 0.0]],
+            vec![[10.3, 0.2], [10.0, 10.0], [0.0, 10.0], [0.1, -0.2]],
+        ];
+        let rings = stitch_closed_rings(frags);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].first(), rings[0].last(), "{:?}", rings[0]);
+
+        let frags = vec![
+            vec![[0.0, 0.0], [10.0, 0.0]],
+            vec![[11.0, 0.0], [10.0, 10.0], [0.0, 10.0], [0.0, 0.0]],
+        ];
+        assert!(stitch_closed_rings(frags).is_empty());
+    }
+
     #[test]
     fn stitch_keeps_an_already_closed_ring_untouched() {
         let ring = vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]];
@@ -1201,6 +1221,17 @@ mod tests {
 
         let triangles = strip.to_triangles();
         assert_eq!(triangles.len(), 6); // 2 triangles × 3 vertices
+        // Strip triangles are (0,1,2) then (2,1,3): every other one is turned
+        // round so they all keep the first one's winding.
+        assert_eq!(&triangles[..3], &[[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]]);
+        assert_eq!(&triangles[3..], &[[0.5, 1.0], [1.0, 0.0], [1.5, 1.0]]);
+        let twice_area = |t: &[[f32; 2]]| {
+            (t[1][0] - t[0][0]) * (t[2][1] - t[0][1]) - (t[2][0] - t[0][0]) * (t[1][1] - t[0][1])
+        };
+        assert!(twice_area(&triangles[..3]) > 0.0 && twice_area(&triangles[3..]) > 0.0);
+        // Too short to hold a triangle is nothing, not a panic.
+        let short = TriPrim { prim_type: TriPrimType::TriangleStrip, vertices: vec![[0.0, 0.0]; 2] };
+        assert!(short.to_triangles().is_empty());
     }
 
     #[test]
@@ -1212,8 +1243,10 @@ mod tests {
 
         let triangles = fan.to_triangles();
         assert_eq!(triangles.len(), 6); // 2 triangles × 3 vertices
-        // First vertex of each triangle should be the center
-        assert_eq!(triangles[0], [0.0, 0.0]);
-        assert_eq!(triangles[3], [0.0, 0.0]);
+        // Every triangle pivots on the first vertex and walks the rim.
+        assert_eq!(
+            triangles,
+            vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+        );
     }
 }

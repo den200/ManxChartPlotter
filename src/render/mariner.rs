@@ -276,6 +276,15 @@ mod tests {
         let one = out[1].position[1] - out[0].position[1];
         let six = out[2].position[1] - out[0].position[1];
         assert!((six / one - 6.0).abs() < 0.05, "{}", six / one);
+        // And a minute is 5 m/s × 60 s = 300 m of sea — SOG is m/s on the
+        // wire, not knots. Mercator stretches that by 1/cos(56.5°) here.
+        let mercator_m = 300.0 / 56.5f64.to_radians().cos();
+        assert!(
+            (one as f64 / mercator_m - 1.0).abs() < 0.01,
+            "one minute drew {one} Mercator m, wanted {mercator_m:.0}"
+        );
+        // Nothing drifts sideways on a due-north course.
+        assert!((out[2].position[0] - out[0].position[0]).abs() < 0.5);
     }
 
     #[test]

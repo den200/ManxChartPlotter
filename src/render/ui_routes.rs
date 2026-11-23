@@ -6,6 +6,7 @@
 //! steer arrow, distance, bearing and closing speed for the active waypoint,
 //! sized to be read from the helm like the instrument bar below it.
 
+use crate::render::ui::ShowWindow as _;
 use egui::{Color32, Context, RichText};
 use uuid::Uuid;
 
@@ -17,6 +18,11 @@ use crate::nav::Guidance;
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteDisplay {
     pub name: String,
+    /// This is the route being drawn: its waypoints are shown as handles
+    /// big enough to take hold of, each with its name.
+    pub editing: bool,
+    /// The waypoint tapped last, by its place in the route.
+    pub selected: Option<usize>,
     pub is_active: bool,
     /// Index of the leg currently being sailed, when this route is active.
     pub active_leg: Option<usize>,
@@ -100,12 +106,22 @@ pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
             if !screen.contains(pos) {
                 continue;
             }
-            painter.circle(
-                pos,
-                4.0,
-                Color32::TRANSPARENT,
-                egui::Stroke::new(1.8_f32, colour),
-            );
+            if route.editing {
+                // A handle, not a dot: something to put a finger on. Filled,
+                // so it reads over whatever the chart has under it.
+                let paper = ctx.style().visuals.panel_fill;
+                if route.selected == Some(i) {
+                    painter.circle_stroke(pos, 13.0, egui::Stroke::new(2.5_f32, colour));
+                }
+                painter.circle(pos, 8.0, paper, egui::Stroke::new(2.5_f32, colour));
+            } else {
+                painter.circle(
+                    pos,
+                    4.0,
+                    Color32::TRANSPARENT,
+                    egui::Stroke::new(1.8_f32, colour),
+                );
+            }
             if let Some(r) = p.arrival_radius_px {
                 painter.add(egui::Shape::dashed_line(
                     &circle_points(pos, r),
@@ -118,7 +134,7 @@ pub fn draw_overlay(ctx: &Context, routes: &[RouteDisplay]) {
             // points always speak; intermediates only when the route is
             // active or planned, to keep a dense wx route readable.
             let ends = i == 0 || i + 1 == route.points.len();
-            if ends || route.is_active || p.eta.is_some() {
+            if ends || route.is_active || route.editing || p.eta.is_some() {
                 painter.text(
                     pos + egui::vec2(7.0, -6.0),
                     egui::Align2::LEFT_CENTER,
@@ -210,20 +226,18 @@ fn name_field(
 fn waypoint_editor(
     ui: &mut egui::Ui,
     row: &RouteRow,
-    undo: Option<&(Uuid, usize, Uuid, String)>,
+    undo: Option<&String>,
     actions: &mut Vec<UiAction>,
 ) {
     // Del is one tap on a small button among others; the way back is one tap
     // too, rather than a question before every removal.
-    if let Some((route_id, _, _, name)) = undo {
-        if *route_id == row.id {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("Removed {name}")).small());
-                if ui.small_button("Undo").clicked() {
-                    actions.push(UiAction::RouteWaypointUndo);
-                }
-            });
-        }
+    if let Some(what) = undo {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(what).small());
+            if ui.button("Undo").clicked() {
+                actions.push(UiAction::RouteWaypointUndo);
+            }
+        });
     }
     ui.horizontal(|ui| {
         ui.label(
@@ -240,11 +254,11 @@ fn waypoint_editor(
             let confirm_id = egui::Id::new(("confirm-delete-route", row.id));
             let asking = ui.data(|d| d.get_temp::<bool>(confirm_id)).unwrap_or(false);
             if asking {
-                if ui.small_button("Keep").clicked() {
+                if ui.button("Keep").clicked() {
                     ui.data_mut(|d| d.remove::<bool>(confirm_id));
                 }
                 if ui
-                    .small_button(RichText::new("Delete it").color(crate::render::theme::current().red))
+                    .button(RichText::new("Delete it").color(crate::render::theme::current().red))
                     .clicked()
                 {
                     ui.data_mut(|d| d.remove::<bool>(confirm_id));
@@ -252,7 +266,7 @@ fn waypoint_editor(
                 }
                 ui.label(RichText::new("Delete this route?").small());
             } else if ui
-                .small_button("Delete route")
+                .button("Delete route")
                 .on_hover_text("Remove this route. Its waypoints stay in the store.")
                 .clicked()
             {
@@ -261,7 +275,7 @@ fn waypoint_editor(
             if ui
                 .add_enabled(
                     row.waypoints.len() > 1,
-                    egui::Button::new("Reverse").small(),
+                    egui::Button::new("Reverse"),
                 )
                 .on_hover_text("Sail it the other way round")
                 .clicked()
@@ -306,7 +320,7 @@ fn waypoint_editor(
             // them as empty boxes. The same trap as "→" in a route name.
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .small_button("Del")
+                    .button("Del")
                     .on_hover_text("Remove this waypoint from the route")
                     .clicked()
                 {
@@ -317,7 +331,7 @@ fn waypoint_editor(
                     });
                 }
                 if ui
-                    .add_enabled(i < last, egui::Button::new("Dn").small())
+                    .add_enabled(i < last, egui::Button::new("Dn"))
                     .on_hover_text("Later in the route")
                     .clicked()
                 {
@@ -329,7 +343,7 @@ fn waypoint_editor(
                     });
                 }
                 if ui
-                    .add_enabled(i > 0, egui::Button::new("Up").small())
+                    .add_enabled(i > 0, egui::Button::new("Up"))
                     .on_hover_text("Earlier in the route")
                     .clicked()
                 {
@@ -361,10 +375,14 @@ pub fn window(
         // over the menu bar hides the very button that closes it.
         .constrain_to(ctx.available_rect())
         .collapsible(false)
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("{} route(s)", view.rows.len()))
+                    RichText::new(match view.rows.len() {
+                        0 => "No routes".to_string(),
+                        1 => "1 route".to_string(),
+                        n => format!("{n} routes"),
+                    })
                         .small()
                         .weak(),
                 );
@@ -409,7 +427,12 @@ pub fn window(
             egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                 for row in view.rows.clone() {
                     ui.horizontal(|ui| {
-                        let mut shown = row.visible;
+                        // Read now, not from the row: the rows are a snapshot
+                        // taken when the list last changed, and a tick does not
+                        // change the list. Read from the snapshot, the box
+                        // never showed its own change — and a second click
+                        // repeated the first instead of undoing it.
+                        let mut shown = route_shown(&view.visible, row.id, row.active);
                         // The route being followed is always drawn; a box
                         // that could be clicked but never cleared read as
                         // broken, so it is shown ticked and greyed instead.
@@ -495,11 +518,10 @@ pub fn window(
                                     actions.push(UiAction::RoutePublish { route_id: row.id });
                                 }
                                 if ui
-                                    .add_enabled(!weather.busy, egui::Button::new("Sail"))
+                                    .add_enabled(!weather.busy, egui::Button::new("Re-route for weather"))
                                     .on_hover_text(
                                         "Plan a sailing passage between this route's ends, on \
-                                         the latest forecast and the polar below — the same \
-                                         as Sail in the menu bar",
+                                         the latest forecast and the boat's polar",
                                     )
                                     .clicked()
                                 {
@@ -518,77 +540,104 @@ pub fn window(
                 }
             });
 
-            // The weather engine's own corner: which forecast feeds it, how
-            // far out, and whose boat it thinks it is planning for. Shown,
-            // not buried — a route is only as good as the forecast and the
-            // polar behind it.
-            ui.add_space(6.0);
-            ui.label(RichText::new("Weather routing").strong());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Forecast:").weak());
-                ui.label("NOAA GFS 0.25° (NOMADS)");
-                ui.add_space(10.0);
-                ui.label(RichText::new("hours:").weak());
-                let r = ui.add(
-                    egui::DragValue::new(&mut weather.hours)
-                        .speed(3)
-                        .range(12..=120),
-                );
-                if r.drag_stopped() || r.lost_focus() {
-                    actions.push(UiAction::SettingsChanged);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Polar:").weak());
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut weather.polar_path)
-                            .hint_text("built-in ~10 m cruiser — set a .pol path for your boat")
-                            .desired_width(280.0),
-                    )
-                    .lost_focus()
-                {
-                    actions.push(UiAction::SettingsChanged);
-                }
-            });
-            let waves = ui
-                .checkbox(&mut weather.use_waves, "Waves (GFS Hs: slows the boat, blocks over the limit)")
-                .on_hover_text(
-                    "Fetches significant wave height alongside the wind. Speed is \
-                     reduced by 1/(1 + 0.03·Hs²) and seas over the configured \
-                     maximum are treated as impassable. If the wave file is not \
-                     yet published the route falls back to wind alone.",
-                );
-            let currents = ui.checkbox(
-                &mut weather.use_currents,
-                format!("Currents ({})", crate::nav::currents::CURRENT_SOURCE_LABEL),
-            )
-            .on_hover_text(
-                "Fetches surface currents over the passage box and lets the \
-                 water carry the boat — in Danish waters the tidal streams \
-                 this includes are often worth more than the wind detail. \
-                 If the fetch fails the route plans in still water.",
-            );
-            if waves.changed() || currents.changed() {
-                actions.push(UiAction::SettingsChanged);
-            }
-            if weather.busy {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(RichText::new(&weather.status).small());
-                });
-            } else if !weather.status.is_empty() {
-                ui.label(RichText::new(&weather.status).small());
-            }
-
         });
-    // Closing the window ends editing too. Left on, every later chart tap
-    // would keep adding waypoints to a route the user can no longer see.
-    if view.open && !open && view.editing.is_some() {
-        actions.push(UiAction::RouteEdit { route_id: None });
-    }
+    // Closing the window does not end the drawing: the strip under the
+    // chart says a route is being drawn, and its Done ends it.
     view.open = open;
 }
+
+/// The strip under the chart while a route is being drawn.
+///
+/// The route used to be drawn through a window that covered half the chart
+/// it asked to be tapped on, and corrected through three small buttons a
+/// row — Up, Dn, Del. Now the chart is the editor: tap water to add a
+/// waypoint, tap a leg to put one into it, drag a waypoint to move it, tap
+/// one to rename or remove it. The strip holds what is left: what the route
+/// is, the way back (Undo), the list for those who want it, and the two
+/// ways out — follow it, or just stop drawing.
+pub fn edit_strip(ctx: &Context, view: &mut RoutesView, actions: &mut Vec<UiAction>) {
+    let Some(id) = view.editing else { return };
+    let Some(row) = view.rows.iter().find(|r| r.id == id).cloned() else { return };
+    let selected = view.selected.and_then(|i| row.waypoints.get(i).map(|wp| (i, wp.clone())));
+    egui::TopBottomPanel::bottom("route-edit-strip").show(ctx, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(MOB_CORNER);
+            ui.vertical(|ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(&row.name).strong());
+                    let n = row.waypoints.len();
+                    ui.label(format!(
+                        "{n} waypoint{} · {:.1} NM",
+                        if n == 1 { "" } else { "s" },
+                        row.distance_nm
+                    ));
+                    ui.label(
+                        RichText::new(if n == 0 {
+                            "Tap the chart to place the first waypoint."
+                        } else {
+                            "Tap water to add, a leg to insert, a waypoint to change it. Drag a waypoint to move it."
+                        })
+                        .weak(),
+                    );
+                });
+                if let Some((index, wp)) = &selected {
+                    ui.horizontal_wrapped(|ui| {
+                        if let Some(name) = name_field(ui, ("strip-wp-name", wp.id), &wp.name, 150.0) {
+                            actions.push(UiAction::RouteWaypointRename {
+                                route_id: id,
+                                index: *index,
+                                waypoint: wp.id,
+                                name,
+                            });
+                        }
+                        ui.label(RichText::new(crate::geo::format_latlon(wp.lat, wp.lon)).weak());
+                        if ui.button("Remove waypoint").clicked() {
+                            actions.push(UiAction::RouteWaypointDelete {
+                                route_id: id,
+                                index: *index,
+                                waypoint: wp.id,
+                            });
+                        }
+                    });
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let undo = view.undo.clone();
+                    let label = match &undo {
+                        Some(what) => format!("Undo: {what}"),
+                        None => "Undo".to_string(),
+                    };
+                    if ui.add_enabled(undo.is_some(), egui::Button::new(label)).clicked() {
+                        actions.push(UiAction::RouteWaypointUndo);
+                    }
+                    if ui
+                        .selectable_label(view.open, "List")
+                        .on_hover_text("The waypoints as a list, to rename and reorder")
+                        .clicked()
+                    {
+                        view.open = !view.open;
+                    }
+                    if ui
+                        .add_enabled(row.waypoints.len() >= 2, egui::Button::new("Follow"))
+                        .on_hover_text("Stop drawing and steer by this route")
+                        .clicked()
+                    {
+                        actions.push(UiAction::RouteEdit { route_id: None });
+                        actions.push(UiAction::RouteActivate { route_id: id });
+                    }
+                    if ui.button("Done").on_hover_text("Stop drawing. Esc does the same.").clicked() {
+                        actions.push(UiAction::RouteEdit { route_id: None });
+                    }
+                });
+            });
+        });
+        ui.add_space(4.0);
+    });
+}
+
+/// Room left at the strip's left end for the MOB button, which sits in
+/// that corner of the chart whether or not the strip is showing.
+pub(crate) const MOB_CORNER: f32 = 84.0;
 
 /// The strip above the instrument bar while a route is active.
 /// The strip, while a route is followed but cannot be steered yet.
@@ -597,7 +646,7 @@ pub fn waiting_strip(ctx: &Context, why: &str) {
         .exact_height(34.0)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(MOB_CORNER);
                 ui.label(RichText::new(why).weak());
             });
         });
@@ -608,7 +657,7 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance, units: &crate::signalk::UnitP
         .exact_height(34.0)
         .show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
-                ui.add_space(8.0);
+                ui.add_space(MOB_CORNER);
                 if g.finished {
                     ui.label(RichText::new("Route complete").strong());
                     return;
@@ -658,6 +707,181 @@ pub fn guidance_strip(ctx: &Context, g: &Guidance, units: &crate::signalk::UnitP
                 }
             });
         });
+}
+
+/// What the weather router takes into account, in a sailor's words. In the
+/// Go to window, beside the two buttons it governs; it used to be at the
+/// foot of the Routes list, named after its data sources.
+pub fn routing_options(
+    ui: &mut egui::Ui,
+    weather: &mut crate::render::ui::WeatherView,
+    boat_name: &str,
+    actions: &mut Vec<UiAction>,
+) {
+    let before = (weather.hours, weather.use_waves, weather.use_currents);
+    ui.label(RichText::new("Look ahead").weak());
+    ui.horizontal_wrapped(|ui| {
+        for (hours, label) in [(24, "1 day"), (48, "2 days"), (72, "3 days"), (120, "5 days")] {
+            ui.selectable_value(&mut weather.hours, hours, label);
+        }
+        // A horizon set by hand before the list existed is still shown.
+        if ![24, 48, 72, 120].contains(&weather.hours) {
+            let _ = ui.selectable_label(true, format!("{} h", weather.hours));
+        }
+    });
+    // A short name and, under it, what ticking the box does to the route.
+    // "Allow for waves: slower in a sea, and not through one too big" was
+    // one line trying to be both, and read as neither.
+    let explain = |ui: &mut egui::Ui, text: String| {
+        ui.indent("routing-option", |ui| {
+            ui.label(RichText::new(text).small().weak());
+        });
+    };
+    ui.checkbox(&mut weather.use_waves, "Use the wave forecast");
+    explain(
+        ui,
+        "The route keeps out of seas too rough for the boat, and counts on less \
+         speed where the waves are high. Forecast: NOAA GFS; if it is not out \
+         yet, the route is planned on wind alone."
+            .to_string(),
+    );
+    ui.checkbox(&mut weather.use_currents, "Use the current forecast");
+    explain(
+        ui,
+        format!(
+            "The route takes a fair current where there is one and counts the \
+             time lost against a foul one. Forecast: {}; if it cannot be \
+             fetched, the route is planned as for still water.",
+            crate::nav::currents::CURRENT_SOURCE_LABEL
+        ),
+    );
+    if before != (weather.hours, weather.use_waves, weather.use_currents) {
+        actions.push(UiAction::SettingsChanged);
+    }
+    // Whose boat the router thinks it is planning for, by name.
+    let polar = std::path::Path::new(weather.polar_path.trim())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty());
+    ui.label(
+        RichText::new(match (polar, boat_name.trim()) {
+            (Some(p), "") => format!("Sailing speeds: {p}"),
+            (Some(p), name) => format!("Sailing speeds: {p} ({name})"),
+            (None, _) => "Sailing speeds: a ten-metre cruiser. Find your boat's under Boat.".to_string(),
+        })
+        .weak(),
+    );
+    ui.label(RichText::new("Forecast: NOAA GFS, a quarter of a degree").weak());
+}
+
+/// What a press on the chart hit of the route being drawn.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RouteHit {
+    /// This waypoint, by its place in the route.
+    Waypoint(usize),
+    /// The leg from this waypoint to the next.
+    Leg(usize),
+}
+
+/// What of a route is under a press at `at`: the nearest waypoint within
+/// `waypoint_reach`, or failing that the nearest leg within `leg_reach`.
+/// All in the same units (screen pixels or points).
+///
+/// A waypoint wins over the leg it ends, however the distances compare:
+/// pressing on a mark means the mark, and a leg always passes through it.
+/// The reaches are a fingertip, not the few pixels the symbol is drawn at.
+pub fn hit_route(points: &[[f32; 2]], at: [f32; 2], waypoint_reach: f32, leg_reach: f32) -> Option<RouteHit> {
+    let dist = |p: [f32; 2]| (p[0] - at[0]).hypot(p[1] - at[1]);
+    let nearest = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (i, dist(*p)))
+        .filter(|(_, d)| d.is_finite() && *d <= waypoint_reach)
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    if let Some((i, _)) = nearest {
+        return Some(RouteHit::Waypoint(i));
+    }
+    points
+        .windows(2)
+        .enumerate()
+        .map(|(i, w)| {
+            let (a, b) = (w[0], w[1]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let len2 = dx * dx + dy * dy;
+            let t = if len2 > 0.0 {
+                (((at[0] - a[0]) * dx + (at[1] - a[1]) * dy) / len2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            (i, dist([a[0] + t * dx, a[1] + t * dy]))
+        })
+        .filter(|(_, d)| d.is_finite() && *d <= leg_reach)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| RouteHit::Leg(i))
+}
+
+#[cfg(test)]
+mod hit_tests {
+    use super::{hit_route, RouteHit};
+
+    /// A dog-leg: (0,0) → (100,0) → (100,100).
+    const ROUTE: [[f32; 2]; 3] = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0]];
+
+    #[test]
+    fn a_press_finds_the_waypoint_or_the_leg_under_it() {
+        // On a mark, and within a fingertip of one.
+        assert_eq!(hit_route(&ROUTE, [100.0, 0.0], 22.0, 14.0), Some(RouteHit::Waypoint(1)));
+        assert_eq!(hit_route(&ROUTE, [10.0, 15.0], 22.0, 14.0), Some(RouteHit::Waypoint(0)));
+        // Mid-leg, a little off the line: the leg.
+        assert_eq!(hit_route(&ROUTE, [50.0, 10.0], 22.0, 14.0), Some(RouteHit::Leg(0)));
+        assert_eq!(hit_route(&ROUTE, [108.0, 50.0], 22.0, 14.0), Some(RouteHit::Leg(1)));
+        // Open water.
+        assert_eq!(hit_route(&ROUTE, [50.0, 50.0], 22.0, 14.0), None);
+        // Past the end of a leg is not on it: the leg is a segment.
+        assert_eq!(hit_route(&ROUTE, [-40.0, 0.0], 22.0, 14.0), None);
+    }
+
+    /// Near the corner both legs and the mark are in reach: the mark wins,
+    /// and of two marks in reach, the nearer.
+    #[test]
+    fn a_mark_wins_over_its_legs_and_the_nearer_mark_over_the_farther() {
+        assert_eq!(hit_route(&ROUTE, [92.0, 8.0], 22.0, 14.0), Some(RouteHit::Waypoint(1)));
+        let close = [[0.0, 0.0], [30.0, 0.0]];
+        assert_eq!(hit_route(&close, [20.0, 0.0], 22.0, 14.0), Some(RouteHit::Waypoint(1)));
+        assert_eq!(hit_route(&close, [10.0, 0.0], 22.0, 14.0), Some(RouteHit::Waypoint(0)));
+    }
+
+    #[test]
+    fn a_route_with_no_legs_or_no_marks_is_never_hit_on_a_leg() {
+        assert_eq!(hit_route(&[], [0.0, 0.0], 22.0, 14.0), None);
+        assert_eq!(hit_route(&[[0.0, 0.0]], [50.0, 0.0], 22.0, 14.0), None);
+        assert_eq!(hit_route(&[[0.0, 0.0]], [5.0, 0.0], 22.0, 14.0), Some(RouteHit::Waypoint(0)));
+        // Two marks in the same place: a leg of no length divides by nothing.
+        assert_eq!(hit_route(&[[0.0, 0.0], [0.0, 0.0]], [40.0, 0.0], 22.0, 14.0), None);
+    }
+}
+
+/// Whether a route is drawn on the chart: ticked, or being followed (the
+/// route being followed is always drawn).
+fn route_shown(visible: &std::collections::HashSet<uuid::Uuid>, id: uuid::Uuid, active: bool) -> bool {
+    active || visible.contains(&id)
+}
+
+#[cfg(test)]
+mod shown_tests {
+    /// Unticking takes effect at once and ticking again puts it back; the
+    /// route being followed is shown whatever the box says.
+    #[test]
+    fn a_route_is_shown_when_ticked_or_followed() {
+        let id = uuid::Uuid::new_v4();
+        let mut visible = std::collections::HashSet::new();
+        assert!(!super::route_shown(&visible, id, false));
+        assert!(super::route_shown(&visible, id, true));
+        visible.insert(id);
+        assert!(super::route_shown(&visible, id, false));
+        visible.remove(&id);
+        assert!(!super::route_shown(&visible, id, false));
+    }
 }
 
 #[cfg(test)]

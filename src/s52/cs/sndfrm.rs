@@ -327,24 +327,17 @@ fn check_tecsou_swept(feature: &Feature) -> bool {
 /// - STATUS 18 = doubtful
 /// - QUAPOS 2-9 = low accuracy position
 fn check_uncertainty(feature: &Feature) -> bool {
-    // Check QUASOU
-    if let Some(AttributeValue::String(quasou)) = feature.attributes.get("QUASOU") {
-        let uncertain = ["3", "4", "5", "8", "9"];
-        if quasou.split(',').any(|v| uncertain.contains(&v.trim())) {
-            return true;
-        }
+    // QUASOU and STATUS are both list attributes: on a real chart they
+    // arrive as text ("1,18"), and in hand-made features as a single integer.
+    if super::list_values(feature, "QUASOU")
+        .iter()
+        .any(|q| matches!(q, 3 | 4 | 5 | 8 | 9))
+    {
+        return true;
     }
-    if let Some(AttributeValue::Integer(quasou)) = feature.attributes.get("QUASOU") {
-        if matches!(*quasou, 3 | 4 | 5 | 8 | 9) {
-            return true;
-        }
-    }
-
-    // Check STATUS
-    if let Some(AttributeValue::Integer(status)) = feature.attributes.get("STATUS") {
-        if *status == 18 {
-            return true;
-        }
+    // STATUS 18 is "existence doubtful".
+    if super::list_values(feature, "STATUS").contains(&18) {
+        return true;
     }
 
     // Check QUAPOS (position accuracy)
@@ -615,9 +608,173 @@ mod tests {
         let info = sndfrm02(10.0, &feature, &settings);
         assert!(!info.is_shallow);
 
-        // Just above safety depth should be deep (>)
-        let info = sndfrm02(10.1, &feature, &settings);
-        assert!(!info.is_shallow);
+        // 9.99 m lands exactly on the 10 m safety depth once the bias is
+        // added, and the test is `<=`: it is a shallow sounding. A strict `<`
+        // would print it grey.
+        let info = sndfrm02(9.99, &feature, &settings);
+        assert!(info.is_shallow, "depth equal to the safety depth is shallow");
+        assert_eq!(info.color_token(), "SNDG2");
+    }
+
+    /// The safety depth is entered in metres but compared in the display
+    /// unit, so it has to be converted with the sounding. Comparing 16.4 ft
+    /// against an unconverted "10" would print a 5 m sounding as safe water
+    /// for a vessel that needs 10 m.
+    #[test]
+    fn safety_depth_is_converted_with_the_sounding_in_feet_and_fathoms() {
+        let feature = make_sounding();
+        for unit in [DepthUnit::Feet, DepthUnit::Fathoms] {
+            let settings = MarinerSettings {
+                safety_depth: 10.0,
+                depth_unit: unit,
+                ..Default::default()
+            };
+            assert!(
+                sndfrm02(5.0, &feature, &settings).is_shallow,
+                "5 m is shallower than a 10 m safety depth in {unit:?}"
+            );
+            assert!(
+                !sndfrm02(15.0, &feature, &settings).is_shallow,
+                "15 m is deeper than a 10 m safety depth in {unit:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fathoms_keep_the_fraction_digit() {
+        // 10 m is 5.47 fathoms (OpenCPN's factor). Unlike feet, fathoms are
+        // not rounded to whole units below 31.
+        let settings = MarinerSettings {
+            depth_unit: DepthUnit::Fathoms,
+            ..Default::default()
+        };
+        let info = sndfrm02(10.0, &make_sounding(), &settings);
+        assert_eq!(info.whole_part, 5);
+        assert_eq!(info.decimal_digit, Some(4));
+        assert_eq!(info.digit_count, 1);
+    }
+
+    #[test]
+    fn rounding_bias_keeps_binary_fractions_from_losing_a_tenth() {
+        // 2.3 is 2.2999... in binary; truncating its fraction without
+        // OpenCPN's +0.01 bias would print 2 with subscript 2.
+        let info = sndfrm02(2.3, &make_sounding(), &MarinerSettings::default());
+        assert_eq!(info.whole_part, 2);
+        assert_eq!(info.decimal_digit, Some(3));
+
+        // A whole metre has no fraction digit at all, bias or not.
+        let info = sndfrm02(3.0, &make_sounding(), &MarinerSettings::default());
+        assert_eq!(info.whole_part, 3);
+        assert_eq!(info.decimal_digit, None);
+    }
+
+    #[test]
+    fn reliable_soundings_carry_no_uncertainty_mark() {
+        let settings = MarinerSettings::default();
+        // QUASOU 1 (depth known), 6 (least depth known), QUAPOS 1 (surveyed)
+        // and 10/11 (precisely known / calculated) are all reliable, and so is
+        // a STATUS other than 18.
+        for (attr, value) in [
+            ("QUASOU", AttributeValue::Integer(1)),
+            ("QUASOU", AttributeValue::String("1,6".to_string())),
+            ("QUAPOS", AttributeValue::Integer(1)),
+            ("QUAPOS", AttributeValue::Integer(10)),
+            ("QUAPOS", AttributeValue::Integer(11)),
+            ("STATUS", AttributeValue::Integer(1)),
+        ] {
+            let feature = make_sounding_with_attr(attr, value.clone());
+            assert!(
+                !sndfrm02(10.0, &feature, &settings).show_uncertainty,
+                "{attr}={value:?} is not an uncertain sounding"
+            );
+        }
+        assert!(!sndfrm02(10.0, &make_sounding(), &settings).show_uncertainty);
+    }
+
+    #[test]
+    fn uncertainty_is_found_anywhere_in_a_quasou_list() {
+        // QUASOU is a list attribute; the SENC stores it as a string.
+        let feature =
+            make_sounding_with_attr("QUASOU", AttributeValue::String("1,8".to_string()));
+        assert!(sndfrm02(10.0, &feature, &MarinerSettings::default()).show_uncertainty);
+    }
+
+    /// STATUS is an S-57 *list* attribute, so the SENC delivers it as a
+    /// string like QUASOU — a doubtful sounding (STATUS 18) on a real chart
+    /// arrives as `String("18")`, which `check_uncertainty` only reads as an
+    /// integer.
+    #[test]
+    fn status_doubtful_is_recognised_when_encoded_as_a_list() {
+        let feature = make_sounding_with_attr("STATUS", AttributeValue::String("18".to_string()));
+        assert!(sndfrm02(10.0, &feature, &MarinerSettings::default()).show_uncertainty);
+    }
+
+    #[test]
+    fn tecsou_six_anywhere_in_the_list_marks_a_swept_depth() {
+        let feature = make_sounding_with_attr("TECSOU", AttributeValue::String("1,6".to_string()));
+        assert!(sndfrm02(10.0, &feature, &MarinerSettings::default()).is_swept);
+        let feature = make_sounding_with_attr("TECSOU", AttributeValue::String("1,3".to_string()));
+        assert!(!sndfrm02(10.0, &feature, &MarinerSettings::default()).is_swept);
+    }
+
+    #[test]
+    fn bogus_depths_are_clamped_like_opencpn() {
+        let settings = MarinerSettings::default();
+        // Above 40 000 m the value is a placeholder: shown as 99999.
+        let info = sndfrm02(50_000.0, &make_sounding(), &settings);
+        assert_eq!(info.whole_part, 99_999);
+        assert_eq!(info.digit_count, 5);
+        assert!(!info.is_drying);
+        // Below -1000 m it is nonsense and becomes 0. (The -0.01 bias then
+        // makes it a "drying" 0, exactly as in s52cnsy.cpp.)
+        let info = sndfrm02(-2_000.0, &make_sounding(), &settings);
+        assert_eq!(info.whole_part, 0);
+        assert_eq!(info.digit_count, 1);
+    }
+
+    #[test]
+    fn flags_round_trip_through_the_gpu_packing() {
+        // The renderer rebuilds the symbols from the packed flags alone, so
+        // every field must survive, including the widest whole part.
+        for info in [
+            SoundingRenderInfo {
+                whole_part: 99_999,
+                decimal_digit: None,
+                digit_count: 5,
+                is_shallow: false,
+                is_drying: false,
+                show_uncertainty: false,
+                is_swept: true,
+            },
+            SoundingRenderInfo {
+                whole_part: 12,
+                decimal_digit: Some(9),
+                digit_count: 2,
+                is_shallow: true,
+                is_drying: true,
+                show_uncertainty: true,
+                is_swept: false,
+            },
+            SoundingRenderInfo {
+                whole_part: 0,
+                decimal_digit: Some(0),
+                digit_count: 1,
+                is_shallow: true,
+                is_drying: false,
+                show_uncertainty: false,
+                is_swept: false,
+            },
+        ] {
+            let back = SoundingRenderInfo::from_flags(info.to_flags());
+            assert_eq!(back.whole_part, info.whole_part);
+            assert_eq!(back.decimal_digit, info.decimal_digit);
+            assert_eq!(back.digit_count, info.digit_count);
+            assert_eq!(back.is_shallow, info.is_shallow);
+            assert_eq!(back.is_drying, info.is_drying);
+            assert_eq!(back.show_uncertainty, info.show_uncertainty);
+            assert_eq!(back.is_swept, info.is_swept);
+            assert_eq!(back.symbols(), info.symbols());
+        }
     }
 
     #[test]
@@ -676,6 +833,39 @@ mod symbol_tests {
             info(1250, None, false).symbols(),
             ["SOUNDG21", "SOUNDG12", "SOUNDG05", "SOUNDG40"]
         );
+    }
+
+    /// Five-digit depths use positions 3, 2, 1, 0 and 4 (s52cnsy.cpp
+    /// "Continuation C").
+    #[test]
+    fn sndfrm02_composes_five_digit_depths() {
+        let mut i = info(12345, None, false);
+        i.digit_count = 5;
+        assert_eq!(
+            i.symbols(),
+            ["SOUNDG31", "SOUNDG22", "SOUNDG13", "SOUNDG04", "SOUNDG45"]
+        );
+    }
+
+    /// A drying two-digit height moves left one place to make room for the
+    /// A1 bar — positions 2 and 1, not 1 and 0 — end to end from the depth.
+    #[test]
+    fn two_digit_drying_height_shifts_left_for_the_bar() {
+        let feature = crate::senc::Feature {
+            type_code: 129,
+            object_class: crate::senc::ObjectClass::Sounding,
+            feature_type: crate::senc::FeatureType::Point,
+            attributes: crate::senc::Attributes::new(),
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        };
+        let s = sndfrm02(-12.0, &feature, &MarinerSettings::default());
+        assert_eq!(s.symbols(), ["SOUNDS21", "SOUNDS12", "SOUNDSA1"]);
+        // The same depth below water is positions 1 and 0, safe set.
+        let s = sndfrm02(12.0, &feature, &MarinerSettings::default());
+        assert_eq!(s.symbols(), ["SOUNDG11", "SOUNDG02"]);
     }
 
     #[test]

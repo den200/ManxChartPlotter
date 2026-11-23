@@ -21,6 +21,10 @@ use serde::Deserialize;
 pub struct Update {
     pub path: String,
     pub value: Value,
+    /// When the server says the value was measured: the update's
+    /// `timestamp`. Absent when the server gave none, or one that cannot
+    /// be read.
+    pub sent: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,6 +71,8 @@ struct RawDelta {
 
 #[derive(Deserialize)]
 struct RawUpdate {
+    #[serde(default)]
+    timestamp: Option<String>,
     #[serde(default)]
     values: Vec<RawValue>,
 }
@@ -120,8 +126,13 @@ pub fn parse(text: &str) -> Option<Delta> {
     }
     let mut updates = Vec::new();
     for update in raw.updates {
+        let sent = update
+            .timestamp
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
         for v in update.values {
-            expand(&v.path, &v.value, &mut updates);
+            expand(&v.path, &v.value, sent, &mut updates);
         }
     }
     (!updates.is_empty()).then_some(Delta {
@@ -142,7 +153,12 @@ pub fn parse(text: &str) -> Option<Delta> {
 /// Position is the exception, kept whole because it is a coordinate rather
 /// than two unrelated numbers, and because it is what puts the boat on the
 /// chart.
-fn expand(path: &str, v: &serde_json::Value, out: &mut Vec<Update>) {
+fn expand(
+    path: &str,
+    v: &serde_json::Value,
+    sent: Option<chrono::DateTime<chrono::Utc>>,
+    out: &mut Vec<Update>,
+) {
     // A delta may carry an empty path when it updates a whole subtree. There
     // is nothing to label or display, so it is not a reading.
     if path.is_empty() {
@@ -152,6 +168,7 @@ fn expand(path: &str, v: &serde_json::Value, out: &mut Vec<Update>) {
         out.push(Update {
             path: path.to_string(),
             value,
+            sent,
         })
     };
     match v {
@@ -169,7 +186,7 @@ fn expand(path: &str, v: &serde_json::Value, out: &mut Vec<Update>) {
                 (Some(lat), Some(lon)) => push(out, Value::Position { lat, lon }),
                 _ => {
                     for (k, child) in map {
-                        expand(&format!("{path}.{k}"), child, out);
+                        expand(&format!("{path}.{k}"), child, sent, out);
                     }
                 }
             }
@@ -197,6 +214,9 @@ mod tests {
           }]
         }"#;
         let d = parse(text).expect("a delta");
+        // Each value carries its update's timestamp.
+        let at = chrono::DateTime::parse_from_rfc3339("2026-07-27T10:00:00Z").unwrap();
+        assert!(d.updates.iter().all(|u| u.sent == Some(at.with_timezone(&chrono::Utc))));
         assert_eq!(d.context.as_deref(), Some("vessels.urn:mrn:signalk:uuid:abc"));
         assert_eq!(d.updates.len(), 2);
         assert_eq!(d.updates[0].path, "navigation.speedOverGround");
@@ -330,6 +350,32 @@ mod tests {
         assert!(parse(r#"{"updates":[{"values":[{"path":"","value":null}]}]}"#).is_none());
     }
 
+    /// The awkward shapes a real server sends, each of which once had to be
+    /// decided: a flag, a list, a position with a coordinate missing, and a
+    /// null inside a compound value.
+    #[test]
+    fn odd_values_are_kept_honestly_or_left_out() {
+        let text = r#"{"updates":[{"values":[
+            {"path":"steering.autopilot.engaged","value":true},
+            {"path":"navigation.gnss.satellitesInView.satellites","value":[{"id":1}]},
+            {"path":"navigation.position","value":{"latitude":55.6,"longitude":null}},
+            {"path":"environment.current","value":{"drift":null,"setTrue":2.1}}]}]}"#;
+        let d = parse(text).expect("a delta");
+        let get = |p: &str| d.updates.iter().find(|u| u.path == p).map(|u| u.value.clone());
+
+        assert_eq!(get("steering.autopilot.engaged"), Some(Value::Text("true".into())));
+        // A list has no single reading, and nothing is made up for it.
+        assert_eq!(get("navigation.gnss.satellitesInView.satellites"), None);
+        // Half a position is not a position: it must not put the boat on the
+        // chart at some default longitude. Its members survive as readings.
+        assert_eq!(get("navigation.position"), None);
+        assert_eq!(get("navigation.position.latitude"), Some(Value::Number(55.6)));
+        assert_eq!(get("navigation.position.longitude"), Some(Value::Null));
+        assert_eq!(get("environment.current.drift"), Some(Value::Null));
+        assert_eq!(get("environment.current.setTrue"), Some(Value::Number(2.1)));
+        assert_eq!(d.updates.len(), 5);
+    }
+
     #[test]
     fn several_updates_in_one_message_all_arrive() {
         // Servers batch by source; one message can carry a whole instrument set.
@@ -339,6 +385,15 @@ mod tests {
                 {"path":"environment.wind.speedApparent","value":7.0},
                 {"path":"environment.wind.angleApparent","value":0.66}]}]}"#;
         let d = parse(text).expect("a delta");
-        assert_eq!(d.updates.len(), 3);
+        let paths: Vec<_> = d.updates.iter().map(|u| u.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "navigation.speedOverGround",
+                "environment.wind.speedApparent",
+                "environment.wind.angleApparent"
+            ]
+        );
+        assert_eq!(d.updates[2].value.as_number(), Some(0.66));
     }
 }

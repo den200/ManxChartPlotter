@@ -789,11 +789,32 @@ mod tests {
         let glyphs = layout_text(&params);
         assert_eq!(glyphs.len(), 2);
         let width = text_width_px(text, params.scale, false, params.space);
-        // Centred text straddles the anchor: the pen starts half a width left.
-        let left = glyphs[0].offset_px[0] - glyphs[0].size_px[0] / 2.0;
-        let right = glyphs[1].offset_px[0] + glyphs[1].size_px[0] / 2.0;
-        assert!((left + right).abs() < width, "not centred: {left}..{right}");
         assert!(glyphs[0].offset_px[0] < glyphs[1].offset_px[0], "A before B");
+        // Centred text is the left-justified text moved back by half its
+        // width, right-justified by all of it; the vertical is untouched.
+        let left = layout_text(&TextParams { hjust: HJust::Left, ..params.clone() });
+        let right = layout_text(&TextParams { hjust: HJust::Right, ..params.clone() });
+        for i in 0..2 {
+            assert!((glyphs[i].offset_px[0] - (left[i].offset_px[0] - width / 2.0)).abs() < 1e-3);
+            assert!((right[i].offset_px[0] - (left[i].offset_px[0] - width)).abs() < 1e-3);
+            assert_eq!(glyphs[i].offset_px[1], left[i].offset_px[1]);
+        }
+    }
+
+    /// S-52 VJUST: "top" hangs the text below its anchor, "bottom" stands it
+    /// on it — a cell height apart on screen, where y runs down — and
+    /// "centre" is halfway.
+    #[test]
+    fn test_layout_vertical_justification() {
+        let at = |vjust| {
+            layout_text(&TextParams { text: "A".into(), vjust, ..Default::default() })[0].offset_px[1]
+        };
+        let (top, centre, bottom) = (at(VJust::Top), at(VJust::Center), at(VJust::Bottom));
+        assert!((top - bottom - CELL_H).abs() < 1e-3, "{top} {bottom}");
+        assert!((centre - bottom - CELL_H / 2.0).abs() < 1e-3, "{centre} {bottom}");
+        // yoffs counts whole cells down the screen.
+        let lower = layout_text(&TextParams { text: "A".into(), vjust: VJust::Bottom, yoffs: 1, ..Default::default() });
+        assert!((lower[0].offset_px[1] - bottom - CELL_H).abs() < 1e-3);
     }
 
     #[test]
@@ -879,6 +900,38 @@ mod tests {
 
         let glyphs = declutter_and_layout_labels(&labels, &camera, glam::DVec2::ZERO);
         assert_eq!(glyphs.len(), 1);
+
+        // The same two labels a hundred pixels apart both stay.
+        let close = Camera::new(0.0, 0.0, 1.0, 800.0, 600.0);
+        assert_eq!(declutter_and_layout_labels(&labels, &close, glam::DVec2::ZERO).len(), 2);
+    }
+
+    /// When labels collide, the more important one stays, whichever order
+    /// they arrived in: higher display priority first, then the lower text
+    /// group (a light's description outranks a place name). With "important
+    /// text only" the place name is not even a candidate.
+    #[test]
+    fn colliding_labels_keep_the_more_important() {
+        let camera = Camera::new(0.0, 0.0, 1000.0, 800.0, 600.0);
+        let label = |text: &str, disp_prio, dis| TextParams {
+            position: [0.0, 0.0],
+            text: text.to_string(),
+            disp_prio,
+            dis,
+            ..Default::default()
+        };
+        let kept = |labels: &[TextParams], important| {
+            let g = declutter_and_layout_labels_ex(labels, &camera, glam::DVec2::ZERO, important);
+            g.len()
+        };
+        // The light's "FlG" is three glyphs, the place name "Havnen" six.
+        let place = label("Havnen", 5, 26);
+        let light = label("FlG", 8, 11);
+        assert_eq!(kept(&[place.clone(), light.clone()], false), 3);
+        let same_prio_light = label("FlG", 5, 11);
+        assert_eq!(kept(&[place.clone(), same_prio_light], false), 3);
+        assert_eq!(kept(&[place.clone()], true), 0);
+        assert_eq!(kept(&[place, light], true), 3);
     }
 
     #[test]
@@ -903,5 +956,33 @@ mod tests {
 
         declutter_soundings(&mut soundings, &camera, glam::DVec2::ZERO);
         assert_eq!(soundings.len(), 1);
+        // The one kept is the shallower: S-52 never hides the shoal sounding
+        // behind a deeper one.
+        assert_eq!(soundings[0].depth, 5.0);
+
+        let mut soundings = vec![
+            super::super::text::SoundingInstance {
+                position: [0.0, 0.0],
+                depth: 12.0,
+                flags: 2 << 5,
+                scale: 1.0,
+                color_index: 0,
+            },
+            super::super::text::SoundingInstance {
+                position: [3.0, 2.0],
+                depth: 2.5,
+                flags: 1 << 5,
+                scale: 1.0,
+                color_index: 0,
+            },
+        ];
+        let mut apart = soundings.clone();
+        declutter_soundings(&mut soundings, &camera, glam::DVec2::ZERO);
+        assert_eq!(soundings.len(), 1);
+        assert_eq!(soundings[0].depth, 2.5, "arrival order does not decide");
+        // Far enough apart on screen, both are shown.
+        let close = Camera::new(0.0, 0.0, 0.01, 800.0, 600.0);
+        declutter_soundings(&mut apart, &close, glam::DVec2::ZERO);
+        assert_eq!(apart.len(), 2);
     }
 }

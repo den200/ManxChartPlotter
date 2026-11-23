@@ -240,7 +240,12 @@ impl RenderInstruction {
             "TX" if args.len() >= 9 => {
                 let (style, weight, width, bsize) = parse_chars(&args[4]);
                 Some(Self::Text {
-                    attribute: args[0].trim().trim_matches('\'').to_string(),
+                    // An attribute name (`TX(OBJNAM,…)`), or a quoted string
+                    // to print as it stands (`TX('V-AIS',…)`, from a SYMINS).
+                    // The quotes are kept: they are the only thing telling
+                    // the two apart, and without them the literal was looked
+                    // up as an attribute no feature has.
+                    attribute: args[0].trim().to_string(),
                     format: None,
                     hjust: args[1].trim().parse().unwrap_or(1),
                     vjust: args[2].trim().parse().unwrap_or(1),
@@ -500,11 +505,120 @@ mod tests {
     #[test]
     fn test_parse_sy() {
         let instr = RenderInstruction::parse_single("SY(ACHARE02)").unwrap();
-        if let RenderInstruction::Symbol { name, .. } = instr {
+        if let RenderInstruction::Symbol { name, rotation } = instr {
             assert_eq!(name, "ACHARE02");
+            assert_eq!(rotation, None);
         } else {
             panic!("Expected Symbol");
         }
+    }
+
+    /// The second SY() argument is either a literal bearing or the name of
+    /// the attribute to take it from.
+    #[test]
+    fn symbol_rotation_is_a_bearing_or_an_attribute() {
+        let rotation = |s: &str| match RenderInstruction::parse_single(s) {
+            Some(RenderInstruction::Symbol { rotation, .. }) => rotation,
+            other => panic!("expected a symbol from {s}, got {other:?}"),
+        };
+        assert_eq!(rotation("SY(LIGHTS12,135)"), Some(SymbolRotation::Degrees(135.0)));
+        assert_eq!(
+            rotation("SY(TSSLPT51,ORIENT)"),
+            Some(SymbolRotation::FromAttribute("ORIENT".to_string()))
+        );
+
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("ORIENT", crate::senc::AttributeValue::Float(42.0));
+        let feature = crate::senc::Feature {
+            type_code: 0,
+            object_class: crate::senc::ObjectClass::Other,
+            feature_type: crate::senc::FeatureType::Point,
+            attributes,
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        };
+        assert_eq!(SymbolRotation::FromAttribute("ORIENT".into()).degrees(&feature), Some(42.0));
+        assert_eq!(SymbolRotation::FromAttribute("SECTR1".into()).degrees(&feature), None);
+        assert_eq!(SymbolRotation::Degrees(135.0).degrees(&feature), Some(135.0));
+    }
+
+    #[test]
+    fn area_colour_transparency_is_optional() {
+        match RenderInstruction::parse_single("AC(TRFCF,3)") {
+            Some(RenderInstruction::AreaColor { color, transparency }) => {
+                assert_eq!(color, "TRFCF");
+                assert_eq!(transparency, Some(3));
+            }
+            other => panic!("expected AreaColor, got {other:?}"),
+        }
+        match RenderInstruction::parse_single("AC(LANDA)") {
+            Some(RenderInstruction::AreaColor { transparency, .. }) => assert_eq!(transparency, None),
+            other => panic!("expected AreaColor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_arguments_land_in_the_right_fields() {
+        // TX(attribute, hjust, vjust, space, chars, xoffs, yoffs, colour, display group)
+        match RenderInstruction::parse_single("TX(OBJNAM,1,2,3,'15118',2,-1,CHBLK,26)") {
+            Some(RenderInstruction::Text {
+                attribute, format, hjust, vjust, xoffs, yoffs, color, style, weight, width, bsize, space, dis,
+            }) => {
+                assert_eq!(attribute, "OBJNAM");
+                assert_eq!(format, None);
+                assert_eq!((hjust, vjust, space), (1, 2, 3));
+                assert_eq!((xoffs, yoffs), (2, -1));
+                assert_eq!(color, "CHBLK");
+                assert_eq!((style, weight, width, bsize), (1, 5, 1, 18));
+                assert_eq!(dis, 26);
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// chartsymbols.xml's LNDARE rows end in a stray "))". Without the
+    /// trimming the display group parses as garbage and falls back to 21,
+    /// promoting a group-26 name into the important-text set.
+    #[test]
+    fn stray_closing_paren_does_not_corrupt_the_last_argument() {
+        let parsed = RenderInstruction::parse_all(
+            "SY(LNDARE01);CS(QUAPOS01;TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26))",
+        );
+        let text: Vec<String> = parsed.iter().map(|i| i.to_s52()).collect();
+        assert_eq!(text, ["SY(LNDARE01)", "TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26)"]);
+    }
+
+    /// to_s52 is what the conformance harness diffs against OpenCPN, so
+    /// parse -> print must reproduce the table text.
+    #[test]
+    fn to_s52_round_trips_table_instructions() {
+        for s in [
+            "LS(DASH,2,CSTLN)",
+            "LS(DASD,1,CHMGD)",
+            "AC(DEPVS)",
+            "AC(TRFCF,3)",
+            "AP(FOULAR01)",
+            "SY(LIGHTS11,135)",
+            "SY(TSSLPT51,ORIENT)",
+            "LC(LOWACC21)",
+            "CS(DEPARE02)",
+            "TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26)",
+            "TE('clr %4.1lf','VERCLR',3,1,2,'15110',1,1,CHBLK,11)",
+        ] {
+            let parsed = RenderInstruction::parse_single(s).unwrap_or_else(|| panic!("{s} did not parse"));
+            assert_eq!(parsed.to_s52(), s);
+        }
+    }
+
+    #[test]
+    fn malformed_instructions_are_skipped_not_misread() {
+        assert!(RenderInstruction::parse_single("").is_none());
+        assert!(RenderInstruction::parse_single("LS(SOLD,1)").is_none()); // too few args
+        assert!(RenderInstruction::parse_single("XX(FOO)").is_none());
+        assert!(RenderInstruction::parse_single("SY(").is_none());
+        assert!(RenderInstruction::parse_single("TX(OBJNAM,1,2)").is_none());
     }
 
     #[test]
@@ -518,30 +632,38 @@ mod tests {
 
     #[test]
     fn test_parse_with_quotes() {
-        // TE instruction with quoted format string
-        let instr =
-            RenderInstruction::parse_single("TE('clr %4.1lf',VERCLR,3,1,2,'15110',1,1,CHBLK,11)");
-        assert!(instr.is_some());
-        if let Some(RenderInstruction::Text {
-            attribute,
-            color,
-            format,
-            hjust,
-            vjust,
-            weight,
-            bsize,
-            dis,
-            ..
-        }) = instr
-        {
-            assert_eq!(attribute, "VERCLR");
-            assert_eq!(color, "CHBLK");
-            assert_eq!(format, Some("clr %4.1lf".to_string()));
-            assert_eq!(hjust, 3);
-            assert_eq!(vjust, 1);
-            assert_eq!(weight, 5);
-            assert_eq!(bsize, 10);
-            assert_eq!(dis, 11);
+        // TE instruction with a quoted format string; a comma inside the
+        // quotes must not split the arguments.
+        let instr = RenderInstruction::parse_single(
+            "TE('clr %4.1lf, max','VERCLR',3,1,2,'15110',1,-1,CHBLK,11)",
+        );
+        match instr {
+            Some(RenderInstruction::Text {
+                attribute,
+                color,
+                format,
+                hjust,
+                vjust,
+                xoffs,
+                yoffs,
+                weight,
+                bsize,
+                space,
+                dis,
+                ..
+            }) => {
+                assert_eq!(attribute, "VERCLR");
+                assert_eq!(color, "CHBLK");
+                assert_eq!(format, Some("clr %4.1lf, max".to_string()));
+                assert_eq!(hjust, 3);
+                assert_eq!(vjust, 1);
+                assert_eq!(space, 2);
+                assert_eq!((xoffs, yoffs), (1, -1));
+                assert_eq!(weight, 5);
+                assert_eq!(bsize, 10);
+                assert_eq!(dis, 11);
+            }
+            other => panic!("expected Text, got {other:?}"),
         }
     }
 
@@ -638,58 +760,251 @@ mod tests {
 
     #[test]
     fn test_instruction_ordering_ls_lc_ls() {
-        // Regression test: LS(...);LC(...);LS(...) should produce 3 ops with pass indices 0, 1, 2
+        // Regression test: LS(...);LC(...);LS(...) must keep its order — the
+        // builder assigns draw passes 0, 1, 2 by position.
         let ops = parse_instructions("LS(SOLD,2,OUTLW);LC(LOWACC21);LS(SOLD,1,CHBLK)");
+        assert_eq!(
+            ops,
+            [
+                LineOp::Style(LineStyleKey::new(LinePattern::Solid, 2, "OUTLW")),
+                LineOp::LC("LOWACC21".into()),
+                LineOp::Style(LineStyleKey::new(LinePattern::Solid, 1, "CHBLK")),
+            ]
+        );
+    }
 
-        // Should have exactly 3 operations
-        assert_eq!(ops.len(), 3, "Should have 3 line operations");
+    /// Only a *surplus* closing paren is stray. A balanced pair at the end of
+    /// the last argument belongs to it and must survive the trimming.
+    #[test]
+    fn balanced_parens_in_the_last_argument_are_kept() {
+        let name = |s: &str| match RenderInstruction::parse_single(s) {
+            Some(RenderInstruction::Symbol { name, .. }) => name,
+            other => panic!("expected a symbol from {s}, got {other:?}"),
+        };
+        assert_eq!(name("SY(FOO(1))"), "FOO(1)");
+        // A ')' that is not trailing is not trimmed either, balanced or not.
+        assert_eq!(name("SY(A)B)"), "A)B");
+        // The stray one is.
+        assert_eq!(name("SY(FOO(1)))"), "FOO(1)");
+    }
 
-        // Verify operation types in order
-        assert!(matches!(&ops[0], LineOp::Style(_)), "First op should be LS");
-        assert!(matches!(&ops[1], LineOp::LC(_)), "Second op should be LC");
-        assert!(matches!(&ops[2], LineOp::Style(_)), "Third op should be LS");
-
-        // Verify first LS style
-        if let LineOp::Style(key) = &ops[0] {
-            assert_eq!(key.pattern, LinePattern::Solid);
-            assert_eq!(key.width, 2);
-            assert_eq!(key.color_token, "OUTLW");
+    /// An instruction with no arguments names nothing to draw. Every
+    /// command needs at least its first argument, and the parser must skip
+    /// the empty form rather than index into it.
+    #[test]
+    fn instructions_without_arguments_are_skipped() {
+        for s in ["AC()", "AP()", "SY()", "LC()", "CS()", "LS()", "TX()", "TE()"] {
+            assert!(RenderInstruction::parse_single(s).is_none(), "{s}");
         }
+        // TE takes ten arguments (format first); nine is malformed.
+        assert!(RenderInstruction::parse_single("TE('%s','OBJNAM',1,2,2,'15110',0,0,CHBLK)").is_none());
+        // The rest of a list still parses around an empty one.
+        let parsed = RenderInstruction::parse_all("AC();SY(BOYSAW12);CS()");
+        assert_eq!(parsed.iter().map(|i| i.to_s52()).collect::<Vec<_>>(), ["SY(BOYSAW12)"]);
 
-        // Verify LC name
-        if let LineOp::LC(name) = &ops[1] {
-            assert_eq!(name, "LOWACC21");
+        assert!(parse_instructions("LS(SOLD,1);CS();LC()").is_empty());
+        assert_eq!(parse_instructions("CS();LC(LOWACC21)"), [LineOp::LC("LOWACC21".into())]);
+    }
+
+    #[test]
+    fn instruction_kind_predicates_say_no_to_other_kinds() {
+        let ls = RenderInstruction::parse_single("LS(SOLD,1,CSTLN)").unwrap();
+        let ac = RenderInstruction::parse_single("AC(LANDA)").unwrap();
+        let sy = RenderInstruction::parse_single("SY(BOYSAW12)").unwrap();
+        assert!(ls.is_line_style() && !ls.is_area_color());
+        assert!(ac.is_area_color() && !ac.is_line_style());
+        assert!(!sy.is_line_style() && !sy.is_area_color());
+    }
+
+    /// LS, AC and TX/TE carry a colour token; symbols, patterns, complex
+    /// lines and CS calls take theirs from the symbol definition, or have
+    /// none.
+    #[test]
+    fn colour_token_is_the_instructions_own_colour() {
+        let token = |s: &str| RenderInstruction::parse_single(s).unwrap().color_token().map(str::to_string);
+        assert_eq!(token("LS(DASH,2,CSTLN)").as_deref(), Some("CSTLN"));
+        assert_eq!(token("AC(DEPVS)").as_deref(), Some("DEPVS"));
+        assert_eq!(token("AC(TRFCF,3)").as_deref(), Some("TRFCF"));
+        assert_eq!(token("TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26)").as_deref(), Some("CHBLK"));
+        assert_eq!(token("TE('%s','OBJNAM',1,2,2,'15110',0,0,CHMGD,21)").as_deref(), Some("CHMGD"));
+        for s in ["SY(BOYSAW12)", "AP(FOULAR01)", "LC(LOWACC21)", "CS(DEPARE02)"] {
+            assert_eq!(token(s), None, "{s}");
         }
+    }
 
-        // Verify second LS style
-        if let LineOp::Style(key) = &ops[2] {
-            assert_eq!(key.pattern, LinePattern::Solid);
-            assert_eq!(key.width, 1);
-            assert_eq!(key.color_token, "CHBLK");
+    /// A quoted first TX argument is a literal to print, an unquoted one an
+    /// attribute to look up; only the quotes tell them apart, so they must
+    /// survive parsing and printing.
+    #[test]
+    fn a_quoted_tx_argument_stays_a_literal() {
+        let s = "TX('V-AIS',3,2,2,'15110',2,0,CHMGD,11)";
+        match RenderInstruction::parse_single(s) {
+            Some(RenderInstruction::Text { attribute, format, .. }) => {
+                assert_eq!(attribute, "'V-AIS'");
+                assert_eq!(format, None);
+            }
+            other => panic!("expected Text, got {other:?}"),
         }
-
-        // The pass indices (0, 1, 2) are assigned during enumeration in builder.rs
-        // Here we just verify the ordering is preserved from parsing
-        // The actual test that pass indices map correctly is done in integration tests
+        assert_eq!(RenderInstruction::parse_single(s).unwrap().to_s52(), s);
     }
 
     #[test]
     fn test_instruction_ordering_casing_pattern() {
-        // Common casing pattern: outer casing, inner line
+        // Common casing pattern: thick outer casing first, thin line on top.
         let ops = parse_instructions("LS(SOLD,4,CHGRD);LS(SOLD,2,CHBLK)");
+        assert_eq!(
+            ops,
+            [
+                LineOp::Style(LineStyleKey::new(LinePattern::Solid, 4, "CHGRD")),
+                LineOp::Style(LineStyleKey::new(LinePattern::Solid, 2, "CHBLK")),
+            ]
+        );
+    }
 
-        assert_eq!(ops.len(), 2, "Should have 2 line operations for casing");
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
 
-        // First pass (0): thick outer casing
-        if let LineOp::Style(key) = &ops[0] {
-            assert_eq!(key.width, 4);
-            assert_eq!(key.color_token, "CHGRD");
+        /// Colour tokens, symbol and procedure names: the tables' upper-case
+        /// alphanumeric names.
+        fn token() -> impl Strategy<Value = String> {
+            "[A-Z][A-Z0-9]{0,7}"
         }
 
-        // Second pass (1): thin inner line
-        if let LineOp::Style(key) = &ops[1] {
-            assert_eq!(key.width, 2);
-            assert_eq!(key.color_token, "CHBLK");
+        /// S-57 attribute acronyms are six letters, which also keeps them
+        /// from reading as a number ("135") or as "inf"/"nan".
+        fn attribute() -> impl Strategy<Value = String> {
+            "[A-Z]{6}"
+        }
+
+        fn pattern() -> impl Strategy<Value = LinePattern> {
+            prop_oneof![
+                Just(LinePattern::Solid),
+                Just(LinePattern::Dashed),
+                Just(LinePattern::Dotted),
+                Just(LinePattern::DashDot),
+            ]
+        }
+
+        fn rotation() -> impl Strategy<Value = Option<SymbolRotation>> {
+            prop_oneof![
+                Just(None),
+                (-360.0..360.0_f64).prop_map(|d| Some(SymbolRotation::Degrees(d))),
+                attribute().prop_map(|a| Some(SymbolRotation::FromAttribute(a))),
+            ]
+        }
+
+        fn text() -> impl Strategy<Value = RenderInstruction> {
+            // TX takes an attribute name or a quoted literal; TE a format
+            // string (which may hold commas) and an attribute.
+            let subject = prop_oneof![attribute(), "'[A-Za-z0-9 -]{1,10}'"];
+            let format = proptest::option::of("[a-z %.0-9,]{0,12}");
+            (
+                (subject, format, any::<u8>(), any::<u8>(), any::<i16>(), any::<i16>()),
+                (token(), 0..10u8, 0..10u8, 0..10u8, 0..100u8, any::<u8>(), any::<u8>()),
+            )
+                .prop_map(
+                    |((attribute, format, hjust, vjust, xoffs, yoffs), (color, style, weight, width, bsize, space, dis))| {
+                        // TE's attribute is quoted in the output and unquoted
+                        // once parsed: give it a bare name.
+                        let attribute = if format.is_some() { attribute.trim_matches('\'').to_string() } else { attribute };
+                        RenderInstruction::Text {
+                            attribute,
+                            format,
+                            hjust,
+                            vjust,
+                            xoffs,
+                            yoffs,
+                            color,
+                            style,
+                            weight,
+                            width,
+                            bsize,
+                            space,
+                            dis,
+                        }
+                    },
+                )
+        }
+
+        fn instruction() -> impl Strategy<Value = RenderInstruction> {
+            prop_oneof![
+                (pattern(), any::<u8>(), token())
+                    .prop_map(|(pattern, width, color)| RenderInstruction::LineStyle { pattern, width, color }),
+                (token(), proptest::option::of(any::<u8>()))
+                    .prop_map(|(color, transparency)| RenderInstruction::AreaColor { color, transparency }),
+                token().prop_map(|pattern| RenderInstruction::AreaPattern { pattern }),
+                (token(), rotation()).prop_map(|(name, rotation)| RenderInstruction::Symbol { name, rotation }),
+                token().prop_map(|name| RenderInstruction::LineComplex { name }),
+                token().prop_map(|procedure| RenderInstruction::ConditionalSymbology { procedure }),
+                text(),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// The conformance harness diffs `to_s52` text against OpenCPN's,
+            /// so printing must lose nothing parsing can recover: whatever
+            /// `to_s52` writes parses back to the same instruction.
+            #[test]
+            fn to_s52_parses_back_to_the_same_instruction(instr in instruction()) {
+                let text = instr.to_s52();
+                let parsed = RenderInstruction::parse_single(&text);
+                prop_assert!(parsed.is_some(), "{text} did not parse");
+                let parsed = parsed.unwrap();
+                prop_assert_eq!(format!("{parsed:?}"), format!("{instr:?}"));
+                prop_assert_eq!(parsed.to_s52(), text);
+            }
+
+            /// A list joined with ';' parses to the same list, in order.
+            #[test]
+            fn instruction_lists_round_trip_in_order(list in proptest::collection::vec(instruction(), 0..6)) {
+                let text = list.iter().map(|i| i.to_s52()).collect::<Vec<_>>().join(";");
+                let parsed = RenderInstruction::parse_all(&text);
+                prop_assert_eq!(format!("{parsed:?}"), format!("{list:?}"));
+            }
+
+            /// The line-only parser reads LS/LC/CS exactly as the full parser
+            /// does, and ignores everything else.
+            #[test]
+            fn line_ops_agree_with_the_full_parser(list in proptest::collection::vec(instruction(), 0..6)) {
+                let text = list.iter().map(|i| i.to_s52()).collect::<Vec<_>>().join(";");
+                let expected: Vec<LineOp> = list
+                    .iter()
+                    .filter_map(|i| match i {
+                        RenderInstruction::LineStyle { pattern, width, color } => {
+                            Some(LineOp::Style(LineStyleKey::new(*pattern, *width, color.clone())))
+                        }
+                        RenderInstruction::LineComplex { name } => Some(LineOp::LC(name.clone())),
+                        RenderInstruction::ConditionalSymbology { procedure } => Some(LineOp::CS(procedure.clone())),
+                        _ => None,
+                    })
+                    .collect();
+                prop_assert_eq!(parse_instructions(&text), expected);
+            }
+
+            /// Instruction strings come from chart data (SYMINS) as well as
+            /// the tables: no input may panic the parsers.
+            #[test]
+            fn parsing_arbitrary_text_never_panics(s in ".{0,64}") {
+                let _ = RenderInstruction::parse_all(&s);
+                let _ = RenderInstruction::parse_single(&s);
+                let _ = parse_instructions(&s);
+            }
+
+            /// The same, for text shaped like instructions: a known command
+            /// with any number of arbitrary, possibly empty, arguments.
+            #[test]
+            fn parsing_instruction_shaped_text_never_panics(
+                command in "(LS|AC|AP|SY|LC|CS|TX|TE)",
+                args in proptest::collection::vec("[^;]{0,6}", 0..12),
+                tail in "\\)*",
+            ) {
+                let s = format!("{command}({}){tail}", args.join(","));
+                let _ = RenderInstruction::parse_all(&s);
+                let _ = parse_instructions(&s);
+            }
         }
     }
 }

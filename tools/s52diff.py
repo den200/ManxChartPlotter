@@ -150,6 +150,20 @@ def main():
     if "--features" in sys.argv:
         feats = load(sys.argv[sys.argv.index("--features") + 1])
 
+    def arg(name, default):
+        return float(sys.argv[sys.argv.index(name) + 1]) if name in sys.argv else default
+
+    safety_contour = arg("--safety-contour", 3.0)
+    deep_contour = arg("--deep-contour", 6.0)
+    # Each chart's safety contour as Manx selects it: the shallowest DEPCNT
+    # line at least as deep as the setting (src/s52/engine.rs).
+    chart_safety = {}
+    for fid, f in feats.items():
+        v = f.get("attrs", {}).get("VALDCO")
+        if f.get("obj") == "DEPCNT" and v and v[1] is not None and v[1] >= safety_contour:
+            chart = fid.split("#")[0]
+            chart_safety[chart] = min(v[1], chart_safety.get(chart, v[1]))
+
     kinds = Counter()
     by_class = defaultdict(Counter)
     examples = defaultdict(list)
@@ -250,6 +264,20 @@ def main():
                     t for t in nrec["expanded"] if not t.startswith("AC(")
                 ]
 
+        # OpenCPN's SetSafetyContour drops the safety contour altogether when
+        # the chart's next line is deeper than the deep contour; S-52 asks for
+        # the next deeper contour, and Manx keeps it (src/s52/engine.rs,
+        # chart_safety_contour). Fold out exactly those lines.
+        if cls == "DEPCNT" and fid in feats:
+            v = feats[fid].get("attrs", {}).get("VALDCO")
+            sel = chart_safety.get(fid.split("#")[0])
+            if v and sel is not None and sel > deep_contour and abs(v[1] - sel) < 1e-4:
+                deviations["safety contour deeper than the deep contour (kept by Manx, dropped by OpenCPN)"] += 1
+                nrec = dict(nrec)
+                orec = dict(orec)
+                nrec["expanded"] = [t for t in nrec["expanded"] if not t.startswith("LS(")]
+                orec["expanded"] = [t for t in orec["expanded"] if not t.startswith("LS(")]
+
         nraw = [t.strip() for t in nrec["expanded"] if not t.startswith("OP(")]
         oraw = [t.strip() for t in orec["expanded"] if not t.startswith("OP(")]
 
@@ -311,6 +339,15 @@ def main():
         print("\nfields OpenCPN emits that manx does not model:")
         for k, c in unmodeled.most_common(15):
             print(f"  {c:7d}  {k}")
+    # Every known deviation has been folded out above, so anything left is a
+    # divergence nobody has explained: that is a failure, not a statistic.
+    if n == 0:
+        print("\nFAIL: nothing was compared")
+        return 1
+    if total_bad:
+        print(f"\nFAIL: {total_bad} features diverge from OpenCPN without a known reason")
+        return 1
+    print("\nPASS: no unexplained divergence")
     return 0
 
 

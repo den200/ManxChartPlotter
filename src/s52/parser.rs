@@ -225,24 +225,19 @@ pub fn parse_chartsymbols<P: AsRef<Path>>(path: P) -> Result<LookupTables, Strin
 mod tests {
     use super::*;
 
+    const PATH: &str = "assets/s52/chartsymbols.xml";
+
     #[test]
     fn test_parse_chartsymbols() {
-        let path = "assets/s52/chartsymbols.xml";
-        if !Path::new(path).exists() {
-            eprintln!("Skipping test - chartsymbols.xml not found");
-            return;
-        }
-
-        let tables = parse_chartsymbols(path).expect("Failed to parse");
-        println!("Loaded {} lookup entries", tables.entry_count());
-        println!("Loaded {} colors", tables.color_count());
-        println!("Loaded {} palette tokens, {} palettes", tables.palette_color_count(), tables.palette_names().len());
+        let tables = parse_chartsymbols(PATH).expect("Failed to parse");
 
         // Check we got some data
         assert!(tables.entry_count() > 100, "Expected many lookup entries");
         assert!(tables.color_count() > 30, "Expected many colors");
         assert_eq!(tables.palette_color_count(), 63, "Expected 63 color tokens");
-        assert_eq!(tables.palette_names().len(), 5, "Expected 5 palettes");
+        let mut palettes = tables.palette_names();
+        palettes.sort_unstable();
+        assert_eq!(palettes, ["DAY_BLACKBACK", "DAY_BRIGHT", "DAY_WHITEBACK", "DUSK", "NIGHT"]);
 
         // Check specific color
         let landa = tables.get_color("LANDA").expect("LANDA color missing");
@@ -257,11 +252,67 @@ mod tests {
         assert_eq!(palette.len(), 63);
         let landa_f32 = palette[landa_idx as usize];
         assert!((landa_f32[0] - 201.0/255.0).abs() < 0.01);
+    }
 
-        // Check a lookup entry
-        let entries = tables
+    /// Each palette keeps its own values under the same index: the dusk and
+    /// night tables must not be overwritten by the day one.
+    #[test]
+    fn each_palette_keeps_its_own_colours() {
+        let mut tables = parse_chartsymbols(PATH).unwrap();
+        let idx = tables.get_color_index("LANDA").unwrap() as usize;
+        let rgb = |p: &[[f32; 4]]| p[idx].map(|c| (c * 255.0).round() as u8);
+        assert_eq!(rgb(&tables.palette_f32("DUSK"))[..3], [44, 41, 27]);
+        assert_eq!(rgb(&tables.palette_f32("NIGHT"))[..3], [13, 10, 8]);
+
+        tables.set_active_palette("NIGHT");
+        assert_eq!(tables.get_color("LANDA"), Some([13, 10, 8]));
+        assert_eq!(rgb(&tables.active_palette_f32())[..3], [13, 10, 8]);
+    }
+
+    #[test]
+    fn lookup_rows_carry_every_field() {
+        let tables = parse_chartsymbols(PATH).unwrap();
+        let rows = tables
+            .lookup("DEPARE", GeometryType::Area, TableName::Plain)
+            .expect("DEPARE lookup missing");
+        // DEPARE has the DRVAL1?/DRVAL2? "no data" row and the CS row.
+        assert_eq!(rows.len(), 2);
+        let attributed = &rows[0];
+        assert_eq!(attributed.attribute_codes, ["DRVAL1?", "DRVAL2?"]);
+        assert_eq!(attributed.instruction, "AC(NODTA);AP(PRTSUR01);LS(SOLD,2,CHGRD)");
+        assert_eq!(attributed.display_category, DisplayCategory::Displaybase);
+        let cs = &rows[1];
+        assert!(cs.attribute_codes.is_empty());
+        assert_eq!(cs.instruction, "CS(DEPARE01)");
+        assert_eq!(cs.display_priority, DisplayPriority::Group1);
+
+        let slcons = tables
             .lookup("SLCONS", GeometryType::Line, TableName::Lines)
             .expect("SLCONS lookup missing");
-        assert!(!entries.is_empty());
+        assert!(slcons.iter().any(|e| e.instruction == "CS(SLCONS03)"));
+    }
+
+    /// Rows with an empty `<display-cat />` (M_NPUB and friends) default to
+    /// OTHER rather than being dropped, and an empty `<instruction>` is kept
+    /// as "draw nothing".
+    #[test]
+    fn empty_fields_keep_the_row() {
+        let tables = parse_chartsymbols(PATH).unwrap();
+        let npub = tables
+            .lookup("M_NPUB", GeometryType::Area, TableName::Plain)
+            .expect("M_NPUB row dropped");
+        assert_eq!(npub[0].display_category, DisplayCategory::Other);
+        assert_eq!(npub[0].display_priority, DisplayPriority::NoData);
+        assert_eq!(npub[0].instruction, "");
+
+        let topmar = tables
+            .lookup("TOPMAR", GeometryType::Point, TableName::Simplified)
+            .expect("TOPMAR Simplified rows");
+        assert!(topmar.iter().any(|e| e.instruction.is_empty() && e.attribute_codes.is_empty()));
+    }
+
+    #[test]
+    fn missing_file_is_an_error() {
+        assert!(parse_chartsymbols("assets/s52/no-such-file.xml").is_err());
     }
 }

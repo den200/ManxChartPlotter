@@ -6,6 +6,7 @@
 //! enough — and the polar found here is the speed model every sailing
 //! plan stands on. One window, because on a boat these are one subject.
 
+use crate::render::ui::ShowWindow as _;
 use egui::{Context, RichText, ScrollArea, Window};
 
 use super::ui::{BoatView, UiAction, WeatherView};
@@ -28,7 +29,7 @@ pub fn window(
         // Inside the space the menu bar and instrument strip leave: a window
         // over the menu bar hides the very button that closes it.
         .constrain_to(ctx.available_rect())
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             let mut edited = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Name:").weak());
@@ -52,16 +53,7 @@ pub fn window(
                 let mut field = |ui: &mut egui::Ui, label: &str, v: &mut f64, max: f64| {
                     ui.label(RichText::new(label).weak());
                     let mut shown = *v * k;
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut shown)
-                                .speed(0.05)
-                                .range(0.0..=max * k)
-                                .fixed_decimals(2)
-                                .suffix(suffix.as_str()),
-                        )
-                        .changed()
-                    {
+                    if crate::render::ui::stepper(ui, &mut shown, 0.1, 0.0..=max * k, 2, suffix.as_str()) {
                         *v = shown / k;
                         edited = true;
                     }
@@ -73,19 +65,10 @@ pub fn window(
             });
             ui.horizontal(|ui| {
                 ui.label(RichText::new("engine").weak());
-                edited |= ui
-                    .add(
-                        egui::DragValue::new(&mut boat.motor_kt)
-                            .speed(0.1)
-                            .range(0.0..=30.0)
-                            .fixed_decimals(1)
-                            .suffix(" kn"),
-                    )
-                    .on_hover_text(
-                        "Cruising speed under engine. Sail plans motor where sailing \
-                         would crawl; zero means never.",
-                    )
-                    .changed();
+                edited |= crate::render::ui::stepper(ui, &mut boat.motor_kt, 0.5, 0.0..=30.0, 1, " kn");
+                ui.label(
+                    RichText::new("Cruising speed under engine. Zero means never motor.").weak(),
+                );
             });
             if edited {
                 // A boat's numbers are worth remembering the moment they are

@@ -136,6 +136,9 @@ fn opening_bridge(feature: &Feature) -> bool {
             .is_some_and(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).any(opens))
 }
 
+/// Headroom kept over the masthead under anything overhead, metres.
+const AIR_MARGIN_M: f64 = 0.5;
+
 /// An opening bridge the boat cannot get under closed: a way through, but
 /// only through its opening span. The grid carves these open after every
 /// chart is stamped — see `build_hazard_grid` — because a bascule opening is
@@ -179,7 +182,7 @@ pub fn classify(feature: &Feature, safety: &SafetyConfig) -> Option<Severity> {
             dangerous.then_some(Severity::Hard)
         }
         // Fixed structures a hull meets.
-        "PONTON" | "DAMCON" | "SLCONS" | "FLODOC" | "HULKES" | "DYKCON" | "CAUSWY" => {
+        "PONTON" | "DAMCON" | "SLCONS" | "FLODOC" | "HULKES" | "DYKCON" | "CAUSWY" | "GATCON" => {
             Some(Severity::Hard)
         }
         "UNSARE" => (!safety.unsare_navigable).then_some(Severity::Hard),
@@ -207,12 +210,15 @@ pub fn classify(feature: &Feature, safety: &SafetyConfig) -> Option<Severity> {
             let clearance = feature
                 .attribute_float("VERCLR")
                 .or_else(|| feature.attribute_float("VERCCL"));
-            let fits = clearance
-                .map(|c| safety.air_draft_m + 0.5 <= c)
-                .unwrap_or(false);
+            let fits = clearance.is_some_and(|c| safety.air_draft_m + AIR_MARGIN_M <= c);
+            // A lifting bridge only rises so far: its clearance when open
+            // (VERCOP) is a limit like any other.
+            let fits_open = feature
+                .attribute_float("VERCOP")
+                .is_none_or(|c| safety.air_draft_m + AIR_MARGIN_M <= c);
             if fits {
                 None
-            } else if opening_bridge(feature) {
+            } else if opening_bridge(feature) && fits_open {
                 // It opens: passable, at a cost, because it opens on its own
                 // schedule. The Limfjord and a dozen Danish sounds are only
                 // reachable through one.
@@ -220,6 +226,17 @@ pub fn classify(feature: &Feature, safety: &SafetyConfig) -> Option<Severity> {
             } else {
                 Some(Severity::Hard)
             }
+        }
+        // Overhead cables, pipes and conveyors: what goes for a fixed bridge
+        // goes for these. A power line gives a *safe* clearance (VERCSA),
+        // which allows for the arc and is the one to respect; without it,
+        // the physical clearance. Neither stated: do not sail under it.
+        "CBLOHD" | "PIPOHD" | "CONVYR" => {
+            let clearance = feature
+                .attribute_float("VERCSA")
+                .or_else(|| feature.attribute_float("VERCLR"));
+            let fits = clearance.is_some_and(|c| safety.air_draft_m + AIR_MARGIN_M <= c);
+            (!fits).then_some(Severity::Hard)
         }
         _ => None,
     }
@@ -265,6 +282,21 @@ mod tests {
         assert!((with_tide.safety_contour_m() - 1.5).abs() < 1e-9);
     }
 
+    /// Every term of the contour counts: squat and under-keel clearance
+    /// deepen it just as draft does.
+    #[test]
+    fn squat_and_clearance_deepen_the_safety_contour() {
+        let area = feature("DEPARE", &[("DRVAL1", AttributeValue::Float(2.7))]);
+        assert_eq!(classify(&area, &cfg()), None, "2.7 m clears a 2.5 m contour");
+        let mut squatting = cfg();
+        squatting.squat_m = 0.3;
+        assert!((squatting.safety_contour_m() - 2.8).abs() < 1e-9);
+        assert_eq!(classify(&area, &squatting), Some(Severity::Hard));
+        let mut careful = cfg();
+        careful.ukc_m = 1.0;
+        assert_eq!(classify(&area, &careful), Some(Severity::Hard));
+    }
+
     #[test]
     fn land_is_always_hard_and_deep_water_is_free() {
         assert_eq!(classify(&feature("LNDARE", &[]), &cfg()), Some(Severity::Hard));
@@ -300,6 +332,20 @@ mod tests {
         );
         assert_eq!(classify(&mast, &cfg()), Some(Severity::Hard));
 
+        // A sounded wreck shallower than the contour: hard, whatever its
+        // category says.
+        let shoal_wreck = feature(
+            "WRECKS",
+            &[("VALSOU", AttributeValue::Float(1.5)), ("CATWRK", AttributeValue::Integer(1))],
+        );
+        assert_eq!(classify(&shoal_wreck, &cfg()), Some(Severity::Hard));
+        // An obstruction always under water but sounded shallow: hard.
+        let shoal_obs = feature(
+            "OBSTRN",
+            &[("VALSOU", AttributeValue::Float(1.5)), ("WATLEV", AttributeValue::Integer(3))],
+        );
+        assert_eq!(classify(&shoal_obs, &cfg()), Some(Severity::Hard));
+
         // An obstruction always under water and sounded deep: clear.
         let deep_obs = feature(
             "OBSTRN",
@@ -333,12 +379,73 @@ mod tests {
         assert_eq!(classify(&feature("MARCUL", &[]), &cfg()), Some(Severity::Hard));
     }
 
+    /// Spec §6.2 lists GATCON with the hard structures: a lock or sluice
+    /// gate drawn over deep dredged water is still a gate.
+    #[test]
+    fn a_gate_is_a_hard_structure() {
+        assert_eq!(classify(&feature("GATCON", &[]), &cfg()), Some(Severity::Hard));
+    }
+
+    /// Spec §6.4's air-draft rule, for what else hangs over the water. A
+    /// 20 m mast with half a metre kept over it needs 20.5 m.
+    #[test]
+    fn overhead_cables_pipes_and_conveyors_gate_on_air_draft() {
+        for class in ["CBLOHD", "PIPOHD", "CONVYR"] {
+            let low = feature(class, &[("VERCLR", AttributeValue::Float(15.0))]);
+            assert_eq!(classify(&low, &cfg()), Some(Severity::Hard), "{class} at 15 m");
+            let high = feature(class, &[("VERCLR", AttributeValue::Float(20.5))]);
+            assert_eq!(classify(&high, &cfg()), None, "{class} at 20.5 m");
+            assert_eq!(classify(&feature(class, &[]), &cfg()), Some(Severity::Hard), "{class}, no clearance");
+        }
+        // A power line's safe clearance is lower than its physical one, and
+        // is the one that counts.
+        let live = feature(
+            "CBLOHD",
+            &[("VERCLR", AttributeValue::Float(24.0)), ("VERCSA", AttributeValue::Float(19.0))],
+        );
+        assert_eq!(classify(&live, &cfg()), Some(Severity::Hard));
+    }
+
+    /// A lifting bridge that rises to 18 m does not pass a 20 m mast open
+    /// or closed; one that rises to 30 m is a gate.
+    #[test]
+    fn a_lifting_bridge_is_limited_by_its_open_clearance() {
+        let lift = |open: f64| {
+            feature(
+                "BRIDGE",
+                &[
+                    ("CATBRG", AttributeValue::Integer(4)),
+                    ("VERCCL", AttributeValue::Float(5.0)),
+                    ("VERCOP", AttributeValue::Float(open)),
+                ],
+            )
+        };
+        assert_eq!(classify(&lift(18.0), &cfg()), Some(Severity::Hard));
+        assert!(!is_gate(&lift(18.0), &cfg()));
+        assert_eq!(classify(&lift(30.0), &cfg()), Some(Severity::Soft));
+        assert!(is_gate(&lift(30.0), &cfg()));
+    }
+
     #[test]
     fn bridges_gate_on_air_draft_and_unsare_on_the_decision() {
         let low = feature("BRIDGE", &[("VERCLR", AttributeValue::Float(18.0))]);
         assert_eq!(classify(&low, &cfg()), Some(Severity::Hard), "20 m mast, 18 m bridge");
         let high = feature("BRIDGE", &[("VERCLR", AttributeValue::Float(35.0))]);
         assert_eq!(classify(&high, &cfg()), None);
+        // Half a metre of headroom is kept over the masthead: 20.3 m does not
+        // pass a 20 m mast, 20.5 m does.
+        let tight = feature("BRIDGE", &[("VERCLR", AttributeValue::Float(20.3))]);
+        assert_eq!(classify(&tight, &cfg()), Some(Severity::Hard));
+        let enough = feature("BRIDGE", &[("VERCLR", AttributeValue::Float(20.5))]);
+        assert_eq!(classify(&enough, &cfg()), None);
+        // An opening bridge whose closed clearance clears the mast needs no
+        // opening, so it is no gate.
+        let high_bascule = feature(
+            "BRIDGE",
+            &[("CATBRG", AttributeValue::Integer(5)), ("VERCCL", AttributeValue::Float(25.0))],
+        );
+        assert_eq!(classify(&high_bascule, &cfg()), None);
+        assert!(!is_gate(&high_bascule, &cfg()));
         // No clearance stated: do not sail under it.
         assert_eq!(classify(&feature("BRIDGE", &[]), &cfg()), Some(Severity::Hard));
         // Unless it opens: then it is a wait, not a wall.

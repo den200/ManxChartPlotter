@@ -81,6 +81,16 @@ pub struct Camera {
 }
 
 impl Camera {
+    /// Metres over the ground that one pixel covers at this latitude.
+    ///
+    /// `zoom` is in Mercator metres, and Mercator stretches the ground by
+    /// 1/cos(latitude): at 60° a Mercator metre is half a real one. Anything
+    /// drawn to a real length — a course vector, a range ring — needs this
+    /// and not `zoom`.
+    pub fn ground_metres_per_pixel(&self, lat_deg: f64) -> f32 {
+        self.zoom * lat_deg.to_radians().cos() as f32
+    }
+
     /// Create camera centered on bounds
     pub fn from_bounds(bounds: &MercatorBounds, viewport_width: f32, viewport_height: f32) -> Self {
         let (cx, cy) = bounds.center();
@@ -431,24 +441,119 @@ impl Camera {
 mod tests {
     use super::*;
 
+    /// Mercator stretches the ground by 1/cos(latitude). At 10 Mercator
+    /// metres a pixel: 10 m of ground at the equator, 5 m at 60°N. So six
+    /// minutes at 6 kn (1111.2 m) is 111 px long at the equator and 222 px
+    /// at 60°N — not 111 px everywhere.
+    #[test]
+    fn a_pixel_covers_less_ground_towards_the_poles() {
+        let camera = Camera::new(0.0, 0.0, 10.0, 800.0, 600.0);
+        assert!((camera.ground_metres_per_pixel(0.0) - 10.0).abs() < 1e-5);
+        assert!((camera.ground_metres_per_pixel(60.0) - 5.0).abs() < 1e-5);
+        assert!((camera.ground_metres_per_pixel(-60.0) - 5.0).abs() < 1e-5);
+        let run_m = 6.0 * 1852.0 / 10.0;
+        assert!((run_m / camera.ground_metres_per_pixel(60.0) - 222.24).abs() < 0.01);
+    }
+
     #[test]
     fn screen_world_roundtrip() {
         let camera = Camera::new(1000.0, 2000.0, 10.0, 800.0, 600.0);
 
         let screen = Vec2::new(100.0, 200.0);
         let world = camera.screen_to_world(screen.x, screen.y);
+        // 300 px left of centre and 100 px up, at 10 m/px: west and north.
+        // (A round trip alone would pass with both directions mirrored.)
+        assert!((world - DVec2::new(-2000.0, 3000.0)).length() < 1e-9, "{world:?}");
         let back = camera.world_to_screen(world.x, world.y);
 
         assert!((screen.x - back.x).abs() < 0.01);
         assert!((screen.y - back.y).abs() < 0.01);
     }
 
+    /// Untilted, the matrix the GPU gets is the plain orthographic chart: it
+    /// puts every point on the same pixel the CPU mapping does, with north
+    /// up. (A negative tilt is the plan view too.)
     #[test]
     fn tilt_zero_is_the_orthographic_view() {
         let mut cam = Camera::new(1000.0, 2000.0, 5.0, 800.0, 600.0);
+        for p in [DVec2::new(1000.0, 2000.0), DVec2::new(-500.0, 2600.0), DVec2::new(2100.0, 1300.0)] {
+            let gpu = gpu_screen(&cam, DVec2::ZERO, [p.x as f32, p.y as f32]);
+            let cpu = cam.world_to_screen(p.x, p.y);
+            assert!((gpu - cpu).length() < 0.01, "{p:?}: {gpu:?} vs {cpu:?}");
+        }
+        // 500 m north of the camera is 100 px above the centre.
+        let up = cam.world_to_screen(1000.0, 2500.0);
+        assert!((up - Vec2::new(400.0, 200.0)).length() < 1e-3, "{up:?}");
         let flat = cam.view_projection_matrix();
-        cam.tilt = 0.0;
+        cam.tilt = -0.3;
         assert_eq!(flat, cam.view_projection_matrix());
+    }
+
+    /// Zooming about the cursor keeps the chart under the cursor still —
+    /// otherwise every wheel step slides the map away from what the user was
+    /// pointing at — and the zoom stays inside its limits.
+    #[test]
+    fn zoom_at_keeps_the_point_under_the_cursor() {
+        let mut cam = Camera::new(1_404_812.0, 7_503_991.0, 20.0, 1400.0, 900.0);
+        let under = cam.screen_to_world(1100.0, 200.0);
+        cam.zoom_at(2.0, 1100.0, 200.0);
+        assert!((cam.zoom - 10.0).abs() < 1e-4, "factor 2 halves the metres per pixel");
+        assert!((cam.screen_to_world(1100.0, 200.0) - under).length() < 1e-6);
+        // The same with the chart turned and tilted.
+        cam.rotation = 0.7;
+        cam.tilt = 0.5;
+        let under = cam.screen_to_world(300.0, 700.0);
+        cam.zoom_at(0.5, 300.0, 700.0);
+        assert!((cam.screen_to_world(300.0, 700.0) - under).length() < 0.01);
+
+        // Positive wheel zooms in; the limits hold however hard it spins.
+        let before = cam.zoom;
+        cam.zoom_by_wheel(1.0, 700.0, 450.0);
+        assert!(cam.zoom < before);
+        cam.zoom_by_wheel(500.0, 700.0, 450.0);
+        assert_eq!(cam.zoom, cam.min_zoom);
+        cam.zoom_by_wheel(-500.0, 700.0, 450.0);
+        assert_eq!(cam.zoom, cam.max_zoom);
+    }
+
+    /// North-up, a drag moves the chart with the finger: dragging right
+    /// brings the west into view, dragging down the north, each by exactly
+    /// the distance dragged.
+    #[test]
+    fn a_plan_view_drag_moves_the_chart_with_the_finger() {
+        let mut cam = Camera::new(1000.0, 2000.0, 4.0, 800.0, 600.0);
+        let grabbed = cam.screen_to_world(300.0, 400.0);
+        cam.pan(25.0, -10.0);
+        assert!((cam.position - DVec2::new(900.0, 1960.0)).length() < 1e-9, "{:?}", cam.position);
+        // The piece of chart under the finger moved with it.
+        let s = cam.world_to_screen(grabbed.x, grabbed.y);
+        assert!((s - Vec2::new(325.0, 390.0)).length() < 1e-3, "{s:?}");
+    }
+
+    /// Tilted, the ground further up the screen is further away, so each
+    /// pixel there covers more of it; that is what picks coarser tiles for
+    /// the far half of the view.
+    #[test]
+    fn tilted_ground_scale_grows_with_distance() {
+        let mut cam = Camera::new(0.0, 0.0, 5.0, 800.0, 600.0);
+        cam.tilt = 0.8;
+        let near = cam.screen_to_world(400.0, 590.0);
+        let far = cam.screen_to_world(400.0, 10.0);
+        let (mpp_near, mpp_far) = (cam.ground_mpp_at(near.x, near.y), cam.ground_mpp_at(far.x, far.y));
+        assert!(mpp_near < cam.zoom && cam.zoom < mpp_far, "{mpp_near} {} {mpp_far}", cam.zoom);
+        // Untilted it is the zoom everywhere.
+        cam.tilt = 0.0;
+        assert_eq!(cam.ground_mpp_at(1e5, -3e4), cam.zoom);
+    }
+
+    /// Fitting a chart puts all of it on screen, centred.
+    #[test]
+    fn from_bounds_shows_the_whole_extent() {
+        let b = MercatorBounds { min_x: 1.40e6, max_x: 1.46e6, min_y: 7.48e6, max_y: 7.50e6 };
+        let cam = Camera::from_bounds(&b, 1200.0, 800.0);
+        let v = cam.visible_bounds();
+        assert!(v.min_x <= b.min_x && v.max_x >= b.max_x && v.min_y <= b.min_y && v.max_y >= b.max_y, "{v:?}");
+        assert_eq!(cam.position, DVec2::new(1.43e6, 7.49e6));
     }
 
     #[test]

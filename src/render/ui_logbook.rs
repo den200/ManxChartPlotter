@@ -4,6 +4,7 @@
 //! The renderer reads the files and hands this module rows already summed
 //! (see `RenderState::logbook_view`); nothing here touches the disk.
 
+use crate::render::ui::ShowWindow as _;
 use chrono::{Local, NaiveDate, TimeZone};
 use egui::{Context, RichText, Sense, Stroke};
 
@@ -119,7 +120,7 @@ pub fn window(ctx: &Context, view: &mut LogView, state: &LogbookState, actions: 
         .max_width(520.0)
         .max_height(max_h)
         .vscroll(true)
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             header(ui, view, state, actions);
             ui.separator();
             match (&state.detail, view.selected) {
@@ -310,7 +311,7 @@ fn detail(
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new(local(n.t).format("%H:%M").to_string()).monospace().weak());
             ui.label(&n.text);
-            if ui.small_button("×").on_hover_text("Delete this note").clicked() {
+            if ui.button("×").on_hover_text("Delete this note").clicked() {
                 actions.push(UiAction::LogNoteDelete(n.clone()));
             }
         });

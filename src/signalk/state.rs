@@ -25,12 +25,20 @@ pub const STALE_AFTER: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct Reading {
     pub value: Value,
+    /// When it arrived here.
     pub at: Instant,
+    /// How old it already was when it arrived, by the server's timestamp:
+    /// a server replays its cache on every connect, and a value measured
+    /// an hour ago does not become fresh by being sent again.
+    pub late: Duration,
+    /// Whether `late` came from a server timestamp (and so can be put right
+    /// when the server's clock becomes better known).
+    pub stamped: bool,
 }
 
 impl Reading {
     pub fn age(&self) -> Duration {
-        self.at.elapsed()
+        self.at.elapsed() + self.late
     }
     pub fn is_stale(&self) -> bool {
         self.age() > STALE_AFTER
@@ -50,15 +58,35 @@ pub struct Vessel {
 
 impl Vessel {
     pub fn apply(&mut self, delta: &Delta) {
-        let now = Instant::now();
+        self.apply_aged(delta, Instant::now(), |_| Duration::ZERO);
+    }
+
+    /// As [`apply`](Self::apply), with the arrival time given and each
+    /// value's age on arrival (`late`) worked out by the caller.
+    pub fn apply_aged(
+        &mut self,
+        delta: &Delta,
+        now: Instant,
+        mut late: impl FnMut(&super::delta::Update) -> Duration,
+    ) {
         for update in &delta.updates {
             self.readings.insert(
                 update.path.clone(),
                 Reading {
                     value: update.value.clone(),
                     at: now,
+                    late: late(update),
+                    stamped: update.sent.is_some(),
                 },
             );
+        }
+    }
+
+    /// Every timestamped reading turns out to be this much older than was
+    /// thought when it arrived.
+    pub fn age_stamped(&mut self, by: Duration) {
+        for reading in self.readings.values_mut().filter(|r| r.stamped) {
+            reading.late += by;
         }
     }
 
@@ -126,7 +154,7 @@ impl Vessel {
     pub fn merge(&mut self, other: &Vessel) {
         for (path, reading) in &other.readings {
             match self.readings.get(path) {
-                Some(mine) if mine.at >= reading.at => {}
+                Some(mine) if mine.age() <= reading.age() => {}
                 _ => {
                     self.readings.insert(path.clone(), reading.clone());
                 }
@@ -197,6 +225,18 @@ mod tests {
         assert_eq!(v.heading_true(), Some(3.0));
     }
 
+    /// A reading received `ago` in the past.
+    fn reading_from(ago: Duration, value: f64) -> Reading {
+        Reading {
+            value: Value::Number(value),
+            at: Instant::now()
+                .checked_sub(ago)
+                .expect("the clock reaches back far enough"),
+            late: Duration::ZERO,
+            stamped: false,
+        }
+    }
+
     #[test]
     fn a_fresh_reading_is_not_stale() {
         let mut v = Vessel::default();
@@ -205,6 +245,70 @@ mod tests {
         let r = v.get("navigation.headingTrue").expect("the reading");
         assert!(!r.is_stale());
         assert!(r.age() < STALE_AFTER);
+    }
+
+    /// The other half, without which `is_stale` could answer `false` for
+    /// ever and the test above would still pass: a reading older than the
+    /// limit is stale, one comfortably inside it is not.
+    #[test]
+    fn a_reading_that_has_gone_quiet_is_stale() {
+        assert!(reading_from(STALE_AFTER + Duration::from_secs(1), 3.0).is_stale());
+        assert!(reading_from(Duration::from_secs(60), 3.0).is_stale());
+        assert!(!reading_from(STALE_AFTER - Duration::from_secs(1), 3.0).is_stale());
+    }
+
+    /// Merging moves readings filed against the wrong vessel without letting
+    /// an older one overwrite what has arrived since.
+    #[test]
+    fn a_merge_keeps_whichever_reading_is_newer() {
+        let mut own = Vessel::default();
+        own.readings.insert(
+            "navigation.speedOverGround".into(),
+            reading_from(Duration::from_secs(1), 3.0),
+        );
+        own.readings.insert(
+            "navigation.headingTrue".into(),
+            reading_from(Duration::from_secs(30), 1.0),
+        );
+
+        let mut misfiled = Vessel::default();
+        // Older than ours: must not win.
+        misfiled.readings.insert(
+            "navigation.speedOverGround".into(),
+            reading_from(Duration::from_secs(20), 9.0),
+        );
+        // Newer than ours: must win.
+        misfiled.readings.insert(
+            "navigation.headingTrue".into(),
+            reading_from(Duration::from_secs(2), 2.0),
+        );
+        // Not held at all: must arrive.
+        misfiled.readings.insert(
+            "environment.depth.belowKeel".into(),
+            reading_from(Duration::from_secs(2), 4.5),
+        );
+
+        own.merge(&misfiled);
+        assert_eq!(own.number("navigation.speedOverGround"), Some(3.0));
+        assert_eq!(own.number("navigation.headingTrue"), Some(2.0));
+        assert_eq!(own.number("environment.depth.belowKeel"), Some(4.5));
+        assert_eq!(own.len(), 3);
+    }
+
+    #[test]
+    fn a_null_or_a_string_is_not_a_number() {
+        // A sensor that has gone quiet sends null; a path the boat fills with
+        // text is not a reading either. Neither may surface as a number.
+        let mut v = Vessel::default();
+        apply(&mut v, r#"{"updates":[{"values":[
+            {"path":"environment.depth.belowKeel","value":4.2}]}]}"#);
+        apply(&mut v, r#"{"updates":[{"values":[
+            {"path":"environment.depth.belowKeel","value":null},
+            {"path":"navigation.state","value":"motoring"}]}]}"#);
+        assert_eq!(v.number("environment.depth.belowKeel"), None, "the null replaced the old depth");
+        assert_eq!(v.number("navigation.state"), None);
+        assert_eq!(v.text("navigation.state"), Some("motoring"));
+        assert_eq!(v.text("environment.depth.belowKeel"), None);
     }
 
     #[test]

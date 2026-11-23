@@ -86,7 +86,7 @@ impl Polar {
                 // rest must be numbers.
                 let tws: Vec<f64> = fields[1..]
                     .iter()
-                    .filter_map(|f| f.parse().ok())
+                    .filter_map(|f| f.parse::<f64>().ok().filter(|v| v.is_finite()))
                     .collect();
                 if tws.len() != fields.len() - 1 || tws.is_empty() {
                     return Err(PolarError::Malformed(format!(
@@ -98,12 +98,16 @@ impl Polar {
             }
             let tws_cols = header.as_ref().unwrap();
             let twa: f64 = fields[0]
-                .parse()
-                .map_err(|_| PolarError::Malformed(format!("row without TWA: {line:?}")))?;
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| PolarError::Malformed(format!("row without TWA: {line:?}")))?;
+            // A cell that is not a finite number is a missing value, like an
+            // empty one.
             let speeds: Vec<(f64, f64)> = fields[1..]
                 .iter()
                 .zip(tws_cols)
-                .filter_map(|(f, &tws)| f.parse::<f64>().ok().map(|s| (tws, s)))
+                .filter_map(|(f, &tws)| f.parse::<f64>().ok().filter(|s| s.is_finite()).map(|s| (tws, s)))
                 .collect();
             if !speeds.is_empty() {
                 rows.push((twa, speeds));
@@ -116,6 +120,16 @@ impl Polar {
             return Err(PolarError::Empty);
         }
         rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        // A repeated angle or speed has no single answer to read from, so
+        // the table is refused rather than read one of the two at random.
+        let mut axis = header.clone();
+        axis.sort_by(f64::total_cmp);
+        if let Some(w) = axis.windows(2).find(|w| w[1] - w[0] < 1e-9) {
+            return Err(PolarError::Malformed(format!("wind speed {} given twice", w[1])));
+        }
+        if let Some(w) = rows.windows(2).find(|w| w[1].0 - w[0].0 < 1e-9) {
+            return Err(PolarError::Malformed(format!("TWA {} given twice", w[1].0)));
+        }
         // …and every row's wind-speed pairs, for the same reason the angles
         // are sorted: the lookup brackets by a forward scan and assumes an
         // ascending axis. A header written strongest-first used to return the
@@ -124,7 +138,18 @@ impl Polar {
             row.1.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
 
-        let min_twa_deg = rows.first().map(|r| r.0).unwrap_or(0.0).max(0.0);
+        // The no-go zone ends at the first angle the boat actually sails
+        // at. Many polars (OpenCPN's, qtVlm's) open with a row of zeros at
+        // 0°: read as a real row it would put the no-go zone at 0° and ramp
+        // the speed up from there, so the router could point 25° off the
+        // wind at two thirds of the close-hauled speed.
+        let min_twa_deg = rows
+            .iter()
+            .find(|r| r.1.iter().any(|(_, speed)| *speed > 0.0))
+            .or(rows.first())
+            .map(|r| r.0)
+            .unwrap_or(0.0)
+            .max(0.0);
         let min_tws_kt = header.iter().cloned().fold(f64::MAX, f64::min);
         let max_tws_kt = header.iter().cloned().fold(f64::MIN, f64::max);
 
@@ -229,8 +254,11 @@ fn sample(rows: &[(f64, Vec<(f64, f64)>)], header: &[f64], twa: f64, tws: f64) -
         if (t1 - t0).abs() < 1e-9 {
             s0
         } else {
+            // Written as a weighted sum so that past the far end the near
+            // value carries weight exactly 0 and the edge value comes out
+            // exact, whichever bracketing index was taken.
             let f = ((tws - t0) / (t1 - t0)).clamp(0.0, 1.0);
-            s0 + (s1 - s0) * f
+            s0 * (1.0 - f) + s1 * f
         }
     };
     let v0 = interp_row(r0);
@@ -241,7 +269,7 @@ fn sample(rows: &[(f64, Vec<(f64, f64)>)], header: &[f64], twa: f64, tws: f64) -
         v0
     } else {
         let f = ((twa - a0) / (a1 - a0)).clamp(0.0, 1.0);
-        v0 + (v1 - v0) * f
+        v0 * (1.0 - f) + v1 * f
     }
 }
 
@@ -263,7 +291,13 @@ fn bracket(values: impl Iterator<Item = f64>, x: f64) -> (usize, usize) {
 fn split_fields(line: &str) -> Vec<&str> {
     for delim in [';', '\t', ','] {
         if line.contains(delim) {
-            return line.split(delim).map(str::trim).filter(|s| !s.is_empty()).collect();
+            // An empty cell in the middle is a missing value that keeps its
+            // column; only the trailing separators are dropped.
+            let mut fields: Vec<&str> = line.split(delim).map(str::trim).collect();
+            while fields.last().is_some_and(|s| s.is_empty()) {
+                fields.pop();
+            }
+            return fields;
         }
     }
     line.split_whitespace().collect()
@@ -293,6 +327,21 @@ pub(crate) mod tests {
         assert!((d.speed_kt(90.0, 10.0).unwrap() - 6.0).abs() < 1e-6);
     }
 
+    /// A boat does not sail at 0° to the wind, and a table that says so
+    /// with a row of zeros means exactly that: below its first sailing
+    /// angle there is no speed to read, not a ramp up from nothing.
+    #[test]
+    fn a_row_of_zeros_at_the_wind_is_not_a_sailing_angle() {
+        let p = Polar::parse("twa/tws\t6\t10\n0\t0\t0\n40\t3.0\t5.0\n90\t4.5\t6.0\n").expect("valid");
+        assert_eq!(p.speed_kt(25.0, 10.0), None, "25° is inside the no-go zone");
+        assert_eq!(p.speed_kt(39.0, 10.0), None);
+        assert!((p.speed_kt(40.0, 10.0).unwrap() - 5.0).abs() < 1e-6);
+        // The same table without the zero row reads the same.
+        let q = Polar::parse("twa/tws\t6\t10\n40\t3.0\t5.0\n90\t4.5\t6.0\n").expect("valid");
+        assert_eq!(q.speed_kt(25.0, 10.0), None);
+        assert_eq!(p.speed_kt(60.0, 10.0), q.speed_kt(60.0, 10.0));
+    }
+
     /// A tidy cruising polar: no-go below 45°, best speed on the beam.
     pub(crate) const TEST_POLAR: &str = "\
 twa/tws\t6\t10\t14\t20
@@ -310,9 +359,15 @@ twa/tws\t6\t10\t14\t20
         // Exact source cells come back exactly.
         assert!((p.speed_kt(90.0, 10.0).unwrap() - 6.0).abs() < 1e-6);
         assert!((p.speed_kt(180.0, 20.0).unwrap() - 6.6).abs() < 1e-6);
-        // Between rows and columns, between the neighbours.
+        // Between rows and columns, bilinear: at 12 kt the 60° row reads
+        // 6.2 and the 90° row 6.5, so 75° reads half way, 6.35.
         let mid = p.speed_kt(75.0, 12.0).unwrap();
-        assert!((5.8..7.0).contains(&mid), "{mid}");
+        assert!((mid - 6.35).abs() < 1e-4, "{mid}");
+        // Between columns only: 120° at 17 kt is half way from 7.2 to 7.9.
+        assert!((p.speed_kt(120.0, 17.0).unwrap() - 7.55).abs() < 1e-4);
+        // Port and starboard are the same polar: a negative TWA reads its
+        // mirror.
+        assert_eq!(p.speed_kt(-75.0, 12.0), p.speed_kt(75.0, 12.0));
     }
 
     #[test]
@@ -341,12 +396,28 @@ twa/tws\t6\t10\t14\t20
         let p = Polar::parse(TEST_POLAR).unwrap();
         let v = p.vmg_at(10.0);
         // Beating: the best cos-weighted speed is at the lowest sailable
-        // angle for this shape.
-        assert!((44.0..=50.0).contains(&v.beat_twa_deg), "{}", v.beat_twa_deg);
-        assert!(v.beat_vmg_kt > 3.0 && v.beat_vmg_kt < v.beat_stw_kt);
-        // Running: broad, not dead down — 150° beats 180° here.
-        assert!((135.0..=165.0).contains(&v.run_twa_deg), "{}", v.run_twa_deg);
-        assert!(v.run_vmg_kt > 4.0, "{}", v.run_vmg_kt);
+        // angle for this shape — 5.0 kn at 45°, a VMG of 5·cos 45°.
+        assert_eq!(v.beat_twa_deg, 45.0);
+        assert!((v.beat_stw_kt - 5.0).abs() < 1e-5);
+        assert!((v.beat_vmg_kt as f64 - 5.0 * 45f64.to_radians().cos()).abs() < 1e-4);
+        // Running: broad, not dead down — the 150°–180° slope peaks near 163°,
+        // well clear of the 4.4 kn a dead run makes.
+        assert!((155.0..=170.0).contains(&v.run_twa_deg), "{}", v.run_twa_deg);
+        assert!(v.run_vmg_kt > 4.6 && v.run_vmg_kt < 4.7, "{}", v.run_vmg_kt);
+    }
+
+    /// Below the lightest band the speeds scale toward zero, and the VMG
+    /// table must scale with them: a beat in 3 kn timed at the 6 kn band's
+    /// VMG would be twice too fast.
+    #[test]
+    fn vmg_scales_down_below_the_lightest_band_like_the_speeds() {
+        let p = Polar::parse(TEST_POLAR).unwrap();
+        let (at_3, at_6) = (p.vmg_at(3.0), p.vmg_at(6.0));
+        assert!((at_3.beat_vmg_kt - 0.5 * at_6.beat_vmg_kt).abs() < 1e-4);
+        assert!((at_3.run_vmg_kt - 0.5 * at_6.run_vmg_kt).abs() < 1e-4);
+        assert!((at_3.beat_stw_kt as f64 - p.speed_kt(at_3.beat_twa_deg as f64, 3.0).unwrap()).abs() < 1e-4);
+        // Above the top band the table clamps like the speeds do.
+        assert_eq!(p.vmg_at(40.0).beat_vmg_kt, p.vmg_at(20.0).beat_vmg_kt);
     }
 
     #[test]
@@ -366,5 +437,183 @@ twa/tws\t6\t10\t14\t20
         assert!(Polar::parse("just some words\nnot a polar\n").is_err());
         // A header alone has nothing to sail on.
         assert!(Polar::parse("twa\t6\t10\n").is_err());
+    }
+
+    /// "The first cell is a label; the rest must be numbers." A header with
+    /// a word among its wind speeds is not read as the speeds around it.
+    #[test]
+    fn a_header_with_a_word_among_its_wind_speeds_is_refused() {
+        let e = Polar::parse("twa\t6\tten\t14\n90\t4.0\t5.0\t6.0\n").err().expect("refused");
+        assert!(matches!(e, PolarError::Malformed(_)), "{e:?}");
+    }
+
+    /// The errors reach the status line, so they must say something — and
+    /// a malformed polar must say what was wrong with it.
+    #[test]
+    fn errors_say_what_went_wrong() {
+        assert!(!PolarError::Empty.to_string().is_empty());
+        let e = PolarError::Malformed("row without TWA: \"x\"".into()).to_string();
+        assert!(e.contains("row without TWA"), "{e:?}");
+    }
+
+    /// One wind speed is a polar too: it is the boat at that wind, and at
+    /// that wind the table's own numbers come back.
+    #[test]
+    fn a_single_wind_column_reads_its_own_values() {
+        let p = Polar::parse("twa\t10\n45\t5.0\n90\t6.0\n").unwrap();
+        assert!((p.speed_kt(90.0, 10.0).unwrap() - 6.0).abs() < 1e-6);
+        assert!((p.speed_kt(45.0, 10.0).unwrap() - 5.0).abs() < 1e-6);
+        // Between the rows, linearly: 60° is a third of the way to 90°.
+        assert!((p.speed_kt(60.0, 10.0).unwrap() - (5.0 + 1.0 / 3.0)).abs() < 1e-5);
+    }
+
+    /// Many polar files carry a 0° row of zeros. A boat speed of zero is
+    /// the polar saying the boat does not sail there — `None`, as in the
+    /// no-go zone — not a speed of 0 kn for the router to time a leg at.
+    #[test]
+    fn a_zero_in_the_table_is_no_speed_not_a_speed_of_zero() {
+        let p = Polar::parse("twa\t6\t10\n0\t0\t0\n45\t4.0\t5.0\n90\t5.0\t6.0\n").unwrap();
+        assert_eq!(p.speed_kt(0.0, 10.0), None);
+        assert_eq!(p.speed_kt(0.0, 6.0), None);
+        assert!((p.speed_kt(90.0, 10.0).unwrap() - 6.0).abs() < 1e-6);
+    }
+
+    /// A boat speed below zero is not a boat speed. Here every angle from
+    /// 90° to 180° makes 5 kn, so the best run is dead downwind at 5 kn —
+    /// not "head to wind at −5 kn", whose negated VMG merely looks like 5.
+    #[test]
+    fn a_negative_cell_is_not_a_run() {
+        let p = Polar::parse("twa\t10\n0\t-5.0\n90\t5.0\n").unwrap();
+        let v = p.vmg_at(10.0);
+        assert_eq!(v.run_twa_deg, 180.0);
+        assert!((v.run_stw_kt - 5.0).abs() < 1e-6, "{}", v.run_stw_kt);
+        // Nor is it a sailing angle: the table's first one is 90°, and
+        // nothing closer to the wind is read out of the negative cell.
+        assert_eq!(p.speed_kt(60.0, 10.0), None);
+        assert!((p.speed_kt(90.0, 10.0).unwrap() - 5.0).abs() < 1e-6);
+    }
+
+    /// The regular grid stops at 60 kn of wind (`N_TWS`), whatever the
+    /// source covers. A polar written up to 80 kn still reads past the end
+    /// of the grid without falling off it: as the 60 kn column, edge-clamped,
+    /// which lies between the source's own 10 and 80 kn values.
+    #[test]
+    fn wind_past_the_end_of_the_grid_reads_the_last_column() {
+        let p = Polar::parse("twa\t10\t80\n45\t5.0\t12.0\n180\t6.0\t13.0\n").unwrap();
+        assert_eq!(p.max_tws_kt, 80.0);
+        for twa in [45.0, 90.0, 180.0] {
+            let top = p.speed_kt(twa, 60.0).unwrap();
+            assert_eq!(p.speed_kt(twa, 70.0), Some(top), "at {twa}°");
+            assert_eq!(p.speed_kt(twa, 80.0), Some(top), "at {twa}°");
+            assert!((5.0..=13.0).contains(&top), "{top}");
+        }
+        assert_eq!(p.vmg_at(70.0).beat_vmg_kt, p.vmg_at(60.0).beat_vmg_kt);
+        assert_eq!(p.vmg_at(80.0).run_vmg_kt, p.vmg_at(60.0).run_vmg_kt);
+    }
+
+    /// In a delimited file a cell's place is its column: `90;4.5;;7.0` says
+    /// nothing at 10 kn and 7.0 kn at 14 kn. The empty cell must not slide
+    /// the 7.0 left into the 10 kn column.
+    #[test]
+    fn an_empty_cell_is_a_missing_value_not_a_shift() {
+        let p = Polar::parse("twa;6;10;14\n90;4.5;;7.0\n").unwrap();
+        assert!((p.speed_kt(90.0, 14.0).unwrap() - 7.0).abs() < 1e-6);
+        // Nothing at 10 kn, so half way between 4.5 at 6 kn and 7.0 at 14 kn.
+        let at_10 = p.speed_kt(90.0, 10.0).unwrap();
+        assert!((at_10 - 5.75).abs() < 1e-6, "{at_10}");
+    }
+
+    /// A polar with only the given `(twa row, tws column, speed)` cells
+    /// filled, the rest no-go, so the VMG table can be checked against sums
+    /// worked by hand.
+    fn sparse(cells: &[(usize, usize, f32)], min_tws_kt: f64) -> Polar {
+        let mut grid = vec![f32::NAN; N_TWA * N_TWS];
+        for &(twa, j, stw) in cells {
+            grid[twa * N_TWS + j] = stw;
+        }
+        let mut p = Polar { grid, min_twa_deg: 0.0, max_tws_kt: 20.0, min_tws_kt, vmg: Vec::new() };
+        p.build_vmg();
+        p
+    }
+
+    /// Column 20 is 10 kn. Two angles with the same VMG tie; the table keeps
+    /// the first found, the angle nearer the wind. The tie is exact: 8·cos 60°
+    /// is 8 times an f32, so it is the same f32 as the 0° product.
+    #[test]
+    fn a_tie_in_beat_vmg_keeps_the_angle_nearer_the_wind() {
+        let c60 = 60f32.to_radians().cos();
+        let p = sparse(&[(0, 20, 8.0 * c60), (60, 20, 8.0)], 6.0);
+        let e = p.vmg_at(10.0);
+        assert_eq!(e.beat_vmg_kt, 8.0 * c60);
+        assert_eq!(e.beat_twa_deg, 0.0);
+        assert_eq!(e.beat_stw_kt, 8.0 * c60);
+    }
+
+    /// A repeated angle or speed is refused, not read at random; an infinite
+    /// or NaN entry is a missing cell, not a speed that poisons the sums.
+    #[test]
+    fn repeated_axes_are_refused_and_non_finite_cells_are_missing() {
+        assert!(matches!(Polar::parse("twa/tws\t6\t6\n90\t4\t5\n"), Err(PolarError::Malformed(_))));
+        assert!(matches!(Polar::parse("twa/tws\t6\t10\n90\t4\t5\n90\t4\t5\n"), Err(PolarError::Malformed(_))));
+        assert!(matches!(Polar::parse("twa/tws\t6\tinf\n90\t4\t5\n"), Err(PolarError::Malformed(_))));
+        assert!(matches!(Polar::parse("twa/tws\t6\t10\ninf\t4\t5\n"), Err(PolarError::Malformed(_))));
+        let p = Polar::parse("twa/tws;6;10;14\n90;inf;5;NaN\n").unwrap();
+        assert_eq!(p.speed_kt(90.0, 10.0), Some(5.0));
+        assert!(p.speed_kt(90.0, 6.0).is_some_and(|v| v.is_finite()));
+    }
+
+    /// The same tie on the run side: 8·cos 120° and the 180° speed that
+    /// matches it. The table keeps the first angle found, 120°.
+    #[test]
+    fn a_tie_in_run_vmg_keeps_the_first_angle_found() {
+        let c120 = 120f32.to_radians().cos();
+        let p = sparse(&[(120, 20, 8.0), (180, 20, -8.0 * c120)], 6.0);
+        let e = p.vmg_at(10.0);
+        assert_eq!(e.run_vmg_kt, -8.0 * c120);
+        assert_eq!(e.run_twa_deg, 120.0);
+        assert_eq!(e.run_stw_kt, 8.0);
+    }
+
+    use proptest::prelude::*;
+
+    const TWA_ROWS: [f64; 6] = [45.0, 60.0, 90.0, 120.0, 150.0, 180.0];
+    const TWS_COLS: [f64; 4] = [6.0, 10.0, 14.0, 20.0];
+    /// `TEST_POLAR`'s cells, `[row][column]`.
+    const CELLS: [[f64; 4]; 6] = [
+        [3.4, 5.0, 5.8, 6.0],
+        [4.0, 5.8, 6.6, 6.9],
+        [4.5, 6.0, 7.0, 7.5],
+        [4.2, 6.0, 7.2, 7.9],
+        [3.2, 5.2, 6.4, 7.2],
+        [2.6, 4.4, 5.6, 6.6],
+    ];
+
+    /// Indices of the table entries either side of `x`.
+    fn around(axis: &[f64], x: f64) -> (usize, usize) {
+        let hi = axis.iter().position(|&a| a >= x).unwrap();
+        (if axis[hi] == x { hi } else { hi - 1 }, hi)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Interpolation invents nothing: inside the table, a reading lies
+        /// between the four table values around it, and port reads as
+        /// starboard.
+        #[test]
+        fn a_reading_stays_between_the_table_values_around_it(
+            twa in 45.0f64..=180.0,
+            tws in 6.0f64..=20.0,
+        ) {
+            let p = Polar::parse(TEST_POLAR).unwrap();
+            let v = p.speed_kt(twa, tws).unwrap();
+            let (r0, r1) = around(&TWA_ROWS, twa);
+            let (c0, c1) = around(&TWS_COLS, tws);
+            let corners = [CELLS[r0][c0], CELLS[r0][c1], CELLS[r1][c0], CELLS[r1][c1]];
+            let lo = corners.iter().copied().fold(f64::MAX, f64::min);
+            let hi = corners.iter().copied().fold(f64::MIN, f64::max);
+            prop_assert!(lo - 1e-5 <= v && v <= hi + 1e-5, "{} not in {}..{}", v, lo, hi);
+            prop_assert_eq!(p.speed_kt(-twa, tws), Some(v));
+        }
     }
 }

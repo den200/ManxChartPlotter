@@ -63,3 +63,7 @@ __pycache__/
 # the PortrayalPipe experiment (with its build output) plus OpenCPN sources.
 /src old attempt/
 /third_party/
+
+
+# Golden images of the licensed DK charts: local only (tools/golden.sh).
+/tests/golden/local/

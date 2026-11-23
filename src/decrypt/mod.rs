@@ -58,6 +58,8 @@ pub struct ChartDecryptor {
     binary: PathBuf,
     fpr_path: PathBuf,
     process: Option<Child>,
+    /// Kills the helper if Manx goes without doing it ([`watch`]).
+    watchdog: Option<Child>,
     requests_since_restart: u32,
 }
 
@@ -87,6 +89,7 @@ impl ChartDecryptor {
             binary: binary_path,
             fpr_path,
             process: None,
+            watchdog: None,
             requests_since_restart: 0,
         })
     }
@@ -143,24 +146,10 @@ impl ChartDecryptor {
         Ok(senc)
     }
 
-    /// Writes the decrypted SENC payload directly to `output_path`.
-    pub fn decrypt_chart_to_file<P: AsRef<Path>, Q: AsRef<Path>>(
-        &mut self,
-        chart_path: P,
-        install_key: &str,
-        output_path: Q,
-    ) -> DecryptResult<()> {
-        let senc = self.decrypt_chart(chart_path, install_key)?;
-        fs::write(output_path, senc)?;
-        Ok(())
-    }
-
     /// Forces a restart of the helper daemon. This is exposed because older versions of
     /// `oexserverd` become unstable after ~25 decryptions in one session.
     pub fn restart(&mut self) -> DecryptResult<()> {
-        if let Some(mut child) = self.process.take() {
-            let _ = child.kill();
-        }
+        self.stop();
 
         if Path::new(PIPE_PATH).exists() {
             let _ = fs::remove_file(PIPE_PATH);
@@ -188,14 +177,30 @@ impl ChartDecryptor {
 
         let mut command = build_spawn_command(&self.binary, &self.fpr_path)?;
 
-        command.stdout(Stdio::piped());
-        command.stderr(Stdio::piped());
+        // Nothing of the helper's is piped back. Its output used to be,
+        // and was never read; when Manx then went away without stopping it
+        // the pipe broke, and the helper's next signal sent it into a loop
+        // — its exit handler flushes stdout, the write raises SIGPIPE, and
+        // the handler runs again — at a full core until someone killed it
+        // (seen 2026-11-23, hours at 95 %). /dev/null cannot break.
+        command.stdin(Stdio::null());
+        command.stdout(Stdio::null());
+        command.stderr(Stdio::null());
 
         let mut child = command
             .spawn()
             .map_err(|err| DecryptError::Process(format!("Failed to start oexserverd: {}", err)))?;
 
-        wait_for_pipe(&mut child)?;
+        if let Err(e) = wait_for_pipe(&mut child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+        // Drop stops the helper, but Drop does not run when Manx is killed,
+        // crashes, or leaves through `process::exit`.
+        self.watchdog = watch(std::process::id(), child.id())
+            .map_err(|e| warn!("no watchdog for oexserverd: {e}"))
+            .ok();
         self.process = Some(child);
         self.requests_since_restart = 0;
         Ok(())
@@ -227,13 +232,48 @@ impl ChartDecryptor {
     }
 }
 
-impl Drop for ChartDecryptor {
-    fn drop(&mut self) {
+impl ChartDecryptor {
+    /// Stop the helper and wait for it to be gone.
+    fn stop(&mut self) {
+        // The watchdog first, so it cannot outlive what it watches and
+        // later kill a stranger that was given the helper's process number.
+        if let Some(mut dog) = self.watchdog.take() {
+            let _ = dog.kill();
+            let _ = dog.wait();
+        }
         if let Some(mut child) = self.process.take() {
             send_exit_command().ok();
             let _ = child.kill();
+            let _ = child.wait();
         }
     }
+}
+
+impl Drop for ChartDecryptor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// A watchdog for a helper process: when `parent` is gone, `child` is
+/// killed. It ends by itself once either is gone.
+///
+/// The helper does not notice Manx leaving, and an orphan holds the
+/// decryption pipe and — worse — could spin (see `spawn_process`). There is
+/// no portable "die with my parent", so a shell looks once a second.
+fn watch(parent: u32, child: u32) -> std::io::Result<Child> {
+    Command::new("/bin/sh")
+        .args([
+            "-c",
+            "while kill -0 \"$0\" 2>/dev/null && kill -0 \"$1\" 2>/dev/null; do sleep 1; done; \
+             kill -9 \"$1\" 2>/dev/null",
+        ])
+        .arg(parent.to_string())
+        .arg(child.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
 }
 
 fn ensure_fpr_path(binary: &Path, requested: PathBuf) -> DecryptResult<PathBuf> {
@@ -801,6 +841,50 @@ fn format_exit(status: ExitStatus) -> String {
 mod tests {
     use super::*;
 
+    fn alive(pid: u32) -> bool {
+        Command::new("/bin/sh")
+            .args(["-c", "kill -0 \"$0\" 2>/dev/null"])
+            .arg(pid.to_string())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// The helper must not outlive Manx: when the watched parent is gone,
+    /// the watchdog kills the child and ends. Stand-ins: two `sleep`s.
+    #[cfg(unix)]
+    #[test]
+    fn the_watchdog_kills_the_helper_when_its_parent_is_gone() {
+        let mut parent = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut helper = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut dog = watch(parent.id(), helper.id()).unwrap();
+        // With both alive it leaves the helper alone.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(helper.try_wait().unwrap().is_none(), "killed while its parent lived");
+
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        let gone = helper.wait().unwrap();
+        assert!(!gone.success(), "the helper was killed, it did not finish");
+        assert!(dog.wait().unwrap().code().is_some(), "the watchdog ends by itself");
+    }
+
+    /// And a watchdog does not outlive the helper it watches: it would sit
+    /// there holding a process number that may later belong to someone else.
+    #[cfg(unix)]
+    #[test]
+    fn the_watchdog_ends_when_the_helper_is_gone() {
+        let mut parent = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut helper = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut dog = watch(parent.id(), helper.id()).unwrap();
+        helper.kill().unwrap();
+        helper.wait().unwrap();
+        dog.wait().unwrap();
+        assert!(alive(parent.id()), "the parent is not touched");
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+    }
+
+
     #[test]
     fn reads_the_android_fingerprint_line() {
         let (stamp, bytes) = parse_android_fpr("1790334623;0D626C79\n").unwrap();
@@ -816,5 +900,45 @@ mod tests {
         let data = vec![0u8; 10];
         let err = find_senc_start(&data).unwrap_err();
         assert!(matches!(err, DecryptError::Protocol(_)));
+    }
+
+    fn tlv(out: &mut Vec<u8>, kind: u16, payload: &[u8]) {
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&((payload.len() + 6) as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    /// The helper's reply can carry records before the SENC proper; the
+    /// SENC starts at the version record (type 1, length 8), found by
+    /// walking the records — not by searching for the bytes, which can turn
+    /// up inside a payload.
+    #[test]
+    fn finds_the_senc_after_leading_records() {
+        let mut reply = Vec::new();
+        tlv(&mut reply, 1, &[0, 0, 0]); // type 1 but not 8 long
+        tlv(&mut reply, 9, &[1, 0, 8, 0, 0, 0, 201, 0]); // the bytes, inside a payload
+        let at = reply.len();
+        tlv(&mut reply, 1, &201u16.to_le_bytes());
+        tlv(&mut reply, 2, b"CELL\0");
+        assert_eq!(find_senc_start(&reply).unwrap(), at);
+
+        let mut header_first = Vec::new();
+        tlv(&mut header_first, 1, &200u16.to_le_bytes());
+        assert_eq!(find_senc_start(&header_first).unwrap(), 0);
+
+        // A record running past the end of the reply is a protocol error.
+        let cut = &reply[..at + 4];
+        assert!(matches!(find_senc_start(cut), Err(DecryptError::Protocol(_))));
+    }
+
+    #[test]
+    fn reads_the_generated_fingerprint_path() {
+        let out = "Starting\nCreated fpr file: /home/pi/.manx/oc03R_1790334623.fpr\nDone";
+        assert_eq!(
+            parse_generated_fpr_path(out),
+            Some(PathBuf::from("/home/pi/.manx/oc03R_1790334623.fpr"))
+        );
+        assert_eq!(parse_generated_fpr_path("fpr file:   \n"), None);
+        assert_eq!(parse_generated_fpr_path("nothing to see"), None);
     }
 }

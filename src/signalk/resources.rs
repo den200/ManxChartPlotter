@@ -78,8 +78,27 @@ pub fn route_to_resource(route: &Route, set: &WaypointSet) -> Value {
 
 /// A Signal K resource back into a route plus its waypoints.
 ///
-/// `resource_id` is the key the server filed it under; it becomes the route's
-/// id when it parses as a uuid, so publish-then-consume is identity-stable.
+/// `resource_id` is the key the server filed it under; the route's id is
+/// made from it ([`id_for_key`]), so publish-then-consume is
+/// identity-stable and fetching twice is fetching the same route.
+/// The route id that belongs to a server's resource key.
+///
+/// A bare uuid is itself. Signal K v1 writes keys as
+/// `urn:mrn:signalk:uuid:<uuid>`: the uuid inside. Any other key — a server
+/// or plugin may use whatever it likes — gets an id worked out from the key
+/// itself, the same every time. A random one, as before, made every fetch
+/// add the route again as a new copy.
+pub fn id_for_key(key: &str) -> Uuid {
+    let bare = key.strip_prefix("urn:mrn:signalk:uuid:").unwrap_or(key);
+    Uuid::parse_str(bare).unwrap_or_else(|_| {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Uuid::from_bytes(bytes)
+    })
+}
+
 pub fn resource_to_route(resource_id: &str, value: &Value) -> Option<(Route, Vec<Waypoint>)> {
     let coords = value
         .pointer("/feature/geometry/coordinates")?
@@ -103,9 +122,7 @@ pub fn resource_to_route(resource_id: &str, value: &Value) -> Option<(Route, Vec
             .and_then(Value::as_str)
             .unwrap_or("Signal K route"),
     );
-    if let Ok(id) = Uuid::parse_str(resource_id) {
-        route.id = id;
-    }
+    route.id = id_for_key(resource_id);
 
     let mut waypoints = Vec::new();
     for (i, c) in coords.iter().enumerate() {
@@ -213,6 +230,19 @@ mod tests {
 
     /// The M2 verification, at the layer a unit test can hold: what a PUT
     /// sends, GET back through the same conversion, identical.
+    /// Signal K v1's key form names the uuid; a key that is no uuid at all
+    /// still names one route, the same on every fetch.
+    #[test]
+    fn a_resource_key_always_gives_the_same_route_id() {
+        let id = Uuid::parse_str("5b3f1c9e-8a44-4a7e-9f0e-2d6c1b7a9e10").unwrap();
+        assert_eq!(id_for_key("5b3f1c9e-8a44-4a7e-9f0e-2d6c1b7a9e10"), id);
+        assert_eq!(id_for_key("urn:mrn:signalk:uuid:5b3f1c9e-8a44-4a7e-9f0e-2d6c1b7a9e10"), id);
+        let a = id_for_key("harbour-to-anholt");
+        assert_eq!(a, id_for_key("harbour-to-anholt"));
+        assert_ne!(a, id_for_key("harbour-to-laesoe"));
+        assert_ne!(a, Uuid::nil());
+    }
+
     #[test]
     fn publish_then_consume_is_identity_stable() {
         let (route, set) = route();
@@ -264,6 +294,25 @@ mod tests {
             "feature": { "geometry": { "coordinates": [[11.0, 56.0]] } }
         });
         assert!(resource_to_route("x", &one_point).is_none());
+    }
+
+    /// A route published before the rename carries its waypoint names and
+    /// ids under `navcore`; it must come back with them, not as WP 1, WP 2.
+    #[test]
+    fn a_route_published_before_the_rename_keeps_its_waypoints() {
+        let (route, set) = route();
+        let mut resource = route_to_resource(&route, &set);
+        let props = resource
+            .pointer_mut("/feature/properties")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        let ours = props.remove("manx").expect("published under manx");
+        props.insert("navcore".into(), ours);
+
+        let (back, wps) = resource_to_route(&route.id.to_string(), &resource).unwrap();
+        assert_eq!(back.waypoints, route.waypoints);
+        let names: Vec<_> = wps.iter().map(|w| w.name.as_str()).collect();
+        assert_eq!(names, ["Grenaa out", "Mid Kattegat", "Anholt harbour"]);
     }
 
     #[test]

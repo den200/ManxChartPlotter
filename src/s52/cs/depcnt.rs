@@ -265,20 +265,26 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_safety_contour() {
-        // With safety_contour = 5m
-        let feature = make_depcnt(5.0);
-        let mut settings = test_contours();
-        settings.safety_contour = 5.0;
-        assert!(is_safety_contour(&feature, &settings, None));
+    fn test_safety_tolerance() {
+        // VALDCO = 10.05 should still match safety_contour = 10.0, but the
+        // tolerance must not swallow a neighbouring contour a few decimetres
+        // away, or two lines would be drawn as the safety contour.
+        let settings = test_contours();
+        assert!(is_safety_contour(&make_depcnt(10.05), &settings, None));
+        assert!(!is_safety_contour(&make_depcnt(9.8), &settings, None));
+        assert!(!is_safety_contour(&make_depcnt(10.2), &settings, None));
     }
 
+    /// A contour shallower than the selected safety contour must never be
+    /// drawn as the safety contour, even when the mariner's setting itself
+    /// would match it: the chart's selection wins.
     #[test]
-    fn test_safety_tolerance() {
-        // VALDCO = 10.05 should still match safety_contour = 10.0
-        let feature = make_depcnt(10.05);
-        let settings = test_contours();
-        assert!(is_safety_contour(&feature, &settings, None));
+    fn selected_safety_contour_overrides_the_setting() {
+        let settings = test_contours(); // setting 10 m
+        let style = depcnt02_selected(&make_depcnt(10.0), &settings, Some(20.0));
+        assert_eq!(style, DepthContourStyle::ShallowContour);
+        assert_eq!(style.color_token(), "DEPCN");
+        assert_eq!(style.width(), 1);
     }
 
     // QUAPOS low-accuracy tests
@@ -328,31 +334,20 @@ mod tests {
     }
 
     #[test]
-    fn test_quapos_2_is_low_accuracy() {
-        // QUAPOS=2 is low accuracy (per spec: quapos > 1 && quapos < 10)
-        let feature = make_depcnt_with_quapos(10.0, Some(2));
+    fn quapos_two_to_nine_is_low_accuracy_and_ten_up_is_not() {
+        // s52cnsy.cpp DEPCNT02: `2 <= quapos && quapos < 10` is unreliable.
+        // 10 (precisely known) and 11 (calculated) are as good as surveyed.
         let settings = test_contours();
-        let style = depcnt02(&feature, &settings);
-        assert_eq!(style, DepthContourStyle::SafetyContourLowAccuracy);
-        assert_eq!(style.pattern(), LinePattern::Dashed);
-    }
-
-    #[test]
-    fn test_quapos_3_is_low_accuracy() {
-        // QUAPOS=3 is low accuracy (per spec: quapos > 1 && quapos < 10)
-        let feature = make_depcnt_with_quapos(10.0, Some(3));
-        let settings = test_contours();
-        let style = depcnt02(&feature, &settings);
-        assert_eq!(style, DepthContourStyle::SafetyContourLowAccuracy);
-        assert_eq!(style.pattern(), LinePattern::Dashed);
-    }
-
-    #[test]
-    fn test_is_safety_contour_with_low_accuracy() {
-        // is_safety_contour should return true even for low-accuracy safety contours
-        let feature = make_depcnt_with_quapos(10.0, Some(4));
-        let settings = test_contours();
-        assert!(is_safety_contour(&feature, &settings, None));
+        for q in 2..=9 {
+            let style = depcnt02(&make_depcnt_with_quapos(10.0, Some(q)), &settings);
+            assert_eq!(style, DepthContourStyle::SafetyContourLowAccuracy, "QUAPOS {q}");
+            assert_eq!(style.pattern(), LinePattern::Dashed, "QUAPOS {q}");
+        }
+        for q in [10, 11] {
+            let style = depcnt02(&make_depcnt_with_quapos(10.0, Some(q)), &settings);
+            assert_eq!(style, DepthContourStyle::SafetyContour, "QUAPOS {q}");
+            assert_eq!(style.pattern(), LinePattern::Solid, "QUAPOS {q}");
+        }
     }
 
     #[test]

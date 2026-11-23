@@ -208,4 +208,59 @@ mod tests {
         let result = slcons03(&feature, &settings);
         assert!(matches!(result, SlconsResult::LineComplex("LOWACC01")));
     }
+
+    fn s52(f: &Feature) -> Vec<String> {
+        slcons03_instructions(f, &MarinerSettings::default())
+            .iter()
+            .map(|i| i.to_s52())
+            .collect()
+    }
+
+    /// The whole decision chain of s52cnsy.cpp SLCONS03 for a line, in its
+    /// order: low accuracy, then condition, then wharf-like category, then
+    /// water level.
+    #[test]
+    fn line_styles_follow_the_slcons03_chain() {
+        // Default: LS(SOLD,2,CSTLN).
+        assert_eq!(s52(&make_slcons(None, None, None, None)), ["LS(SOLD,2,CSTLN)"]);
+        // Wharf (6), mole (15), log ramp (16): thick.
+        for c in [6, 15, 16] {
+            assert_eq!(s52(&make_slcons(Some(c), None, None, None)), ["LS(SOLD,4,CSTLN)"]);
+        }
+        // Pier (4) and breakwater (1) are not in that list.
+        assert_eq!(s52(&make_slcons(Some(4), None, None, None)), ["LS(SOLD,2,CSTLN)"]);
+        // Under construction (1) or ruined (2): thin dashed.
+        for c in [1, 2] {
+            assert_eq!(s52(&make_slcons(None, None, Some(c), None)), ["LS(DASH,1,CSTLN)"]);
+        }
+        // WATLEV 2 (always dry) solid; 3 and 4 (under water, covers and
+        // uncovers) dashed.
+        assert_eq!(s52(&make_slcons(None, Some(2), None, None)), ["LS(SOLD,2,CSTLN)"]);
+        assert_eq!(s52(&make_slcons(None, Some(3), None, None)), ["LS(DASH,2,CSTLN)"]);
+        assert_eq!(s52(&make_slcons(None, Some(4), None, None)), ["LS(DASH,2,CSTLN)"]);
+        // QUAPOS 2..9 replaces everything with LOWACC01; 10 and up do not.
+        assert_eq!(s52(&make_slcons(Some(6), None, Some(1), Some(9))), ["LC(LOWACC01)"]);
+        assert_eq!(s52(&make_slcons(Some(6), None, None, Some(10))), ["LS(SOLD,4,CSTLN)"]);
+    }
+
+    #[test]
+    fn earlier_tests_in_the_chain_win() {
+        // A ruined wharf is drawn as ruined, not as a wharf.
+        assert_eq!(s52(&make_slcons(Some(6), None, Some(2), None)), ["LS(DASH,1,CSTLN)"]);
+        // A submerged wharf is still drawn as a wharf.
+        assert_eq!(s52(&make_slcons(Some(15), Some(3), None, None)), ["LS(SOLD,4,CSTLN)"]);
+    }
+
+    #[test]
+    fn area_gets_cross_hatch_and_point_only_the_accuracy_mark() {
+        let mut area = make_slcons(Some(6), None, None, None);
+        area.feature_type = FeatureType::Area;
+        assert_eq!(s52(&area), ["AP(CROSSX01)", "LS(SOLD,4,CSTLN)"]);
+
+        let mut point = make_slcons(Some(6), None, None, None);
+        point.feature_type = FeatureType::Point;
+        assert!(s52(&point).is_empty());
+        point.attributes.insert("QUAPOS", AttributeValue::Integer(5));
+        assert_eq!(s52(&point), ["SY(LOWACC01)"]);
+    }
 }

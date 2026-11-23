@@ -369,6 +369,22 @@ mod tests {
         b.line(Pos2::new(0.0, 0.0), Pos2::new(10.0, 0.0), 2.0, Color32::RED);
         assert_eq!(b.mesh.vertices.len(), 8);
         assert_eq!(b.mesh.indices.len(), 18);
+        // 2 px wide with a 1 px feather: solid to ±0.5, faded out by ±1.5,
+        // at both ends.
+        let ys: Vec<f32> = b.mesh.vertices.iter().map(|v| v.pos.y).collect();
+        assert_eq!(ys, [-1.5, -0.5, 0.5, 1.5, -1.5, -0.5, 0.5, 1.5]);
+        // And the triangles tile the 10 × 3 strip exactly once.
+        let v = &b.mesh.vertices;
+        let area: f32 = b
+            .mesh
+            .indices
+            .chunks(3)
+            .map(|t| {
+                let (p, q, r) = (v[t[0] as usize].pos, v[t[1] as usize].pos, v[t[2] as usize].pos);
+                ((q - p).x * (r - p).y - (r - p).x * (q - p).y).abs() * 0.5
+            })
+            .sum();
+        assert!((area - 30.0).abs() < 1e-4, "{area}");
     }
 
     /// The rim must be transparent, or the anti-aliasing draws a halo instead

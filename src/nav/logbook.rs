@@ -586,6 +586,9 @@ pub struct Recorder {
     pub day: Option<NaiveDate>,
     /// How many of `today` are not yet written.
     pending: usize,
+    /// Samples of earlier days that could not be written when their day
+    /// ended (a full or missing disk), kept to be tried again.
+    held: Vec<(NaiveDate, Vec<Sample>)>,
     last_sample: Option<Instant>,
     last_flush: Option<Instant>,
     moving: bool,
@@ -598,6 +601,7 @@ impl Recorder {
             today: Vec::new(),
             day: None,
             pending: 0,
+            held: Vec::new(),
             last_sample: None,
             last_flush: None,
             moving: false,
@@ -616,6 +620,13 @@ impl Recorder {
             // Midnight UTC, or the first sample since starting: finish the
             // old day's file and pick up the new one where it left off.
             self.flush();
+            // What the old day could not write must not be counted against
+            // the new day's samples: set it aside under its own date.
+            if let (Some(old), true) = (self.day, self.pending > 0) {
+                let from = self.today.len().saturating_sub(self.pending);
+                self.held.push((old, self.today.split_off(from)));
+            }
+            self.pending = 0;
             self.today = read_day(&self.dir, day);
             self.day = Some(day);
         }
@@ -641,8 +652,13 @@ impl Recorder {
 
     /// Append what is not yet written, as one block, and sync it.
     pub fn flush(&mut self) {
+        // Earlier days first, oldest first, each into its own file.
+        let dir = self.dir.clone();
+        self.held.retain(|(day, samples)| {
+            append(&log_path(&dir, *day), &encode_block(samples)).is_err()
+        });
         let (Some(day), true) = (self.day, self.pending > 0) else { return };
-        let from = self.today.len() - self.pending;
+        let from = self.today.len().saturating_sub(self.pending);
         let block = encode_block(&self.today[from..]);
         match append(&log_path(&self.dir, day), &block) {
             Ok(()) => self.pending = 0,
@@ -697,6 +713,35 @@ mod tests {
         assert_eq!(back[1].get(Field::Awa), Some(178.0));
     }
 
+    /// What goes in is rounded to what matters and wrapped the short way:
+    /// the round trip above compares quantized values, so the quantizing
+    /// itself is pinned here.
+    #[test]
+    fn values_are_quantized_and_angles_wrapped_on_the_way_in() {
+        let mut s = Sample::new(1_790_000_000);
+        s.set(Field::Lat, Some(-33.8567844)); // south…
+        s.set(Field::Lon, Some(-151.2152967)); // …and west
+        s.set(Field::Sog, Some(5.44));
+        s.set(Field::Cog, Some(359.6)); // rounds to 360, which is 0
+        s.set(Field::Heading, Some(-10.0));
+        s.set(Field::Awa, Some(190.0)); // 190° to starboard is 170° to port
+        s.set(Field::Depth, Some(f64::NAN)); // a sounder's garbage is no depth
+        assert_eq!(s.get(Field::Lat), Some(-33.856784));
+        assert_eq!(s.get(Field::Lon), Some(-151.215297));
+        assert_eq!(s.get(Field::Sog), Some(5.4));
+        assert_eq!(s.get(Field::Cog), Some(0.0));
+        assert_eq!(s.get(Field::Heading), Some(350.0));
+        assert_eq!(s.get(Field::Awa), Some(-170.0));
+        assert_eq!(s.get(Field::Depth), None);
+        // And the negative, wrapped values survive a block.
+        let mut t = s;
+        t.t += 10;
+        t.set(Field::Cog, Some(358.0)); // two degrees back across north
+        let back = decode(&encode_block(&[s, t]));
+        assert_eq!(back, vec![s, t]);
+        assert_eq!(back[1].get(Field::Cog), Some(358.0));
+    }
+
     #[test]
     fn a_steady_sail_costs_a_dozen_bytes_a_sample() {
         let mut samples = Vec::new();
@@ -727,6 +772,26 @@ mod tests {
         assert_eq!(back.iter().map(|s| s.t).collect::<Vec<_>>(), vec![100, 300]);
     }
 
+    /// A block whose bytes changed but whose length did not — a bad sector,
+    /// not a power cut — fails its CRC and is skipped, rather than read back
+    /// as a position the boat never had.
+    #[test]
+    fn a_corrupted_block_is_skipped_not_misread() {
+        let a = encode_block(&[sample(100, 55.0, 11.0, 0.0, 0.0)]);
+        let mut b = encode_block(&[sample(200, 55.1, 11.1, 0.0, 0.0)]);
+        let c = encode_block(&[sample(300, 55.2, 11.2, 0.0, 0.0)]);
+        // The last byte is the end of the course: changing it keeps every
+        // varint well-formed, so only the CRC can tell.
+        let last = b.len() - 1;
+        b[last] ^= 0x01;
+        let mut file = FILE_MAGIC.to_vec();
+        for block in [&a, &b, &c] {
+            file.extend_from_slice(block);
+        }
+        let back = decode(&file);
+        assert_eq!(back.iter().map(|s| s.t).collect::<Vec<_>>(), vec![100, 300]);
+    }
+
     #[test]
     fn the_recorder_paces_itself_and_the_file_reads_back() {
         let dir = scratch("rec");
@@ -746,9 +811,116 @@ mod tests {
         assert_eq!(back.len(), 12);
         assert_eq!(back, r.today);
         let sum = summarize(&back);
-        assert!(sum.underway_s >= 100, "{}", sum.underway_s);
-        assert!(sum.distance_nm > 0.0);
+        // Twelve samples ten seconds apart: 110 s under way, over 110e-5° of
+        // latitude.
+        assert_eq!(sum.underway_s, 110);
+        let expected_nm = crate::geo::distance_m(LatLon::new(57.0, 10.0), LatLon::new(57.0011, 10.0))
+            / crate::geo::METRES_PER_NM;
+        assert!((sum.distance_nm - expected_nm).abs() < 1e-3, "{} vs {expected_nm}", sum.distance_nm);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// At anchor a sample a minute is plenty; getting under way takes one
+    /// at once, because the departure is the moment that matters.
+    #[test]
+    fn the_recorder_slows_when_stopped_and_wakes_when_moving() {
+        let dir = scratch("pace");
+        let mut r = Recorder::new(dir.clone());
+        let t0 = Instant::now();
+        let base = 1_790_000_000;
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut kept = 0;
+        for i in 0..63u64 {
+            // Swinging at anchor: 0.2 kn.
+            if r.offer(sample(base + i as i64, 57.0, 10.0, 0.2, 90.0), at(i)) {
+                kept += 1;
+            }
+        }
+        assert_eq!(kept, 2, "one a minute at anchor: 0 s and 60 s");
+        // Five seconds after the last sample she moves: taken at once, not
+        // ten seconds on and not at the next minute.
+        assert!(r.offer(sample(base + 65, 57.0, 10.0, 4.0, 90.0), at(65)));
+        // And under way, the ten-second pace holds.
+        assert!(!r.offer(sample(base + 70, 57.0, 10.0, 4.0, 90.0), at(70)));
+        assert!(r.offer(sample(base + 75, 57.0, 10.0, 4.0, 90.0), at(75)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A disk that cannot be written at midnight UTC: nothing panics, and
+    /// when it can be written again each day's samples are in that day's
+    /// file. (The folder sits under a plain file, so it cannot be created.)
+    #[test]
+    fn a_failed_write_at_midnight_loses_nothing() {
+        let root = scratch("held");
+        std::fs::create_dir_all(&root).unwrap();
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"x").unwrap();
+        let dir = blocker.join("log");
+        let mut r = Recorder::new(dir.clone());
+        let t0 = Instant::now();
+        let before = 1_789_603_190; // 2026-09-16 23:59:50
+        let after = before + 20;
+        let later = after + 700;
+        assert!(r.offer(sample(before, 57.0, 10.0, 5.0, 90.0), t0));
+        assert!(r.offer(sample(after, 57.0001, 10.0, 5.0, 90.0), t0 + Duration::from_secs(20)));
+        // Past the flush interval: another write is tried, and fails.
+        assert!(r.offer(sample(later, 57.0002, 10.0, 5.0, 90.0), t0 + Duration::from_secs(720)));
+        assert_eq!(r.today.iter().map(|s| s.t).collect::<Vec<_>>(), vec![after, later]);
+
+        std::fs::remove_file(&blocker).unwrap();
+        r.flush();
+        assert_eq!(read_day(&dir, day_of(before)).iter().map(|s| s.t).collect::<Vec<_>>(), vec![before]);
+        assert_eq!(
+            read_day(&dir, day_of(after)).iter().map(|s| s.t).collect::<Vec<_>>(),
+            vec![after, later]
+        );
+        // And nothing is written twice.
+        r.flush();
+        assert_eq!(read_day(&dir, day_of(before)).len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Midnight UTC starts a new file; the old day's samples are written
+    /// to the old day's file.
+    #[test]
+    fn midnight_starts_a_new_day_file() {
+        let dir = scratch("midnight");
+        let mut r = Recorder::new(dir.clone());
+        let t0 = Instant::now();
+        // 2026-09-16 23:59:50, and ten seconds after midnight.
+        let before = 1_789_603_190;
+        let after = before + 20;
+        assert_ne!(day_of(before), day_of(after));
+        assert!(r.offer(sample(before, 57.0, 10.0, 5.0, 90.0), t0));
+        assert!(r.offer(sample(after, 57.0001, 10.0, 5.0, 90.0), t0 + Duration::from_secs(20)));
+        r.flush();
+        assert_eq!(read_day(&dir, day_of(before)).iter().map(|s| s.t).collect::<Vec<_>>(), vec![before]);
+        assert_eq!(read_day(&dir, day_of(after)).iter().map(|s| s.t).collect::<Vec<_>>(), vec![after]);
+        assert_eq!(r.today.len(), 1, "today is the new day");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_summary_counts_only_time_under_way_and_not_across_gaps() {
+        let mut v = Vec::new();
+        // 60 s at 5 kn, then 60 s stopped, then a 10-minute gap in the log,
+        // then 30 s at 5 kn.
+        for (t, sog) in [(0, 5.0), (30, 5.0), (60, 5.0), (90, 0.1), (120, 0.1), (720, 5.0), (750, 5.0)] {
+            let mut s = sample(1_790_000_000 + t, 57.0, 10.0, sog, 0.0);
+            s.set(Field::Depth, Some(10.0 - t as f64 / 100.0));
+            s.set(Field::Tws, Some(12.0 + t as f64 / 100.0));
+            v.push(s);
+        }
+        let sum = summarize(&v);
+        assert_eq!(sum.samples, 7);
+        // Counted: 0→30 and 30→60 moving, 720→750 moving. Not counted: the
+        // stopped samples at 90 and 120, and 120→720 across the gap.
+        assert_eq!(sum.underway_s, 90);
+        assert_eq!(sum.max_sog, Some(5.0));
+        assert_eq!(sum.min_depth, Some(2.5));
+        assert_eq!(sum.max_tws, Some(19.5));
+        assert_eq!(sum.max_aws, None, "no wind instrument, no maximum");
+        assert_eq!(sum.avg_sog(), Some(0.0), "she never moved over ground");
     }
 
     #[test]

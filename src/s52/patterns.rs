@@ -574,26 +574,12 @@ mod tests {
     #[test]
     fn test_pattern_count() {
         assert_eq!(PATTERNS.len(), PATTERN_COUNT);
-    }
-
-    #[test]
-    fn test_lookup_diamond1() {
-        let p = get_pattern("DIAMOND1").expect("DIAMOND1 should exist");
-        assert_eq!(p.name, "DIAMOND1");
-        assert_eq!(p.fill_type, FillType::Linear);
-        assert_eq!(p.width, 2250);
-        assert_eq!(p.height, 4313);
-        assert!(!p.is_staggered());
-        assert_eq!(p.stagger_factor(), 0.0);
-    }
-
-    #[test]
-    fn test_lookup_drgare01() {
-        let p = get_pattern("DRGARE01").expect("DRGARE01 should exist");
-        assert_eq!(p.name, "DRGARE01");
-        assert_eq!(p.fill_type, FillType::Linear);
-        assert_eq!(p.width, 200);
-        assert_eq!(p.height, 200);
+        // Names are unique, or get_pattern would hide the second entry.
+        let mut names: Vec<&str> = PATTERNS.iter().map(|p| p.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), PATTERN_COUNT);
+        assert!(get_pattern("NOSUCH01").is_none());
     }
 
     #[test]
@@ -601,21 +587,77 @@ mod tests {
         let p = get_pattern("DQUALA11").expect("DQUALA11 should exist");
         assert!(p.is_staggered());
         assert_eq!(p.stagger_factor(), 0.5);
+        let p = get_pattern("DIAMOND1").expect("DIAMOND1 should exist");
+        assert!(!p.is_staggered());
+        assert_eq!(p.stagger_factor(), 0.0);
     }
 
+    /// The table is a hand transcription of chartsymbols.xml; check every
+    /// entry against the file it was copied from, field by field. A typo in
+    /// a tile size, pivot or HPGL string would otherwise only show up as a
+    /// subtly wrong fill on screen.
     #[test]
-    fn test_raster_pattern() {
-        let p = get_pattern("CROSSX01").expect("CROSSX01 should exist");
-        assert_eq!(p.pattern_type, PatternType::Raster);
-        assert!(p.bitmap_location.is_some());
-        assert!(p.hpgl.is_none());
-    }
+    fn every_pattern_matches_chartsymbols_xml() {
+        let xml = std::fs::read_to_string("assets/s52/chartsymbols.xml").unwrap();
 
-    #[test]
-    fn test_vector_with_bitmap() {
-        let p = get_pattern("FSHFAC04").expect("FSHFAC04 should exist");
-        assert_eq!(p.pattern_type, PatternType::Vector);
-        assert!(p.bitmap_location.is_some()); // Has both
-        assert!(p.hpgl.is_some());
+        /// The text between `<tag>` and `</tag>`.
+        fn element<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
+            let start = block.find(&format!("<{tag}>"))? + tag.len() + 2;
+            let end = block[start..].find(&format!("</{tag}>"))? + start;
+            Some(block[start..end].trim())
+        }
+        /// The `<tag ...>` section (up to `</tag>` or the tag's own end).
+        fn section<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
+            let start = block.find(&format!("<{tag} "))?;
+            let rest = &block[start..];
+            let end = rest.find(&format!("</{tag}>")).or_else(|| rest.find("/>").map(|e| e + 2))?;
+            Some(&rest[..end])
+        }
+        /// An integer attribute on the first `<tag ...>` in `block`.
+        fn attr(block: &str, tag: &str, name: &str) -> i64 {
+            let open = section(block, tag).unwrap_or_else(|| panic!("no <{tag}> in {block}"));
+            let open = &open[..open.find('>').unwrap()];
+            let key = format!("{name}=\"");
+            let at = open.find(&key).unwrap_or_else(|| panic!("no {name} on <{tag}>")) + key.len();
+            open[at..at + open[at..].find('"').unwrap()].parse().unwrap()
+        }
+
+        let mut seen = 0;
+        for block in xml.split("<pattern RCID=").skip(1) {
+            let block = &block[..block.find("</pattern>").unwrap()];
+            let name = element(block, "name").unwrap();
+            let p = get_pattern(name).unwrap_or_else(|| panic!("{name} missing from PATTERNS"));
+            seen += 1;
+
+            let vector = matches!(element(block, "definition"), Some("V"));
+            assert_eq!(p.pattern_type == PatternType::Vector, vector, "{name} definition");
+            let staggered = matches!(element(block, "filltype"), Some("S"));
+            assert_eq!(p.is_staggered(), staggered, "{name} filltype");
+
+            // Vector patterns are sized by their vector tile, raster ones by
+            // their bitmap.
+            let tag = if vector { "vector" } else { "bitmap" };
+            let geom = section(block, tag).unwrap();
+            assert_eq!(p.width as i64, attr(geom, tag, "width"), "{name} width");
+            assert_eq!(p.height as i64, attr(geom, tag, "height"), "{name} height");
+            assert_eq!(p.pivot_x as i64, attr(geom, "pivot", "x"), "{name} pivot x");
+            assert_eq!(p.pivot_y as i64, attr(geom, "pivot", "y"), "{name} pivot y");
+            assert_eq!(p.origin_x as i64, attr(geom, "origin", "x"), "{name} origin x");
+            assert_eq!(p.origin_y as i64, attr(geom, "origin", "y"), "{name} origin y");
+            assert_eq!(p.min_distance as i64, attr(geom, "distance", "min"), "{name} min distance");
+            assert_eq!(p.max_distance as i64, attr(geom, "distance", "max"), "{name} max distance");
+
+            assert_eq!(p.hpgl, element(block, "HPGL"), "{name} HPGL");
+            let bitmap = section(block, "bitmap").map(|b| {
+                (attr(b, "graphics-location", "x") as u32, attr(b, "graphics-location", "y") as u32)
+            });
+            assert_eq!(p.bitmap_location, bitmap, "{name} bitmap location");
+
+            // The table sometimes drops the pen letter in front of the
+            // five-character colour token; the token itself must agree.
+            let colour = element(block, "color-ref").unwrap();
+            assert_eq!(&p.color_ref[p.color_ref.len() - 5..], &colour[colour.len() - 5..], "{name} colour");
+        }
+        assert_eq!(seen, PATTERN_COUNT);
     }
 }

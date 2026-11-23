@@ -12,7 +12,7 @@
 # Usage: tools/reference_views.sh [chart_dir] [out_dir]
 
 set -e
-CHARTS="${1:-charts/oeuSENC-DK-2025-1-20-base-macbook/}"
+CHARTS="${1:-tests/fixtures/s57-harbour}"
 OUT="${2:-doc/reference-views}"
 mkdir -p "$OUT"
 

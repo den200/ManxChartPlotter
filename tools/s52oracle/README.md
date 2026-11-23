@@ -136,6 +136,14 @@ so they stay visible without burying real bugs.
   procedure describes.
 - **Multipoint soundings** — OpenCPN emits `MP()` and expands per point in the
   renderer; Manx has a dedicated multipoint path.
+- **A safety contour deeper than the deep contour** — OpenCPN's
+  `s57chart::SetSafetyContour` drops the safety contour when the chart's next
+  line lies deeper than the deep contour; S-52 asks for the next deeper
+  contour, and Manx keeps it.
+
+The oracle models OpenCPN's per-chart safety contour (`SetSafetyContour`: the
+shallowest DEPCNT VALDCO at or deeper than the mariner's setting), read from
+the whole feature stream before any feature is resolved.
 
 ## Where the numbers stand
 
@@ -143,6 +151,15 @@ Full Danish set, 391 charts, 153,276 features: **zero unexplained divergences**,
 down from 22 % when the harness was first run end to end. Every remaining
 difference is one of the deviations above, each counted separately — so any new
 divergence appearing in the ranked section is a regression.
+
+That last sentence only holds if somebody runs it, and for two months nobody
+did: by 2026-10-19 the oracle no longer started (a wxWidgets upgrade, its error
+thrown away) and 2,008 features had drifted — a safety contour picked from a
+depth-area limit no line carries, so the real one went undrawn, and virtual AIS
+aids (SYMINS01) drawing nothing. `s52diff.py` now exits non-zero on any
+unexplained divergence, `s52conformance.sh` fails when the oracle does, and
+`tools/conformance.sh` runs this and the S-57 oracle together. Run it whenever
+anything under `src/s52`, `src/senc` or `src/s57` changes (doc/testing.md).
 
 ## Version note
 

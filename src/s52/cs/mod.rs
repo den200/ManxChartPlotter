@@ -50,6 +50,22 @@ pub use wrecks::{wrecks02, wrecks02_instructions, wrecks02_symbol, Wrecks02Resul
 
 use crate::s52::instruction::{RenderInstruction, SymbolRotation};
 use crate::s52::MarinerSettings;
+
+/// Read an S-57 list attribute as integers. Values arrive either as a single
+/// integer or as the comma-separated string the SENC stores for 'L' types —
+/// so a procedure that matches only one of the two misses real charts.
+fn list_values(feature: &crate::senc::Feature, name: &str) -> Vec<i32> {
+    if let Some(s) = feature.attribute_str(name) {
+        return s
+            .split(',')
+            .filter_map(|v| v.trim().parse::<i32>().ok())
+            .collect();
+    }
+    if let Some(v) = feature.attribute_int(name) {
+        return vec![v];
+    }
+    Vec::new()
+}
 use crate::senc::Feature;
 
 /// Execute a conditional symbology procedure by name.
@@ -105,8 +121,28 @@ pub fn execute_cs(
         "RESTRN01" => Some(restrn01_instructions(feature)),
         "QUALIN01" => Some(qualin01_instructions(feature)),
         "TOPMAR01" => Some(topmar01_instructions(feature, settings)),
+        "SYMINS01" => Some(symins01_instructions(feature)),
         _ => None, // Unknown procedure
     }
+}
+
+/// SYMINS01: the feature carries its own symbology. A NEWOBJ — a virtual AIS
+/// aid to navigation, or any object class newer than the presentation
+/// library — states in its SYMINS attribute exactly what to draw, e.g.
+/// `SY(BOYSAW12);TX('V-AIS',3,2,2,'15110',2,0,CHMGD,11)`, and s52cnsy.cpp
+/// hands that string straight back as the rules. Without it a virtual
+/// buoy marking a new wreck draws nothing at all.
+///
+/// A CS call inside SYMINS is dropped rather than run: chart data must not
+/// be able to send the engine round in a loop.
+fn symins01_instructions(feature: &Feature) -> Vec<RenderInstruction> {
+    feature
+        .attribute_str("SYMINS")
+        .map(RenderInstruction::parse_all)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| !matches!(i, RenderInstruction::ConditionalSymbology { .. }))
+        .collect()
 }
 
 /// Check if an instruction string contains a CS procedure reference.
@@ -159,17 +195,171 @@ mod tests {
         }
     }
 
+    fn s52(instrs: &[RenderInstruction]) -> Vec<String> {
+        instrs.iter().map(|i| i.to_s52()).collect()
+    }
+
     #[test]
     fn test_execute_depare02() {
         let feature = make_depare(0.0, 3.0);
         let settings = test_contours();
-        let instructions = execute_cs("DEPARE02", &feature, &settings, CsContext::EMPTY).unwrap();
-        assert_eq!(instructions.len(), 1);
-        if let RenderInstruction::AreaColor { color, .. } = &instructions[0] {
-            assert_eq!(color, "DEPVS"); // Very shallow
-        } else {
-            panic!("Expected AreaColor instruction");
+        // The lookup tables name both DEPARE01 and DEPARE02; both must reach
+        // the same procedure.
+        for name in ["DEPARE01", "DEPARE02"] {
+            let instructions = execute_cs(name, &feature, &settings, CsContext::EMPTY).unwrap();
+            assert_eq!(s52(&instructions), ["AC(DEPVS)"], "{name}");
         }
+    }
+
+    /// Every CS procedure the lookup tables reference is either dispatched
+    /// here or deliberately handled elsewhere. A typo in a match arm, or a
+    /// dropped one, silently draws nothing for a whole object class.
+    #[test]
+    fn every_procedure_named_by_the_lookup_tables_is_dispatched() {
+        let xml = std::fs::read_to_string("assets/s52/chartsymbols.xml").unwrap();
+        // The name is the alphanumeric run after "CS(": LNDARE's point rows
+        // misplace the closing paren ("CS(QUAPOS01;TX(...))").
+        let mut names: Vec<&str> = xml
+            .match_indices("CS(")
+            .filter_map(|(i, _)| {
+                let rest = &xml[i + 3..];
+                let end = rest.find(|c: char| !c.is_ascii_alphanumeric())?;
+                Some(&rest[..end])
+            })
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        // Not CS procedures in Manx: SOUNDG02 is SNDFRM02 run by the tile
+        // builder; the rest are mariner/ownship overlays, or procedures
+        // s52cnsy.cpp does not implement either (RESARE01, TOPMARI1). Each
+        // name here was checked against s52cnsy.cpp's condTable — SYMINS01
+        // once sat on this list wrongly, and every virtual AIS aid went
+        // undrawn with this test passing.
+        let elsewhere = [
+            "CLRLIN01", "LEGLIN02", "OWNSHP02", "PASTRK01", "RESARE01", "SOUNDG02",
+            "TOPMARI1", "VESSEL01", "VRMEBL01",
+        ];
+        let feature = make_depare(0.0, 3.0);
+        let settings = test_contours();
+        let mut missing = Vec::new();
+        for name in &names {
+            let dispatched = execute_cs(name, &feature, &settings, CsContext::EMPTY).is_some();
+            if dispatched == elsewhere.contains(name) {
+                missing.push(*name);
+            }
+        }
+        assert!(names.len() > 15, "found only {names:?}");
+        assert!(missing.is_empty(), "dispatch disagrees with the tables for {missing:?}");
+    }
+
+    #[test]
+    fn a_new_object_draws_what_its_symins_says() {
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert(
+            "SYMINS",
+            AttributeValue::String(
+                "SY(BRTHNO01);SY(BOYSAW12);TX('V-AIS',3,2,2,'15110',2,0,CHMGD,11);CS(SYMINS01)"
+                    .into(),
+            ),
+        );
+        let newobj = Feature {
+            type_code: 0,
+            object_class: ObjectClass::Other,
+            feature_type: FeatureType::Point,
+            attributes,
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        };
+        let out = execute_cs("SYMINS01", &newobj, &test_contours(), CsContext::EMPTY)
+            .expect("SYMINS01 is dispatched");
+        // Exactly what OpenCPN expands chart C14902's virtual safe-water
+        // marks to — and the nested CS, which would recurse, dropped.
+        assert_eq!(
+            s52(&out),
+            vec!["SY(BRTHNO01)", "SY(BOYSAW12)", "TX('V-AIS',3,2,2,'15110',2,0,CHMGD,11)"]
+        );
+        // No SYMINS: nothing to draw, and no panic.
+        let bare = Feature { attributes: crate::senc::Attributes::new(), ..newobj };
+        assert!(execute_cs("SYMINS01", &bare, &test_contours(), CsContext::EMPTY)
+            .unwrap()
+            .is_empty());
+    }
+
+    fn make_light(attrs: &[(&str, AttributeValue)]) -> Feature {
+        let mut attributes = crate::senc::Attributes::new();
+        for (k, v) in attrs {
+            attributes.insert(k, v.clone());
+        }
+        Feature {
+            type_code: 75,
+            object_class: ObjectClass::Light,
+            feature_type: FeatureType::Point,
+            attributes,
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        }
+    }
+
+    /// LIGHTS05/06 carries the flare's 135-degree turn in the instruction
+    /// stream; a sector light emits nothing here because the tile builder
+    /// draws its arc.
+    #[test]
+    fn test_execute_lights() {
+        let settings = test_contours();
+        let flare = make_light(&[
+            ("COLOUR", AttributeValue::String("3".into())),
+            ("VALNMR", AttributeValue::Float(5.0)),
+        ]);
+        for name in ["LIGHTS05", "LIGHTS06"] {
+            let out = execute_cs(name, &flare, &settings, CsContext::EMPTY).unwrap();
+            assert_eq!(s52(&out), ["SY(LIGHTS11,135)"], "{name}");
+        }
+
+        let sector = make_light(&[
+            ("COLOUR", AttributeValue::String("4".into())),
+            ("SECTR1", AttributeValue::Float(90.0)),
+            ("SECTR2", AttributeValue::Float(180.0)),
+        ]);
+        assert!(execute_cs("LIGHTS05", &sector, &settings, CsContext::EMPTY).unwrap().is_empty());
+
+        let directional = make_light(&[
+            ("COLOUR", AttributeValue::String("1".into())),
+            ("CATLIT", AttributeValue::String("1".into())),
+            ("ORIENT", AttributeValue::Float(10.0)),
+        ]);
+        let out = execute_cs("LIGHTS05", &directional, &settings, CsContext::EMPTY).unwrap();
+        assert_eq!(s52(&out), ["SY(LIGHTS13,190)"]);
+    }
+
+    /// OBSTRN04 and WRECKS02 need the surroundings, and DEPCNT02 the chart's
+    /// selected safety contour: the dispatcher must hand both through.
+    #[test]
+    fn context_reaches_the_procedures_that_need_it() {
+        let settings = test_contours();
+        let deep = CsContext {
+            area_drval1: vec![20.0],
+            ..Default::default()
+        };
+        let mut rock = make_depare(0.0, 0.0);
+        rock.object_class = ObjectClass::UnderwaterRock;
+        rock.feature_type = FeatureType::Point;
+        rock.attributes = crate::senc::Attributes::new();
+        rock.attributes.insert("VALSOU", AttributeValue::Float(2.0));
+        assert_eq!(s52(&execute_cs("OBSTRN04", &rock, &settings, &deep).unwrap()), ["SY(ISODGR51)"]);
+        assert_eq!(s52(&execute_cs("WRECKS02", &rock, &settings, &deep).unwrap()), ["SY(ISODGR51)"]);
+
+        let selected = CsContext {
+            safety_contour: Some(20.0),
+            ..Default::default()
+        };
+        let out = execute_cs("DEPCNT02", &make_depcnt(20.0), &settings, &selected).unwrap();
+        assert_eq!(s52(&out), ["LS(SOLD,2,DEPSC)"]);
+        let out = execute_cs("DEPCNT02", &make_depcnt(10.0), &settings, &selected).unwrap();
+        assert_eq!(s52(&out), ["LS(SOLD,1,DEPCN)"]);
     }
 
     fn make_depcnt(valdco: f64) -> Feature {
@@ -242,6 +432,25 @@ mod tests {
         } else {
             panic!("Expected LineStyle instruction");
         }
+    }
+
+    /// QUALIN01 is in s52cnsy.cpp's condTable but no lookup row names it
+    /// (QUAPOS01 calls it for lines), so the table-driven test above cannot
+    /// see its arm. CSQUALIN01: QUAPOS 2..9 is LC(LOWACC21); a COALNE with
+    /// no QUAPOS and CONRAD 1 is "LS(SOLD,3,CHMGF);LS(SOLD,1,CSTLN)".
+    #[test]
+    fn qualin01_is_dispatched() {
+        let settings = test_contours();
+        let low_accuracy = make_feature_with_quapos(4);
+        let out = execute_cs("QUALIN01", &low_accuracy, &settings, CsContext::EMPTY).expect("QUALIN01 is dispatched");
+        assert_eq!(s52(&out), ["LC(LOWACC21)"]);
+
+        let mut radar_conspicuous = make_slcons(None);
+        radar_conspicuous.type_code = 30; // COALNE
+        radar_conspicuous.object_class = ObjectClass::Coastline;
+        radar_conspicuous.attributes.insert("CONRAD", AttributeValue::Integer(1));
+        let out = execute_cs("QUALIN01", &radar_conspicuous, &settings, CsContext::EMPTY).unwrap();
+        assert_eq!(s52(&out), ["LS(SOLD,3,CHMGF)", "LS(SOLD,1,CSTLN)"]);
     }
 
     #[test]

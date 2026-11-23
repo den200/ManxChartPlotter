@@ -2,11 +2,12 @@
 //! state, republished weekly.
 //!
 //! A package is a zip holding an `ENC_ROOT` of S-57 cells. It is unpacked
-//! into `<chart folder>/noaa/<STATE>/`, where the chart catalogue finds S-57
-//! cells in subfolders — so NOAA charts sit beside o-charts cells in the one
-//! folder, with nothing else to manage. A small `manx-noaa.json` beside
-//! the cells records what was installed and when, which is what "Update
-//! available" is worked out from.
+//! into Manx's own folder, `<data dir>/charts/noaa/<STATE>/` ([`library`]),
+//! whatever chart folder is open, and the catalogue loads them alongside it.
+//! They used to go into the open folder itself, which put them inside
+//! somebody's o-charts set; [`adopt`] moves any found there. A small
+//! `manx-noaa.json` beside the cells records what was installed and when,
+//! which is what "Update available" is worked out from.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -77,6 +78,48 @@ pub struct Installed {
 }
 
 const MARKER: &str = "manx-noaa.json";
+/// The marker's name before Manx was renamed.
+const OLD_MARKER: &str = "navcore-noaa.json";
+
+/// The root free charts install under: `<data dir>/charts`, the folder a
+/// first start opens. Packages go into its `noaa/`.
+pub fn library() -> Option<PathBuf> {
+    crate::paths::data_dir().map(|d| d.join("charts"))
+}
+
+/// Move free charts found under `<root>/noaa/` into `<library>/noaa/`.
+///
+/// Packages are recognised by their marker, under either name; anything
+/// else in there is not Manx's and is left alone. A package already in the
+/// library wins, and the stray copy stays where it is. A move that fails —
+/// another disk, say — is logged and leaves the charts where they were,
+/// where the catalogue still finds them.
+pub fn adopt(root: &Path, library: &Path) {
+    if root == library {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root.join("noaa")) else { return };
+    for entry in entries.flatten() {
+        let from = entry.path();
+        let marked = [MARKER, OLD_MARKER].iter().any(|m| from.join(m).is_file());
+        let Some(code) = from.file_name() else { continue };
+        if !from.is_dir() || !marked {
+            continue;
+        }
+        let to = library.join("noaa").join(code);
+        if to.exists() {
+            continue;
+        }
+        let moved = std::fs::create_dir_all(library.join("noaa"))
+            .and_then(|()| std::fs::rename(&from, &to));
+        match moved {
+            Ok(()) => log::info!("free charts: moved {} to {}", from.display(), to.display()),
+            Err(e) => log::warn!("free charts: could not move {}: {e}", from.display()),
+        }
+    }
+    // Leave no empty `noaa/` behind in somebody else's chart set.
+    let _ = std::fs::remove_dir(root.join("noaa"));
+}
 
 /// A HEAD is small: 20 seconds for all of it.
 fn probe_agent() -> ureq::Agent {
@@ -137,7 +180,10 @@ pub fn probe(code: &str) -> Result<Remote, String> {
 
 /// What is installed for a package under `root`, if anything.
 pub fn installed(root: &Path, code: &str) -> Option<Installed> {
-    let text = std::fs::read_to_string(region_dir(root, code).join(MARKER)).ok()?;
+    let dir = region_dir(root, code);
+    let text = std::fs::read_to_string(dir.join(MARKER))
+        .or_else(|_| std::fs::read_to_string(dir.join(OLD_MARKER)))
+        .ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -349,13 +395,110 @@ mod tests {
             z.write_all(b"update").unwrap();
             z.start_file("readme.txt", opt).unwrap();
             z.write_all(b"not a chart").unwrap();
+            // NOAA's real packages put ENC_ROOT one folder down.
+            z.start_file("NY_ENCs/ENC_ROOT/US5NY1AA/US5NY1AA.000", opt).unwrap();
+            z.write_all(b"nested").unwrap();
+            // And the escapes, which `enclosed_name` must refuse.
+            z.start_file("ENC_ROOT/../../escaped.000", opt).unwrap();
+            z.write_all(b"bad").unwrap();
+            z.start_file("/ENC_ROOT/absolute.000", opt).unwrap();
+            z.write_all(b"bad").unwrap();
             z.finish().unwrap();
         }
         let dest = dir.path().join("out");
         unpack(&zip_path, &dest).unwrap();
-        assert!(dest.join("US5XX1AA/US5XX1AA.000").exists());
-        assert!(dest.join("US5XX1AA/US5XX1AA.001").exists());
+        assert_eq!(std::fs::read(dest.join("US5XX1AA/US5XX1AA.000")).unwrap(), b"cell");
+        assert_eq!(std::fs::read(dest.join("US5XX1AA/US5XX1AA.001")).unwrap(), b"update");
+        assert_eq!(std::fs::read(dest.join("US5NY1AA/US5NY1AA.000")).unwrap(), b"nested");
         assert!(!dest.join("readme.txt").exists());
+
+        // Nothing landed anywhere but the cell folders: not beside the zip,
+        // not loose in the destination.
+        let names = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(dir.path()), ["out", "t.zip"]);
+        assert_eq!(names(&dest), ["US5NY1AA", "US5XX1AA"]);
+    }
+
+    /// Free charts that landed inside a chart set move out to the library,
+    /// pre-rename ones included; what is not Manx's stays put, and a package
+    /// the library already holds is not overwritten.
+    #[test]
+    fn stray_free_charts_move_to_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("oeuSENC-DK");
+        let lib = dir.path().join("library");
+        let marker = r#"{"downloaded":"2026-09-23","last_modified":"x"}"#;
+        for (code, name) in [("NJ", OLD_MARKER), ("NY", MARKER), ("CT", MARKER)] {
+            std::fs::create_dir_all(set.join("noaa").join(code).join("US3NJ1AA")).unwrap();
+            std::fs::write(set.join("noaa").join(code).join(name), marker).unwrap();
+        }
+        std::fs::create_dir_all(set.join("noaa/someone-elses")).unwrap();
+        std::fs::create_dir_all(lib.join("noaa/CT")).unwrap();
+
+        adopt(&set, &lib);
+
+        assert!(lib.join("noaa/NJ/US3NJ1AA").is_dir());
+        assert_eq!(
+            installed(&lib, "NJ").map(|i| i.downloaded),
+            Some("2026-09-23".to_string()),
+            "the old marker still counts"
+        );
+        assert!(installed(&lib, "NY").is_some());
+        assert!(!set.join("noaa/NJ").exists());
+        assert!(!set.join("noaa/NY").exists());
+        // The library's CT is kept as it was, and the stray one stays put
+        // rather than being merged into it or thrown away.
+        assert!(installed(&set, "CT").is_some(), "the stray copy was lost");
+        assert!(installed(&lib, "CT").is_none(), "the library's copy was replaced");
+        assert!(set.join("noaa/someone-elses").exists());
+        // Adopting the library into itself does nothing.
+        adopt(&lib, &lib);
+        assert!(lib.join("noaa/NJ").is_dir());
+    }
+
+    /// When everything in a chart set's `noaa/` was ours and has moved, the
+    /// empty folder goes too; a set with no `noaa/` at all is left as found.
+    #[test]
+    fn adopting_leaves_no_empty_folder_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("oeuSENC-DK");
+        let lib = dir.path().join("library");
+        std::fs::create_dir_all(set.join("noaa/RI")).unwrap();
+        std::fs::write(
+            set.join("noaa/RI").join(MARKER),
+            r#"{"downloaded":"2026-09-23","last_modified":"x"}"#,
+        )
+        .unwrap();
+        std::fs::write(set.join("ChartList.XML"), "<chartList/>").unwrap();
+
+        adopt(&set, &lib);
+        assert!(installed(&lib, "RI").is_some());
+        assert!(!set.join("noaa").exists());
+        assert!(set.join("ChartList.XML").is_file(), "the chart set itself is untouched");
+
+        // Nothing to adopt: no error, and nothing created in the library.
+        let bare = dir.path().join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let empty_lib = dir.path().join("empty-library");
+        adopt(&bare, &empty_lib);
+        assert!(!empty_lib.exists());
+    }
+
+    #[test]
+    fn a_marker_that_is_not_json_is_not_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(region_dir(dir.path(), "ME")).unwrap();
+        assert_eq!(installed(dir.path(), "ME"), None);
+        std::fs::write(region_dir(dir.path(), "ME").join(MARKER), "garbage").unwrap();
+        assert_eq!(installed(dir.path(), "ME"), None);
     }
 
     #[test]

@@ -155,11 +155,55 @@ pub fn is_worth_showing(name: &str) -> bool {
 /// 1:180000 overview does.
 pub fn sort_picks(picks: &mut [PickedObject]) {
     picks.sort_by(|a, b| {
-        specificity(a.geometry, &a.acronym)
-            .cmp(&specificity(b.geometry, &b.acronym))
+        interest(&a.acronym)
+            .cmp(&interest(&b.acronym))
+            .then(is_overhead(&b.acronym).cmp(&is_overhead(&a.acronym)))
+            .then(specificity(a.geometry, &a.acronym).cmp(&specificity(b.geometry, &b.acronym)))
             .then(a.distance_m.total_cmp(&b.distance_m))
             .then(a.chart_scale.cmp(&b.chart_scale))
     });
+}
+
+/// What a sailor tapping the chart most likely means, lower first.
+///
+/// A tap in a harbour mouth lands on a light, inside a caution area, on a
+/// depth contour and in a depth area all at once. Sorted by geometry alone
+/// the contour (a line) came before the caution area, and where no point
+/// was hit the answer to "what is that?" opened with "Depth contour". So,
+/// before geometry:
+///
+/// 0. what a mast must pass under — bridges, overhead cables — and then
+///    aids to navigation: lights, buoys, beacons and what they carry;
+/// 1. dangers — wrecks, rocks, obstructions;
+/// 2. everything else charted on purpose: areas with rules, submarine
+///    cables, berths, names;
+/// 3. the seabed and the land themselves — depth areas and contours,
+///    soundings, coastline;
+/// 4. the cell's own description (`M_`, `C_`).
+pub fn interest(acronym: &str) -> u8 {
+    if acronym.starts_with("M_") || acronym.starts_with("C_") {
+        return 4;
+    }
+    match acronym {
+        // Whether the mast goes under is the first thing to know about a
+        // bridge or a cable, and a tap on one usually lands nearer to one
+        // of its lights than to anything else.
+        a if is_overhead(a) => 0,
+        "LIGHTS" | "LITFLT" | "LITVES" | "TOPMAR" | "DAYMAR" | "FOGSIG" | "RTPBCN" | "RDOSTA"
+        | "RADRFL" | "PILBOP" => 0,
+        a if a.starts_with("BOY") || a.starts_with("BCN") => 0,
+        "WRECKS" | "UWTROC" | "OBSTRN" => 1,
+        // Magnetic variation covers whole sea areas: true everywhere, the
+        // answer to a tap nowhere.
+        "DEPARE" | "DEPCNT" | "DRGARE" | "SOUNDG" | "LNDARE" | "COALNE" | "UNSARE" | "SBDARE"
+        | "MAGVAR" => 3,
+        _ => 2,
+    }
+}
+
+/// Something a mast has to pass under.
+pub fn is_overhead(acronym: &str) -> bool {
+    matches!(acronym, "BRIDGE" | "CBLOHD" | "PIPOHD" | "CONVYR")
 }
 
 /// Lower sorts first: points, then lines, then areas, with the meta objects
@@ -210,7 +254,7 @@ fn multipoint_hit(feature: &Feature, ref_mx: f64, ref_my: f64, at: [f64; 2], tol
 /// answer is a list ranked by distance rather than a single hit, so a fat grab
 /// costs nothing: the line joins the list, and a point that is genuinely under
 /// the finger still sorts above it.
-const LINE_GRAB: f64 = 4.0;
+pub(crate) const LINE_GRAB: f64 = 4.0;
 
 fn line_hit(
     feature: &Feature,
@@ -540,7 +584,7 @@ mod tests {
         let f = light(&[
             ("LITCHR", AttributeValue::Integer(2)), // flashing
             ("SIGGRP", AttributeValue::String("(1)".into())),
-            ("COLOUR", AttributeValue::String("3".into())),
+            ("COLOUR", AttributeValue::String("4".into())), // green
             ("SIGPER", AttributeValue::Float(3.0)),
             ("HEIGHT", AttributeValue::Float(3.5)),
             ("VALNMR", AttributeValue::Float(4.0)),
@@ -552,6 +596,43 @@ mod tests {
         assert!(summary.contains("green"), "the sector's colour: {summary}");
         assert!(summary.contains("165°–305°"), "the sector: {summary}");
         assert!(summary.contains("4 M"), "the range: {summary}");
+    }
+
+    /// A tap on Kalvebodbroen lands 9 m from one of its lights and inside
+    /// the bridge's area. The bridge is the answer: its clearance decides
+    /// whether the boat goes through at all.
+    #[test]
+    fn a_bridge_comes_before_the_lights_it_carries() {
+        let mut bridge = obj("BRIDGE", "plan", 12000, &[("VERCLR", "16")]);
+        bridge.geometry = FeatureType::Area;
+        bridge.distance_m = 0.0;
+        let mut picks = vec![
+            obj("CTNARE", "plan", 12000, &[]),
+            obj("LIGHTS", "plan", 12000, &[("COLOUR", "red")]),
+            bridge,
+        ];
+        sort_picks(&mut picks);
+        let order: Vec<&str> = picks.iter().map(|p| p.acronym.as_str()).collect();
+        assert_eq!(order, ["BRIDGE", "LIGHTS", "CTNARE"]);
+        assert!(is_overhead("CBLOHD") && !is_overhead("CBLSUB"));
+    }
+
+    /// What is tapped for comes before what merely lies there: a light
+    /// before a wreck, a wreck before the caution area round it, and all of
+    /// them before the depth contour and the depth area — whatever their
+    /// geometry — with the cell's description last.
+    #[test]
+    fn a_tap_is_answered_with_what_a_sailor_means_first() {
+        let order = ["LIGHTS", "BOYLAT", "BCNCAR", "WRECKS", "UWTROC", "CTNARE", "RESARE", "CBLSUB", "DEPCNT", "DEPARE", "SOUNDG", "M_QUAL"];
+        let ranks: Vec<u8> = order.iter().map(|a| interest(a)).collect();
+        assert!(ranks.windows(2).all(|w| w[0] <= w[1]), "{ranks:?}");
+        assert!(interest("BOYLAT") < interest("WRECKS"));
+        assert!(interest("OBSTRN") < interest("CTNARE"));
+        assert!(interest("CTNARE") < interest("DEPCNT"), "an area with a rule before a contour line");
+        assert!(interest("DEPARE") < interest("M_NPUB"));
+        // Seen on the NOAA Boston cell: a tap on open water was answered
+        // "Magnetic variation", ahead of the sea area's name.
+        assert!(interest("SEAARE") < interest("MAGVAR"));
     }
 
     #[test]
@@ -572,6 +653,129 @@ mod tests {
         assert!(is_cell_bookkeeping("SORDAT"));
         assert!(is_worth_showing("SORDAT"));
         assert!(!is_cell_bookkeeping("COLOUR"));
+    }
+
+    fn feature(acronym: &str, feature_type: FeatureType) -> Feature {
+        Feature {
+            type_code: crate::senc::s57_acronym_to_code(acronym).unwrap(),
+            object_class: crate::senc::ObjectClass::Other,
+            feature_type,
+            attributes: crate::senc::Attributes::new(),
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        }
+    }
+
+    /// A small cell referenced at 56°N 11°E, all positions in metres from
+    /// there: a buoy on the reference point, soundings 30 m and 500 m east,
+    /// a depth contour running north–south 45 m west, and a depth area
+    /// 400 m square around it all.
+    fn harbour() -> (ChartData, ChartInfo, [f64; 2]) {
+        use crate::senc::{
+            AreaGeometry, BBox, CellExtent, EdgeRef, EdgeTable, LineGeometry, TriPrim, TriPrimType,
+        };
+        let (ref_lat, ref_lon) = (56.0, 11.0);
+        let (rx, ry) = crate::tiles::latlon_to_mercator(ref_lat, ref_lon);
+        let bbox = BBox { min_x: 10.99, max_x: 11.01, min_y: 55.99, max_y: 56.01 };
+
+        // The point and multipoint geometry types cannot be named outside
+        // `senc`, so they are borrowed from a real cell and moved here.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/s57/US4MA1BD.000");
+        let cell = crate::s57::cell::Cell::open(std::path::Path::new(path)).unwrap();
+        let fixture = ChartData::parse(crate::s57::senc_encode::encode(&cell)).unwrap();
+        let like = |t: FeatureType| fixture.features.iter().find(|f| f.feature_type == t).cloned();
+
+        let mut buoy = like(FeatureType::Point).expect("a point feature in the fixture");
+        buoy.type_code = crate::senc::s57_acronym_to_code("BOYLAT").unwrap();
+        buoy.attributes = crate::senc::Attributes::new();
+        let pg = buoy.point_geometry.as_mut().unwrap();
+        (pg.x, pg.y) = (ref_lat, ref_lon);
+        let mut soundings = like(FeatureType::Multipoint).expect("soundings in the fixture");
+        soundings.type_code = crate::senc::s57_acronym_to_code("SOUNDG").unwrap();
+        soundings.multipoint_geometry.as_mut().unwrap().points = vec![[500.0, 0.0, 3.0], [30.0, 0.0, 4.0]];
+        let mut edge_table = EdgeTable::new();
+        edge_table.edges.insert(1, vec![[-45.0, -500.0], [-45.0, 500.0]]);
+        let mut contour = feature("DEPCNT", FeatureType::Line);
+        contour.line_geometry = Some(LineGeometry {
+            extent: bbox,
+            edge_refs: vec![EdgeRef { start_node: 1, edge_index: 1, end_node: 2, reversed: Some(false) }],
+        });
+        let mut depth = feature("DEPARE", FeatureType::Area);
+        let (lo, hi) = (-200.0, 200.0);
+        depth.area_geometry = Some(AreaGeometry {
+            extent: bbox,
+            triangles: vec![TriPrim {
+                prim_type: TriPrimType::Triangles,
+                vertices: vec![[lo, lo], [hi, lo], [hi, hi], [lo, lo], [hi, hi], [lo, hi]],
+            }],
+            edge_refs: Vec::new(),
+        });
+
+        let chart = ChartData {
+            header: crate::senc::SencHeader::default(),
+            // Areas first, as a cell stores them: the ranking must not
+            // depend on the order the features arrive in.
+            features: vec![depth, contour, soundings, buoy],
+            edge_table,
+        };
+        let info = ChartInfo {
+            id: 1,
+            path: "/charts/TEST.oesu".into(),
+            name: "TEST".into(),
+            native_scale: 12_000,
+            extent_wgs84: CellExtent { min_lat: 55.99, max_lat: 56.01, min_lon: 10.99, max_lon: 11.01 },
+            extent_mercator: crate::tiles::TileBounds::new(rx - 1e3, rx + 1e3, ry - 1e3, ry + 1e3),
+            ref_lat,
+            ref_lon,
+        };
+        (chart, info, [rx, ry])
+    }
+
+    fn tap(at: [f64; 2], dx: f64, dy: f64, tol: f64) -> Vec<(String, f64)> {
+        let (chart, info, _) = harbour();
+        pick_at(&chart, &info, [at[0] + dx, at[1] + dy], tol)
+            .into_iter()
+            .map(|p| (p.acronym, p.distance_m))
+            .collect()
+    }
+
+    /// The tolerance is the reach: a point just inside it is found, just
+    /// outside it is not. A buoy on a depth area is listed first even though
+    /// the cursor is *inside* the area (distance 0) and only near the buoy.
+    #[test]
+    fn a_tap_finds_points_within_the_tolerance_and_lists_them_first() {
+        let (_, _, at) = harbour();
+        let names = |v: &[(String, f64)]| v.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>();
+        let hits = tap(at, 0.0, 9.99, 10.0);
+        assert_eq!(names(&hits), ["BOYLAT", "DEPARE"]);
+        assert!((hits[0].1 - 9.99).abs() < 1e-6, "{hits:?}");
+        assert_eq!(hits[1].1, 0.0);
+        assert_eq!(names(&tap(at, 0.0, 10.01, 10.0)), ["DEPARE"]);
+        // A sounding is found by its own position, not the multipoint's
+        // first one.
+        let hits = tap(at, 28.0, 0.0, 5.0);
+        assert_eq!(names(&hits), ["SOUNDG", "DEPARE"]);
+        assert!((hits[0].1 - 2.0).abs() < 1e-3, "{hits:?}");
+        // Outside the area and away from everything: nothing.
+        assert!(tap(at, 300.0, 0.0, 10.0).is_empty());
+    }
+
+    /// A line is grabbed from four times as far as a point, because a
+    /// hairline is hard to hit with a finger — but not from further.
+    #[test]
+    fn a_line_is_grabbed_from_further_than_a_point() {
+        let (_, _, at) = harbour();
+        // 20 m from the contour, with a 10 m tolerance: within 4 × 10.
+        let hits = tap(at, -25.0, 0.0, 10.0);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].0, "DEPCNT");
+        assert!((hits[0].1 - 20.0).abs() < 1e-3, "{hits:?}");
+        assert_eq!(hits[1].0, "DEPARE");
+        // With a 4 m tolerance the grab is 16 m, short of it.
+        let hits = tap(at, -25.0, 0.0, 4.0);
+        assert_eq!(hits.iter().map(|h| h.0.as_str()).collect::<Vec<_>>(), ["DEPARE"]);
     }
 
     #[test]

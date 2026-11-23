@@ -267,5 +267,46 @@ mod tests {
     fn normalizes_names() {
         assert_eq!(normalize_chart_name("OC-45-A.oesu"), "OC-45-A");
         assert_eq!(normalize_chart_name("/tmp/charts/OC-45-B"), "OC-45-B");
+        assert_eq!(normalize_chart_name(" /charts/OC-45-C.OESU \n"), "OC-45-C");
+    }
+
+    /// A chart entry missing its key (or its name) is skipped rather than
+    /// stored with an empty key that would only fail later at decryption;
+    /// a document that is not a key list is refused.
+    #[test]
+    fn incomplete_entries_are_skipped_and_other_documents_refused() {
+        let xml = r#"<keyList>
+            <Chart><FileName>OC-45-NOKEY</FileName></Chart>
+            <Chart><FileName>OC-45-EMPTY</FileName><RInstallKey></RInstallKey></Chart>
+            <Chart><RInstallKey>ORPHAN</RInstallKey></Chart>
+            <Chart><FileName> OC-45-OK </FileName><RInstallKey> K1 </RInstallKey></Chart>
+        </keyList>"#;
+        let entries = parse_keylist(xml, Path::new("k.xml")).unwrap();
+        assert_eq!(
+            entries,
+            vec![ChartKey { filename: "OC-45-OK".into(), install_key: "K1".into() }]
+        );
+        assert!(parse_keylist("<chartList><Chart/></chartList>", Path::new("c.xml")).is_err());
+        assert!(parse_keylist("", Path::new("e.xml")).is_err());
+    }
+
+    /// Pointed at a chart folder, every key list in it is read, and the
+    /// chart list and other files beside them are passed over.
+    #[test]
+    fn a_folder_of_key_lists_loads_them_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let list = |name: &str, key: &str| {
+            format!("<keyList><Chart><FileName>{name}</FileName><RInstallKey>{key}</RInstallKey></Chart></keyList>")
+        };
+        std::fs::write(dir.path().join("a.XML"), list("OC-45-A.oesu", "KA")).unwrap();
+        std::fs::write(dir.path().join("b.xml"), list("OC-45-B", "KB")).unwrap();
+        std::fs::write(dir.path().join("ChartList.XML"), "<chartList></chartList>").unwrap();
+        std::fs::write(dir.path().join("c.txt"), list("OC-45-C", "KC")).unwrap();
+        let mut store = KeyStore::new();
+        assert_eq!(store.load_keylists_in_dir(dir.path()).unwrap(), 2);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store.lookup("/charts/OC-45-A.oesu"), Some("KA"));
+        assert_eq!(store.lookup("OC-45-B"), Some("KB"));
+        assert_eq!(store.lookup("OC-45-C"), None);
     }
 }

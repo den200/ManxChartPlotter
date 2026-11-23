@@ -41,9 +41,6 @@ pub enum Request {
         chart_id: String,
         /// What is on disk already, if anything.
         installed: Option<super::types::Edition>,
-        /// Ask for this edition by name instead of the shop's current one.
-        /// Set when a lapsed licence may only have an older edition.
-        edition: Option<String>,
         /// Where chart sets live.
         root: std::path::PathBuf,
     },
@@ -235,14 +232,12 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>) {
             Request::Download {
                 chart_id,
                 installed,
-                edition,
                 root,
             } => download(
                 &client,
                 session.as_ref(),
                 &chart_id,
                 installed,
-                edition.as_deref(),
                 &root,
                 &events,
             ),
@@ -257,15 +252,13 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>) {
 
 /// Claim a slot for a chart, then ask the shop what it will give us.
 ///
-/// Stops at the grant rather than fetching: what the shop is willing to hand
-/// over for a lapsed subscription is its decision, and the useful thing is to
-/// see the answer in its own words.
+/// Refused outright for an expired licence: an install can only happen
+/// during the licensing period.
 fn download(
     client: &ShopClient,
     session: Option<&Session>,
     chart_id: &str,
     installed: Option<super::types::Edition>,
-    edition: Option<&str>,
     root: &std::path::Path,
     events: &Sender<Event>,
 ) {
@@ -293,6 +286,14 @@ fn download(
         return;
     };
 
+    // o-charts' conditions: an install can only happen during the licensing
+    // period. Checked here, against the shop's own answer and before a slot
+    // is touched, so no path through the interface can get round it.
+    if chart.expired {
+        let _ = events.send(Event::Failed(super::protocol::LICENCE_EXPIRED.into()));
+        return;
+    }
+
     // A slot is this machine's claim on one copy of the chart. If we already
     // hold one, reuse it; the shop counts assignments, and burning a second is
     // a real cost to the user.
@@ -317,25 +318,12 @@ fn download(
         }
     };
 
-    // An edition named by the caller was confirmed by the user and wins; the
-    // slot's own record is the fallback.
-    let last_requested = edition.unwrap_or_else(|| {
-        chart
-            .slot_for(&system_name)
-            .map(|(_, s)| s.last_requested.as_str())
-            .unwrap_or_default()
-    });
-    let (target, requested_version) =
-        super::protocol::choose_request(chart.expired, last_requested, installed, chart.edition);
+    let (target, requested_version) = super::protocol::choose_request(installed, chart.edition);
     let asked = requested_version.clone();
-    let _ = events.send(Event::Status(if chart.expired {
-        format!("Asking for edition {asked}, the last one your licence covered…")
-    } else {
-        format!(
-            "Asking for the {} package…",
-            target.requested_file().unwrap_or("nothing")
-        )
-    }));
+    let _ = events.send(Event::Status(format!(
+        "Asking for the {} package…",
+        target.requested_file().unwrap_or("nothing")
+    )));
     match client.request_download(
         session,
         &slot_uuid,

@@ -188,6 +188,14 @@ pub struct TileBounds {
 }
 
 impl TileBounds {
+    /// Whether a point lies inside, or within `margin` metres outside.
+    pub fn reaches(&self, x: f64, y: f64, margin: f64) -> bool {
+        x >= self.min_x - margin
+            && x <= self.max_x + margin
+            && y >= self.min_y - margin
+            && y <= self.max_y + margin
+    }
+
     /// Create bounds from min/max values
     pub fn new(min_x: f64, max_x: f64, min_y: f64, max_y: f64) -> Self {
         Self { min_x, max_x, min_y, max_y }
@@ -318,11 +326,18 @@ pub fn visible_tiles(bounds: &TileBounds, z: u8, margin_factor: f32) -> Vec<Tile
     // Expand bounds by margin factor
     let expanded = bounds.expand(margin_factor);
 
+    // Tiles are half-open, [start, end): bounds that end exactly on a tile
+    // edge do not reach into the next tile. "Exactly" is judged in tile
+    // units — a millionth of a tile — because Mercator metres run to 2e7,
+    // where an epsilon in metres is smaller than one step of an f64 and
+    // does nothing at all.
+    const EDGE: f64 = 1e-6;
+    let first = |u: f64| (u + EDGE).floor() as i64;
+    let last = |u: f64, first: i64| ((u - EDGE).ceil() as i64 - 1).max(first);
+
     // X tile range (may wrap around dateline)
-    // Use floor for min, and subtract epsilon for max to handle exact boundaries
-    let x_min_raw = ((expanded.min_x + ORIGIN_SHIFT) / tile_size).floor() as i64;
-    // Subtract tiny epsilon to avoid including tile when max_x is exactly on boundary
-    let x_max_raw = ((expanded.max_x + ORIGIN_SHIFT - 1e-9) / tile_size).floor() as i64;
+    let x_min_raw = first((expanded.min_x + ORIGIN_SHIFT) / tile_size);
+    let x_max_raw = last((expanded.max_x + ORIGIN_SHIFT) / tile_size, x_min_raw);
 
     // GUARD: If bounds span full world width, just iterate all x tiles
     let x_span = x_max_raw - x_min_raw + 1;
@@ -332,10 +347,9 @@ pub fn visible_tiles(bounds: &TileBounds, z: u8, margin_factor: f32) -> Vec<Tile
         (x_min_raw, x_span)
     };
 
-    // Y tile range (clamped, no wrap)
-    // Same epsilon handling for y
-    let y_min = ((MAX_Y - expanded.max_y + 1e-9) / tile_size).floor() as i64;
-    let y_max = ((MAX_Y - expanded.min_y) / tile_size).floor() as i64;
+    // Y tile range (clamped, no wrap). Rows count down from the top.
+    let y_min = first((MAX_Y - expanded.max_y) / tile_size);
+    let y_max = last((MAX_Y - expanded.min_y) / tile_size, y_min);
     let y_min = y_min.clamp(0, n_i - 1);
     let y_max = y_max.clamp(0, n_i - 1);
 
@@ -453,13 +467,70 @@ mod tests {
         assert!(y.abs() < 1.0);
     }
 
+    /// Checked against the other closed form of the Mercator northing,
+    /// R·atanh(sin φ), rather than the ln tan one the code uses, and against
+    /// the world's half-width at the antimeridian. Both directions, both
+    /// hemispheres — a lost sign or a swapped pair shows here, where a round
+    /// trip alone would happily invert its own mistake.
+    #[test]
+    fn mercator_matches_the_closed_form_and_inverts() {
+        for (lat, lon) in [(55.7, 12.6), (-33.9, 151.2), (40.6, -73.8), (78.2, 15.6), (0.0, 180.0)] {
+            let (x, y) = latlon_to_mercator(lat, lon);
+            let y_ref = R * (lat as f64).to_radians().sin().atanh();
+            assert!((y - y_ref).abs() < 1e-6, "{lat}: {y} vs {y_ref}");
+            assert!((x - R * (lon as f64).to_radians()).abs() < 1e-6, "{lon}: {x}");
+            let (lat2, lon2) = mercator_to_latlon(x, y);
+            assert!((lat2 - lat).abs() < 1e-9 && (lon2 - lon).abs() < 1e-9, "{lat2},{lon2}");
+        }
+        // The antimeridian is the edge of the square world.
+        assert!((latlon_to_mercator(0.0, 180.0).0 - ORIGIN_SHIFT).abs() < 1e-6);
+    }
+
     #[test]
     fn latlon_to_mercator_poles_clamped() {
-        // Extreme latitudes should be clamped
+        // The poles are at infinity in Mercator; they clamp to the 85.0511°
+        // limit, which is (to within a few tens of metres) the top of the
+        // square world — finite, and symmetric about the equator.
         let (_, y_north) = latlon_to_mercator(90.0, 0.0);
         let (_, y_south) = latlon_to_mercator(-90.0, 0.0);
-        assert!(y_north <= MAX_Y);
-        assert!(y_south >= -MAX_Y);
+        assert!(y_north.is_finite() && y_north <= MAX_Y && MAX_Y - y_north < 50.0, "{y_north}");
+        assert!((y_south + y_north).abs() < 1e-6, "{y_south} vs {y_north}");
+        assert_eq!(latlon_to_mercator(90.0, 0.0), latlon_to_mercator(MAX_LAT, 0.0));
+    }
+
+    /// Slippy-map rows count down from the north: the Kattegat is in the
+    /// top half of the world, Sydney in the bottom, and Greenwich splits the
+    /// columns in two.
+    #[test]
+    fn tile_rows_run_north_to_south() {
+        let z = 4u8;
+        let n = 1u32 << z;
+        let (x, y) = latlon_to_mercator(56.5, 11.5);
+        let t = TileId::from_mercator(x, y, z);
+        assert!(t.y < n / 2 && t.x >= n / 2, "{t:?}");
+        let (x, y) = latlon_to_mercator(-33.9, 151.2);
+        let t = TileId::from_mercator(x, y, z);
+        assert!(t.y >= n / 2 && t.x >= n / 2, "{t:?}");
+        let (x, y) = latlon_to_mercator(40.6, -73.8);
+        let t = TileId::from_mercator(x, y, z);
+        assert!(t.y < n / 2 && t.x < n / 2, "{t:?}");
+        // The tile's own bounds contain the point it was found from.
+        let b = t.bounds();
+        assert!(b.min_x <= x && x < b.max_x && b.min_y < y && y <= b.max_y, "{b:?}");
+    }
+
+    /// A point exactly on the antimeridian, or past it, wraps to the first
+    /// column rather than indexing a column that does not exist.
+    #[test]
+    fn tiles_wrap_at_the_antimeridian() {
+        let z = 3u8;
+        assert_eq!(TileId::from_mercator(ORIGIN_SHIFT, 0.0, z).x, 0);
+        assert_eq!(TileId::from_mercator(-ORIGIN_SHIFT, 0.0, z).x, 0);
+        assert_eq!(TileId::from_mercator(ORIGIN_SHIFT + 1.0, 0.0, z).x, 0);
+        assert_eq!(TileId::from_mercator(-ORIGIN_SHIFT - 1.0, 0.0, z).x, 7);
+        // Rows clamp instead of wrapping.
+        assert_eq!(TileId::from_mercator(0.0, MAX_Y * 2.0, z).y, 0);
+        assert_eq!(TileId::from_mercator(0.0, -MAX_Y * 2.0, z).y, 7);
     }
 
     #[test]
@@ -486,8 +557,90 @@ mod tests {
         // Test a bounds that should intersect 2 tiles
         let bounds = TileBounds::new(-1000.0, 1000.0, -1000.0, 1000.0);  // Small area at origin
         let tiles = visible_tiles(&bounds, 1, 1.0);
-        // Should get 4 tiles (2x2 grid around origin)
-        assert_eq!(tiles.len(), 4);
+        // Should get 4 tiles (2x2 grid around origin), each once.
+        let mut got: Vec<(u32, u32)> = tiles.iter().map(|t| (t.x, t.y)).collect();
+        got.sort();
+        assert_eq!(got, vec![(0, 0), (0, 1), (1, 0), (1, 1)]);
+    }
+
+    /// A view straddling the antimeridian takes the last column and the
+    /// first, not every column between them.
+    #[test]
+    fn visible_tiles_wrap_across_the_antimeridian() {
+        let z = 3u8;
+        let w = WORLD_WIDTH / 8.0;
+        let bounds = TileBounds::new(ORIGIN_SHIFT - 0.5 * w, ORIGIN_SHIFT + 0.5 * w, 10.0, 20.0);
+        let mut xs: Vec<u32> = visible_tiles(&bounds, z, 1.0).iter().map(|t| t.x).collect();
+        xs.sort();
+        assert_eq!(xs, vec![0, 7]);
+    }
+
+    /// A view whose edge lies exactly on a tile boundary should not pull in
+    /// the tile beyond it — `visible_tiles` says it subtracts an epsilon for
+    /// exactly this. It does not work: 1e-9 is below an f64 step at 2e7 m,
+    /// and in y the epsilon is on the top bound while the bottom one has none,
+    /// so a tile's own bounds come back as that tile and three neighbours.
+    #[test]
+    fn visible_tiles_at_an_exact_tile_edge() {
+        let t = TileId::new(5, 17, 9).bounds();
+        assert_eq!(visible_tiles(&t, 5, 1.0), vec![TileId::new(5, 17, 9)]);
+        // The tolerance must not swallow a real overlap: a view reaching a
+        // thousandth of a tile past the east and south edges needs the
+        // neighbours.
+        let reach = (t.max_x - t.min_x) * 1e-3;
+        let over = TileBounds::new(t.min_x, t.max_x + reach, t.min_y - reach, t.max_y);
+        let mut got = visible_tiles(&over, 5, 1.0);
+        got.sort_by_key(|t| (t.x, t.y));
+        assert_eq!(
+            got,
+            vec![
+                TileId::new(5, 17, 9),
+                TileId::new(5, 17, 10),
+                TileId::new(5, 18, 9),
+                TileId::new(5, 18, 10),
+            ]
+        );
+        // And at a fine zoom, where a tile is a few hundred metres.
+        let t = TileId::new(16, 35_000, 20_000).bounds();
+        assert_eq!(visible_tiles(&t, 16, 1.0), vec![TileId::new(16, 35_000, 20_000)]);
+    }
+
+    /// Untilted, the ground scale is the same everywhere, so the walk stops
+    /// at the one level the camera asks for and covers the view exactly as
+    /// the flat tile list does.
+    #[test]
+    fn lod_walk_untilted_is_the_plain_tile_list() {
+        let z = 9u8;
+        let mpp = meters_per_pixel(z) as f32;
+        let (cx, cy) = latlon_to_mercator(55.7, 12.6);
+        let half = meters_per_pixel(z) * 600.0;
+        let view = TileBounds::new(cx - half, cx + half, cy - half, cy + half);
+        let mut lod = visible_tiles_lod(&view, MIN_TILE_Z, 18, &|_, _| mpp, &|b| b.intersects(&view));
+        let mut flat = visible_tiles(&view, z, 1.0);
+        let key = |t: &TileId| (t.z, t.x, t.y);
+        lod.sort_by_key(key);
+        flat.sort_by_key(key);
+        assert_eq!(lod, flat);
+        // A tile out of view is never returned, however fine it would be.
+        assert!(visible_tiles_lod(&view, MIN_TILE_Z, 18, &|_, _| mpp, &|_| false).is_empty());
+    }
+
+    /// The ground scale of a tile is its Mercator scale shrunk by cos φ:
+    /// half at 60°, and unchanged at the equator.
+    #[test]
+    fn tile_scale_is_a_ground_scale() {
+        let z = 12u8;
+        let at = |lat: f64| {
+            let (x, y) = latlon_to_mercator(lat, 0.3);
+            let t = TileId::from_mercator(x, y, z);
+            (tile_scale_denominator(t, 4.0), mercator_to_latlon(x, y).0)
+        };
+        let mercator = meters_per_pixel(z) * 4.0 * 1000.0;
+        let (eq, _) = at(0.01);
+        assert!((eq / mercator - 1.0).abs() < 1e-4, "{eq} vs {mercator}");
+        let (sixty, _) = at(60.0);
+        // Within a tile's height of 60°, where cos is within 0.1 % of a half.
+        assert!((sixty / mercator - 0.5).abs() < 2e-3, "{}", sixty / mercator);
     }
 
     #[test]
@@ -496,5 +649,25 @@ mod tests {
         let (gx, gy) = sm_to_global(0.0, 0.0, 0.0, 0.0);
         assert!(gx.abs() < 1.0);
         assert!(gy.abs() < 1.0);
+    }
+}
+
+#[cfg(test)]
+mod reach_tests {
+    use super::TileBounds;
+
+    /// A box from 0 to 100 m each way reaches a point 30 m beyond any edge
+    /// with a 40 m margin and not with a 20 m one; with no margin it is the
+    /// box itself, edges included.
+    #[test]
+    fn bounds_reach_a_point_within_the_margin_outside_them() {
+        let b = TileBounds { min_x: 0.0, max_x: 100.0, min_y: 0.0, max_y: 100.0 };
+        for (x, y) in [(130.0, 50.0), (-30.0, 50.0), (50.0, 130.0), (50.0, -30.0)] {
+            assert!(b.reaches(x, y, 40.0), "{x},{y}");
+            assert!(!b.reaches(x, y, 20.0), "{x},{y}");
+            assert!(!b.reaches(x, y, 0.0), "{x},{y}");
+        }
+        assert!(b.reaches(100.0, 0.0, 0.0));
+        assert!(b.reaches(50.0, 50.0, 0.0));
     }
 }

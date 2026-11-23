@@ -66,13 +66,22 @@ fn settings_hash(settings: &MarinerSettings) -> u64 {
 
 /// Compute a fast hash of a feature's integer attribute map.
 fn feature_attr_hash(feature: &Feature) -> u64 {
+    use crate::senc::AttributeValue;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    // Hash attributes sorted by name for consistency
-    let mut attrs: Vec<_> = feature.attributes_as_map().into_iter().collect();
+    // Every attribute exactly as the procedures will read it, sorted by name.
+    // This once hashed a summary — floats cut to integers, text reduced to
+    // the numbers in it — so DRVAL1 −0.5 and 0.5 shared a cache entry and
+    // drew the same depth shade, and every virtual AIS aid drew whatever the
+    // first one's SYMINS said.
+    let mut attrs: Vec<_> = feature.attributes.iter().collect();
     attrs.sort_by_key(|(k, _)| *k);
-    for (name, values) in &attrs {
+    for (name, value) in attrs {
         name.hash(&mut hasher);
-        values.hash(&mut hasher);
+        match value {
+            AttributeValue::Integer(v) => (0u8, *v).hash(&mut hasher),
+            AttributeValue::Float(v) => (1u8, v.to_bits()).hash(&mut hasher),
+            AttributeValue::String(s) => (2u8, s.as_str()).hash(&mut hasher),
+        }
     }
     hasher.finish()
 }
@@ -128,23 +137,26 @@ impl S52Engine {
         feature.type_code == 43 && super::cs::is_safety_contour(feature, &self.settings, selected)
     }
 
-    /// The chart's selected safety contour: the shallowest DEPCNT value or
-    /// depth-area limit at least as deep as the mariner's setting.
+    /// The chart's selected safety contour: the shallowest DEPCNT line at
+    /// least as deep as the mariner's setting, as OpenCPN's
+    /// `s57chart::SetSafetyContour` picks it.
+    ///
+    /// Only contour *lines* are candidates. The value decides which line is
+    /// drawn as the safety contour, so a depth that no line carries selects
+    /// nothing at all: the Danish cell E94704 has lines at 2, 4, 6 and 10 m
+    /// and two small depth areas limited at 3 m, and counting area limits
+    /// chose 3 m there — and left the 4 m line, the real safety contour,
+    /// drawn as an ordinary contour.
+    ///
+    /// One deliberate difference from OpenCPN: it drops the safety contour
+    /// altogether when the next line is deeper than the deep contour. S-52
+    /// asks for the next deeper contour, and a 10 m line in a chart with no
+    /// shallower one is still the edge of safe water.
     pub fn chart_safety_contour(&self, features: &[crate::senc::Feature]) -> Option<f64> {
-        let depths = features.iter().flat_map(|f| {
-            let mut out = [None, None];
-            match f.type_code {
-                43 => out[0] = f.valdco(),
-                // DEPARE: an area's limits are contours too, and some cells
-                // carry depth areas without separate DEPCNT lines.
-                42 => {
-                    out[0] = f.drval1();
-                    out[1] = f.drval2();
-                }
-                _ => {}
-            }
-            out.into_iter().flatten()
-        });
+        let depths = features
+            .iter()
+            .filter(|f| f.type_code == 43)
+            .filter_map(|f| f.valdco());
         super::cs::select_safety_contour(depths, self.settings.safety_contour as f64)
     }
 
@@ -266,6 +278,14 @@ impl S52Engine {
             "RESOLVE: {} geom={:?} table={:?} → instr='{}'",
             acronym, geom_type, table, entry.instruction
         );
+
+        // M_QUAL belongs to the quality-of-data switch alone: s52plib puts it
+        // on the no-show list whenever that switch is off
+        // (`SetQualityOfData(false)`, honoured by `ObjectRenderCheckRules` in
+        // every display category), whether meta objects are shown or not.
+        if acronym == "M_QUAL" && !self.settings.show_quality_of_data {
+            return None;
+        }
 
         // Meta-object filter, mirroring s52plib.cpp ObjectRenderCheckCat.
         //
@@ -657,17 +677,76 @@ impl S52Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::senc::{AttributeValue, FeatureType, ObjectClass};
+
+    const CHARTSYMBOLS: &str = "assets/s52/chartsymbols.xml";
+
+    /// An engine against the contours these cases were written for, so they
+    /// do not drift with `MarinerSettings::default()`.
+    fn engine(show_other: bool) -> S52Engine {
+        let mut engine = S52Engine::load(CHARTSYMBOLS).expect("chartsymbols.xml loads");
+        engine.set_settings(MarinerSettings {
+            safety_depth: 10.0,
+            safety_contour: 10.0,
+            shallow_contour: 2.0,
+            deep_contour: 30.0,
+            show_other,
+            ..Default::default()
+        });
+        engine
+    }
+
+    fn feature(
+        type_code: u16,
+        object_class: ObjectClass,
+        feature_type: FeatureType,
+        attrs: &[(&str, AttributeValue)],
+    ) -> Feature {
+        let mut attributes = crate::senc::Attributes::new();
+        for (k, v) in attrs {
+            attributes.insert(k, v.clone());
+        }
+        Feature {
+            type_code,
+            object_class,
+            feature_type,
+            attributes,
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        }
+    }
+
+    fn rock(valsou: f64) -> Feature {
+        feature(
+            153,
+            ObjectClass::UnderwaterRock,
+            FeatureType::Point,
+            &[
+                ("VALSOU", AttributeValue::Float(valsou)),
+                ("WATLEV", AttributeValue::Integer(3)),
+            ],
+        )
+    }
+
+    fn water(drval1: f64) -> CsContext {
+        CsContext {
+            area_drval1: vec![drval1],
+            ..Default::default()
+        }
+    }
+
+    fn s52(resolved: &Option<ResolvedFeature>) -> Vec<String> {
+        resolved
+            .as_ref()
+            .map(|r| r.instructions.iter().map(|i| i.to_s52()).collect())
+            .unwrap_or_default()
+    }
 
     #[test]
     fn test_engine_load() {
-        let path = "assets/s52/chartsymbols.xml";
-        if !Path::new(path).exists() {
-            eprintln!("Skipping test - chartsymbols.xml not found");
-            return;
-        }
-
-        let engine = S52Engine::load(path).expect("Failed to load");
-        println!("{}", engine.summary());
+        let engine = S52Engine::load(CHARTSYMBOLS).expect("Failed to load");
 
         // Check display category for ROADWY (code 116, should be "Other")
         let cat = engine.get_display_category(116, GeometryType::Line);
@@ -689,5 +768,530 @@ mod tests {
         let cat = engine.get_display_category(30, GeometryType::Line);
         assert_eq!(cat, Some(DisplayCategory::Displaybase));
         assert!(engine.should_render_class(30, GeometryType::Line));
+    }
+
+    /// Rocks are category OTHER, but UDWHAZ03 promotes an isolated danger to
+    /// DISPLAYBASE. Under the Standard display the ISODGR51 symbol must
+    /// still be drawn — it is the one symbol that warns of a rock in water
+    /// the mariner would otherwise cross.
+    #[test]
+    fn isolated_danger_survives_the_standard_display() {
+        let engine = engine(false);
+        let resolved = engine.resolve_feature_ctx(&rock(5.0), GeometryType::Point, &water(20.0));
+        assert_eq!(s52(&resolved), ["SY(ISODGR51)"]);
+        assert_eq!(resolved.unwrap().category, DisplayCategory::Displaybase);
+
+        // The same rock inside shallow water is an ordinary OTHER object and
+        // the Standard display hides it.
+        assert!(engine
+            .resolve_feature_ctx(&rock(5.0), GeometryType::Point, &water(0.0))
+            .is_none());
+    }
+
+    /// The caches key on the surroundings: the rock resolved first in
+    /// shallow water must not be served from the cache when it is asked
+    /// about again in deep water, or vice versa.
+    #[test]
+    fn surroundings_are_part_of_the_cache_key() {
+        let engine = engine(true);
+        let shallow = engine.resolve_feature_ctx(&rock(5.0), GeometryType::Point, &water(0.0));
+        assert_eq!(s52(&shallow)[0], "SY(DANGER51)");
+        let deep = engine.resolve_feature_ctx(&rock(5.0), GeometryType::Point, &water(20.0));
+        assert_eq!(s52(&deep), ["SY(ISODGR51)"]);
+        let shallow = engine.resolve_feature_ctx(&rock(5.0), GeometryType::Point, &water(0.0));
+        assert_eq!(s52(&shallow)[0], "SY(DANGER51)");
+        assert_eq!(shallow.unwrap().category, DisplayCategory::Other);
+    }
+
+    /// OBSTRN04 draws a point and an area completely differently; two
+    /// obstructions with identical attributes but different primitives must
+    /// not share a CS cache entry.
+    #[test]
+    fn point_and_area_obstructions_do_not_share_cs_results() {
+        let engine = engine(true);
+        let attrs = [("VALSOU", AttributeValue::Float(15.0))];
+        let point = feature(86, ObjectClass::Obstruction, FeatureType::Point, &attrs);
+        let area = feature(86, ObjectClass::Obstruction, FeatureType::Area, &attrs);
+
+        let p = s52(&engine.resolve_feature(&point, GeometryType::Point));
+        assert_eq!(p[0], "SY(DANGER51)");
+        let a = s52(&engine.resolve_feature(&area, GeometryType::Area));
+        assert_eq!(a[0], "LS(DOTT,2,CHBLK)");
+        assert!(a.iter().all(|i| !i.starts_with("SY(")), "area drew a symbol: {a:?}");
+    }
+
+    /// DEPCNT02 promotes the safety contour to DISPLAYBASE: it survives the
+    /// Standard display that hides every other contour.
+    #[test]
+    fn safety_contour_survives_the_standard_display() {
+        let engine = engine(false);
+        let contour = |valdco: f64| {
+            feature(43, ObjectClass::DepthContour, FeatureType::Line, &[("VALDCO", AttributeValue::Float(valdco))])
+        };
+        let safety = engine.resolve_feature(&contour(10.0), GeometryType::Line);
+        assert_eq!(s52(&safety), ["LS(SOLD,2,DEPSC)"]);
+        assert!(engine.resolve_feature(&contour(20.0), GeometryType::Line).is_none());
+
+        // With the chart's own selection the 20 m line is the safety contour.
+        let selected = CsContext {
+            safety_contour: Some(20.0),
+            ..Default::default()
+        };
+        let resolved = engine.resolve_feature_ctx(&contour(20.0), GeometryType::Line, &selected);
+        assert_eq!(s52(&resolved), ["LS(SOLD,2,DEPSC)"]);
+    }
+
+    /// The CS cache is keyed without the settings, so `set_settings` must
+    /// clear it — otherwise a new safety contour leaves every depth area
+    /// painted for the old one.
+    #[test]
+    fn changing_contours_reshades_depth_areas() {
+        let mut engine = engine(true);
+        let area = feature(
+            42,
+            ObjectClass::DepthArea,
+            FeatureType::Area,
+            &[("DRVAL1", AttributeValue::Float(5.0)), ("DRVAL2", AttributeValue::Float(15.0))],
+        );
+        let before = engine.resolve_feature(&area, GeometryType::Area);
+        assert_eq!(s52(&before), ["AC(DEPMS)"]); // 5 m: past shallow (2), short of safety (10)
+
+        let mut settings = engine.settings.clone();
+        settings.safety_contour = 5.0;
+        engine.set_settings(settings);
+        let after = engine.resolve_feature(&area, GeometryType::Area);
+        assert_eq!(s52(&after), ["AC(DEPMD)"]);
+    }
+
+    #[test]
+    fn chart_safety_contour_is_the_next_deeper_depth_the_chart_has() {
+        let mut engine = engine(true);
+        let mut settings = engine.settings.clone();
+        settings.safety_contour = 3.0;
+        engine.set_settings(settings);
+        let line = |v: f64| {
+            feature(43, ObjectClass::DepthContour, FeatureType::Line, &[("VALDCO", AttributeValue::Float(v))])
+        };
+        let area = |d1: f64, d2: f64| {
+            feature(
+                42,
+                ObjectClass::DepthArea,
+                FeatureType::Area,
+                &[("DRVAL1", AttributeValue::Float(d1)), ("DRVAL2", AttributeValue::Float(d2))],
+            )
+        };
+        // The shape of cell E94704: lines at 2, 4, 6 and 10 m, and a small
+        // depth area limited at 3 m. The safety contour is the 4 m line —
+        // a depth area's limit is not a line, and choosing it would leave
+        // no line highlighted at all.
+        let features = vec![line(2.0), line(4.0), line(6.0), line(10.0), area(2.0, 3.0), area(3.0, 4.0)];
+        assert_eq!(engine.chart_safety_contour(&features), Some(4.0));
+        // A setting that matches a line exactly selects that line.
+        let features = vec![line(2.0), line(3.0), line(10.0)];
+        assert_eq!(engine.chart_safety_contour(&features), Some(3.0));
+        // The next line may be deep — still the edge of safe water (S-52;
+        // OpenCPN drops it beyond the deep contour, Manx does not).
+        let features = vec![line(10.0), line(20.0), area(0.0, 10.0)];
+        assert_eq!(engine.chart_safety_contour(&features), Some(10.0));
+        // No line at or below the setting: nothing to highlight.
+        let features = vec![line(1.0), line(2.0), area(2.0, 5.0)];
+        assert_eq!(engine.chart_safety_contour(&features), None);
+    }
+
+    /// An engine with the given display categories switched on, against the
+    /// same pinned contours as [`engine`]. `(false, false)` is OpenCPN's
+    /// "Base" display, `(true, false)` Standard and `(true, true)` All.
+    fn engine_showing(standard: bool, other: bool) -> S52Engine {
+        let mut engine = engine(other);
+        let mut settings = engine.settings.clone();
+        settings.show_standard = standard;
+        engine.set_settings(settings);
+        engine
+    }
+
+    fn with_settings(mut engine: S52Engine, change: impl FnOnce(&mut MarinerSettings)) -> S52Engine {
+        let mut settings = engine.settings.clone();
+        change(&mut settings);
+        engine.set_settings(settings);
+        engine
+    }
+
+    fn road(attrs: &[(&str, AttributeValue)]) -> Feature {
+        feature(116, ObjectClass::Road, FeatureType::Line, attrs)
+    }
+
+    /// M_NSYS with no attributes: the LC(MARSYS51) row, category STANDARD.
+    fn m_nsys() -> Feature {
+        feature(306, ObjectClass::Other, FeatureType::Area, &[])
+    }
+
+    /// M_QUAL with CATZOC 1: AP(DQUALA11);LS(DASH,2,CHGRD), category OTHER.
+    fn m_qual() -> Feature {
+        feature(308, ObjectClass::QualityOfData, FeatureType::Area, &[("CATZOC", AttributeValue::Integer(1))])
+    }
+
+    fn depth_area(drval1: f64, drval2: f64) -> Feature {
+        feature(
+            42,
+            ObjectClass::DepthArea,
+            FeatureType::Area,
+            &[("DRVAL1", AttributeValue::Float(drval1)), ("DRVAL2", AttributeValue::Float(drval2))],
+        )
+    }
+
+    /// `settings` is public, so a caller can change it without going through
+    /// `set_settings` and its cache flush. The resolve cache keys on a hash
+    /// of the settings for exactly that case: a toggle must not be answered
+    /// with the verdict cached under the old settings.
+    #[test]
+    fn settings_changed_in_place_are_not_answered_from_the_cache() {
+        let mut engine = engine(true);
+        let roadway = road(&[]);
+        // ROADWY is category OTHER: drawn under "All"...
+        assert_eq!(s52(&engine.resolve_feature(&roadway, GeometryType::Line)), ["LS(SOLD,2,LANDF)"]);
+        // ...and hidden under Standard, even though the "All" verdict is cached.
+        engine.settings.show_other = false;
+        assert!(engine.resolve_feature(&roadway, GeometryType::Line).is_none());
+        // And back again.
+        engine.settings.show_other = true;
+        assert!(engine.resolve_feature(&roadway, GeometryType::Line).is_some());
+
+        // The quality-of-data switch, one of the three settings the hash
+        // comment singles out, toggled the same way.
+        let mut engine = engine_showing(true, false);
+        assert!(engine.resolve_feature(&m_qual(), GeometryType::Area).is_none());
+        engine.settings.show_quality_of_data = true;
+        assert!(engine.resolve_feature(&m_qual(), GeometryType::Area).is_some());
+    }
+
+    /// s52plib.cpp `ObjectRenderCheckCat`: under "All" the meta-object filter
+    /// applies only to objects whose own category is OTHER, so M_NSYS
+    /// (STANDARD) keeps its navigational-system boundary while M_QUAL (OTHER)
+    /// is dropped. Under any narrower display every `M_*` class goes ("We
+    /// want to filter out M_NSYS objects everywhere except OTHER category").
+    #[test]
+    fn meta_objects_follow_opencpns_category_filter() {
+        let all = engine_showing(true, true);
+        assert_eq!(s52(&all.resolve_feature(&m_nsys(), GeometryType::Area)), ["LC(MARSYS51)"]);
+        assert!(all.resolve_feature(&m_qual(), GeometryType::Area).is_none());
+
+        let standard = engine_showing(true, false);
+        assert!(standard.resolve_feature(&m_nsys(), GeometryType::Area).is_none());
+        assert!(standard.resolve_feature(&m_qual(), GeometryType::Area).is_none());
+
+        // Showing meta objects lifts the filter: M_NSYS is STANDARD and draws.
+        let shown = with_settings(engine_showing(true, false), |s| s.show_meta_objects = true);
+        assert_eq!(s52(&shown.resolve_feature(&m_nsys(), GeometryType::Area)), ["LC(MARSYS51)"]);
+    }
+
+    /// The quality-of-data switch forces M_QUAL visible (OpenCPN's
+    /// `SetQualityOfData` forces its `nViz` on) — and only M_QUAL: it is not a
+    /// licence for every other meta object or OTHER-category feature.
+    #[test]
+    fn quality_of_data_rescues_m_qual_and_nothing_else() {
+        let standard = with_settings(engine_showing(true, false), |s| s.show_quality_of_data = true);
+        assert_eq!(
+            s52(&standard.resolve_feature(&m_qual(), GeometryType::Area)),
+            ["AP(DQUALA11)", "LS(DASH,2,CHGRD)"]
+        );
+        assert!(standard.resolve_feature(&m_nsys(), GeometryType::Area).is_none());
+        assert!(standard.resolve_feature(&road(&[]), GeometryType::Line).is_none());
+        assert!(standard.should_render(&road(&[]), GeometryType::Line, 10_000.0).is_none());
+        assert!(standard.should_render(&m_qual(), GeometryType::Area, 10_000.0).is_some());
+
+        // Under "All", M_QUAL is still the quality switch's to show.
+        let all = with_settings(engine_showing(true, true), |s| s.show_quality_of_data = true);
+        assert!(all.resolve_feature(&m_qual(), GeometryType::Area).is_some());
+    }
+
+    /// OpenCPN hides M_QUAL whenever "Quality of data" is off: the
+    /// constructor and `SetQualityOfData(false)` put it on the no-show list,
+    /// which `ObjectRenderCheckRules` honours in every display category, and
+    /// `ObjectRenderCheckCat` drops it under "All" even with meta objects on
+    /// (`if (!strncmp(OBCL, "M_QUAL", 6) && !m_qualityOfDataOn) return false`).
+    #[test]
+    fn showing_meta_objects_does_not_switch_on_quality_of_data() {
+        let all = with_settings(engine_showing(true, true), |s| s.show_meta_objects = true);
+        assert!(all.resolve_feature(&m_qual(), GeometryType::Area).is_none());
+    }
+
+    /// UDWHAZ03 is the only procedure that promotes to DISPLAYBASE
+    /// (s52cnsy.cpp sets `m_DisplayCat` there and in DEPCNT02, nowhere else),
+    /// so only rocks, wrecks and obstructions get the second look. A new
+    /// object whose SYMINS happens to draw ISODGR51 keeps its own category:
+    /// SYMINS01 hands the string back and promotes nothing.
+    #[test]
+    fn only_danger_classes_are_promoted_by_the_isolated_danger_symbol() {
+        let base = engine_showing(false, false);
+        let newobj = feature(
+            163,
+            ObjectClass::Other,
+            FeatureType::Point,
+            &[("SYMINS", AttributeValue::String("SY(ISODGR51)".into()))],
+        );
+        assert!(base.resolve_feature_ctx(&newobj, GeometryType::Point, &water(20.0)).is_none());
+
+        // The same display does promote a rock in deep water.
+        let resolved = base.resolve_feature_ctx(&rock(5.0), GeometryType::Point, &water(20.0));
+        assert_eq!(s52(&resolved), ["SY(ISODGR51)"]);
+
+        // NEWOBJ is STANDARD, so the Standard display draws its SYMINS as is.
+        let standard = engine_showing(true, false);
+        let resolved = standard.resolve_feature_ctx(&newobj, GeometryType::Point, &water(20.0));
+        assert_eq!(s52(&resolved), ["SY(ISODGR51)"]);
+        assert_eq!(resolved.unwrap().category, DisplayCategory::Standard);
+    }
+
+    /// Both caches key on the feature's attribute hash XOR its surroundings'
+    /// hash. For a fixed feature XOR keeps every distinct surrounding
+    /// distinct; OR and AND fold some pairs together, and then the same rock
+    /// in deep water is answered with what it resolved to in shallow water.
+    /// Search for a pair each lossy combination would merge and check the
+    /// engine still tells them apart.
+    #[test]
+    fn surroundings_a_lossy_hash_would_merge_still_resolve_apart() {
+        type Combine = fn(u64, u64) -> u64;
+        type Suitable = fn(u32) -> bool;
+        let lossy: [(&str, Combine, Suitable); 2] = [
+            // OR keeps the feature's one-bits: few zero-bits leave few for
+            // the surroundings to vary, so collisions come quickly.
+            ("or", |f, c| f | c, |ones| ones >= 42),
+            ("and", |f, c| f & c, |ones| ones <= 22),
+        ];
+        for (name, combine, suitable) in lossy {
+            // SCAMIN does not enter portrayal; it only changes the hash.
+            let rock = (0..200_000)
+                .map(|k| {
+                    let mut r = rock(5.0);
+                    r.attributes.insert("SCAMIN", AttributeValue::Integer(k));
+                    r
+                })
+                .find(|r| suitable(feature_attr_hash(r).count_ones()))
+                .expect("a rock whose hash suits the search");
+            let f = feature_attr_hash(&rock);
+
+            // Surrounding depth areas from 0 to 20 m; 10 m is the safety
+            // contour, so one side is an isolated danger and the other not.
+            let mut seen: HashMap<u64, f64> = HashMap::new();
+            let (a, b) = (0..2_000_000)
+                .find_map(|i| {
+                    let d = i as f64 * 0.00001;
+                    let key = combine(f, water(d).hash_value());
+                    match seen.get(&key) {
+                        Some(&other) if (other >= 10.0) != (d >= 10.0) => Some((other, d)),
+                        Some(_) => None,
+                        None => {
+                            seen.insert(key, d);
+                            None
+                        }
+                    }
+                })
+                .unwrap_or_else(|| panic!("no surroundings merge under {name}"));
+
+            let engine = engine(true);
+            for d in [a, b] {
+                let resolved = s52(&engine.resolve_feature_ctx(&rock, GeometryType::Point, &water(d)));
+                let expected = if d >= 10.0 { "SY(ISODGR51)" } else { "SY(DANGER51)" };
+                assert_eq!(resolved[0], expected, "{name}: rock in {d} m of water");
+            }
+        }
+    }
+
+    /// The resolve and CS caches key on `attributes_as_map`, which truncates
+    /// floats to integers. DRVAL1 -0.5 (drying) and 0.5 both hash as 0, so
+    /// whichever depth area resolves first decides the colour of both.
+    /// s52cnsy.cpp DEPARE01/SEABED01 starts from DEPIT and moves to DEPVS
+    /// only when `drval1 >= 0.0 && drval2 > 0.0`.
+    #[test]
+    fn depth_areas_either_side_of_the_datum_do_not_share_a_cache_entry() {
+        let engine = engine(true);
+        let drying = engine.resolve_feature(&depth_area(-0.5, 1.0), GeometryType::Area);
+        assert_eq!(s52(&drying), ["AC(DEPIT)"]);
+        let wet = engine.resolve_feature(&depth_area(0.5, 1.0), GeometryType::Area);
+        assert_eq!(s52(&wet), ["AC(DEPVS)"]);
+    }
+
+    /// `attributes_as_map` keeps only the integers it can parse out of a
+    /// string attribute, so every SYMINS hashes the same. s52cnsy.cpp
+    /// SYMINS01 returns each feature's own SYMINS string; two virtual aids
+    /// with different instructions must draw differently.
+    #[test]
+    fn new_objects_with_different_symins_draw_their_own() {
+        let engine = engine(true);
+        let newobj = |symins: &str| {
+            feature(163, ObjectClass::Other, FeatureType::Point, &[("SYMINS", AttributeValue::String(symins.into()))])
+        };
+        let buoy = engine.resolve_feature(&newobj("SY(BOYSAW12)"), GeometryType::Point);
+        assert_eq!(s52(&buoy), ["SY(BOYSAW12)"]);
+        let beacon = engine.resolve_feature(&newobj("SY(BCNSAW13)"), GeometryType::Point);
+        assert_eq!(s52(&beacon), ["SY(BCNSAW13)"]);
+    }
+
+    /// The conformance harness's view: the lookup row and the expanded
+    /// instructions, with nothing hidden by the display category.
+    #[test]
+    fn resolve_ir_expands_cs_and_ignores_the_display_category() {
+        let standard = engine_showing(true, false);
+        // ROADWY is OTHER, hidden from the Standard display, but the IR still
+        // reports its row: LS(SOLD,2,LANDF) from chartsymbols.xml.
+        let (entry, ir) = standard.resolve_ir(&road(&[]), GeometryType::Line, CsContext::EMPTY);
+        assert_eq!(entry.map(|e| e.display_category), Some(DisplayCategory::Other));
+        assert_eq!(ir.iter().map(|i| i.to_s52()).collect::<Vec<_>>(), ["LS(SOLD,2,LANDF)"]);
+
+        // DEPARE's row is CS(DEPARE01); the IR carries what it expands to,
+        // not the call. 5..15 m: past shallow (2), short of safety (10).
+        let (entry, ir) = standard.resolve_ir(&depth_area(5.0, 15.0), GeometryType::Area, CsContext::EMPTY);
+        assert!(entry.is_some_and(|e| e.instruction.contains("CS(DEPARE")));
+        assert_eq!(ir.iter().map(|i| i.to_s52()).collect::<Vec<_>>(), ["AC(DEPMS)"]);
+    }
+
+    /// The row that applies to the feature, not the class's first row: OBSTRN
+    /// points are OTHER except the WATLEV 7 (floating) row, which is
+    /// DISPLAYBASE.
+    #[test]
+    fn display_category_follows_the_row_the_attributes_select() {
+        let engine = engine(true);
+        let floating = feature(86, ObjectClass::Obstruction, FeatureType::Point, &[("WATLEV", AttributeValue::Integer(7))]);
+        assert_eq!(engine.get_display_category(86, GeometryType::Point), Some(DisplayCategory::Other));
+        assert_eq!(engine.display_category_for(&floating, GeometryType::Point), Some(DisplayCategory::Displaybase));
+        assert_eq!(engine.display_category_for(&road(&[]), GeometryType::Line), Some(DisplayCategory::Other));
+    }
+
+    /// chartsymbols.xml: COALNE lines are "Routing" (7), ROADWY lines
+    /// "Point Symbol" (4), LNDARE areas "Group 1" (1).
+    #[test]
+    fn display_priority_comes_from_the_lookup_row() {
+        let engine = engine(true);
+        let coastline = feature(30, ObjectClass::Coastline, FeatureType::Line, &[]);
+        assert_eq!(engine.get_display_priority(&coastline, GeometryType::Line), 7);
+        assert_eq!(engine.get_display_priority(&road(&[]), GeometryType::Line), 4);
+        let land = feature(71, ObjectClass::LandArea, FeatureType::Area, &[]);
+        assert_eq!(engine.get_display_priority(&land, GeometryType::Area), 1);
+        assert_eq!(engine.resolve_feature(&coastline, GeometryType::Line).unwrap().priority, 7);
+    }
+
+    /// SCAMIN hides an object once the display scale is *smaller* than it:
+    /// s52plib.cpp `ObjectRenderCheckCat` drops it only when
+    /// `chart_scale > Scamin`, so at exactly SCAMIN it still shows. SCAMAX
+    /// (S-57: the largest scale the object may be used at) is the mirror image.
+    #[test]
+    fn scamin_and_scamax_bound_the_scales_an_object_shows_at() {
+        let engine = engine(true);
+        let roadway = road(&[("SCAMIN", AttributeValue::Integer(20_000))]);
+        assert!(engine.should_render(&roadway, GeometryType::Line, 19_999.0).is_some());
+        assert!(engine.should_render(&roadway, GeometryType::Line, 20_000.0).is_some());
+        assert!(engine.should_render(&roadway, GeometryType::Line, 20_001.0).is_none());
+
+        let roadway = road(&[("SCAMAX", AttributeValue::Integer(5_000))]);
+        assert!(engine.should_render(&roadway, GeometryType::Line, 4_999.0).is_none());
+        assert!(engine.should_render(&roadway, GeometryType::Line, 5_000.0).is_some());
+        assert!(engine.should_render(&roadway, GeometryType::Line, 5_001.0).is_some());
+
+        let returned = engine.should_render(&road(&[]), GeometryType::Line, 1.0e6);
+        assert_eq!(returned.map(|e| e.instruction.as_str()), Some("LS(SOLD,2,LANDF)"));
+    }
+
+    /// s52plib.cpp: "According to S52 specs, SCAMIN must not apply to GROUP1
+    /// objects, Meta Objects or DisplayCategoryBase objects" — either one
+    /// suffices.
+    #[test]
+    fn displaybase_or_group_one_objects_ignore_scamin() {
+        let engine = engine(true);
+        let scamin = ("SCAMIN", AttributeValue::Integer(1_000));
+        // A floating obstruction: DISPLAYBASE, priority "Point Symbol".
+        let floating = feature(
+            86,
+            ObjectClass::Obstruction,
+            FeatureType::Point,
+            &[("WATLEV", AttributeValue::Integer(7)), scamin.clone()],
+        );
+        assert!(engine.should_render(&floating, GeometryType::Point, 50_000.0).is_some());
+        // A dredged area: STANDARD, priority "Group 1".
+        let dredged = feature(46, ObjectClass::DredgedArea, FeatureType::Area, &[scamin.clone()]);
+        assert!(engine.should_render(&dredged, GeometryType::Area, 50_000.0).is_some());
+        // A road is neither, and SCAMIN applies.
+        assert!(engine.should_render(&road(&[scamin]), GeometryType::Line, 50_000.0).is_none());
+    }
+
+    #[test]
+    fn should_render_honours_the_display_category() {
+        let standard = engine_showing(true, false);
+        assert!(standard.should_render(&road(&[]), GeometryType::Line, 10_000.0).is_none());
+        let coastline = feature(30, ObjectClass::Coastline, FeatureType::Line, &[]);
+        assert!(standard.should_render(&coastline, GeometryType::Line, 10_000.0).is_some());
+        // M_QUAL is OTHER; with the quality switch off it stays hidden.
+        assert!(standard.should_render(&m_qual(), GeometryType::Area, 10_000.0).is_none());
+        // M_CSCL is OTHER too, but passes the category filter: it carries no
+        // visible portrayal and the SCAMIN book-keeping needs it.
+        let cscl = feature(301, ObjectClass::CompilationScale, FeatureType::Area, &[]);
+        assert!(standard.should_render(&cscl, GeometryType::Area, 10_000.0).is_some());
+        assert!(standard.should_render_class(301, GeometryType::Area));
+        assert!(!standard.should_render_class(308, GeometryType::Area));
+    }
+
+    /// Colours come from the DAY_BRIGHT table, scaled to 0..1 with opaque
+    /// alpha, and indices are positions in that table.
+    #[test]
+    fn colours_and_indices_come_from_the_day_bright_table() {
+        let engine = engine(true);
+        let rgb = |r: f32, g: f32, b: f32| Some([r / 255.0, g / 255.0, b / 255.0, 1.0]);
+        // <color name="DEPDW" r="212" g="234" b="238"/>
+        assert_eq!(engine.get_color("DEPDW"), rgb(212.0, 234.0, 238.0));
+        assert_eq!(engine.get_color("NOSUCH"), None);
+        // CHBLK is the third colour in DAY_BRIGHT, LANDA the twenty-second.
+        assert_eq!(engine.get_color_index("CHBLK"), Some(2));
+        assert_eq!(engine.get_color_index("LANDA"), Some(21));
+        assert_eq!(engine.get_color_index("NOSUCH"), None);
+    }
+
+    /// LNDARE's area row is "AC(LANDA);TX(OBJNAM,…)"; DEPARE's is a CS call
+    /// that produces the fill.
+    #[test]
+    fn area_colour_comes_from_the_first_fill_direct_or_from_cs() {
+        let engine = engine(true);
+        let land = feature(71, ObjectClass::LandArea, FeatureType::Area, &[]);
+        let instructions = engine.get_instructions(&land, GeometryType::Area).unwrap();
+        assert_eq!(
+            instructions.iter().map(|i| i.to_s52()).collect::<Vec<_>>(),
+            ["AC(LANDA)", "TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26)"]
+        );
+        // <color name="LANDA" r="201" g="185" b="122"/>, index 21.
+        assert_eq!(engine.get_area_color(&land), Some([201.0 / 255.0, 185.0 / 255.0, 122.0 / 255.0, 1.0]));
+        assert_eq!(engine.get_area_color_index(&land), Some(21));
+
+        // 5..15 m resolves to DEPMS (152, 197, 242), the thirty-first colour.
+        let depth = depth_area(5.0, 15.0);
+        assert_eq!(engine.get_area_color(&depth), Some([152.0 / 255.0, 197.0 / 255.0, 242.0 / 255.0, 1.0]));
+        assert_eq!(engine.get_area_color_index(&depth), Some(30));
+
+        // COALNE has no area row at all; M_NSYS has one, but it only draws
+        // a boundary.
+        let coastline = feature(30, ObjectClass::Coastline, FeatureType::Line, &[]);
+        assert_eq!(engine.get_area_color(&coastline), None);
+        assert_eq!(engine.get_area_color_index(&coastline), None);
+        assert_eq!(engine.get_area_color(&m_nsys()), None);
+        assert_eq!(engine.get_area_color_index(&m_nsys()), None);
+    }
+
+    /// ROADWY's line row is LS(SOLD,2,LANDF); LANDF is (139, 102, 31).
+    #[test]
+    fn line_style_params_come_from_the_ls_row() {
+        let engine = engine(true);
+        let (pattern, width, rgba) = engine.get_line_style_params(&road(&[])).unwrap();
+        assert_eq!(pattern, crate::s52::instruction::LinePattern::Solid);
+        assert_eq!(width, 2);
+        assert_eq!(rgba, [139.0 / 255.0, 102.0 / 255.0, 31.0 / 255.0, 1.0]);
+    }
+
+    /// The summary reports the table sizes and which categories are shown.
+    #[test]
+    fn summary_reports_tables_and_categories() {
+        let standard = engine_showing(true, false);
+        let summary = standard.summary();
+        let sizes = format!("{} entries, {} colors", standard.tables.entry_count(), standard.tables.color_count());
+        assert!(summary.contains(&sizes), "{summary}");
+        assert!(standard.tables.entry_count() > 1000, "chartsymbols.xml has thousands of rows");
+        assert!(summary.contains("disp=B/S/-"), "{summary}");
+        assert!(engine_showing(false, true).summary().contains("disp=B/-/O"));
     }
 }

@@ -300,19 +300,33 @@ mod tests {
         assert!((v - 3600.0 / 673.1).abs() < 0.05, "{v}");
         // Inside the no-go cone there is no number.
         assert!(polar.speed_kt(20.0, 10.0).is_none());
+        // At 150° R150 (445.9 s/nm) and DW150 (451.9) disagree by sail
+        // choice; the boat carries the faster sail, so R150's 8.07 kn wins
+        // over DW150's 7.97.
+        let v = polar.speed_kt(150.0, 10.0).unwrap();
+        assert!((v - 3600.0 / 445.9).abs() < 0.02, "{v}");
+        // The header is the certificate's wind speeds, in order: the 16 kt
+        // column is the 16 kt allowance (R90 316.8 s/nm), not a neighbour's.
+        let v = polar.speed_kt(90.0, 16.0).unwrap();
+        assert!((v - 3600.0 / 316.8).abs() < 0.02, "{v}");
 
         // The beat row is boat speed, not VMG: faster than VMG by 1/cos.
         let al = &doc["rms"][0]["Allowances"];
         let vmg10 = 3600.0 / al["Beat"][3].as_f64().unwrap();
         let beat10 = polar.vmg_at(10.0).beat_vmg_kt as f64;
         assert!(
-            (beat10 - vmg10).abs() < 0.35,
+            (beat10 - vmg10).abs() < 0.1,
             "recovered beat VMG {beat10:.2} vs certificate {vmg10:.2}"
         );
 
-        // The search is case-insensitive and misses politely.
-        assert_eq!(parse_and_filter(FIXTURE, "SHOGUN".to_lowercase().as_str()).len(), 1);
+        // The search matches class, yacht name and builder whatever their
+        // case ("Shogun 50" matched "shogun" above; the caller lowercases
+        // the needle), and misses politely.
+        assert_eq!(parse_and_filter(FIXTURE, "fantastic").len(), 1);
+        assert_eq!(parse_and_filter(FIXTURE, "linjett").len(), 1);
         assert!(parse_and_filter(FIXTURE, "bavaria").is_empty());
+        // An empty search lists everything.
+        assert_eq!(parse_and_filter(FIXTURE, "").len(), 1);
     }
 
     /// A gap in an allowance row must not shift the columns after it. The

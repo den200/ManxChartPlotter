@@ -3618,13 +3618,22 @@ fn get_text_for_attribute(
 ) -> Option<String> {
     use crate::senc::AttributeValue;
 
+    // A quoted TX argument is text to print, not an attribute to look up.
+    if let Some(literal) = attribute
+        .strip_prefix('\'')
+        .and_then(|a| a.strip_suffix('\''))
+    {
+        return (!literal.is_empty()).then(|| sanitize_bitmap_text(literal));
+    }
     let attr_val = if attribute == "OBJNAM" {
         // Match OpenCPN's national text behavior: when a rule requests OBJNAM,
-        // prefer NOBJNM if it exists and differs.
-        feature
+        // prefer NOBJNM — but only one that says something. An empty
+        // national name must not hide the ordinary one.
+        let national = feature
             .attributes
             .get("NOBJNM")
-            .or_else(|| feature.attributes.get(attribute))?
+            .filter(|v| !matches!(v, AttributeValue::String(s) if s.trim().is_empty()));
+        national.or_else(|| feature.attributes.get(attribute))?
     } else {
         feature.attributes.get(attribute)?
     };
@@ -4493,10 +4502,9 @@ mod tests {
         assert_eq!(std::mem::align_of::<AreaVertex>(), 4);
     }
 
-    /// Packet positions are metres from the tile centre, and the renderer
-    /// re-bases each tile on `TileId::origin`. The two must agree exactly, and
-    /// the offset must survive f32 at Danish latitudes to well under a
-    /// millimetre — global Mercator in f32 would be 0.5 m out here.
+    /// The no-data fill reaches every corner of its tile (a hair beyond, so
+    /// neighbouring tiles leave no seam), at the lowest priority so any chart
+    /// drawn in the tile covers it.
     #[test]
     fn the_no_data_quad_covers_the_whole_tile() {
         let (mx, my) = crate::tiles::latlon_to_mercator(55.9, 12.7);
@@ -4515,6 +4523,10 @@ mod tests {
         assert!(q.iter().all(|v| v.color_index == 7 && v.disp_prio == 0));
     }
 
+    /// Packet positions are metres from the tile centre, and the renderer
+    /// re-bases each tile on `TileId::origin`. The two must agree exactly, and
+    /// the offset must survive f32 at Danish latitudes to well under a
+    /// millimetre — global Mercator in f32 would be 0.5 m out here.
     #[test]
     fn tile_relative_positions_keep_millimetres() {
         let (mx, my) = crate::tiles::latlon_to_mercator(55.70333, 12.61457);
@@ -4606,30 +4618,54 @@ mod tests {
     #[test]
     fn tile_packet_byte_size() {
         let mut packet = TilePacket::new(TileId::new(10, 512, 512));
-        packet.area_vertices.push(AreaVertex {
+        let v = AreaVertex {
             position: [0.0, 0.0],
             color_index: 0,
             disp_prio: 0,
             shade: 0.0,
-        });
+        };
+        packet.area_vertices.push(v);
         packet.compute_byte_size();
         assert_eq!(packet.byte_size, std::mem::size_of::<AreaVertex>());
+
+        // Every buffer counts towards the cache budget, the background and
+        // instanced ones too: one left out lets the GPU cache overrun.
+        packet.bg_area_vertices.push(v);
+        packet.sector_instances.push(bytemuck::Zeroable::zeroed());
+        packet.label_candidates.push(crate::render::TextParams::default());
+        packet.lc_batches.push(LcBatch {
+            key: LineBatchKey::new(0, crate::s52::LineStyleKey::new(LinePattern::Solid, 1, "CHBLK")),
+            segments: vec![bytemuck::Zeroable::zeroed(); 3],
+        });
+        packet.compute_byte_size();
+        assert_eq!(
+            packet.byte_size,
+            2 * std::mem::size_of::<AreaVertex>()
+                + std::mem::size_of::<crate::render::SectorInstance>()
+                + std::mem::size_of::<crate::render::TextParams>()
+                + 3 * std::mem::size_of::<crate::render::LcSegment>()
+        );
+    }
+
+    /// A tile whose only content is a coarser chart's land, held in the
+    /// background buffer, is not empty — marked empty, it showed as a
+    /// tile-sized square of sea cut into the land.
+    #[test]
+    fn a_tile_with_only_background_land_is_not_empty() {
+        let mut packet = TilePacket::new(TileId::new(12, 2200, 1270));
+        assert!(packet.is_empty());
+        packet.bg_area_vertices.push(AreaVertex {
+            position: [0.0, 0.0],
+            color_index: 3,
+            disp_prio: 1,
+            shade: 0.0,
+        });
+        assert!(!packet.is_empty());
     }
 
     // test_scamin_and_scamax_combined: removed (missing make_feature_with_scamin helper)
 
     // LC symbol lookup tests
-
-    #[test]
-    fn test_line_style_table_loads() {
-        let table = get_line_style_table();
-        assert!(
-            table.is_some(),
-            "LineStyleTable should load from chartsymbols.xml"
-        );
-        let table = table.unwrap();
-        assert!(table.len() > 0, "LineStyleTable should have symbols");
-    }
 
     #[test]
     fn test_line_style_table_has_lowacc21() {
@@ -4691,6 +4727,15 @@ mod tests {
             false,
         );
         assert!(key3 < key4, "pass=0 should sort before pass=1");
+
+        // At the same priority a background chart's line draws first, under
+        // the foreground — but priority still comes before that.
+        let style = || LineStyleKey::new(LinePattern::Solid, 1, "CHBLK");
+        let bg = LineBatchKey::new_with_priority(4, 1, style(), 9, true);
+        let fg = LineBatchKey::new_with_priority(4, 0, style(), 1, false);
+        assert!(bg < fg, "background before foreground at one priority");
+        let fg_low = LineBatchKey::new_with_priority(3, 0, style(), 1, false);
+        assert!(fg_low < bg, "priority decides first");
     }
 
     #[test]
@@ -4720,6 +4765,55 @@ mod tests {
             get_text_for_attribute(&feature, "OBJNAM", None),
             Some("Brøndby".to_string())
         );
+
+        // Without a national name the international one is used.
+        let mut feature = feature;
+        let mut attributes = crate::senc::Attributes::new();
+        attributes.insert("OBJNAM", AttributeValue::String("Brondby".to_string()));
+        feature.attributes = attributes;
+        assert_eq!(
+            get_text_for_attribute(&feature, "OBJNAM", None),
+            Some("Brondby".to_string())
+        );
+
+        // A national name that is present but blank does not hide the name
+        // that is there.
+        feature
+            .attributes
+            .insert("NOBJNM", AttributeValue::String("  ".to_string()));
+        assert_eq!(
+            get_text_for_attribute(&feature, "OBJNAM", None),
+            Some("Brondby".to_string())
+        );
+    }
+
+    /// A quoted TX argument is printed as written: a virtual AIS aid's
+    /// SYMINS asks for `TX('V-AIS',…)`, and looked up as an attribute that
+    /// text came out as nothing.
+    #[test]
+    fn a_quoted_text_argument_is_printed_as_it_stands() {
+        let tx = crate::s52::instruction::RenderInstruction::parse_single(
+            "TX('V-AIS',3,2,2,'15110',2,0,CHMGD,11)",
+        )
+        .unwrap();
+        let crate::s52::instruction::RenderInstruction::Text { attribute, .. } = &tx else {
+            panic!("not a text instruction: {tx:?}");
+        };
+        let feature = Feature {
+            type_code: 0,
+            object_class: ObjectClass::Other,
+            feature_type: FeatureType::Point,
+            attributes: crate::senc::Attributes::new(),
+            area_geometry: None,
+            point_geometry: None,
+            line_geometry: None,
+            multipoint_geometry: None,
+        };
+        assert_eq!(get_text_for_attribute(&feature, attribute, None), Some("V-AIS".to_string()));
+        // And it round-trips as OpenCPN writes it.
+        assert_eq!(tx.to_s52(), "TX('V-AIS',3,2,2,'15110',2,0,CHMGD,11)");
+        // An unquoted argument is still an attribute name.
+        assert_eq!(get_text_for_attribute(&feature, "V-AIS", None), None);
     }
 
     #[test]
@@ -4728,6 +4822,31 @@ mod tests {
         close_ring_if_needed(&mut points);
         assert_eq!(points.len(), 4);
         assert_eq!(points.first(), points.last());
+        // A ring that is already closed, or closed to within rounding, is
+        // left alone rather than given a zero-length closing edge.
+        close_ring_if_needed(&mut points);
+        assert_eq!(points.len(), 4);
+        let mut nearly = vec![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [1.0005, 2.0]];
+        close_ring_if_needed(&mut nearly);
+        assert_eq!(nearly.len(), 4);
+    }
+
+    /// A boundary path is closed only across a rounding gap. A real gap is
+    /// an open path — cut at an edge shared with the coastline — and bridging
+    /// it would draw a straight line across the chart.
+    #[test]
+    fn only_a_rounding_gap_is_closed() {
+        let mut nearly = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.2, 0.1]];
+        close_open_ring_if_rounding_gap(&mut nearly);
+        assert_eq!(nearly.last(), Some(&[0.0, 0.0]));
+
+        let mut open = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]];
+        close_open_ring_if_rounding_gap(&mut open);
+        assert_eq!(open.len(), 4, "a 100 m gap is a real gap");
+
+        let mut closed = vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 0.0]];
+        close_open_ring_if_rounding_gap(&mut closed);
+        assert_eq!(closed.len(), 4, "already closed");
     }
 
     #[test]
@@ -4740,6 +4859,13 @@ mod tests {
         assert!(point_in_any_triangle([1.0, 9.0], &tris));
         assert!(!point_in_any_triangle([15.0, 5.0], &tris));
         assert!(!point_in_any_triangle([-1.0, 5.0], &tris));
+        // On the shared diagonal and on an outer edge counts as covered.
+        assert!(point_in_any_triangle([3.0, 3.0], &tris));
+        assert!(point_in_any_triangle([10.0, 4.0], &tris));
+        // SENC triangles come in either winding.
+        let cw = [[[0.0, 0.0], [0.0, 10.0], [10.0, 0.0]]];
+        assert!(point_in_any_triangle([2.0, 2.0], &cw));
+        assert!(!point_in_any_triangle([8.0, 8.0], &cw));
     }
 
     #[test]
@@ -4752,6 +4878,12 @@ mod tests {
         };
 
         assert!(bbox_is_degenerate(bbox));
+        // A line-shaped box is degenerate too, and so is one with a NaN.
+        let line = crate::senc::BBox { max_y: 56.0, ..bbox };
+        assert!(bbox_is_degenerate(line));
+        let real = crate::senc::BBox { max_x: 12.5, max_y: 55.5, ..bbox };
+        assert!(!bbox_is_degenerate(real));
+        assert!(bbox_is_degenerate(crate::senc::BBox { min_x: f64::NAN, ..real }));
     }
 
     #[test]
@@ -4773,5 +4905,14 @@ mod tests {
             tile_relation_mercator(feature_bounds, tile),
             BBoxTileRelation::Intersects
         );
+        // FullyInside is what lets the builder skip clipping, so it must
+        // only be said of bounds that really are inside, edges included.
+        let b = |a, b, c, d| TileBounds { min_x: a, max_x: b, min_y: c, max_y: d };
+        assert_eq!(tile_relation_mercator(b(12.0, 18.0, 11.0, 19.0), tile), BBoxTileRelation::FullyInside);
+        assert_eq!(tile_relation_mercator(tile, tile), BBoxTileRelation::FullyInside);
+        assert_eq!(tile_relation_mercator(b(12.0, 21.0, 11.0, 19.0), tile), BBoxTileRelation::Intersects);
+        assert_eq!(tile_relation_mercator(b(12.0, 18.0, 9.0, 19.0), tile), BBoxTileRelation::Intersects);
+        assert_eq!(tile_relation_mercator(b(21.0, 30.0, 11.0, 19.0), tile), BBoxTileRelation::Outside);
+        assert_eq!(tile_relation_mercator(b(12.0, 18.0, 0.0, 9.0), tile), BBoxTileRelation::Outside);
     }
 }

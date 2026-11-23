@@ -77,10 +77,30 @@ mod tests {
         );
         let settings = MarinerSettings::default();
         let instructions = quapos01_instructions(&feature, &settings);
-        assert!(matches!(
-            instructions.as_slice(),
-            [RenderInstruction::LineComplex { .. }]
-        ));
+        assert_eq!(s52(&instructions), ["LC(LOWACC21)"]);
+    }
+
+    fn s52(instrs: &[RenderInstruction]) -> Vec<String> {
+        instrs.iter().map(|i| i.to_s52()).collect()
+    }
+
+    #[test]
+    fn accurate_or_absent_quapos_is_a_plain_coastline() {
+        // Only 2..9 is low accuracy; 1 (surveyed), 10 and 11 are not.
+        for q in [None, Some(1), Some(10), Some(11)] {
+            let attrs = q
+                .map(|q| vec![("QUAPOS", AttributeValue::Integer(q))])
+                .unwrap_or_default();
+            let feature = make_feature(ObjectClass::Coastline, attrs);
+            let out = quapos01_instructions(&feature, &MarinerSettings::default());
+            assert_eq!(s52(&out), ["LS(SOLD,1,CSTLN)"], "QUAPOS {q:?}");
+        }
+        for q in [2, 9] {
+            let feature =
+                make_feature(ObjectClass::Coastline, vec![("QUAPOS", AttributeValue::Integer(q))]);
+            let out = quapos01_instructions(&feature, &MarinerSettings::default());
+            assert_eq!(s52(&out), ["LC(LOWACC21)"], "QUAPOS {q}");
+        }
     }
 
     #[test]
@@ -91,6 +111,17 @@ mod tests {
         );
         let settings = MarinerSettings::default();
         let instructions = quapos01_instructions(&feature, &settings);
-        assert_eq!(instructions.len(), 2);
+        // A radar-conspicuous coastline gets a magenta halo under the line.
+        assert_eq!(s52(&instructions), ["LS(SOLD,3,CHMGF)", "LS(SOLD,1,CSTLN)"]);
+    }
+
+    #[test]
+    fn conrad_emphasis_is_for_coastlines_only() {
+        let feature = make_feature(
+            ObjectClass::ShorelineConstruction,
+            vec![("CONRAD", AttributeValue::Integer(1))],
+        );
+        let out = quapos01_instructions(&feature, &MarinerSettings::default());
+        assert_eq!(s52(&out), ["LS(SOLD,1,CSTLN)"]);
     }
 }

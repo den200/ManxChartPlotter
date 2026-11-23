@@ -130,6 +130,7 @@ impl Simulator {
                 .map(|(path, value)| Update {
                     path: path.to_string(),
                     value,
+                    sent: None,
                 })
                 .collect(),
         }
@@ -171,14 +172,17 @@ impl Traffic {
                     Update {
                         path: "navigation.position".into(),
                         value: Value::Position { lat, lon },
+                        sent: None,
                     },
                     Update {
                         path: "navigation.speedOverGround".into(),
                         value: Value::Number(0.0),
+                        sent: None,
                     },
                     Update {
                         path: "navigation.headingTrue".into(),
                         value: Value::Number(self.sim.heading()),
+                        sent: None,
                     },
                 ],
             }
@@ -189,14 +193,17 @@ impl Traffic {
         delta.updates.push(Update {
             path: "name".into(),
             value: Value::Text(self.name.to_string()),
+            sent: None,
         });
         delta.updates.push(Update {
             path: "navigation.state".into(),
             value: Value::Text(self.state.to_string()),
+            sent: None,
         });
         delta.updates.push(Update {
             path: "design.aisShipType".into(),
             value: Value::Number(self.ship_type as f64),
+            sent: None,
         });
         delta.context = Some(self.context.clone());
         delta
@@ -215,7 +222,7 @@ pub fn traffic_around(centre: Course) -> Vec<Traffic> {
         ("NORDLYS", "under way using engine", "219001234", 60, 0.045, -0.070, 95.0, 12.0, true),
         ("KATTEGAT TRADER", "under way using engine", "244060807", 70, -0.055, 0.045, 340.0, 9.5, true),
         ("HAVFISK", "under way using engine", "219778001", 30, 0.020, 0.065, 210.0, 4.0, true),
-        ("ANNA MAERSK", "at anchor", "219900555", 80, -0.030, -0.055, 15.0, 0.0, false),
+        ("ANNA MAERSK", "anchored", "219900555", 80, -0.030, -0.055, 15.0, 0.0, false),
     ];
     spec.iter()
         .map(
@@ -241,11 +248,14 @@ pub fn traffic_around(centre: Course) -> Vec<Traffic> {
 ///
 /// `None` when this is not a simulator address at all.
 pub fn parse_course(input: &str) -> Option<Course> {
-    let rest = input
-        .trim()
-        .strip_prefix("sim")?
-        .trim_start_matches(':')
-        .trim();
+    let rest = input.trim().strip_prefix("sim")?;
+    if rest.trim().is_empty() {
+        return Some(Course::default());
+    }
+    // Only `sim` itself or `sim:` and a position: a server called
+    // `simrad.local` or `simon-boat.local` is a real boat to connect to,
+    // not a request for a pretend one.
+    let rest = rest.trim_start().strip_prefix(':')?.trim();
     if rest.is_empty() {
         return Some(Course::default());
     }
@@ -359,8 +369,74 @@ mod tests {
         let c = parse_course("sim:56.1,11.2,90,4.5").expect("a course");
         assert_eq!((c.heading_deg, c.speed_kn), (90.0, 4.5));
 
+        let c = parse_course("sim: 56.1, 11.2, 90").expect("a course");
+        assert_eq!((c.lat, c.lon, c.heading_deg), (56.1, 11.2, 90.0));
+        assert_eq!(c.speed_kn, Course::default().speed_kn);
+
         // The default is the Kattegat, which is where the Danish charts are.
         let d = Course::default();
         assert!((56.0..57.0).contains(&d.lat) && (10.5..12.5).contains(&d.lon));
+    }
+
+    /// A Signal K server whose name happens to begin with "sim" — a Simrad
+    /// gateway, say — must be connected to, not replaced by a pretend boat.
+    #[test]
+    fn a_host_that_merely_starts_with_sim_is_a_host() {
+        assert!(parse_course("simrad.local").is_none());
+        assert!(parse_course("simon-boat.local:3000").is_none());
+    }
+
+    /// The traffic is what the AIS layer is exercised against, so it must
+    /// arrive as other vessels — each under its own MMSI context — and the
+    /// ones that are meant to move must move while the one at anchor stays.
+    #[test]
+    fn traffic_speaks_as_other_vessels_and_only_the_moving_ones_move() {
+        let mut traffic = traffic_around(Course::default());
+        assert_eq!(traffic.len(), 4);
+        let pos = |d: &Delta| {
+            d.updates
+                .iter()
+                .find_map(|u| match u.value {
+                    Value::Position { lat, lon } => Some((lat, lon)),
+                    _ => None,
+                })
+                .expect("a position")
+        };
+        let mut contexts = Vec::new();
+        for t in traffic.iter_mut() {
+            let first = t.step(1.0);
+            let mut last = t.step(1.0);
+            for _ in 0..30 {
+                last = t.step(1.0);
+            }
+            let ctx = last.context.clone().expect("a target names itself");
+            assert!(!last.is_self(None), "{} spoke as our own boat", t.name);
+            assert!(ctx.starts_with("vessels.urn:mrn:imo:mmsi:"), "{ctx}");
+            assert!(last
+                .updates
+                .iter()
+                .any(|u| u.path == "name" && u.value == Value::Text(t.name.into())));
+            let moved = pos(&first) != pos(&last);
+            assert_eq!(moved, t.name != "ANNA MAERSK", "{} moved: {moved}", t.name);
+            contexts.push(ctx);
+        }
+        contexts.sort();
+        contexts.dedup();
+        assert_eq!(contexts.len(), 4, "two targets share a context");
+    }
+
+    /// The anchored ship is there so that one target draws no course
+    /// vector. That rests on the fleet reading its state as not under way.
+    #[test]
+    fn the_anchored_ship_reads_as_not_under_way() {
+        let mut fleet = crate::signalk::Fleet::default();
+        for t in traffic_around(Course::default()).iter_mut() {
+            fleet.apply(&t.step(1.0));
+        }
+        let anchored = fleet
+            .targets()
+            .find(|t| t.name() == Some("ANNA MAERSK"))
+            .expect("the anchored ship");
+        assert!(!anchored.under_way());
     }
 }

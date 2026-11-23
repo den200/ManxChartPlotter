@@ -1,6 +1,6 @@
 [package]
 name = "manx"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 description = "A fast, light chart plotter for the Raspberry Pi, Linux and Android"
 license = "GPL-3.0-or-later"
@@ -101,3 +101,6 @@ winit = { version = "0.30", features = ["android-native-activity"] }
 # Both already come in with winit's android-activity.
 jni = "0.21"
 ndk-context = "0.1"
+
+[dev-dependencies]
+proptest = "1.12.0"

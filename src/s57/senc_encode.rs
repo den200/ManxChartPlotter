@@ -602,4 +602,68 @@ mod tests {
             assert!(g.triangles.iter().any(|t| t.triangle_count() > 0));
         }
     }
+
+    /// Every position the SENC holds — points in degrees, lines and area
+    /// triangles in metres from the reference point — reads back as a
+    /// coordinate the S-57 cell actually has. A sign, an axis or a reference
+    /// point that the writer and the reader disagree on moves every feature
+    /// while the checks above (a scale, a reference point in range, some
+    /// triangles) still pass.
+    #[test]
+    fn every_encoded_position_is_one_the_cell_holds() {
+        use crate::tiles::{latlon_to_mercator, mercator_to_latlon};
+        let path = std::path::PathBuf::from(format!(
+            "{}/tests/fixtures/s57/US4MA1BD.000",
+            env!("CARGO_MANIFEST_DIR")
+        ));
+        let cell = Cell::open(&path).unwrap();
+        let chart = ChartData::parse(encode(&cell)).unwrap();
+        let source: Vec<[f64; 2]> = cell
+            .vectors
+            .values()
+            .flat_map(|v| v.coords.iter().map(|c| cell.lonlat(*c)))
+            .map(|[lon, lat, _]| [lat, lon])
+            .collect();
+        // A tenth of a metre, about 1e-6°: far above f32 noise at cell size,
+        // far below any real displacement.
+        let known = |lat: f64, lon: f64| {
+            source.iter().any(|p| (p[0] - lat).abs() < 1e-6 && (p[1] - lon).abs() < 1e-6)
+        };
+        let (rx, ry) = latlon_to_mercator(chart.header.ref_lat, chart.header.ref_lon);
+        let local = |p: [f32; 2]| mercator_to_latlon(rx + p[0] as f64, ry + p[1] as f64);
+
+        let (mut points, mut vertices) = (0, 0);
+        for f in &chart.features {
+            if let Some(pg) = &f.point_geometry {
+                assert!(known(pg.x, pg.y), "point {} {} is not in the cell", pg.x, pg.y);
+                points += 1;
+            }
+            if let Some(mp) = &f.multipoint_geometry {
+                for p in &mp.points {
+                    let (lat, lon) = local([p[0], p[1]]);
+                    assert!(known(lat, lon), "sounding {lat} {lon} is not in the cell");
+                    points += 1;
+                }
+            }
+            if let Some(lg) = &f.line_geometry {
+                for line in lg.resolve(&chart.edge_table) {
+                    for p in line {
+                        let (lat, lon) = local(p);
+                        assert!(known(lat, lon), "line vertex {lat} {lon} is not in the cell");
+                        vertices += 1;
+                    }
+                }
+            }
+            if let Some(ag) = &f.area_geometry {
+                for prim in &ag.triangles {
+                    for p in &prim.vertices {
+                        let (lat, lon) = local(*p);
+                        assert!(known(lat, lon), "triangle vertex {lat} {lon} is not in the cell");
+                        vertices += 1;
+                    }
+                }
+            }
+        }
+        assert!(points > 0 && vertices > 100, "{points} points, {vertices} vertices");
+    }
 }

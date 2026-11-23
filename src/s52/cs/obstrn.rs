@@ -138,19 +138,19 @@ pub fn obstrn04(
         }),
     };
 
-    let is_isolated = is_isolated_danger(depth_value, expsou, settings, ctx);
+    // UDWHAZ03 gives nothing for an object that is dry (WATLEV 1 or 2):
+    // it is land to steer round, not a hidden danger. Decided once, here, so
+    // the point and the area paths cannot disagree about it.
+    let is_isolated = is_isolated_danger(depth_value, expsou, settings, ctx)
+        && !matches!(watlev, 1 | 2);
 
-    // Check for isolated danger (UDWHAZ03)
     if is_isolated {
-        // Only show isolated danger symbol if not always dry
-        if watlev != 1 && watlev != 2 {
-            return Obstrn04Result {
-                symbol: ObstrnSymbol::Isodgr51,
-                show_sounding: false,
-                is_isolated_danger: true,
-                depth_value,
-            };
-        }
+        return Obstrn04Result {
+            symbol: ObstrnSymbol::Isodgr51,
+            show_sounding: false,
+            is_isolated_danger: true,
+            depth_value,
+        };
     }
 
     // Handle point features
@@ -164,7 +164,7 @@ pub fn obstrn04(
     }
 
     // Handle area features
-    obstrn04_area(valsou, watlev, is_isolated, depth_value)
+    obstrn04_area(valsou, watlev, depth_value)
 }
 
 fn obstrn04_point(
@@ -251,22 +251,9 @@ fn obstrn04_line(valsou: Option<f64>, depth_value: Option<f64>) -> Obstrn04Resul
     }
 }
 
-fn obstrn04_area(
-    valsou: Option<f64>,
-    watlev: i32,
-    is_isolated: bool,
-    depth_value: Option<f64>,
-) -> Obstrn04Result {
-    // Area obstructions get fill pattern + line style
-    if is_isolated {
-        return Obstrn04Result {
-            symbol: ObstrnSymbol::Isodgr51,
-            show_sounding: false,
-            is_isolated_danger: true,
-            depth_value,
-        };
-    }
-
+fn obstrn04_area(valsou: Option<f64>, watlev: i32, depth_value: Option<f64>) -> Obstrn04Result {
+    // Area obstructions get fill pattern + line style; an isolated danger
+    // has already been returned by the caller.
     let show_sounding = valsou.is_some() && valsou.unwrap() <= 20.0;
 
     // Default area obstruction symbol
@@ -522,8 +509,8 @@ mod tests {
     }
 
     #[test]
-    fn test_obstrn_always_dry() {
-        // WATLEV=1 (always dry) -> OBSTRN11
+    fn test_obstrn_above_water_no_valsou() {
+        // WATLEV=1 (partly submerged at high water) -> OBSTRN11
         let feature = make_obstrn(None, Some(1));
         let settings = test_contours();
         let result = obstrn04(&feature, &settings, CsContext::EMPTY);
@@ -531,9 +518,9 @@ mod tests {
     }
 
     #[test]
-    fn test_obstrn_covers_uncovers_with_depth() {
-        // WATLEV=3 (covers/uncovers) with VALSOU > safety_contour -> DANGER52
-        // (shallow depths trigger isolated danger instead)
+    fn test_obstrn_submerged_with_depth() {
+        // WATLEV=3 (always under water) with a VALSOU of 20 m or less ->
+        // DANGER52 plus the sounding.
         let feature = make_obstrn(Some(15.0), Some(3));
         let settings = test_contours();
         let result = obstrn04(&feature, &settings, CsContext::EMPTY);
@@ -547,19 +534,203 @@ mod tests {
         let settings = test_contours();
         let instrs = obstrn04_instructions(&feature, &settings, CsContext::EMPTY);
 
-        // Should have Symbol and Text
-        assert!(instrs.len() >= 2);
-        assert!(matches!(instrs[0], RenderInstruction::Symbol { .. }));
-        if let RenderInstruction::Text { attribute, .. } = &instrs[1] {
-            assert_eq!(attribute, "VALSOU");
-        } else {
-            panic!("Expected Text instruction");
+        // The danger symbol, then the sounding (black: it is within 20 m).
+        assert_eq!(s52(&instrs), ["SY(DANGER52)", "TE('%4.1lf','VALSOU',3,1,2,'15110',1,1,CHBLK,11)"]);
+    }
+
+    fn s52(instrs: &[RenderInstruction]) -> Vec<String> {
+        instrs.iter().map(|i| i.to_s52()).collect()
+    }
+
+    fn with_type(mut f: Feature, t: FeatureType) -> Feature {
+        f.feature_type = t;
+        f
+    }
+
+    fn deep_water() -> CsContext {
+        CsContext {
+            area_drval1: vec![20.0],
+            line_drval2: vec![],
+            ..Default::default()
         }
     }
 
+    /// UDWHAZ03 compares `depth_value <= safety_contour`: an obstruction lying
+    /// exactly at the safety contour in otherwise safe water is still an
+    /// isolated danger. One a centimetre deeper is not.
     #[test]
-    fn test_obstrn_awash_with_depth() {
-        // WATLEV=4 (awash) with VALSOU > safety_contour -> DANGER53
+    fn obstruction_at_the_safety_contour_is_an_isolated_danger() {
+        let settings = test_contours(); // safety contour 10 m
+        let at = obstrn04(&make_obstrn(Some(10.0), Some(3)), &settings, &deep_water());
+        assert!(at.is_isolated_danger);
+        assert_eq!(at.symbol, ObstrnSymbol::Isodgr51);
+
+        let below = obstrn04(&make_obstrn(Some(10.01), Some(3)), &settings, &deep_water());
+        assert!(!below.is_isolated_danger);
+        assert_eq!(below.symbol, ObstrnSymbol::Danger52);
+    }
+
+    /// A point isolated danger is drawn as ISODGR51 alone — no sounding.
+    #[test]
+    fn isolated_danger_point_draws_only_isodgr51() {
+        let settings = test_contours();
+        let instrs = obstrn04_instructions(&make_uwtroc(Some(3.0), Some(3)), &settings, &deep_water());
+        assert_eq!(s52(&instrs), ["SY(ISODGR51)"]);
+    }
+
+    /// An object that stands above the water (S-57 WATLEV 1, partly
+    /// submerged at high water, or 2, always dry) is not given the
+    /// isolated-danger symbol even when the water around it is deep: UDWHAZ03
+    /// leaves its command string empty for those, and the ordinary symbol is
+    /// drawn.
+    #[test]
+    fn dry_rock_in_deep_water_keeps_its_own_symbol() {
+        let settings = test_contours();
+        let r = obstrn04(&make_uwtroc(None, Some(2)), &settings, &deep_water());
+        assert_eq!(r.symbol, ObstrnSymbol::Lndare01);
+        assert!(!r.is_isolated_danger);
+
+        let r = obstrn04(&make_obstrn(None, Some(1)), &settings, &deep_water());
+        assert_eq!(r.symbol, ObstrnSymbol::Obstrn11);
+        assert!(!r.is_isolated_danger);
+    }
+
+    /// Without VALSOU the depth is inferred: a rock always under water
+    /// (WATLEV 3) is taken as 0.01 m — shallower than any safety contour — so
+    /// in deep water it is an isolated danger.
+    #[test]
+    fn submerged_rock_without_sounding_in_deep_water_is_isolated() {
+        let r = obstrn04(&make_uwtroc(None, Some(3)), &test_contours(), &deep_water());
+        assert!(r.is_isolated_danger);
+        assert_eq!(r.symbol, ObstrnSymbol::Isodgr51);
+    }
+
+    #[test]
+    fn exposed_sounding_is_not_promoted_by_its_surroundings() {
+        // EXPSOU 1: the object is within the range of the surrounding depth
+        // area, so the area test does not apply.
+        let mut f = make_obstrn(Some(5.0), Some(3));
+        f.attributes.insert("EXPSOU", AttributeValue::Integer(1));
+        let r = obstrn04(&f, &test_contours(), &deep_water());
+        assert!(!r.is_isolated_danger);
+    }
+
+    /// The rest of continuation A, point by point against s52cnsy.cpp.
+    #[test]
+    fn point_symbol_table_matches_obstrn04() {
+        let settings = test_contours();
+        let sym = |f: Feature| obstrn04(&f, &settings, CsContext::EMPTY);
+
+        // UWTROC with a sounding.
+        let r = sym(make_uwtroc(Some(5.0), Some(4)));
+        assert_eq!((r.symbol, r.show_sounding), (ObstrnSymbol::Uwtroc04, false));
+        let r = sym(make_uwtroc(Some(5.0), None));
+        assert_eq!((r.symbol, r.show_sounding), (ObstrnSymbol::Danger51, true));
+        // UWTROC without a sounding.
+        assert_eq!(sym(make_uwtroc(None, None)).symbol, ObstrnSymbol::Uwtroc04);
+        assert_eq!(sym(make_uwtroc(None, Some(4))).symbol, ObstrnSymbol::Uwtroc04);
+        // OBSTRN with a sounding.
+        let r = sym(make_obstrn(Some(5.0), Some(1)));
+        assert_eq!((r.symbol, r.show_sounding), (ObstrnSymbol::Lndare01, false));
+        let r = sym(make_obstrn(Some(5.0), Some(5)));
+        assert_eq!((r.symbol, r.show_sounding), (ObstrnSymbol::Danger53, true));
+        // A sounding exactly 20 m deep is still "shallow" for this table.
+        let r = sym(make_obstrn(Some(20.0), Some(4)));
+        assert_eq!(r.symbol, ObstrnSymbol::Danger53);
+        // OBSTRN without a sounding.
+        assert_eq!(sym(make_obstrn(None, Some(2))).symbol, ObstrnSymbol::Obstrn11);
+        assert_eq!(sym(make_obstrn(None, Some(3))).symbol, ObstrnSymbol::Obstrn01);
+        assert_eq!(sym(make_obstrn(None, Some(5))).symbol, ObstrnSymbol::Obstrn03);
+    }
+
+    #[test]
+    fn deep_obstruction_sounding_is_grey() {
+        let instrs =
+            obstrn04_instructions(&make_obstrn(Some(25.0), Some(3)), &test_contours(), CsContext::EMPTY);
+        assert_eq!(
+            s52(&instrs),
+            ["SY(DANGER52)", "TE('%4.1lf','VALSOU',3,1,2,'15110',1,1,CHGRD,11)"]
+        );
+    }
+
+    /// Continuation B: a line obstruction is dotted within 20 m (with its
+    /// sounding) and dashed deeper (without).
+    #[test]
+    fn line_obstruction_style_follows_its_depth() {
+        let settings = test_contours();
+        let line = |v| {
+            s52(&obstrn04_instructions(
+                &with_type(make_obstrn(v, None), FeatureType::Line),
+                &settings,
+                CsContext::EMPTY,
+            ))
+        };
+        assert_eq!(
+            line(Some(5.0)),
+            ["LS(DOTT,2,CHBLK)", "TE('%4.1lf','VALSOU',3,1,2,'15110',1,1,CHBLK,11)"]
+        );
+        assert_eq!(line(Some(25.0)), ["LS(DASH,2,CHBLK)"]);
+        assert_eq!(line(None), ["LS(DOTT,2,CHBLK)"]);
+    }
+
+    /// Continuation C: area obstructions are filled, never marked with a
+    /// point symbol, and the fill depends on WATLEV.
+    #[test]
+    fn area_obstruction_fill_follows_watlev() {
+        let settings = test_contours();
+        let area = |f: Feature| {
+            s52(&obstrn04_instructions(&with_type(f, FeatureType::Area), &settings, CsContext::EMPTY))
+        };
+        assert_eq!(area(make_obstrn(None, None)), ["AC(DEPVS)", "LS(DOTT,2,CHBLK)"]);
+        assert_eq!(area(make_obstrn(None, Some(1))), ["AC(CHBRN)", "LS(SOLD,2,CSTLN)"]);
+        assert_eq!(area(make_obstrn(None, Some(4))), ["AC(DEPIT)", "LS(DASH,2,CSTLN)"]);
+        assert_eq!(area(make_obstrn(None, Some(3))), ["AC(DEPVS)", "LS(DOTT,2,CHBLK)"]);
+        // Foul ground (CATOBS 6) always under water gets the pattern.
+        let mut foul = make_obstrn(None, Some(3));
+        foul.attributes.insert("CATOBS", AttributeValue::Integer(6));
+        assert_eq!(area(foul), ["AC(DEPVS)", "AP(FOULAR01)", "LS(DOTT,2,CHBLK)"]);
+        // With a sounding: an outline and the depth, no fill.
+        assert_eq!(
+            area(make_obstrn(Some(25.0), None)),
+            ["LS(DASH,2,CHBLK)", "TE('%4.1lf','VALSOU',3,1,2,'15110',1,1,CHGRD,11)"]
+        );
+    }
+
+    #[test]
+    fn isolated_danger_area_is_filled_and_marked() {
+        let f = with_type(make_obstrn(Some(5.0), None), FeatureType::Area);
+        let instrs = obstrn04_instructions(&f, &test_contours(), &deep_water());
+        assert_eq!(
+            s52(&instrs),
+            ["AC(DEPVS)", "AP(FOULAR01)", "LS(DOTT,2,CHBLK)", "SY(ISODGR51)"]
+        );
+    }
+
+    /// s52cnsy.cpp OBSTRN04 continuation C draws an area obstruction that
+    /// UDWHAZ03 flags as dangerous but is WATLEV 1/2 (dry) with the ordinary
+    /// dry-area fill: UDWHAZ03 returns no symbol for dry objects, so the
+    /// `0 != udwhaz03str->Len()` branch is not taken.
+    #[test]
+    fn dry_area_obstruction_in_deep_water_keeps_the_dry_fill() {
+        let f = with_type(make_obstrn(None, Some(1)), FeatureType::Area);
+        let instrs = obstrn04_instructions(&f, &test_contours(), &deep_water());
+        assert_eq!(s52(&instrs), ["AC(CHBRN)", "LS(SOLD,2,CSTLN)"]);
+    }
+
+    #[test]
+    fn named_obstruction_carries_its_name() {
+        let mut f = make_obstrn(None, Some(3));
+        f.attributes.insert("OBJNAM", AttributeValue::String("Horn Rock".to_string()));
+        let instrs = obstrn04_instructions(&f, &test_contours(), CsContext::EMPTY);
+        assert_eq!(
+            s52(&instrs),
+            ["SY(OBSTRN01)", "TX(OBJNAM,1,2,3,'15118',-1,-1,CHBLK,26)"]
+        );
+    }
+
+    #[test]
+    fn test_obstrn_covers_and_uncovers_with_depth() {
+        // WATLEV=4 (covers and uncovers) with a sounding -> DANGER53
         let feature = make_obstrn(Some(12.0), Some(4));
         let settings = test_contours();
         let result = obstrn04(&feature, &settings, CsContext::EMPTY);
@@ -568,8 +739,8 @@ mod tests {
     }
 
     #[test]
-    fn test_uwtroc_covers_uncovers_no_valsou() {
-        // UWTROC with WATLEV=3 (covers/uncovers), no VALSOU -> UWTROC03
+    fn test_uwtroc_submerged_no_valsou() {
+        // UWTROC with WATLEV=3 (always under water), no VALSOU -> UWTROC03
         let feature = make_uwtroc(None, Some(3));
         let settings = test_contours();
         let result = obstrn04(&feature, &settings, CsContext::EMPTY);
@@ -578,7 +749,7 @@ mod tests {
 
     #[test]
     fn test_uwtroc_with_depth() {
-        // UWTROC with VALSOU > safety_contour, WATLEV=3 -> DANGER51
+        // UWTROC with a sounding within 20 m, WATLEV=3 -> DANGER51
         let feature = make_uwtroc(Some(15.0), Some(3));
         let settings = test_contours();
         let result = obstrn04(&feature, &settings, CsContext::EMPTY);
@@ -615,7 +786,8 @@ mod tests {
             ..Default::default()
         };
         let result = obstrn04(&feature, &settings, &ctx);
-        assert_ne!(result.symbol, ObstrnSymbol::Isodgr51);
+        assert_eq!(result.symbol, ObstrnSymbol::Danger52);
+        assert!(result.show_sounding);
         assert!(!result.is_isolated_danger);
     }
 

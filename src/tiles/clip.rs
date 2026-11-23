@@ -384,14 +384,74 @@ mod tests {
         assert!(clipped.is_empty());
     }
 
+    /// Shoelace area of a polygon, unsigned.
+    fn area(poly: &[[f64; 2]]) -> f64 {
+        let n = poly.len();
+        (0..n)
+            .map(|i| {
+                let (a, b) = (poly[i], poly[(i + 1) % n]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum::<f64>()
+            .abs()
+            * 0.5
+    }
+
+    fn inside(p: &[f64; 2], b: &TileBounds) -> bool {
+        p[0] >= b.min_x && p[0] <= b.max_x && p[1] >= b.min_y && p[1] <= b.max_y
+    }
+
     #[test]
     fn clip_triangle_partial() {
         let bounds = TileBounds::new(0.0, 100.0, 0.0, 100.0);
-        // Triangle extends beyond right edge
+        // Triangle extends beyond right edge; the part left of x = 100 is the
+        // triangle (50,50) (100,50) (100,100), half the original.
         let tri = [[50.0, 50.0], [150.0, 50.0], [100.0, 100.0]];
         let clipped = clip_triangle(tri, &bounds);
-        // Should be clipped to a polygon with 4 or 5 vertices
-        assert!(clipped.len() >= 3 && clipped.len() <= 7);
+        assert!(clipped.iter().all(|p| inside(p, &bounds)), "{clipped:?}");
+        assert!((area(&clipped) - 1250.0).abs() < 1e-9, "{clipped:?}");
+    }
+
+    /// A triangle far larger than the tile — a big sea area seen at high
+    /// zoom — clips to the whole tile, not to nothing and not to a corner.
+    #[test]
+    fn a_triangle_spanning_the_tile_clips_to_the_whole_tile() {
+        let bounds = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        let tri = [[-1000.0, -1000.0], [3000.0, -1000.0], [-1000.0, 3000.0]];
+        let clipped = clip_triangle(tri, &bounds);
+        assert!(clipped.iter().all(|p| inside(p, &bounds)), "{clipped:?}");
+        assert!((area(&clipped) - 10_000.0).abs() < 1e-6, "{clipped:?}");
+    }
+
+    /// Four tiles sharing a corner each clip the same triangle; the pieces
+    /// must add back up to the triangle, with nothing lost or drawn twice
+    /// at the shared edges. Catches an intersection on the wrong axis or an
+    /// edge test the wrong way round, which a vertex count would not.
+    #[test]
+    fn neighbouring_tiles_share_a_triangle_without_gap_or_overlap() {
+        let tri = [[13.0, 7.0], [181.0, 42.0], [64.0, 171.0]];
+        let total: f64 = [(0.0, 0.0), (100.0, 0.0), (0.0, 100.0), (100.0, 100.0)]
+            .iter()
+            .map(|&(x, y)| {
+                let b = TileBounds::new(x, x + 100.0, y, y + 100.0);
+                let piece = clip_triangle(tri, &b);
+                assert!(piece.iter().all(|p| inside(p, &b)), "{piece:?} outside {b:?}");
+                area(&piece)
+            })
+            .sum();
+        assert!((total - area(&tri)).abs() < 1e-6, "{total} vs {}", area(&tri));
+    }
+
+    /// A triangle that only touches the tile along an edge has no area in
+    /// it; one with a vertex exactly on the edge keeps all of its area.
+    #[test]
+    fn triangles_on_the_tile_edge() {
+        let bounds = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        let touching = [[100.0, 10.0], [150.0, 20.0], [100.0, 30.0]];
+        assert!(area(&clip_triangle(touching, &bounds)) < 1e-9);
+        let on_edge = [[100.0, 10.0], [50.0, 20.0], [100.0, 30.0]];
+        let clipped = clip_triangle(on_edge, &bounds);
+        assert!((area(&clipped) - area(&on_edge)).abs() < 1e-9, "{clipped:?}");
     }
 
     #[test]
@@ -400,6 +460,10 @@ mod tests {
         let triangles = triangulate_fan(&polygon);
         // 4-vertex polygon = 2 triangles = 6 vertices
         assert_eq!(triangles.len(), 6);
+        // And they cover the square exactly once.
+        let covered: f64 = triangles.chunks(3).map(area).sum();
+        assert!((covered - 100.0).abs() < 1e-9, "{covered}");
+        assert!(triangulate_fan(&polygon[..2]).is_empty());
     }
 
     #[test]
@@ -429,6 +493,43 @@ mod tests {
         // Should be clipped to [0, 50] - [100, 50]
         assert!((clipped[0][0][0] - 0.0).abs() < 0.01);
         assert!((clipped[0][1][0] - 100.0).abs() < 0.01);
+        assert!(clipped[0].iter().all(|p| (p[1] - 50.0).abs() < 1e-9), "{clipped:?}");
+    }
+
+    /// Cohen-Sutherland's trap: both ends outside, on different sides (so
+    /// the trivial reject does not fire), and the segment still misses the
+    /// tile by passing outside its corner.
+    #[test]
+    fn a_segment_cutting_past_a_corner_is_rejected() {
+        let bounds = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        // From left of the tile to above it; at x = 0 it is already at y 148.
+        let line = [[-50.0, 90.0], [10.0, 160.0]];
+        assert!(clip_polyline(&line, &bounds).is_empty());
+    }
+
+    /// A diagonal crossing the tile is cut exactly where it meets the edges,
+    /// on both axes.
+    #[test]
+    fn a_diagonal_is_cut_at_both_edges() {
+        let bounds = TileBounds::new(0.0, 100.0, 0.0, 100.0);
+        // y = x / 2 + 20: in through the left edge at (0, 20), out through
+        // the right edge at (100, 70).
+        let line = [[-40.0, 0.0], [160.0, 100.0]];
+        let pieces = clip_polyline(&line, &bounds);
+        assert_eq!(pieces.len(), 1);
+        let p = &pieces[0];
+        assert_eq!(p.len(), 2);
+        assert!((p[0][0] - 0.0).abs() < 1e-9 && (p[0][1] - 20.0).abs() < 1e-9, "{p:?}");
+        assert!((p[1][0] - 100.0).abs() < 1e-9 && (p[1][1] - 70.0).abs() < 1e-9, "{p:?}");
+
+        // And through the bottom and top: x = 20 + (y + 50) / 5, so in at
+        // (30, 0) and out at (50, 100).
+        let line = [[20.0, -50.0], [60.0, 150.0]];
+        let pieces = clip_polyline(&line, &bounds);
+        assert_eq!(pieces.len(), 1);
+        let p = &pieces[0];
+        assert!((p[0][0] - 30.0).abs() < 1e-9 && (p[0][1] - 0.0).abs() < 1e-9, "{p:?}");
+        assert!((p[1][0] - 50.0).abs() < 1e-9 && (p[1][1] - 100.0).abs() < 1e-9, "{p:?}");
     }
 
     #[test]

@@ -69,7 +69,7 @@ known! {
     "tanks.fuel.0.currentLevel"                 => "Fuel",     Ratio;
     "tanks.freshWater.0.currentLevel"           => "Water",    Ratio;
     "tanks.blackWater.0.currentLevel"           => "Waste",    Ratio;
-    "propulsion.port.revolutions"               => "RPM",      Count;
+    "propulsion.port.revolutions"               => "RPM",      Revolutions;
     "propulsion.port.coolantTemperature"        => "Coolant",  Temperature;
 
     // Fix quality — worth a tile when the position looks wrong.
@@ -137,7 +137,15 @@ pub fn label_for(path: &str) -> &str {
 /// How to present a path's number. Unknown paths are shown as a bare count,
 /// because guessing a unit is worse than showing none.
 pub fn quantity_for(path: &str) -> Quantity {
-    lookup(path).map(|k| k.quantity).unwrap_or(Quantity::Count)
+    if let Some(k) = lookup(path) {
+        return k.quantity;
+    }
+    // Any engine's speed, whatever the boat calls it (`main`, `starboard`,
+    // `0`): Signal K gives them all in Hz.
+    if path.starts_with("propulsion.") && path.ends_with(".revolutions") {
+        return Quantity::Revolutions;
+    }
+    Quantity::Count
 }
 
 /// What a bar shows before anyone has configured it.
@@ -179,6 +187,15 @@ mod tests {
         assert_eq!(label_for("odd"), "odd");
     }
 
+    /// The Signal K schema gives every `propulsion.<id>.revolutions` in Hz,
+    /// whatever the engine is called.
+    #[test]
+    fn every_engines_speed_is_revolutions() {
+        for path in ["propulsion.port.revolutions", "propulsion.main.revolutions", "propulsion.0.revolutions"] {
+            assert_eq!(quantity_for(path), Quantity::Revolutions, "{path}");
+        }
+    }
+
     #[test]
     fn the_table_has_no_duplicate_paths() {
         // A duplicate would make lookup order decide the label, silently.
@@ -193,6 +210,57 @@ mod tests {
         for path in DEFAULT_BAR {
             assert!(lookup(path).is_some(), "{path} is not in the table");
         }
+    }
+
+    /// A path filed under the wrong quantity shows a plausible wrong number —
+    /// sea temperature as 287, depth in knots — so the table is checked
+    /// against what each path's own name says it measures.
+    #[test]
+    fn every_path_is_filed_under_what_its_name_says() {
+        for k in KNOWN {
+            let p = k.path.to_ascii_lowercase();
+            let expected = if p.contains("temperature") {
+                Some(Quantity::Temperature)
+            } else if p.starts_with("environment.depth.") {
+                Some(Quantity::Depth)
+            } else if p.contains("speed") {
+                Some(Quantity::Speed)
+            } else if p.contains("heading") || p.contains("courseoverground") || p.contains("directiontrue") {
+                Some(Quantity::Angle)
+            } else if p.contains("angle") || p.contains("attitude") {
+                Some(Quantity::RelativeAngle)
+            } else if p.contains("currentlevel") || p.contains("stateofcharge") || p.contains("humidity") {
+                Some(Quantity::Ratio)
+            } else if p.ends_with(".voltage") {
+                Some(Quantity::Voltage)
+            } else if p.ends_with(".pressure") {
+                Some(Quantity::Pressure)
+            } else {
+                None
+            };
+            if let Some(q) = expected {
+                assert_eq!(k.quantity, q, "{} is filed as {:?}", k.path, k.quantity);
+            }
+        }
+        // The ones the name alone does not settle.
+        assert_eq!(quantity_for("navigation.log"), Quantity::Distance);
+        assert_eq!(quantity_for("electrical.batteries.house.current"), Quantity::Current);
+        assert_eq!(quantity_for("navigation.magneticVariation"), Quantity::RelativeAngle);
+    }
+
+    #[test]
+    fn manx_tiles_have_their_own_labels_and_old_ids_are_brought_forward() {
+        assert_eq!(label_for(WIND_ROSE), "Wind rose");
+        assert_eq!(label_for("manx.route.wpEta"), "WP ETA");
+        assert!(is_route_tile("manx.route.planDelta"));
+        assert!(!is_route_tile(WIND_ROSE));
+        assert!(!is_route_tile("navigation.speedOverGround"));
+        // A bar saved before the rename keeps its wind rose.
+        assert_eq!(current_tile("navcore.windRose".into()), WIND_ROSE);
+        assert_eq!(
+            current_tile("navigation.headingTrue".into()),
+            "navigation.headingTrue"
+        );
     }
 
     #[test]

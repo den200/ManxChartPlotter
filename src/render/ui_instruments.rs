@@ -17,6 +17,7 @@
 //!   instruments on one, the route being followed on the next — and a swipe
 //!   across it turns the page, as on a phone.
 
+use crate::render::ui::ShowWindow as _;
 use egui::{Align2, Color32, Context, FontId, RichText, Sense, Stroke, Vec2};
 
 use super::ui::{BarPosition, InstrumentPage, InstrumentView, UiAction};
@@ -100,7 +101,12 @@ fn strip(
             ui.vertical_centered(|ui| {
                 ui.add_space(6.0);
                 let size = Vec2::new(SIDE_WIDTH - 12.0, BAR_HEIGHT - 12.0);
-                tiles(ui, view, src, size, size.x);
+                if !view.active {
+                    not_connected(ui, view, actions);
+                } else {
+                    tiles(ui, view, src, size, size.x);
+                    waiting_for_gps(ui, view, src.vessel);
+                }
                 status_dot(ui, view);
                 page_dots(ui, view, actions);
             });
@@ -110,7 +116,12 @@ fn strip(
     ui.horizontal_centered(|ui| {
         ui.add_space(6.0);
         let size = Vec2::new(TILE_WIDTH, BAR_HEIGHT - 12.0);
-        tiles(ui, view, src, size, size.y);
+        if !view.active {
+            not_connected(ui, view, actions);
+        } else {
+            tiles(ui, view, src, size, size.y);
+            waiting_for_gps(ui, view, src.vessel);
+        }
         // The connection's health belongs on the bar, not buried in a
         // window: a stale reading and a dropped link look identical
         // otherwise.
@@ -120,6 +131,34 @@ fn strip(
             page_dots(ui, view, actions);
         });
     });
+}
+
+/// The bar with no connection asked for: say so, and offer the way to one.
+/// A row of dashes said nothing — not that there was no boat on the other
+/// end, and not where to go to find her.
+fn not_connected(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
+    ui.label("Not connected to the boat");
+    if ui
+        .button("Connect")
+        .on_hover_text("Connect to the Signal K server on board")
+        .clicked()
+    {
+        // The address used last time, if there is one; else ask for it.
+        if view.url.trim().is_empty() {
+            view.open = true;
+        } else {
+            actions.push(UiAction::SignalKConnect { url: view.url.clone() });
+        }
+    }
+}
+
+/// Connected, and no position from the boat (or none lately): the one
+/// missing reading everything else on a plotter depends on, named.
+fn waiting_for_gps(ui: &mut egui::Ui, view: &InstrumentView, vessel: &Vessel) {
+    let fresh = vessel.get("navigation.position").is_some_and(|r| !r.is_stale());
+    if view.connected && !fresh {
+        ui.label(RichText::new("Waiting for GPS").color(ui.visuals().warn_fg_color));
+    }
 }
 
 /// Every tile on the bar, each `size` — the wind rose excepted, which is a
@@ -310,6 +349,17 @@ fn tile(
             ],
             Stroke::new(1.5_f32, ui.visuals().warn_fg_color),
         );
+        // How old, in so many words and on the tile: a hover is no use to
+        // a finger.
+        if let Some(r) = reading {
+            painter.text(
+                rect.center_bottom() - Vec2::new(0.0, 2.0),
+                Align2::CENTER_BOTTOM,
+                age_text(r.age()),
+                FontId::proportional(LABEL_SIZE),
+                ui.visuals().warn_fg_color,
+            );
+        }
         if let Some(r) = reading {
             return response.on_hover_text(format!(
                 "{path}\nLast heard {:.0}s ago",
@@ -319,6 +369,18 @@ fn tile(
     }
 
     response.on_hover_text(path)
+}
+
+/// How long ago a reading was heard, as the tile says it.
+fn age_text(age: std::time::Duration) -> String {
+    let s = age.as_secs();
+    if s < 90 {
+        format!("{s} s ago")
+    } else if s < 5400 {
+        format!("{} min ago", (s + 30) / 60)
+    } else {
+        format!("{} h ago", (s + 1800) / 3600)
+    }
 }
 
 /// A tile fed by the route being followed: distance, time or arrival, to
@@ -585,7 +647,7 @@ pub fn settings(
     actions: &mut Vec<UiAction>,
 ) {
     let mut open = view.open;
-    egui::Window::new("Instruments")
+    egui::Window::new("Connection and instruments")
         .constrain_to(ctx.available_rect())
         // No title-bar collapse: on a touchscreen it is an easy accidental
         // tap that leaves an empty title bar and no obvious way back.
@@ -593,14 +655,11 @@ pub fn settings(
         .open(&mut open)
         .resizable(true)
         .default_width(460.0)
-        .show(ctx, |ui| {
+        .show_fitted(ctx, |ui| {
             // Scrolled: on a plotter-sized screen the pages and the tile
             // lists run well below the bottom edge.
             egui::ScrollArea::vertical().show(ui, |ui| {
                 connection(ui, view, actions);
-                ui.add_space(10.0);
-                ui.separator();
-                layout(ui, view, actions);
                 ui.add_space(10.0);
                 ui.separator();
                 pages(ui, view, actions);
@@ -665,70 +724,40 @@ fn connection(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<Ui
     }
 }
 
-fn layout(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
-    ui.label(RichText::new("Layout").strong());
+/// Where the instrument bar sits, the units everything is read in, and
+/// whether the traffic is drawn. In the Display window, with the rest of
+/// how things look — they used to be under Instruments, between the server
+/// address and the tile lists.
+pub fn layout(ui: &mut egui::Ui, view: &mut InstrumentView, actions: &mut Vec<UiAction>) {
     let before = after(view);
-    ui.horizontal(|ui| {
-        ui.label("Bar:");
+    ui.label(RichText::new("Instrument bar").strong());
+    ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut view.position, BarPosition::Top, "Top");
         ui.selectable_value(&mut view.position, BarPosition::Bottom, "Bottom");
         ui.selectable_value(&mut view.position, BarPosition::Left, "Left");
         ui.selectable_value(&mut view.position, BarPosition::Right, "Right");
         ui.selectable_value(&mut view.position, BarPosition::Hidden, "Hidden");
     });
-    ui.horizontal(|ui| {
-        ui.label("Depth:");
+    ui.label(RichText::new("Units").strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Depth");
         use crate::signalk::units::DepthUnit::*;
         ui.selectable_value(&mut view.units.depth, Metres, "m");
         ui.selectable_value(&mut view.units.depth, Feet, "ft");
         ui.selectable_value(&mut view.units.depth, Fathoms, "fm");
         ui.add_space(12.0);
-        ui.label("Speed:");
+        ui.label("Speed");
         use crate::signalk::units::SpeedUnit::*;
         ui.selectable_value(&mut view.units.speed, Knots, "kn");
         ui.selectable_value(&mut view.units.speed, Kilometres, "km/h");
         ui.selectable_value(&mut view.units.speed, MetresPerSecond, "m/s");
-    });
-    ui.horizontal(|ui| {
-        ui.label("Temperature:");
+        ui.add_space(12.0);
+        ui.label("Temperature");
         use crate::signalk::units::TemperatureUnit::*;
         ui.selectable_value(&mut view.units.temperature, Celsius, "°C");
         ui.selectable_value(&mut view.units.temperature, Fahrenheit, "°F");
     });
-    ui.checkbox(&mut view.follow, "Keep the boat centred on the chart");
-
-    ui.add_space(8.0);
-    ui.label(RichText::new("AIS traffic").strong());
-    ui.checkbox(&mut view.show_ais, "Show other vessels");
-    ui.label(
-        RichText::new(
-            "A target is called dangerous only when it passes both tests. The \
-             right numbers depend on the water — a quarter-mile is prudent \
-             offshore and unusable in a busy strait, where every ferry would \
-             trip it.",
-        )
-        .small()
-        .weak(),
-    );
-    ui.horizontal(|ui| {
-        ui.label("Warn within");
-        ui.add(
-            egui::DragValue::new(&mut view.cpa_alarm_nm)
-                .speed(0.05)
-                .range(0.02..=5.0)
-                .fixed_decimals(2)
-                .suffix(" NM"),
-        );
-        ui.label("and");
-        ui.add(
-            egui::DragValue::new(&mut view.tcpa_alarm_min)
-                .speed(1.0)
-                .range(1.0..=60.0)
-                .fixed_decimals(0)
-                .suffix(" min"),
-        );
-    });
-
+    ui.checkbox(&mut view.show_ais, "Other vessels (AIS)");
     if before != after(view) {
         actions.push(UiAction::SettingsChanged);
     }
@@ -832,54 +861,59 @@ fn picker(
     let mut move_to: Option<(usize, usize)> = None;
 
     for (i, path) in tiles.iter().enumerate() {
-        ui.horizontal(|ui| {
-            let live = is_live(path, src);
-            let dot = if live {
-                crate::render::theme::current().green
-            } else {
-                ui.visuals().weak_text_color()
-            };
-            let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-            ui.painter().circle_filled(rect.center(), 3.5, dot);
-
-            ui.label(RichText::new(catalog::label_for(path)).strong());
-            let about = if path == catalog::WIND_ROSE {
-                "apparent and true wind"
-            } else if let Some(t) = catalog::ROUTE_TILES.iter().find(|t| t.0 == path) {
-                t.2
-            } else {
-                path
-            };
-            ui.label(RichText::new(about).small().weak());
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("✕").on_hover_text("Remove").clicked() {
-                    remove = Some(i);
-                }
-                if ui
-                    .add_enabled(i + 1 < tiles.len(), egui::Button::new("▼"))
-                    .clicked()
-                {
-                    move_to = Some((i, i + 1));
-                }
-                if ui.add_enabled(i > 0, egui::Button::new("▲")).clicked() {
-                    move_to = Some((i, i - 1));
-                }
-                if !live {
-                    // Offline, nothing is sent at all; saying the boat does
-                    // not send this path would read as a data fault.
-                    ui.label(
-                        RichText::new(if catalog::is_route_tile(path) {
-                            "no route followed"
-                        } else if view.connected {
-                            "not sent by this boat"
-                        } else {
-                            "not connected"
-                        })
-                        .small()
-                        .weak(),
-                    );
-                }
+        let live = is_live(path, src);
+        let about = if path == catalog::WIND_ROSE {
+            "apparent and true wind"
+        } else if let Some(t) = catalog::ROUTE_TILES.iter().find(|t| t.0 == path) {
+            t.2
+        } else {
+            path
+        };
+        // Offline, nothing is sent at all; saying the boat does not send
+        // this path would read as a data fault.
+        let state = if live {
+            ""
+        } else if catalog::is_route_tile(path) {
+            " · no route followed"
+        } else if view.connected {
+            " · not sent by this boat"
+        } else {
+            " · not connected"
+        };
+        // The buttons first, from the right, so the text gets what is left
+        // and is cut short rather than running under them.
+        // Words: the bundled font has no ▲ ▼ ✕ and drew three empty boxes.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("Remove").clicked() {
+                remove = Some(i);
+            }
+            if ui
+                .add_enabled(i + 1 < tiles.len(), egui::Button::new("Down"))
+                .on_hover_text("Later on the bar")
+                .clicked()
+            {
+                move_to = Some((i, i + 1));
+            }
+            if ui
+                .add_enabled(i > 0, egui::Button::new("Up"))
+                .on_hover_text("Earlier on the bar")
+                .clicked()
+            {
+                move_to = Some((i, i - 1));
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                let dot = if live {
+                    crate::render::theme::current().green
+                } else {
+                    ui.visuals().weak_text_color()
+                };
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                ui.painter().circle_filled(rect.center(), 3.5, dot);
+                ui.label(RichText::new(catalog::label_for(path)).strong());
+                ui.add(
+                    egui::Label::new(RichText::new(format!("{about}{state}")).small().weak())
+                        .truncate(),
+                );
             });
         });
     }
@@ -990,6 +1024,21 @@ fn picker(
 }
 
 #[cfg(test)]
+mod age_tests {
+    use super::age_text;
+    use std::time::Duration;
+
+    #[test]
+    fn a_stale_reading_says_how_old_it_is() {
+        assert_eq!(age_text(Duration::from_secs(12)), "12 s ago");
+        assert_eq!(age_text(Duration::from_secs(89)), "89 s ago");
+        assert_eq!(age_text(Duration::from_secs(90)), "2 min ago");
+        assert_eq!(age_text(Duration::from_secs(600)), "10 min ago");
+        assert_eq!(age_text(Duration::from_secs(3 * 3600)), "3 h ago");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
@@ -1049,7 +1098,7 @@ mod tests {
     fn a_long_passage_counts_days() {
         assert_eq!(time_to_go(7.0 + 5.0 / 60.0), ("7:05".into(), String::new()));
         assert_eq!(time_to_go(240.0), ("10".into(), "d".into()));
-        // 30 hours from noon is six in the evening, the day after next.
+        // 30 hours from noon is six in the evening of the next day.
         assert_eq!(eta(at_noon(), 30.0), ("18:00".into(), "+1d".into()));
     }
 
