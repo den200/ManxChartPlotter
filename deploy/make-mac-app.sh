@@ -21,7 +21,7 @@ APP="$TMP/Manx.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/manx "$APP/Contents/MacOS/"
 cp -R assets "$APP/Contents/Resources/"
-deploy/fetch-decoder.sh osx "$APP/Contents/Resources"
+bash deploy/fetch-decoder.sh osx "$APP/Contents/Resources"
 
 # The icon, from the 512 px mark at every size macOS asks for.
 ICONSET="$TMP/Manx.iconset"

@@ -82,7 +82,7 @@ jobs:
           fi
           cp -R assets "$dir/"
           if [[ -n "${{ matrix.decoder }}" ]]; then
-            deploy/fetch-decoder.sh "${{ matrix.decoder }}" "$dir"
+            bash deploy/fetch-decoder.sh "${{ matrix.decoder }}" "$dir"
           fi
           cp README.md COPYING deploy/INSTALL.md "$dir/"
           if [[ "${{ matrix.archive }}" == zip ]]; then
