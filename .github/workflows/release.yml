@@ -6,10 +6,9 @@
 # The licence is COPYING, not LICENSE: on a Mac, LICENSE is the same name
 # as the gitignored license/ folder that holds the o-charts fingerprint.
 #
-# Each download is the binary plus its assets/ folder; Manx finds assets/
-# beside itself wherever it is unpacked. Not included, on purpose:
-# - o-charts' decryption helper (oexserverd), which is not ours to
-#   redistribute. Users copy it from o-charts' OpenCPN plugin; see INSTALL.
+# Each download is the binary, its assets/ folder and, except on Windows,
+# o-charts' decryption helper in oeserverd/ (deploy/fetch-decoder.sh); Manx
+# finds both beside itself wherever it is unpacked. Not built here:
 # - The Android APK, which must be signed with the one key the Odroid's
 #   o-charts licence depends on. That key never leaves Denis's machines, so
 #   the APK is built locally (deploy/build-apk.sh) and attached by hand.
@@ -36,12 +35,15 @@ jobs:
           - name: linux-x86_64
             os: ubuntu-22.04
             archive: tar.gz
+            decoder: linux64
           - name: linux-arm64
             os: ubuntu-22.04-arm
             archive: tar.gz
+            decoder: linuxarm64
           - name: macos-arm64
             os: macos-15
             archive: tar.gz
+            decoder: osx
           # Experimental: builds, but o-charts decryption speaks Unix pipes
           # and is not ported to Windows yet, so only free charts open.
           - name: windows-x86_64
@@ -79,6 +81,9 @@ jobs:
             strip "$dir/manx" || true
           fi
           cp -R assets "$dir/"
+          if [[ -n "${{ matrix.decoder }}" ]]; then
+            deploy/fetch-decoder.sh "${{ matrix.decoder }}" "$dir"
+          fi
           cp README.md COPYING deploy/INSTALL.md "$dir/"
           if [[ "${{ matrix.archive }}" == zip ]]; then
             7z a -tzip "$dir.zip" "$dir" > /dev/null

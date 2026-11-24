@@ -4,7 +4,7 @@
 
 ## Run it
 
-Unpack the download anywhere and run `manx` (`manx.exe` on Windows). Keep the `assets` folder next to it.
+Unpack the download anywhere and run `manx` (`manx.exe` on Windows). Keep the `assets` and `oeserverd` folders next to it.
 
 - **Raspberry Pi 5 / Odroid:** Raspberry Pi OS (Bookworm or Trixie) or any 64-bit ARM Linux with a Vulkan driver. The Pi's standard desktop has one.
 - **macOS:** the app is not signed yet. The first time, right-click `manx` and choose Open, or run `xattr -dr com.apple.quarantine .` in the unpacked folder.
@@ -13,10 +13,7 @@ Unpack the download anywhere and run `manx` (`manx.exe` on Windows). Keep the `a
 ## Charts
 
 - **Free charts:** Charts → Free charts. NOAA charts download and open in the app.
-- **o-charts:** buy them at [o-charts.org](https://o-charts.org), then download them in Charts → My o-charts. To read them, Manx needs o-charts' own decryption helper, which we may not redistribute:
-  1. Install the o-charts plugin in OpenCPN, or download it from o-charts.
-  2. Copy `oexserverd` and the libraries beside it into `~/.manx/decoder/`.
-  3. On a Mac, the helper is Intel-only: install Rosetta with `softwareupdate --install-rosetta`.
+- **o-charts:** buy them at [o-charts.org](https://o-charts.org), then download them in Charts → My o-charts. o-charts' own decryption helper, `oexserverd`, comes with Manx in the `oeserverd` folder; keep it next to `manx`, as with `assets`. On a Mac the helper is Intel-only: install Rosetta once with `softwareupdate --install-rosetta`.
 
 Manx asks you to accept o-charts' licence agreement before the charts are installed and opened. o-charts chart sets are not official charts and cannot be used to meet carriage requirements. Each machine uses one of your installs (two or five per licence, depending on the chart); do not clone a system that holds one. A set can only be installed while its licence runs. On Android the install belongs to Manx alone and can't be shared with OpenCPN or another app. o-charts doesn't support Manx; ask us instead. See [o-charts terms](../README.md#o-charts-terms).
 

@@ -5,7 +5,7 @@
 #   deploy/make-mac-app.sh [destination]     (default: target/Manx.app)
 #
 # The app is ad-hoc signed, not notarised: fine on the Mac that built it.
-# o-charts still need oexserverd in ~/.manx/decoder (see deploy/INSTALL.md).
+# o-charts' helper goes in Contents/Resources/oeserverd (fetch-decoder.sh).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -21,6 +21,7 @@ APP="$TMP/Manx.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/manx "$APP/Contents/MacOS/"
 cp -R assets "$APP/Contents/Resources/"
+deploy/fetch-decoder.sh osx "$APP/Contents/Resources"
 
 # The icon, from the 512 px mark at every size macOS asks for.
 ICONSET="$TMP/Manx.iconset"
